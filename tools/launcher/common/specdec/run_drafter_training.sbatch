@@ -77,7 +77,9 @@ done
 [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_STEPS must be positive" >&2; exit 2; }
 [[ $((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE)) -eq "$GLOBAL_BATCH_SIZE" ]] || { echo "manifest batch arithmetic must equal GBS 512" >&2; exit 2; }
 CONTROL_ROOT="${OUTPUT_ROOT}/control"
+STAGE_LOG_ROOT="${OUTPUT_ROOT}/logs/stage-${SLURM_JOB_ID}"
 mkdir -p "$OUTPUT_ROOT" "$CONTROL_ROOT"
+mkdir -p "$STAGE_LOG_ROOT"
 
 case "${METHOD}:${BLOCK_SIZE}" in
     dflash:8|dflash:16)
@@ -102,10 +104,12 @@ case "${METHOD}:${BLOCK_SIZE}" in
 esac
 export SERVE_NODES NUM_SPEC_TOKENS
 
-export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT SCRATCH_JOB_ROOT
+export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT SCRATCH_JOB_ROOT STAGE_LOG_ROOT
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
 srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
     set -euo pipefail
+    exec >"${STAGE_LOG_ROOT}/node-${SLURM_NODEID}.log" 2>&1
+    set -x
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
     cp -a "$SOURCE_PATH" "$node_root/source"

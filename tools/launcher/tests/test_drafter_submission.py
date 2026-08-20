@@ -362,6 +362,16 @@ def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir()
     assert 'ln -s .. "$node_root/source/modules/Model-Optimizer"' not in runner
 
 
+def test_host_staging_preserves_one_bounded_diagnostic_log_per_node() -> None:
+    """A failed staging command must remain attributable without a shared log funnel."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    assert 'STAGE_LOG_ROOT="${OUTPUT_ROOT}/logs/stage-${SLURM_JOB_ID}"' in runner
+    assert 'mkdir -p "$STAGE_LOG_ROOT"' in runner
+    assert 'exec >"${STAGE_LOG_ROOT}/node-${SLURM_NODEID}.log" 2>&1' in runner
+    assert "set -x" in runner
+
+
 def test_runtime_relocation_accepts_exported_and_quoted_activate_assignments() -> None:
     """OCI virtualenv activation lines may use export and shell quotes."""
     parser = re.compile(r"^\s*export\s+VIRTUAL_ENV=(.*)$")
