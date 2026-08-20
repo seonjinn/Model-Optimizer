@@ -156,6 +156,7 @@ def test_streaming_serve_uses_activated_runtime_python(tmp_path: Path) -> None:
     activate.write_text(f'export PATH="{runtime / "bin"}:$PATH"\n')
     fake_python = f"""#!/bin/sh
 printf 'runtime-python %s\\n' "$*" >> "{invocation_log}"
+[ "$1" = "-m" ] && sleep 1
 exit 0
 """
     _write_executable(runtime / "bin" / "python", fake_python)
