@@ -1,6 +1,13 @@
 # DSpark streaming speculative-decoding training for Qwen3-235B-A22B (multi-node).
 #
 # One four-GPU TP=4 serve node streams hidden states to one four-GPU trainer node.
+# B16 coupled override:
+#   pipeline.global_vars.dflash_block_size=16 pipeline.global_vars.num_spec_tokens=16
+#   pipeline.global_vars.dflash_loss_decay_factor=7
+# Reuse staged data with: pipeline.task_0.skip=true pipeline.global_vars.hf_data=<path>
+# Supply the pinned deployment artifacts at launch time:
+#   pipeline.global_vars.modelopt_runtime=<runtime> pipeline.task_1.slurm_config.container=<image>
+#   pipeline.task_2.slurm_config.container=<image>
 
 job_name: Qwen3-235B-A22B_DSpark_streaming_multi_node
 pipeline:
@@ -10,10 +17,17 @@ pipeline:
 
   global_vars:
     hf_model: /hf-local/Qwen/Qwen3-235B-A22B
+    hf_data: /scratchspace/data/train.jsonl
+    sample_size: "50000"
+    modelopt_runtime: ""
+    report_to: wandb
+    run_name: Qwen3-235B-A22B_DSpark_streaming_multi_node
     dflash_block_size: "8"
     dflash_loss_decay_factor: "4"
+    num_spec_tokens: "8"
 
   task_0:
+    skip: false
     script: common/eagle3/make_dataset.sh
     args:
       - -f modules/Model-Optimizer/examples/dataset/example_data_config.yaml
@@ -32,15 +46,19 @@ pipeline:
       - model.model_name_or_path=<<global_vars.hf_model>>
       - model.use_fake_base_for_offline=true
       - data.mode=streaming
-      - data.data_path=/scratchspace/data/train.jsonl
+      - data.data_path=<<global_vars.hf_data>>
+      - data.sample_size=<<global_vars.sample_size>>
       - training.output_dir=/scratchspace/dspark
       - training.training_seq_len=4096
       - training.disable_tqdm=true
       - training.answer_only_loss=false
       - training.num_train_epochs=1
       - training.max_steps=2000
-      - training.report_to=none
+      - training.seed=42
+      - training.report_to=<<global_vars.report_to>>
+      - training.run_name=<<global_vars.run_name>>
       - dflash.dflash_block_size=<<global_vars.dflash_block_size>>
+      - dflash.dflash_loss_objective=decay
       - dflash.dflash_loss_decay_factor=<<global_vars.dflash_loss_decay_factor>>
       - dflash.dflash_mask_token_id=151669
       - dflash.dflash_architecture_config.num_hidden_layers=5
@@ -50,6 +68,11 @@ pipeline:
       - dflash.dflash_architecture_config.intermediate_size=12288
     environment:
       - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - MODELOPT_RUNTIME: <<global_vars.modelopt_runtime>>
+      - WANDB_PROJECT: "sna-modelopt-specdec"
+      - WANDB_LOG_MODEL: "false"
+      - WANDB_WATCH: "false"
+      - WANDB_DIR: "/tmp/wandb"
       - EAGLE_CAPTURE_IDS: "[2,25,47,69,92,94]"
       - SERVE_TP: "4"
       - SERVE_NODES: "1"
@@ -62,3 +85,19 @@ pipeline:
       ntasks_per_node: 1
       gpus_per_node: 4
       container: vllm/vllm-openai:latest
+
+  task_2:
+    script: common/specdec/vllm_smoke_test.sh
+    environment:
+      - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - DRAFT_MODEL: /scratchspace/export
+      - SPEC_METHOD: "dspark"
+      - NUM_SPEC_TOKENS: <<global_vars.num_spec_tokens>>
+      - MIN_ACCEPTANCE_LENGTH: "1.2"
+      - TP_SIZE: "4"
+    slurm_config:
+      _factory_: "slurm_factory"
+      container: vllm/vllm-openai:nightly
+      nodes: 1
+      ntasks_per_node: 1
+      gpus_per_node: 4

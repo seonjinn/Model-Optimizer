@@ -2,6 +2,13 @@
 #
 # Task 1 runs two TP=2 serve replicas alongside two DDP trainer nodes. Hidden
 # states move from serve to trainer over NIXL RDMA.
+# B16 coupled override:
+#   pipeline.global_vars.dflash_block_size=16 pipeline.global_vars.num_spec_tokens=16
+#   pipeline.global_vars.dflash_loss_decay_factor=7
+# Reuse staged data with: pipeline.task_0.skip=true pipeline.global_vars.hf_data=<path>
+# Supply the pinned deployment artifacts at launch time:
+#   pipeline.global_vars.modelopt_runtime=<runtime> pipeline.task_1.slurm_config.container=<image>
+#   pipeline.task_2.slurm_config.container=<image>
 
 job_name: Qwen3-30B-A3B_DSpark_streaming_multi_node
 pipeline:
@@ -12,13 +19,16 @@ pipeline:
   global_vars:
     hf_model: /hf-local/Qwen/Qwen3-30B-A3B
     hf_data: /scratchspace/data/train.jsonl
+    sample_size: "50000"
     modelopt_runtime: ""
     report_to: wandb
     run_name: Qwen3-30B-A3B_DSpark_streaming_multi_node
     dflash_block_size: "8"
     dflash_loss_decay_factor: "4"
+    num_spec_tokens: "8"
 
   task_0:
+    skip: false
     script: common/eagle3/make_dataset.sh
     args:
       - -f modules/Model-Optimizer/examples/dataset/example_data_config.yaml
@@ -38,6 +48,7 @@ pipeline:
       - model.use_fake_base_for_offline=true
       - data.mode=streaming
       - data.data_path=<<global_vars.hf_data>>
+      - data.sample_size=<<global_vars.sample_size>>
       - training.output_dir=/scratchspace/dspark
       - training.training_seq_len=4096
       - training.disable_tqdm=true
@@ -81,3 +92,19 @@ pipeline:
       ntasks_per_node: 1
       gpus_per_node: 2
       container: vllm/vllm-openai:latest
+
+  task_2:
+    script: common/specdec/vllm_smoke_test.sh
+    environment:
+      - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - DRAFT_MODEL: /scratchspace/export
+      - SPEC_METHOD: "dspark"
+      - NUM_SPEC_TOKENS: <<global_vars.num_spec_tokens>>
+      - MIN_ACCEPTANCE_LENGTH: "1.2"
+      - TP_SIZE: "2"
+    slurm_config:
+      _factory_: "slurm_factory"
+      container: vllm/vllm-openai:nightly
+      nodes: 1
+      ntasks_per_node: 1
+      gpus_per_node: 2
