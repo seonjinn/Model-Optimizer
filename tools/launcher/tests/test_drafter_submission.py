@@ -265,5 +265,8 @@ def test_resume_chain_gates_each_cumulative_wave_on_public_acceptance() -> None:
         "--segment=1",
         "/raid/scratch",
         "receipt",
+        "Q30 uses per-device batch 4 with gradient accumulation 16",
+        "Q235 uses per-device batch 2 with gradient accumulation 32",
     ):
         assert required in readme
+    assert "512 / (2 * 4) = 64" not in readme

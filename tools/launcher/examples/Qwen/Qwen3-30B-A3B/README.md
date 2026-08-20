@@ -133,9 +133,14 @@ bash common/specdec/submit_drafter_training_wave.sh \
 Remove `--dry-run` only after the command's built-in `sbatch --test-only`
 passes. Every production training allocation is exactly `-N4 --segment=4`:
 nodes 0--1 are the two four-GPU vLLM serve replicas and nodes 2--3 are the two
-four-GPU trainer nodes. The global batch size is 512, so each trainer GPU uses
-`512 / (2 * 4) = 64` samples. `segment=4` keeps this allocation within one
-OCI-HSG NVL72 segment; staging and public evaluation use `--segment=1`.
+four-GPU trainer nodes. The pinned global batch settings are:
+
+- Q30 uses per-device batch 4 with gradient accumulation 16.
+- Q235 uses per-device batch 2 with gradient accumulation 32.
+
+Both satisfy `per-device batch * accumulation * 8 trainer GPUs = 512`.
+`segment=4` keeps the allocation within one OCI-HSG NVL72 segment; staging and
+public evaluation use `--segment=1`.
 
 Use the matching target and manifest identity for each public case:
 
