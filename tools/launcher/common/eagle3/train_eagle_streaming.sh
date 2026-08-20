@@ -121,6 +121,7 @@ fi
 SCRIPT_ARGS=("$@")
 
 SERVE_PORT="${SERVE_PORT:-8765}"
+SERVED_MODEL_NAME="${SERVE_MODEL_NAME:-$HF_MODEL_CKPT}"
 SERVE_READY_TIMEOUT="${SERVE_READY_TIMEOUT:-900}"
 SERVE_NODES="${SERVE_NODES:-1}"
 SERVE_LOG="${SERVE_LOG:-/scratchspace/vllm_serve.log}"   # serve nodes override with a per-node path
@@ -178,6 +179,7 @@ launch_vllm() {
     "${gpu_env[@]}" python -m vllm.entrypoints.cli.main serve "$HF_MODEL_CKPT" \
         --host "$bind_host" \
         --port "$SERVE_PORT" \
+        --served-model-name "$SERVED_MODEL_NAME" \
         --tensor-parallel-size "$tp" \
         --enforce-eager \
         --no-enable-chunked-prefill \
@@ -234,7 +236,7 @@ run_trainer_and_export() {
         "${SCRIPT_ARGS[@]}" \
         "${mn_args[@]}" \
         data.streaming_server_url="$url" \
-        data.streaming_model_name="$HF_MODEL_CKPT" \
+        data.streaming_model_name="$SERVED_MODEL_NAME" \
         training.dataloader_num_workers="${STREAMING_NUM_WORKERS:-4}" \
         || { echo "ERROR: trainer failed." >&2; return 1; }
 

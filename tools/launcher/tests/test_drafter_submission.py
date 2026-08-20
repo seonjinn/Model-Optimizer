@@ -445,8 +445,14 @@ def test_training_runner_preserves_proven_production_training_semantics() -> Non
         "training.answer_only_loss=false",
         "training.seed=42",
         'mkdir -p "$OUTPUT_ROOT"',
+        'SERVE_MODEL_NAME="modelopt-${RUN_NAME}"',
     ):
         assert required in runner
+
+    streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
+    assert 'SERVED_MODEL_NAME="${SERVE_MODEL_NAME:-$HF_MODEL_CKPT}"' in streaming
+    assert '--served-model-name "$SERVED_MODEL_NAME"' in streaming
+    assert 'data.streaming_model_name="$SERVED_MODEL_NAME"' in streaming
 
 
 def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> None:
