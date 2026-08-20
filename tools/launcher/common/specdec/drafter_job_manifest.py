@@ -288,7 +288,12 @@ def load_manifest(path: Path) -> tuple[DrafterExperiment, ...]:
             cumulative_max_steps=tuple(entry["cumulative_max_steps"]),
             run_name=entry["run_name"],
             sample_size=entry["sample_size"],
-            topology=TargetTopology(**entry["topology"]),
+            topology=TargetTopology(
+                **{
+                    **entry["topology"],
+                    "capture_ids": tuple(entry["topology"]["capture_ids"]),
+                }
+            ),
             paths=PinnedPaths(**entry["paths"]),
             slurm=SlurmSettings(**entry["slurm"]),
         )

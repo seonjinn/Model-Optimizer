@@ -16,6 +16,7 @@ from common.specdec.drafter_job_manifest import (
     SlurmSettings,
     TargetTopology,
     canonical_manifest,
+    load_manifest,
     speculative_tokens,
     validate_topology,
     write_manifest,
@@ -107,6 +108,16 @@ def test_canonical_manifest_is_stable_and_written_atomically(tmp_path: Path) -> 
     assert json.loads(expected)["experiments"][0]["num_speculative_tokens"] == 7
     assert json.loads(expected)["experiments"][0]["sample_size"] == 1_300_000
     assert not list(tmp_path.glob(".manifest.json.*"))
+
+
+def test_written_manifest_round_trips_tuple_topology_fields(tmp_path: Path) -> None:
+    """JSON list encoding must restore immutable topology tuples when loaded."""
+    experiment = _experiment()
+    output = tmp_path / "manifest.json"
+
+    write_manifest(output, (experiment,))
+
+    assert load_manifest(output) == (experiment,)
 
 
 @pytest.mark.parametrize(
