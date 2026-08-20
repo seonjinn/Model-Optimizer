@@ -184,17 +184,46 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
         "HF_HUB_CACHE",
         "LOCK",
         "snapshot_download",
+        "--source-dir",
+        "--source-id",
+        'cp -aL "$SOURCE_DIR"/. "$local_snapshot"/',
         "sbatch --test-only",
         "squeue -h -n",
         "xargs -0 -r -P 4",
         "snapshot-manifest.json",
         "completion.json",
+        'mv -T --no-clobber "$partial" "$ARTIFACT_DIR"',
     ):
         assert required in script
     assert "pip install" not in script
     assert "git clone" not in script
     assert "find /lustre" not in script
     assert "rm -rf /lustre" not in script
+
+
+def test_model_staging_fails_closed_and_bounds_shared_filesystem_operations() -> None:
+    """Local sources are copied once through scratch without replacing durable trees."""
+    script = (_LAUNCHER_DIR / "common/specdec/stage_hf_model.sh").read_text()
+
+    for required in (
+        '[[ "$SOURCE_DIR" == /lustre/* ]]',
+        '[[ "$ARTIFACT_DIR" == /lustre/* ]]',
+        '[[ "$SCRATCH_ROOT" == /raid/scratch/* ]]',
+        'SOURCE_CANONICAL="$(realpath -m -- "$SOURCE_DIR")"',
+        'ARTIFACT_CANONICAL="$(realpath -m -- "$ARTIFACT_DIR")"',
+        '[[ "$SOURCE_CANONICAL" == /lustre/* ]]',
+        '[[ "$ARTIFACT_CANONICAL" == /lustre/* ]]',
+        '[[ "$ARTIFACT_CANONICAL" != "$SOURCE_CANONICAL"/* ]]',
+        '[[ "$SOURCE_CANONICAL" != "$ARTIFACT_CANONICAL"/* ]]',
+        '[[ ! -e "$ARTIFACT_DIR" && ! -L "$ARTIFACT_DIR" ]]',
+        '[[ ! -e "$partial" && ! -L "$partial" ]]',
+        'find "$local_snapshot" -type f -print0',
+        '[[ ! -e "$partial" ]] || {',
+    ):
+        assert required in script
+    assert script.count('cp -aL "$SOURCE_DIR"/. "$local_snapshot"/') == 1
+    assert 'rm -rf "$partial"' not in script
+    assert 'rm -rf "$ARTIFACT_DIR"' not in script
 
 
 def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
