@@ -372,6 +372,15 @@ def test_host_staging_preserves_one_bounded_diagnostic_log_per_node() -> None:
     assert "set -x" in runner
 
 
+def test_missing_optional_target_sidecar_does_not_fail_host_staging() -> None:
+    """An absent final optional tokenizer file must still leave the subshell successful."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    assert 'if [[ -e "$TARGET_PATH/$sidecar" ]]; then' in runner
+    assert '[[ -e "$TARGET_PATH/$sidecar" ]] && cp' not in runner
+    assert 'echo "host staging complete: node=${SLURM_NODEID}"' in runner
+
+
 def test_runtime_relocation_accepts_exported_and_quoted_activate_assignments() -> None:
     """OCI virtualenv activation lines may use export and shell quotes."""
     parser = re.compile(r"^\s*export\s+VIRTUAL_ENV=(.*)$")

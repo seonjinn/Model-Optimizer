@@ -127,9 +127,12 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
         # Fake-base trainers still need the target configuration/tokenizer sidecars.
         mkdir -p "$node_root/input/target"
         for sidecar in config.json generation_config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do
-            [[ -e "$TARGET_PATH/$sidecar" ]] && cp -aL "$TARGET_PATH/$sidecar" "$node_root/input/target/"
+            if [[ -e "$TARGET_PATH/$sidecar" ]]; then
+                cp -aL "$TARGET_PATH/$sidecar" "$node_root/input/target/"
+            fi
         done
     fi
+    echo "host staging complete: node=${SLURM_NODEID}"
 '
 
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS RUN_NAME SAMPLE_SIZE
