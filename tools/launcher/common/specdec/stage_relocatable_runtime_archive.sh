@@ -54,9 +54,11 @@ work_root="${SCRATCH_ROOT}/${SLURM_JOB_ID:?SLURM_JOB_ID is required}/runtime-arc
 archive="${work_root}/runtime.tar.zst"
 checksum="${archive}.sha256"
 provenance="${archive}.provenance.json"
+listing="${work_root}/runtime.list"
 mkdir -p "$work_root" "$(dirname "$OUTPUT_ARCHIVE")"
 tar --dereference --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .
-tar --list --use-compress-program=zstd --file="$archive" | grep -q '/bin/activate$'
+tar --list --use-compress-program=zstd --file="$archive" >"$listing"
+grep -q '/bin/activate$' "$listing"
 archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
 printf '%s  %s\n' "$archive_sha" "$(basename "$OUTPUT_ARCHIVE")" >"$checksum"
 printf '{"source_runtime":"%s","sha256":"%s"}\n' "$SOURCE_RUNTIME" "$archive_sha" >"$provenance"

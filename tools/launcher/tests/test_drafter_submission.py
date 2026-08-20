@@ -195,6 +195,8 @@ def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
         "/raid/scratch",
         "tar --dereference --create",
         "tar --list",
+        'tar --list --use-compress-program=zstd --file="$archive" >"$listing"',
+        "grep -q '/bin/activate$' \"$listing\"",
         "sha256sum",
         ".provenance.json",
         ".partial-",
