@@ -111,6 +111,29 @@ def test_qwen30_dflash_training_data_is_overridable() -> None:
     assert environment["MODELOPT_RUNTIME"] == "<<global_vars.modelopt_runtime>>"
 
 
+def test_qwen30_dspark_uses_shared_opb_runtime_and_paper_loss() -> None:
+    path = "examples/Qwen/Qwen3-30B-A3B/hf_streaming_dspark_multi_node.yaml"
+    with (_LAUNCHER_DIR / path).open() as yaml_file:
+        config = yaml.safe_load(yaml_file)
+
+    global_vars = config["pipeline"]["global_vars"]
+    task = config["pipeline"]["task_1"]
+    environment = {
+        key: value
+        for item in task["environment"]
+        for key, value in item.items()
+    }
+
+    assert global_vars["hf_data"] == "/scratchspace/data/train.jsonl"
+    assert global_vars["modelopt_runtime"] == ""
+    assert "data.data_path=<<global_vars.hf_data>>" in task["args"]
+    assert "training.seed=42" in task["args"]
+    assert "dflash.dflash_loss_objective=decay" in task["args"]
+    assert environment["MODELOPT_RUNTIME"] == "<<global_vars.modelopt_runtime>>"
+    assert environment["SERVE_BLOCK_SIZE"] == "32"
+    assert environment["SERVE_READY_TIMEOUT"] == "1800"
+
+
 def test_streaming_training_can_reuse_shared_runtime() -> None:
     script = (_LAUNCHER_DIR / "common" / "eagle3" / "train_eagle_streaming.sh").read_text()
 
