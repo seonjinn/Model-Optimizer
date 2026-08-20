@@ -397,7 +397,6 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
         "/home",
         "/lustre",
         "/raid/scratch",
-        "--no-container-mount-home",
         "--container-image",
         "tar --extract",
         "VIRTUAL_ENV",
@@ -415,7 +414,6 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
         "--job-name=modelopt-runtime-probe",
         '--output="$PROBE_LOG"',
         '--error="$PROBE_LOG"',
-        "${SOURCE_PATH}:${SOURCE_PATH}",
         "${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT}",
         "runtime-probe-${SLURM_JOB_ID}.trace",
         'exec >>"$TRACE_LOG" 2>&1',
@@ -424,6 +422,8 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
     assert "pip install" not in script
     assert "git clone" not in script
     assert "${SCRIPT_PATH}:${SCRIPT_PATH}" not in script
+    assert "--no-container-mount-home" not in script
+    assert "${SOURCE_PATH}:${SOURCE_PATH}" not in script
 
 
 def test_training_manifest_pins_and_verifies_runtime_archive_bytes() -> None:

@@ -48,8 +48,8 @@ if [[ "$MODE" == "outer" ]]; then
     mkdir -p "$(dirname "$PROBE_LOG")"
     srun --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks=1 --gpus-per-node=4 --segment=1 --time=00:10:00 \
         --job-name=modelopt-runtime-probe --output="$PROBE_LOG" --error="$PROBE_LOG" \
-        --no-container-mount-home --container-image="$IMAGE_PATH" \
-        --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},/raid/scratch:/raid/scratch" \
+        --container-image="$IMAGE_PATH" \
+        --container-mounts="${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},/raid/scratch:/raid/scratch" \
         bash "$SCRIPT_PATH" --inside --source-path "$SOURCE_PATH" --runtime-archive "$RUNTIME_ARCHIVE" --runtime-sha256 "$RUNTIME_SHA256" --image "$IMAGE_PATH" --scratch-root "$SCRATCH_ROOT"
     echo "runtime probe log: $PROBE_LOG"
     exit 0
