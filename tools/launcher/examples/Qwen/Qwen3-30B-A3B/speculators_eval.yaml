@@ -1,0 +1,53 @@
+# Pinned Speculators acceptance evaluation for an exported Qwen3-30B-A3B drafter.
+# Every /path/to value is a deployment input and must point to an existing shared
+# artifact. The container must already contain vLLM; the runtime must already
+# contain the dependencies of Speculators scripts/evaluate/evaluate.py.
+# Launcher interpolation does not reach slurm_config.container, so deployment
+# must override both pipeline.global_vars.container_image and
+# pipeline.task_0.slurm_config.container with the same pinned image identifier.
+#
+# B/K matrix overrides:
+#   DFlash B8:  spec_method=dflash dflash_block_size=8  num_spec_tokens=7
+#   DFlash B16: spec_method=dflash dflash_block_size=16 num_spec_tokens=15
+#   DSpark B8:  spec_method=dspark dflash_block_size=8  num_spec_tokens=8
+#   DSpark B16: spec_method=dspark dflash_block_size=16 num_spec_tokens=16
+
+job_name: Qwen3-30B-A3B_speculators_eval
+pipeline:
+  allow_to_fail: false
+  skip: false
+
+  global_vars:
+    hf_model: /path/to/Qwen3-30B-A3B
+    draft_model: /path/to/exported-drafter
+    hf_local: /path/to/shared/huggingface-cache
+    output_dir: /path/to/shared/speculators-results
+    speculators_runtime: /path/to/shared/speculators-runtime
+    speculators_repo: /path/to/shared/speculators
+    container_image: /path/to/pinned-vllm-speculators.sqsh
+    spec_method: dspark
+    dflash_block_size: "8"
+    num_spec_tokens: "8"
+
+  task_0:
+    script: common/specdec/run_speculators_eval.sh
+    environment:
+      - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - DRAFT_MODEL: <<global_vars.draft_model>>
+      - HF_HOME: <<global_vars.hf_local>>
+      - EVAL_OUTPUT_ROOT: <<global_vars.output_dir>>
+      - SPECULATORS_RUNTIME: <<global_vars.speculators_runtime>>
+      - SPECULATORS_REPO: <<global_vars.speculators_repo>>
+      - CONTAINER_IMAGE: <<global_vars.container_image>>
+      - SPEC_METHOD: <<global_vars.spec_method>>
+      - DFLASH_BLOCK_SIZE: <<global_vars.dflash_block_size>>
+      - NUM_SPEC_TOKENS: <<global_vars.num_spec_tokens>>
+      - EVAL_CONFIG_PATH: modules/Model-Optimizer/tools/launcher/examples/Qwen/Qwen3-30B-A3B/speculators_eval.yaml
+      - TP_SIZE: "2"
+      - SERVE_READY_TIMEOUT: "1800"
+    slurm_config:
+      _factory_: "slurm_factory"
+      nodes: 1
+      ntasks_per_node: 1
+      gpus_per_node: 2
+      container: /path/to/pinned-vllm-speculators.sqsh

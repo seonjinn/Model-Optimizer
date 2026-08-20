@@ -236,6 +236,10 @@ class GlobalVariables:
     dflash_dpace_alpha: str = None
     dflash_loss_decay_factor: str = None
     num_spec_tokens: str = None
+    spec_method: str = None
+    speculators_repo: str = None
+    speculators_runtime: str = None
+    container_image: str = None
 
 
 @dataclass
