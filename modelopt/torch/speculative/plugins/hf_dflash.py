@@ -391,8 +391,8 @@ class HFDFlashModel(DFlashModel):
         base_config = self._base_llm_config
         dflash_architecture_config = dict(config.dflash_architecture_config)
 
-        # Inherit before Qwen3Config fills non-None defaults. Existing keys remain
-        # authoritative explicit draft overrides.
+        # Inherit before Qwen3Config fills non-None defaults. Concrete values remain
+        # authoritative explicit draft overrides; legacy null values mean unspecified.
         for attr in (
             "max_position_embeddings",
             "intermediate_size",
@@ -401,7 +401,7 @@ class HFDFlashModel(DFlashModel):
             "head_dim",
             "rms_norm_eps",
         ):
-            if attr not in dflash_architecture_config and hasattr(base_config, attr):
+            if dflash_architecture_config.get(attr) is None and hasattr(base_config, attr):
                 base_value = getattr(base_config, attr)
                 if base_value is not None:
                     dflash_architecture_config[attr] = base_value

@@ -111,6 +111,39 @@ class TestDFlashConvert:
         assert model.dflash_config.intermediate_size == 256
         assert model.dflash_config.max_position_embeddings == 8192
 
+    @pytest.mark.parametrize(
+        ("num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size"),
+        [
+            pytest.param(32, 4, 128, 6144, id="qwen3-30b-a3b"),
+            pytest.param(64, 4, 128, 12288, id="qwen3-235b-a22b"),
+        ],
+    )
+    def test_convert_treats_null_draft_architecture_as_unspecified(
+        self,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        intermediate_size,
+    ):
+        """Explicit null dimensions retain the legacy target-inheritance behavior."""
+        model = get_tiny_llama(num_hidden_layers=4, hidden_size=64)
+        target_dimensions = {
+            "num_attention_heads": num_attention_heads,
+            "num_key_value_heads": num_key_value_heads,
+            "head_dim": head_dim,
+            "intermediate_size": intermediate_size,
+            "max_position_embeddings": 40960,
+        }
+        for attr, value in target_dimensions.items():
+            setattr(model.config, attr, value)
+        config = get_dflash_config()
+        config["dflash_architecture_config"].update(dict.fromkeys(target_dimensions))
+
+        mtsp.convert(model, [("dflash", config)])
+
+        for attr, value in target_dimensions.items():
+            assert getattr(model.dflash_config, attr) == value
+
     def test_convert_uses_canonical_target_rope_parameters_for_rotary(self):
         """Canonical target RoPE updates the active Qwen3 draft and rotary config."""
         model = get_tiny_llama(num_hidden_layers=4)
