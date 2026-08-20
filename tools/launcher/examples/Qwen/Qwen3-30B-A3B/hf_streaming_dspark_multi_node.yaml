@@ -11,6 +11,8 @@ pipeline:
 
   global_vars:
     hf_model: /hf-local/Qwen/Qwen3-30B-A3B
+    hf_data: /scratchspace/data/train.jsonl
+    modelopt_runtime: ""
     dflash_block_size: "8"
     dflash_loss_decay_factor: "4"
 
@@ -33,15 +35,19 @@ pipeline:
       - model.model_name_or_path=<<global_vars.hf_model>>
       - model.use_fake_base_for_offline=true
       - data.mode=streaming
-      - data.data_path=/scratchspace/data/train.jsonl
+      - data.data_path=<<global_vars.hf_data>>
       - training.output_dir=/scratchspace/dspark
       - training.training_seq_len=4096
       - training.disable_tqdm=true
       - training.answer_only_loss=false
       - training.num_train_epochs=1
       - training.max_steps=2000
+      - training.seed=42
       - training.report_to=none
       - dflash.dflash_block_size=<<global_vars.dflash_block_size>>
+      # DSpark's paper loss applies static exp(-k/gamma) position weights to
+      # CE, TVD, and confidence BCE. Make that objective explicit.
+      - dflash.dflash_loss_objective=decay
       - dflash.dflash_loss_decay_factor=<<global_vars.dflash_loss_decay_factor>>
       - dflash.dflash_mask_token_id=151669
       - dflash.dflash_architecture_config.num_hidden_layers=5
@@ -51,11 +57,16 @@ pipeline:
       - dflash.dflash_architecture_config.intermediate_size=6144
     environment:
       - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - MODELOPT_RUNTIME: <<global_vars.modelopt_runtime>>
       - EAGLE_CAPTURE_IDS: "[2,13,24,35,46,48]"
       - SERVE_TP: "2"
       - SERVE_NODES: "2"
       - STREAMING_NUM_WORKERS: "4"
+      # Six captured hidden-state planes do not fit the default TP2 KV page at
+      # block 16; block 32 provides sufficient page capacity.
+      - SERVE_BLOCK_SIZE: "32"
       - SERVE_MAX_MODEL_LEN: "8192"
+      - SERVE_READY_TIMEOUT: "1800"
       - EXPORT_EXTRA_ARGS: "--trust_remote_code"
     slurm_config:
       _factory_: "slurm_factory"
