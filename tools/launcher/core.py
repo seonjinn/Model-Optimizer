@@ -240,6 +240,10 @@ class GlobalVariables:
     speculators_repo: str = None
     speculators_runtime: str = None
     container_image: str = None
+    modelopt_repo: str = None
+    eval_config: str = None
+    dataset_manifest: str = None
+    container_identity: str = None
 
 
 @dataclass

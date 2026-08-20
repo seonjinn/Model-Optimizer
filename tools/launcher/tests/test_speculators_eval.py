@@ -17,19 +17,29 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 import yaml
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _LAUNCHER_DIR = Path(__file__).resolve().parents[1]
 _WRAPPER = _LAUNCHER_DIR / "common/specdec/run_speculators_eval.sh"
 _RECIPE = _LAUNCHER_DIR / "examples/Qwen/Qwen3-30B-A3B/speculators_eval.yaml"
 _SPECULATORS_SHA = "0b08a89a83b92007be63f128e01497455b0209df"
+_MODELOPT_SHA = "a" * 40
+_DATASET_REVISION = "b" * 40
+_IMAGE_SHA256 = "c" * 64
 _SUBSETS = (
     "HumanEval",
     "math_reasoning",
@@ -49,6 +59,10 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _make_harness(
     tmp_path: Path,
     *,
@@ -60,6 +74,10 @@ def _make_harness(
     csv_positions: int | None = None,
     drafts: int = 10,
     spec_metrics_ready: bool = True,
+    preexisting_health: bool = False,
+    server_exit: int | None = None,
+    stale_after_spawn: bool = False,
+    evaluator_block: bool = False,
 ) -> tuple[dict[str, str], Path, Path]:
     runtime = tmp_path / "runtime"
     runtime_bin = runtime / "bin"
@@ -68,6 +86,8 @@ def _make_harness(
     evaluator.parent.mkdir(parents=True)
     evaluator.write_text("# staged evaluator fixture\n")
     (repo / ".git").mkdir()
+    modelopt_repo = tmp_path / "modelopt"
+    (modelopt_repo / ".git").mkdir(parents=True)
 
     target = tmp_path / "target"
     draft = tmp_path / "draft"
@@ -79,9 +99,45 @@ def _make_harness(
     launcher_config.write_text("job_name: fixture\n")
     hf_home = tmp_path / "shared-cache"
     hf_home.mkdir()
+    dataset_files = {}
+    for subset in _SUBSETS:
+        dataset_file = (
+            hf_home
+            / "datasets--RedHatAI--speculator_benchmarks"
+            / "snapshots"
+            / _DATASET_REVISION
+            / f"{subset}.parquet"
+        )
+        dataset_file.parent.mkdir(parents=True, exist_ok=True)
+        dataset_file.write_text(f"fixture:{subset}\n")
+        dataset_files[subset] = {"path": str(dataset_file), "sha256": _sha256(dataset_file)}
+    dataset_manifest = tmp_path / "dataset-manifest.json"
+    dataset_manifest.write_text(
+        json.dumps(
+            {
+                "dataset_id": "RedHatAI/speculator_benchmarks",
+                "revision": _DATASET_REVISION,
+                "hf_home": str(hf_home),
+                "files": dataset_files,
+            }
+        )
+    )
+    container_image = tmp_path / "vllm-speculators.sqsh"
+    container_image.write_bytes(b"staged image fixture")
+    container_identity = tmp_path / "vllm-speculators.sqsh.identity.json"
+    container_identity.write_text(
+        json.dumps(
+            {
+                "path": str(container_image),
+                "sha256": _IMAGE_SHA256,
+                "size_bytes": container_image.stat().st_size,
+            }
+        )
+    )
     output_root = tmp_path / "results"
     invocation_log = tmp_path / "invocations.log"
     server_pid_file = tmp_path / "server.pid"
+    evaluator_ready = tmp_path / "evaluator.ready"
     positions = num_spec_tokens if csv_positions is None else csv_positions
     acceptance_fixture = tmp_path / "acceptance-fixture.csv"
     acceptance_fixture.write_text(_acceptance_csv_text(positions, drafts))
@@ -96,7 +152,11 @@ def _make_harness(
         f"""#!/bin/bash
 printf 'git %s\\n' "$*" >> "{invocation_log}"
 if [[ "$*" == *" rev-parse HEAD" ]]; then
-  printf '%s\\n' "{repo_sha}"
+  if [[ "$*" == *"{modelopt_repo}"* ]]; then
+    printf '%s\\n' "{_MODELOPT_SHA}"
+  else
+    printf '%s\\n' "{repo_sha}"
+  fi
 elif [[ "$*" == *" status --porcelain" ]]; then
   exit 0
 else
@@ -116,9 +176,20 @@ exit 98
         runtime_bin / "curl",
         f"""#!/bin/bash
 printf 'curl %s\\n' "$*" >> "{invocation_log}"
+live=0
+if [[ -f "{server_pid_file}" ]] && kill -0 "$(cat "{server_pid_file}")" 2>/dev/null; then
+  live=1
+fi
+if [[ "{int(preexisting_health)}" == "1" ]]; then
+  live=1
+fi
+if [[ "{int(stale_after_spawn)}" == "1" && -f "{server_pid_file}" ]]; then
+  live=1
+fi
+[[ "$live" == "1" ]] || exit 7
 case "$*" in
   *'/health'*) exit 0 ;;
-  *'/v1/models'*) printf '{{"data":[{{"id":"target-model"}}]}}\\n' ;;
+  *'/v1/models'*) printf '{{"data":[{{"id":"{target}"}}]}}\\n' ;;
   *'/metrics'*) printf '{"vllm:spec_decode_num_drafts 1" if spec_metrics_ready else "vllm:num_requests 1"}\\n' ;;
   *) exit 96 ;;
 esac
@@ -130,6 +201,7 @@ esac
 printf 'python3 %s\\n' "$*" >> "{invocation_log}"
 if [[ "$1" == "-m" && "$2" == "vllm.entrypoints.cli.main" ]]; then
   printf '%s\\n' "$$" > "{server_pid_file}"
+  {f"exit {server_exit}" if server_exit is not None else ":"}
   trap 'exit 0' TERM INT
   while true; do sleep 1; done
 elif [[ "$1" == "{evaluator}" ]]; then
@@ -152,7 +224,13 @@ elif [[ "$1" == "{evaluator}" ]]; then
   done
   mkdir -p "$output_dir"
   cp "{acceptance_fixture}" "$output_dir/acceptance.csv"
+  touch "{evaluator_ready}"
+  {"while true; do sleep 1; done" if evaluator_block else ":"}
   exit {evaluator_exit}
+elif [[ "$1" == "--version" ]]; then
+  printf 'Python 3.12.9\\n'
+elif [[ "$1" == "-c" && "$2" == *'importlib.metadata'* ]]; then
+  if [[ "$2" == *'vllm'* ]]; then printf '0.27.1\\n'; else printf '0.4.0\\n'; fi
 else
   exec "{sys.executable}" "$@"
 fi
@@ -163,6 +241,7 @@ fi
         **os.environ,
         "SPECULATORS_RUNTIME": str(runtime),
         "SPECULATORS_REPO": str(repo),
+        "MODELOPT_REPO": str(modelopt_repo),
         "HF_MODEL_CKPT": str(target),
         "DRAFT_MODEL": str(draft),
         "SPEC_METHOD": method,
@@ -175,7 +254,9 @@ fi
         "EVAL_OUTPUT_ROOT": str(output_root),
         "EVAL_RUN_ID": "fixture-run",
         "EVAL_CONFIG_PATH": str(launcher_config),
-        "CONTAINER_IMAGE": "/shared/containers/vllm-speculators@sha256:abc.sqsh",
+        "DATASET_MANIFEST_PATH": str(dataset_manifest),
+        "CONTAINER_IMAGE": str(container_image),
+        "CONTAINER_IDENTITY_PATH": str(container_identity),
         "SLURM_JOB_ID": "12345",
         "INVOCATION_LOG": str(invocation_log),
     }
@@ -188,8 +269,14 @@ def _acceptance_csv_text(positions: int, drafts: int) -> str:
         "subset,num_drafts,num_draft_tokens,num_accepted_tokens,acceptance_length,"
         f"{position_columns}\n"
     )
+    rate = 0.4
+    draft_tokens = drafts * positions
+    accepted_tokens = int(drafts * positions * rate)
+    acceptance_length = 1 + accepted_tokens / drafts if drafts else 1
     return header + "".join(
-        f"{subset},{drafts},80,40,4.0," + ",".join("0.5" for _ in range(positions)) + "\n"
+        f"{subset},{drafts},{draft_tokens},{accepted_tokens},{acceptance_length},"
+        + ",".join(str(rate) for _ in range(positions))
+        + "\n"
         for subset in _SUBSETS
     )
 
@@ -230,8 +317,27 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
     assert manifest["block_size"] == block_size
     assert manifest["num_speculative_tokens"] == num_spec_tokens
     assert manifest["speculators_sha"] == _SPECULATORS_SHA
+    assert manifest["modelopt_sha"] == _MODELOPT_SHA
+    assert manifest["modelopt_dirty"] is False
     assert manifest["slurm_job_id"] == "12345"
-    assert manifest["container_image"].endswith("@sha256:abc.sqsh")
+    assert manifest["container"]["sha256"] == _IMAGE_SHA256
+    assert manifest["dataset"]["revision"] == _DATASET_REVISION
+    assert set(manifest["dataset"]["files"]) == set(_SUBSETS)
+    assert manifest["versions"] == {
+        "guidellm": "0.4.0",
+        "python": "Python 3.12.9",
+        "vllm": "0.27.1",
+    }
+    assert manifest["evaluation"]["temperature"] == 0
+    assert manifest["evaluation"]["max_concurrency"] == 128
+    assert manifest["evaluation"]["max_requests"] == 200
+    assert manifest["evaluation"]["tensor_parallel_size"] == 2
+    assert manifest["server_args"][0:3] == [
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+    ]
+    assert manifest["evaluator_args"][-1] == "throughput"
     assert len(manifest["config_sha256"]) == 3
     assert all(len(value) == 64 for value in manifest["config_sha256"].values())
     assert (run_dir / "acceptance.csv").stat().st_size > 0
@@ -280,6 +386,75 @@ def test_speculators_sha_mismatch_fails_before_server_start(tmp_path: Path) -> N
     assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
 
 
+@pytest.mark.parametrize("identity", ["dataset", "container"])
+def test_staged_identity_mismatch_fails_before_server_start(tmp_path: Path, identity: str) -> None:
+    """A lying snapshot revision or image path sidecar must fail before serving."""
+    env, run_dir, server_pid_file = _make_harness(tmp_path)
+    identity_path = Path(
+        env["DATASET_MANIFEST_PATH"] if identity == "dataset" else env["CONTAINER_IDENTITY_PATH"]
+    )
+    payload = json.loads(identity_path.read_text())
+    if identity == "dataset":
+        payload["revision"] = "d" * 40
+    else:
+        payload["path"] = str(tmp_path / "different.sqsh")
+    identity_path.write_text(json.dumps(payload))
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert not server_pid_file.exists()
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+
+
+def test_preexisting_health_endpoint_is_rejected_before_server_spawn(tmp_path: Path) -> None:
+    """An occupied serving port must fail before the owned vLLM process is launched."""
+    env, run_dir, server_pid_file = _make_harness(tmp_path, preexisting_health=True)
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "already serving health" in result.stderr
+    assert not server_pid_file.exists()
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+
+
+def test_owned_server_exit_zero_cannot_attach_to_stale_server(tmp_path: Path) -> None:
+    """Loss of the owned PID must fail even if another server then answers every probe."""
+    env, run_dir, _ = _make_harness(tmp_path, server_exit=0, stale_after_spawn=True)
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "owned vLLM server exited" in result.stderr
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+
+
+def test_term_signal_writes_failed_manifest_and_exits_143(tmp_path: Path) -> None:
+    """Slurm TERM cancellation must never be reported as a successful evaluation."""
+    env, run_dir, _ = _make_harness(tmp_path, evaluator_block=True)
+    process = subprocess.Popen(
+        ["bash", str(_WRAPPER)],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    evaluator_ready = tmp_path / "evaluator.ready"
+    deadline = time.monotonic() + 10
+    while not evaluator_ready.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert evaluator_ready.exists(), process.communicate(timeout=2)
+
+    os.killpg(process.pid, signal.SIGTERM)
+    _, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 143, stderr
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+
+
 def test_readiness_requires_speculative_metrics_before_evaluation(tmp_path: Path) -> None:
     """A generic metrics response must not be mistaken for a SpecDec-ready server."""
     env, run_dir, _ = _make_harness(tmp_path, spec_metrics_ready=False)
@@ -321,6 +496,44 @@ def test_invalid_acceptance_csv_fails_the_job(
     assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda text: text.replace(",0.4,", ",nan,", 1),
+        lambda text: text.replace(",0.4,", ",not-a-number,", 1),
+        lambda text: text.replace(",0.4,", ",1.1,", 1),
+        lambda text: text.replace(",80,32,", ",79,32,", 1),
+        lambda text: text.replace(",80,32,", ",80,31,", 1),
+        lambda text: text.replace(",32,4.2,", ",32,4.3,", 1),
+        lambda text: text.replace(",0.4,0.4,", ",0.2,0.6,", 1),
+        lambda text: text.replace(",80,32,", ",80,-1,", 1),
+    ],
+)
+def test_acceptance_csv_rejects_invalid_numeric_contract(
+    tmp_path: Path, mutation: Callable[[str], str]
+) -> None:
+    """Corrupt counters, rates, monotonicity, and acceptance formulas must be rejected."""
+    csv_path = tmp_path / "acceptance.csv"
+    csv_path.write_text(mutation(_acceptance_csv_text(8, 10)))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_LAUNCHER_DIR / "common/specdec/speculators_eval_artifacts.py"),
+            "validate",
+            "--csv",
+            str(csv_path),
+            "--num-speculative-tokens",
+            "8",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+
+
 def test_speculators_eval_yaml_typed_resolves_without_internal_paths(tmp_path: Path) -> None:
     """The generic recipe must resolve through the real launcher and remain deployment-neutral."""
     resolved_path = tmp_path / "resolved.yaml"
@@ -350,4 +563,5 @@ def test_speculators_eval_yaml_typed_resolves_without_internal_paths(tmp_path: P
     resolved = yaml.safe_load(resolved_path.read_text())
     global_vars = resolved["pipeline"]["global_vars"]
     assert global_vars["_target_"] == "modelopt_launcher.core.GlobalVariables"
+    assert global_vars["eval_config"] == "/path/to/resolved-launch.yaml"
     assert resolved["pipeline"]["task_0"]["script"] == "common/specdec/run_speculators_eval.sh"

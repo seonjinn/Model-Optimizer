@@ -22,6 +22,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARTIFACT_HELPER="${SCRIPT_DIR}/speculators_eval_artifacts.py"
 SERVER_PID=""
 FINAL_STATUS="failed"
+MODELOPT_SHA="unknown"
+MODELOPT_DIRTY="unknown"
+PYTHON_VERSION="unknown"
+VLLM_VERSION="unknown"
+GUIDELLM_VERSION="unknown"
+TP="${TP_SIZE:-1}"
+SERVER_ARGS=()
+EVALUATOR_ARGS=()
 
 require_var() {
     local name="$1"
@@ -32,7 +40,8 @@ require_var() {
 }
 
 for name in SPECULATORS_RUNTIME SPECULATORS_REPO HF_MODEL_CKPT DRAFT_MODEL SPEC_METHOD \
-    DFLASH_BLOCK_SIZE NUM_SPEC_TOKENS HF_HOME EVAL_OUTPUT_ROOT EVAL_CONFIG_PATH CONTAINER_IMAGE; do
+    DFLASH_BLOCK_SIZE NUM_SPEC_TOKENS HF_HOME EVAL_OUTPUT_ROOT EVAL_CONFIG_PATH CONTAINER_IMAGE \
+    CONTAINER_IDENTITY_PATH DATASET_MANIFEST_PATH MODELOPT_REPO; do
     require_var "$name"
 done
 
@@ -67,7 +76,7 @@ if ! mkdir "${RUN_DIR}"; then
 fi
 
 write_manifest() {
-    python3 "${ARTIFACT_HELPER}" manifest \
+    local helper_args=(manifest \
         --output "${RUN_DIR}/manifest.json" \
         --status "$1" \
         --method "${SPEC_METHOD}" \
@@ -77,10 +86,34 @@ write_manifest() {
         --draft-model "${DRAFT_MODEL}" \
         --speculators-repo "${SPECULATORS_REPO}" \
         --speculators-sha "${SPECULATORS_EXPECTED_SHA}" \
+        --modelopt-repo "${MODELOPT_REPO}" \
+        --modelopt-sha "${MODELOPT_SHA}" \
+        --modelopt-dirty "${MODELOPT_DIRTY}" \
         --runtime "${SPECULATORS_RUNTIME}" \
         --container-image "${CONTAINER_IMAGE}" \
+        --container-identity "${CONTAINER_IDENTITY_PATH}" \
+        --dataset-manifest "${DATASET_MANIFEST_PATH}" \
+        --hf-home "${HF_HOME}" \
         --slurm-job-id "${SLURM_JOB_ID:-none}" \
-        --launcher-config "${EVAL_CONFIG_PATH}"
+        --launcher-config "${EVAL_CONFIG_PATH}" \
+        --python-version "${PYTHON_VERSION}" \
+        --vllm-version "${VLLM_VERSION}" \
+        --guidellm-version "${GUIDELLM_VERSION}" \
+        --max-concurrency 128 \
+        --max-requests 200 \
+        --tensor-parallel-size "${TP}")
+    local arg
+    if [[ ${#SERVER_ARGS[@]} -gt 0 ]]; then
+        for arg in "${SERVER_ARGS[@]}"; do
+            helper_args+=("--server-arg=${arg}")
+        done
+    fi
+    if [[ ${#EVALUATOR_ARGS[@]} -gt 0 ]]; then
+        for arg in "${EVALUATOR_ARGS[@]}"; do
+            helper_args+=("--evaluator-arg=${arg}")
+        done
+    fi
+    python3 "${ARTIFACT_HELPER}" "${helper_args[@]}"
 }
 
 cleanup() {
@@ -96,7 +129,16 @@ cleanup() {
     fi
     exit "${rc}"
 }
-trap cleanup EXIT INT TERM
+
+handle_signal() {
+    local signal_number="$1"
+    FINAL_STATUS="failed"
+    exit "$((128 + signal_number))"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 2' INT
+trap 'handle_signal 15' TERM
 
 for path in "${SPECULATORS_REPO}/scripts/evaluate/evaluate.py" \
     "${HF_MODEL_CKPT}/config.json" "${DRAFT_MODEL}/config.json" "${EVAL_CONFIG_PATH}"; do
@@ -124,29 +166,58 @@ if [[ -n "$(git -C "${SPECULATORS_REPO}" status --porcelain 2>/dev/null)" ]]; th
     exit 2
 fi
 
+MODELOPT_SHA="$(git -C "${MODELOPT_REPO}" rev-parse HEAD 2>/dev/null || true)"
+if [[ ! "${MODELOPT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: ModelOpt checkout does not resolve to a full commit: ${MODELOPT_REPO}" >&2
+    exit 2
+fi
+if [[ -n "$(git -C "${MODELOPT_REPO}" status --porcelain 2>/dev/null)" ]]; then
+    echo "ERROR: ModelOpt checkout is dirty: ${MODELOPT_REPO}" >&2
+    exit 2
+fi
+MODELOPT_DIRTY="false"
+if ! python3 "${ARTIFACT_HELPER}" verify-inputs \
+    --dataset-manifest "${DATASET_MANIFEST_PATH}" \
+    --hf-home "${HF_HOME}" \
+    --container-identity "${CONTAINER_IDENTITY_PATH}" \
+    --container-image "${CONTAINER_IMAGE}"; then
+    echo "ERROR: staged dataset or container identity verification failed" >&2
+    exit 2
+fi
+
+PYTHON_VERSION="$(python3 --version 2>&1)"
+VLLM_VERSION="$(python3 -c 'from importlib.metadata import version; print(version("vllm"))')"
+GUIDELLM_VERSION="$(python3 -c 'from importlib.metadata import version; print(version("guidellm"))')"
+
 PORT="${VLLM_PORT:-8000}"
-TP="${TP_SIZE:-1}"
+if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+    echo "ERROR: port ${PORT} is already serving health before vLLM launch" >&2
+    exit 5
+fi
 SPEC_CONFIG="$(printf '{\"method\":\"%s\",\"model\":\"%s\",\"num_speculative_tokens\":%s}' \
     "${SPEC_METHOD}" "${DRAFT_MODEL}" "${NUM_SPEC_TOKENS}")"
-python3 -m vllm.entrypoints.cli.main serve "${HF_MODEL_CKPT}" \
-    --speculative-config "${SPEC_CONFIG}" \
-    --tensor-parallel-size "${TP}" \
-    --port "${PORT}" \
+SERVER_ARGS=(-m vllm.entrypoints.cli.main serve "${HF_MODEL_CKPT}"
+    --speculative-config "${SPEC_CONFIG}"
+    --tensor-parallel-size "${TP}"
+    --port "${PORT}")
+python3 "${SERVER_ARGS[@]}" \
     >"${RUN_DIR}/vllm.log" 2>&1 &
 SERVER_PID=$!
 
 READY=0
 for ((attempt = 1; attempt <= ${SERVE_READY_TIMEOUT:-1800}; attempt++)); do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        echo "ERROR: vLLM server exited before readiness" >&2
-        wait "${SERVER_PID}" || exit $?
+        wait "${SERVER_PID}" 2>/dev/null
+        echo "ERROR: owned vLLM server exited before readiness" >&2
+        exit 5
     fi
     if curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 \
         && curl -fsS "http://127.0.0.1:${PORT}/v1/models" \
-            | python3 -c 'import json,sys; assert json.load(sys.stdin).get("data")' \
+            | python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); sys.exit(0 if any(item.get("id") == sys.argv[1] for item in data) else 1)' "${HF_MODEL_CKPT}" \
             >/dev/null 2>&1 \
         && curl -fsS "http://127.0.0.1:${PORT}/metrics" 2>/dev/null \
-            | grep -q 'vllm:spec_decode'; then
+            | grep -q 'vllm:spec_decode' \
+        && kill -0 "${SERVER_PID}" 2>/dev/null; then
         READY=1
         break
     fi
@@ -157,15 +228,16 @@ if [[ ${READY} -ne 1 ]]; then
     exit 3
 fi
 
-python3 "${SPECULATORS_REPO}/scripts/evaluate/evaluate.py" \
-    --target "http://127.0.0.1:${PORT}/v1" \
-    --dataset RedHatAI/speculator_benchmarks \
-    --subsets "${STANDARD_SUBSETS}" \
-    --output-dir "${RUN_DIR}" \
-    --max-concurrency 128 \
-    --max-requests 200 \
-    --gen-kwargs '{"temperature":0}' \
-    throughput
+EVALUATOR_ARGS=("${SPECULATORS_REPO}/scripts/evaluate/evaluate.py"
+    --target "http://127.0.0.1:${PORT}/v1"
+    --dataset RedHatAI/speculator_benchmarks
+    --subsets "${STANDARD_SUBSETS}"
+    --output-dir "${RUN_DIR}"
+    --max-concurrency 128
+    --max-requests 200
+    --gen-kwargs '{"temperature":0}'
+    throughput)
+python3 "${EVALUATOR_ARGS[@]}"
 EVALUATOR_RC=$?
 if [[ ${EVALUATOR_RC} -ne 0 ]]; then
     echo "ERROR: Speculators evaluator failed with status ${EVALUATOR_RC}" >&2

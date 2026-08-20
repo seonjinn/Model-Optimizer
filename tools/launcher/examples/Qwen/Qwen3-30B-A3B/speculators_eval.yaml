@@ -25,6 +25,10 @@ pipeline:
     speculators_runtime: /path/to/shared/speculators-runtime
     speculators_repo: /path/to/shared/speculators
     container_image: /path/to/pinned-vllm-speculators.sqsh
+    container_identity: /path/to/pinned-vllm-speculators.sqsh.identity.json
+    modelopt_repo: /path/to/clean/modelopt-checkout
+    eval_config: /path/to/resolved-launch.yaml
+    dataset_manifest: /path/to/speculator-benchmarks.snapshot.json
     spec_method: dspark
     dflash_block_size: "8"
     num_spec_tokens: "8"
@@ -39,10 +43,13 @@ pipeline:
       - SPECULATORS_RUNTIME: <<global_vars.speculators_runtime>>
       - SPECULATORS_REPO: <<global_vars.speculators_repo>>
       - CONTAINER_IMAGE: <<global_vars.container_image>>
+      - CONTAINER_IDENTITY_PATH: <<global_vars.container_identity>>
+      - MODELOPT_REPO: <<global_vars.modelopt_repo>>
+      - EVAL_CONFIG_PATH: <<global_vars.eval_config>>
+      - DATASET_MANIFEST_PATH: <<global_vars.dataset_manifest>>
       - SPEC_METHOD: <<global_vars.spec_method>>
       - DFLASH_BLOCK_SIZE: <<global_vars.dflash_block_size>>
       - NUM_SPEC_TOKENS: <<global_vars.num_spec_tokens>>
-      - EVAL_CONFIG_PATH: modules/Model-Optimizer/tools/launcher/examples/Qwen/Qwen3-30B-A3B/speculators_eval.yaml
       - TP_SIZE: "2"
       - SERVE_READY_TIMEOUT: "1800"
     slurm_config:
