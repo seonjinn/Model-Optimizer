@@ -408,6 +408,10 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
         "is_relative_to",
         "--runtime-sha256",
         "sha256sum",
+        '--account="$ACCOUNT"',
+        '--partition="$PARTITION"',
+        "--gpus-per-node=4",
+        "--segment=1",
     ):
         assert required in script
     assert "pip install" not in script
