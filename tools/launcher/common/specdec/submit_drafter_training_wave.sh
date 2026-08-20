@@ -55,6 +55,12 @@ PY
 }
 
 declare -A identities=()
+scheduler_jobs="$(
+    {
+        squeue -h -u "$USER" -o "%j|%A"
+        sacct -X -n -u "$USER" -S today --format=JobName,JobIDRaw | awk 'NF {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}'
+    } || true
+)"
 while IFS=$'\t' read -r index identity boundary _run_name account partition; do
     [[ -n "$index" ]] || continue
     tuple_identity="${identity}:${boundary}"
@@ -77,8 +83,7 @@ PY
         printf '{"job_id":"%s","status":"receipt","tuple_identity":"%s"}\n' "$receipt_job" "$tuple_identity" >>"$RECEIPT"
         continue
     fi
-    existing="$(squeue -h -n "$job_name" -o "%A" | head -n 1 || true)"
-    [[ -n "$existing" ]] || existing="$(sacct -X -n --name "$job_name" --format=JobIDRaw,State | awk 'NF {print $1; exit}' || true)"
+    existing="$(awk -F'|' -v name="$job_name" '$1 == name {print $2; exit}' <<<"$scheduler_jobs")"
     if [[ -n "$existing" ]]; then
         printf '{"job_id":"%s","status":"already-known","tuple_identity":"%s","max_steps":%s}\n' "$existing" "$tuple_identity" "$boundary" >>"$RECEIPT"
         continue

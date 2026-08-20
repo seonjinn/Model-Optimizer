@@ -9,8 +9,10 @@ if [[ "${1:-}" == "--run-evaluation-container" ]]; then
     work_root="/raid/scratch/${SLURM_JOB_ID}/evaluation"
     mkdir -p "$work_root"
     tar --extract --file="$EVAL_RUNTIME_ARCHIVE" --directory="$work_root"
-    # shellcheck disable=SC1091
-    source "$work_root/bin/activate"
+    old_venv="$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?VIRTUAL_ENV=[\\042\\047]?([^\\042\\047]+)[\\042\\047]?.*/\\2/p" "$work_root/bin/activate" | head -n 1)"
+    [[ -n "$old_venv" ]] || { echo "runtime archive has no VIRTUAL_ENV" >&2; exit 1; }
+    grep -IlZ "$old_venv" "$work_root/bin"/* "$work_root/pyvenv.cfg" 2>/dev/null | xargs -0 -r sed -i "s|$old_venv|$work_root|g"
+    export VIRTUAL_ENV="$work_root" PATH="$work_root/bin:$PATH"
     export HF_HOME="$work_root/hf" HF_HUB_CACHE="$work_root/hf/hub" HF_DATASETS_CACHE="$work_root/hf/datasets"
     export XDG_CACHE_HOME="$work_root/xdg" SQLITE_TMPDIR="$work_root/sqlite" TMPDIR="$work_root/tmp"
     # shellcheck disable=SC1090

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,7 @@ def test_canonical_manifest_is_stable_and_written_atomically(tmp_path: Path) -> 
 
     assert output.read_text() == expected
     assert json.loads(expected)["experiments"][0]["num_speculative_tokens"] == 7
+    assert json.loads(expected)["experiments"][0]["sample_size"] == 1_300_000
     assert not list(tmp_path.glob(".manifest.json.*"))
 
 
@@ -183,6 +185,25 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
     assert "rm -rf /lustre" not in script
 
 
+def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
+    """The legacy Lustre venv becomes one checksummed archive without a rebuild."""
+    script = (_LAUNCHER_DIR / "common/specdec/stage_relocatable_runtime_archive.sh").read_text()
+
+    for required in (
+        "--segment=1",
+        "/raid/scratch",
+        "tar --dereference --create",
+        "tar --list",
+        "sha256sum",
+        ".provenance.json",
+        ".partial-",
+        'mv "$temporary" "$OUTPUT_ARCHIVE"',
+    ):
+        assert required in script
+    for forbidden in ("pip install", "git clone", "find /lustre", "rm -rf"):
+        assert forbidden not in script
+
+
 def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
     """A wave renders unique tuple jobs with node-local mutable runtime state."""
     submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
@@ -248,17 +269,53 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
         "WANDB_PROJECT",
         "WANDB_CACHE_DIR",
         "report_to=wandb",
-        "training.save_steps=\"${MAX_STEPS}\"",
+        'training.save_steps="${MAX_STEPS}"',
         "training.save_total_limit=2",
-        "cp -aL \"$SOURCE_PATH\"",
-        "cp -aL \"$TARGET_PATH\"",
-        "cp -aL \"$DATASET_PATH\"",
+        'cp -aL "$SOURCE_PATH"',
+        'cp -aL "$TARGET_PATH"',
+        'cp -aL "$DATASET_PATH"',
         "import accelerate, datasets, modelopt, wandb",
         "is_relative_to",
+        'ln -s .. "$node_root/source/modules/Model-Optimizer"',
+        "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml",
+        "dflash.dflash_mask_token_id=151669",
+        'data.sample_size="${SAMPLE_SIZE}"',
+        "${CONTROL_ROOT}:/scratchspace",
     ):
         assert required in runner
     assert "training.global_batch_size=512" not in runner
     assert "EXTRA_MODELOPT_DOTLIST" not in runner
+
+
+def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir() -> None:
+    """The staged source resolves recipe paths and all ranks rendezvous in one control mount."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        'mkdir -p "$node_root/source/modules"',
+        'ln -s .. "$node_root/source/modules/Model-Optimizer"',
+        'CONTROL_ROOT="${OUTPUT_ROOT}/control"',
+        'mkdir -p "$OUTPUT_ROOT" "$CONTROL_ROOT"',
+        "${CONTROL_ROOT}:/scratchspace",
+    ):
+        assert required in runner
+
+
+def test_runtime_relocation_accepts_exported_and_quoted_activate_assignments() -> None:
+    """OCI virtualenv activation lines may use export and shell quotes."""
+    parser = re.compile(r"^\s*(?:export\s+)?VIRTUAL_ENV=[\"']?([^\"']+)[\"']?.*$")
+    unquoted = parser.match("VIRTUAL_ENV=/lustre/runtime")
+    quoted = parser.match('export VIRTUAL_ENV="/lustre/runtime"')
+    assert unquoted and unquoted.group(1) == "/lustre/runtime"
+    assert quoted and quoted.group(1) == "/lustre/runtime"
+
+    for script_name in (
+        "run_drafter_training.sbatch",
+        "probe_relocatable_runtime.sh",
+    ):
+        script = (_LAUNCHER_DIR / f"common/specdec/{script_name}").read_text()
+        assert "(export[[:space:]]+)?" in script
+        assert "VIRTUAL_ENV=[" in script
 
 
 def test_cumulative_runner_writes_a_checkpoint_for_every_resume_boundary() -> None:
@@ -268,6 +325,19 @@ def test_cumulative_runner_writes_a_checkpoint_for_every_resume_boundary() -> No
     assert 'training.output_dir="${OUTPUT_ROOT}"' in runner
     assert 'training.save_steps="${MAX_STEPS}"' in runner
     assert "training.save_total_limit=2" in runner
+
+
+def test_training_runner_preserves_proven_production_training_semantics() -> None:
+    """Production waves must not inherit incompatible generic recipe defaults."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        "training.training_seq_len=4096",
+        "training.answer_only_loss=false",
+        "training.seed=42",
+        'mkdir -p "$OUTPUT_ROOT"',
+    ):
+        assert required in runner
 
 
 def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> None:
@@ -284,7 +354,7 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
         "VIRTUAL_ENV",
         "sed -i",
         "PYTHONPATH",
-        "cp -aL \"$SOURCE_PATH\"",
+        'cp -aL "$SOURCE_PATH"',
         "import accelerate, datasets, modelopt, wandb",
         "is_relative_to",
     ):

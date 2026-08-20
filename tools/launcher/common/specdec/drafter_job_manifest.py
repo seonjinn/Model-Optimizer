@@ -174,6 +174,7 @@ class DrafterExperiment:
     topology: TargetTopology
     paths: PinnedPaths
     slurm: SlurmSettings
+    sample_size: int = 1_300_000
 
     def __post_init__(self) -> None:
         if not self.target.strip() or not self.dataset.strip() or not self.run_name.strip():
@@ -185,6 +186,8 @@ class DrafterExperiment:
             raise ValueError("training requires exactly four nodes with --segment=4")
         if not self.cumulative_max_steps or any(step < 1 for step in self.cumulative_max_steps):
             raise ValueError("cumulative_max_steps must contain positive boundaries")
+        if self.sample_size != 1_300_000:
+            raise ValueError("production sample_size must be exactly 1,300,000")
         if tuple(sorted(set(self.cumulative_max_steps))).__len__() != len(
             self.cumulative_max_steps
         ):
@@ -280,6 +283,7 @@ def load_manifest(path: Path) -> tuple[DrafterExperiment, ...]:
             block_size=entry["block_size"],
             cumulative_max_steps=tuple(entry["cumulative_max_steps"]),
             run_name=entry["run_name"],
+            sample_size=entry["sample_size"],
             topology=TargetTopology(**entry["topology"]),
             paths=PinnedPaths(**entry["paths"]),
             slurm=SlurmSettings(**entry["slurm"]),

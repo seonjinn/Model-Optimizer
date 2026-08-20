@@ -32,7 +32,7 @@ experiment = load_manifest(manifest)[int(sys.argv[2])]
 for value in (
     experiment.paths.source_path, experiment.paths.source_sha, experiment.paths.image_path, experiment.paths.runtime_archive_path,
     experiment.paths.target_path, experiment.paths.dataset_path, experiment.paths.output_root,
-    experiment.method, experiment.block_size, experiment.run_name,
+    experiment.method, experiment.block_size, experiment.run_name, experiment.sample_size,
     ",".join(map(str, experiment.topology.capture_ids)), experiment.topology.serve_tp,
     experiment.topology.per_device_train_batch_size, experiment.topology.gradient_accumulation_steps,
     experiment.topology.num_attention_heads, experiment.topology.num_key_value_heads,
@@ -41,25 +41,27 @@ for value in (
     print(value)
 PY
 )
-(( ${#manifest_values[@]} == 18 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
+(( ${#manifest_values[@]} == 19 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
 SOURCE_PATH="${manifest_values[0]}"
 SOURCE_SHA="${manifest_values[1]}"
 IMAGE_PATH="${manifest_values[2]}"
 RUNTIME_ARCHIVE="${manifest_values[3]}"
 TARGET_PATH="${manifest_values[4]}"
 DATASET_PATH="${manifest_values[5]}"
+DATASET_LOCAL_NAME="$(basename "$DATASET_PATH")"
 OUTPUT_ROOT="${manifest_values[6]}"
 METHOD="${manifest_values[7]}"
 BLOCK_SIZE="${manifest_values[8]}"
 RUN_NAME="${manifest_values[9]}"
-EAGLE_CAPTURE_IDS="[${manifest_values[10]}]"
-SERVE_TP="${manifest_values[11]}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${manifest_values[12]}"
-GRADIENT_ACCUMULATION_STEPS="${manifest_values[13]}"
-NUM_ATTENTION_HEADS="${manifest_values[14]}"
-NUM_KEY_VALUE_HEADS="${manifest_values[15]}"
-HEAD_DIM="${manifest_values[16]}"
-INTERMEDIATE_SIZE="${manifest_values[17]}"
+SAMPLE_SIZE="${manifest_values[10]}"
+EAGLE_CAPTURE_IDS="[${manifest_values[11]}]"
+SERVE_TP="${manifest_values[12]}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${manifest_values[13]}"
+GRADIENT_ACCUMULATION_STEPS="${manifest_values[14]}"
+NUM_ATTENTION_HEADS="${manifest_values[15]}"
+NUM_KEY_VALUE_HEADS="${manifest_values[16]}"
+HEAD_DIM="${manifest_values[17]}"
+INTERMEDIATE_SIZE="${manifest_values[18]}"
 for name in SOURCE_PATH SOURCE_SHA RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT METHOD BLOCK_SIZE RUN_NAME; do
     [[ -n "${!name:-}" ]] || { echo "missing manifest value: $name" >&2; exit 2; }
 done
@@ -72,6 +74,8 @@ done
 [[ -f "$RUNTIME_ARCHIVE" ]] || { echo "runtime archive is missing" >&2; exit 2; }
 [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_STEPS must be positive" >&2; exit 2; }
 [[ $((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE)) -eq "$GLOBAL_BATCH_SIZE" ]] || { echo "manifest batch arithmetic must equal GBS 512" >&2; exit 2; }
+CONTROL_ROOT="${OUTPUT_ROOT}/control"
+mkdir -p "$OUTPUT_ROOT" "$CONTROL_ROOT"
 
 case "${METHOD}:${BLOCK_SIZE}" in
     dflash:8|dflash:16)
@@ -96,22 +100,24 @@ case "${METHOD}:${BLOCK_SIZE}" in
 esac
 export SERVE_NODES NUM_SPEC_TOKENS
 
-export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT SCRATCH_JOB_ROOT
+export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT SCRATCH_JOB_ROOT
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
 srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE}:${RUNTIME_ARCHIVE},${TARGET_PATH}:${TARGET_PATH},${DATASET_PATH}:${DATASET_PATH},${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT}" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
     cp -aL "$SOURCE_PATH" "$node_root/source"
+    mkdir -p "$node_root/source/modules"
+    ln -s .. "$node_root/source/modules/Model-Optimizer"
     tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
-    old_venv=$(sed -n "s/^VIRTUAL_ENV=//p" "$node_root/runtime/bin/activate" | head -n 1)
+    old_venv=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?VIRTUAL_ENV=[\\042\\047]?([^\\042\\047]+)[\\042\\047]?.*/\\2/p" "$node_root/runtime/bin/activate" | head -n 1)
     [[ -n "$old_venv" ]] || { echo "runtime archive has no VIRTUAL_ENV" >&2; exit 2; }
     grep -IlZ "$old_venv" "$node_root/runtime/bin"/* "$node_root/runtime/pyvenv.cfg" 2>/dev/null \
         | xargs -0 -r sed -i "s|$old_venv|$node_root/runtime|g"
     if (( SLURM_NODEID < SERVE_NODES )); then
         cp -aL "$TARGET_PATH" "$node_root/input/target"
     else
-        cp -aL "$DATASET_PATH" "$node_root/input/dataset"
+        cp -aL "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"
         # Fake-base trainers still need the target configuration/tokenizer sidecars.
         mkdir -p "$node_root/input/target"
         for sidecar in config.json generation_config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do
@@ -120,10 +126,10 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --contai
     fi
 '
 
-export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS RUN_NAME
+export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS RUN_NAME SAMPLE_SIZE
 
-# shellcheck disable=SC2016 # The child shell expands its Slurm-node environment.
-srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT},${OUTPUT_ROOT}:${OUTPUT_ROOT}" bash -c '
+# shellcheck disable=SC2016,SC2026 # The child shell expands its Slurm-node environment.
+srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT},${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     export MODELOPT_RUNTIME="$node_root/runtime"
@@ -169,17 +175,22 @@ PY
         model.model_name_or_path="$HF_MODEL_CKPT" \
         model.use_fake_base_for_offline=true \
         data.mode=streaming \
-        data.data_path="$node_root/input/dataset" \
+        data.data_path="$node_root/input/$DATASET_LOCAL_NAME" \
+        data.sample_size="${SAMPLE_SIZE}" \
         training.output_dir="${OUTPUT_ROOT}" \
         training.max_steps="${MAX_STEPS}" \
         training.save_steps="${MAX_STEPS}" \
         training.save_total_limit=2 \
+        training.training_seq_len=4096 \
+        training.answer_only_loss=false \
+        training.seed=42 \
         training.per_device_train_batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}" \
         training.gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}" \
         training.report_to=wandb \
         training.run_name="${RUN_NAME}" \
         dflash.dflash_block_size="${BLOCK_SIZE}" \
         dflash.dflash_num_anchors=512 \
+        dflash.dflash_mask_token_id=151669 \
         dflash.dflash_architecture_config.num_attention_heads="${NUM_ATTENTION_HEADS}" \
         dflash.dflash_architecture_config.num_key_value_heads="${NUM_KEY_VALUE_HEADS}" \
         dflash.dflash_architecture_config.head_dim="${HEAD_DIM}" \

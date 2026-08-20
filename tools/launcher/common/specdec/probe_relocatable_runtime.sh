@@ -45,7 +45,7 @@ rm -rf "$node_root"
 mkdir -p "$node_root/runtime"
 cp -aL "$SOURCE_PATH" "$node_root/source"
 tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
-old_venv="$(sed -n 's/^VIRTUAL_ENV=//p' "$node_root/runtime/bin/activate" | head -n 1)"
+old_venv="$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?VIRTUAL_ENV=[\\042\\047]?([^\\042\\047]+)[\\042\\047]?.*/\\2/p" "$node_root/runtime/bin/activate" | head -n 1)"
 [[ -n "$old_venv" ]] || { echo "runtime archive has no VIRTUAL_ENV" >&2; exit 1; }
 grep -IlZ "$old_venv" "$node_root/runtime/bin"/* "$node_root/runtime/pyvenv.cfg" 2>/dev/null \
     | xargs -0 -r sed -i "s|$old_venv|$node_root/runtime|g"
