@@ -226,6 +226,19 @@ def test_model_staging_fails_closed_and_bounds_shared_filesystem_operations() ->
     assert 'rm -rf "$ARTIFACT_DIR"' not in script
 
 
+def test_model_staging_rejects_broken_destinations_and_cleans_failed_publishes() -> None:
+    """Failure cleanup covers errexit, and lexical symlinks cannot evade conflict checks."""
+    script = (_LAUNCHER_DIR / "common/specdec/stage_hf_model.sh").read_text()
+
+    symlink_guard = '[[ ! -L "$ARTIFACT_DIR" ]] || {'
+    canonicalization = 'ARTIFACT_CANONICAL="$(realpath -m -- "$ARTIFACT_DIR")"'
+    assert symlink_guard in script
+    assert script.index(symlink_guard) < script.index(canonicalization)
+    assert "run_stage() (" in script
+    assert "trap cleanup EXIT" in script
+    assert "trap cleanup RETURN" not in script
+
+
 def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
     """The legacy Lustre venv becomes one checksummed archive without a rebuild."""
     script = (_LAUNCHER_DIR / "common/specdec/stage_relocatable_runtime_archive.sh").read_text()

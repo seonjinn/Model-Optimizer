@@ -49,6 +49,7 @@ done
 [[ "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
 [[ "$LOG_DIR" == /raid/scratch* ]] || usage
 [[ -n "$ACCOUNT" && -n "$PARTITION" ]] || usage
+[[ ! -L "$ARTIFACT_DIR" ]] || { echo "refusing symlink artifact path: $ARTIFACT_DIR" >&2; exit 2; }
 ARTIFACT_CANONICAL="$(realpath -m -- "$ARTIFACT_DIR")"
 SCRATCH_CANONICAL="$(realpath -m -- "$SCRATCH_ROOT")"
 LOG_CANONICAL="$(realpath -m -- "$LOG_DIR")"
@@ -99,7 +100,7 @@ completed_artifact_matches() {
         && grep -Fq "\"source_identity\": \"${SOURCE_IDENTITY}\"" "$marker"
 }
 
-run_stage() {
+run_stage() (
     require_inputs
     local work_dir="${SCRATCH_ROOT}/${SLURM_JOB_ID:?SLURM_JOB_ID is required}/hf-stage"
     local local_snapshot="${work_dir}/snapshot"
@@ -114,13 +115,14 @@ run_stage() {
 
     mkdir -p "$local_snapshot" "$(dirname "$ARTIFACT_DIR")"
     mkdir "$partial"
+    # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
     cleanup() {
         find "$work_dir" -depth -delete 2>/dev/null || true
         if [[ -e "$partial" ]]; then
             find "$partial" -depth -delete 2>/dev/null || true
         fi
     }
-    trap cleanup RETURN
+    trap cleanup EXIT
 
     if [[ "$SOURCE_KIND" == "local" ]]; then
         cp -aL "$SOURCE_DIR"/. "$local_snapshot"/
@@ -150,7 +152,7 @@ run_stage() {
 
     mv -T --no-clobber "$partial" "$ARTIFACT_DIR"
     [[ ! -e "$partial" ]] || { echo "another publisher created artifact: $ARTIFACT_DIR" >&2; return 1; }
-}
+)
 
 submit() {
     require_inputs
