@@ -167,11 +167,6 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
 
     for required in (
         "--segment=1",
-        "--job-name=modelopt-runtime-probe",
-        '--output="$PROBE_LOG"',
-        '--error="$PROBE_LOG"',
-        "${SOURCE_PATH}:${SOURCE_PATH}",
-        "${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT}",
         "--revision",
         "/raid/scratch",
         "HF_HOME",
@@ -187,7 +182,6 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
         assert required in script
     assert "pip install" not in script
     assert "git clone" not in script
-    assert "${SCRIPT_PATH}:${SCRIPT_PATH}" not in script
     assert "find /lustre" not in script
     assert "rm -rf /lustre" not in script
 
@@ -418,10 +412,18 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
         '--partition="$PARTITION"',
         "--gpus-per-node=4",
         "--segment=1",
+        "--job-name=modelopt-runtime-probe",
+        '--output="$PROBE_LOG"',
+        '--error="$PROBE_LOG"',
+        "${SOURCE_PATH}:${SOURCE_PATH}",
+        "${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT}",
+        "runtime-probe-${SLURM_JOB_ID}.trace",
+        'exec >>"$TRACE_LOG" 2>&1',
     ):
         assert required in script
     assert "pip install" not in script
     assert "git clone" not in script
+    assert "${SCRIPT_PATH}:${SCRIPT_PATH}" not in script
 
 
 def test_training_manifest_pins_and_verifies_runtime_archive_bytes() -> None:

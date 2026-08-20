@@ -55,6 +55,9 @@ if [[ "$MODE" == "outer" ]]; then
     exit 0
 fi
 
+TRACE_LOG="$(dirname "$RUNTIME_ARCHIVE")/probes/runtime-probe-${SLURM_JOB_ID}.trace"
+exec >>"$TRACE_LOG" 2>&1
+set -x
 node_root="${SCRATCH_ROOT}/node-${SLURM_NODEID:-0}"
 rm -rf "$node_root"
 mkdir -p "$node_root/runtime"
