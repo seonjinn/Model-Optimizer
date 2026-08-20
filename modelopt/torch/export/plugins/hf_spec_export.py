@@ -517,7 +517,9 @@ class DSparkExporter(DFlashExporter):
 
     def _extract_state_dict(self, full_state_dict: dict):
         """Extract DSpark weights using the Qwen3 DSpark head names."""
-        markov_head_type = getattr(self.model.dflash_config, "markov_head_type", "vanilla")
+        markov_head_type = str(
+            getattr(self.model.dflash_config, "markov_head_type", "vanilla")
+        ).lower()
         if markov_head_type != "vanilla":
             raise ValueError(
                 "vLLM's Qwen3 DSpark exporter only supports the vanilla Markov head; "
@@ -539,12 +541,13 @@ class DSparkExporter(DFlashExporter):
         """Extend the DFlash config with the DSpark head fields."""
         config = super()._export_config()
         draft_config = self.model.dflash_config
+        markov_head_type = str(getattr(draft_config, "markov_head_type", "vanilla")).lower()
 
         config.update(
             {
                 "architectures": ["Qwen3DSparkModel"],
                 "markov_rank": draft_config.markov_rank,
-                "markov_head_type": getattr(draft_config, "markov_head_type", "vanilla"),
+                "markov_head_type": markov_head_type,
             }
         )
 
@@ -553,7 +556,7 @@ class DSparkExporter(DFlashExporter):
                 "projector_type": getattr(draft_config, "projector_type", "dspark"),
                 "shift_label": getattr(draft_config, "shift_label", True),
                 "markov_rank": draft_config.markov_rank,
-                "markov_head_type": getattr(draft_config, "markov_head_type", "vanilla"),
+                "markov_head_type": markov_head_type,
                 "use_confidence_head": bool(getattr(draft_config, "use_confidence_head", False)),
             }
         )

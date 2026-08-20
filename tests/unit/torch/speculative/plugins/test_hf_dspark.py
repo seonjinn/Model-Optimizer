@@ -30,6 +30,7 @@ from _test_utils.torch.transformers_models import get_tiny_llama
 from safetensors.torch import load_file
 
 import modelopt.torch.speculative as mtsp
+from modelopt.torch.export.plugins.hf_spec_export import DFlashExporter
 from modelopt.torch.speculative.config import DFLASH_DEFAULT_CFG
 from modelopt.torch.speculative.plugins.hf_dflash import HFDFlashModel
 from modelopt.torch.speculative.plugins.hf_dspark import HFDSparkModel
@@ -260,7 +261,8 @@ class TestDSparkSwa:
 class TestDSparkExporter:
     """Test the DSpark checkpoint export format used by vLLM's Qwen3 loader."""
 
-    def _export(self, tmp_path, head_type="vanilla", use_confidence_head=False):
+    def _make_exporter(self, tmp_path, head_type="vanilla", use_confidence_head=False):
+        """Create a DSpark model and its export directory."""
         model = get_tiny_llama(num_hidden_layers=4)
         mtsp.convert(
             model,
@@ -274,12 +276,17 @@ class TestDSparkExporter:
             ],
         )
         export_dir = tmp_path / "exported"
+        return model, export_dir
+
+    def _export(self, tmp_path, head_type="vanilla", use_confidence_head=False):
+        """Export a DSpark model and return it with its export directory."""
+        model, export_dir = self._make_exporter(tmp_path, head_type, use_confidence_head)
         model.get_exporter().export(export_dir)
-        return export_dir
+        return export_dir, model
 
     def test_export_matches_qwen3_dspark_contract(self, tmp_path):
         """Vanilla DSpark exports the Qwen3 config and canonical head weight names."""
-        export_dir = self._export(tmp_path, use_confidence_head=True)
+        export_dir, model = self._export(tmp_path, use_confidence_head=True)
         sd = load_file(str(export_dir / "model.safetensors"))
         for key in sd:
             assert "dflash_module." not in key
@@ -292,6 +299,18 @@ class TestDSparkExporter:
         assert "markov_w2.weight" not in sd
         assert "confidence_proj.weight" not in sd
         assert "confidence_proj.bias" not in sd
+
+        expected_sd = DFlashExporter._extract_state_dict(model.get_exporter(), model.state_dict())
+        for source_key, target_key in {
+            "markov_w1.weight": "markov_head.markov_w1.weight",
+            "markov_w2.weight": "markov_head.markov_w2.weight",
+            "confidence_proj.weight": "confidence_head.proj.weight",
+            "confidence_proj.bias": "confidence_head.proj.bias",
+        }.items():
+            expected_sd[target_key] = expected_sd.pop(source_key)
+        assert set(sd) == set(expected_sd)
+        for key, tensor in expected_sd.items():
+            assert torch.equal(sd[key], tensor)
 
         with open(export_dir / "config.json") as f:
             cfg = json.load(f)
@@ -311,5 +330,17 @@ class TestDSparkExporter:
     @pytest.mark.parametrize("head_type", ["gated", "rnn"])
     def test_export_rejects_unsupported_markov_head_types(self, tmp_path, head_type):
         """vLLM's Qwen3 DSpark loader cannot load gated or RNN heads."""
+        model, export_dir = self._make_exporter(tmp_path, head_type=head_type)
         with pytest.raises(ValueError, match="only supports the vanilla Markov head"):
-            self._export(tmp_path, head_type=head_type)
+            model.get_exporter().export(export_dir)
+        for filename in ("model.safetensors", "config.json", "hf_quant_config.json"):
+            assert not (export_dir / filename).exists()
+
+    @pytest.mark.parametrize("head_type", ["Vanilla", "VANILLA"])
+    def test_export_normalizes_vanilla_markov_head_type(self, tmp_path, head_type):
+        """Case-insensitive vanilla configs export with the canonical head type."""
+        export_dir, _ = self._export(tmp_path, head_type=head_type)
+        with open(export_dir / "config.json") as f:
+            cfg = json.load(f)
+        assert cfg["markov_head_type"] == "vanilla"
+        assert cfg["dflash_config"]["markov_head_type"] == "vanilla"
