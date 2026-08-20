@@ -228,11 +228,14 @@ class GlobalVariables:
     # dataclass schema didn't include the key; the agent worked
     # around it inline but the canonical YAML stayed broken.
     draft_model: str = None
-    modelopt_runtime: str = None
+    modelopt_runtime: str = ""
     report_to: str = None
     run_name: str = None
+    sample_size: str = None
     dflash_block_size: str = None
+    dflash_dpace_alpha: str = None
     dflash_loss_decay_factor: str = None
+    num_spec_tokens: str = None
 
 
 @dataclass

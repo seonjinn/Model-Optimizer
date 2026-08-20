@@ -19,7 +19,6 @@ pipeline:
     hf_model: /hf-local/Qwen/Qwen3-235B-A22B
     hf_data: /scratchspace/data/train.jsonl
     sample_size: "50000"
-    modelopt_runtime: ""
     report_to: wandb
     run_name: Qwen3-235B-A22B_DSpark_streaming_multi_node
     dflash_block_size: "8"

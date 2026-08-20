@@ -123,7 +123,7 @@ SCRIPT_ARGS=("$@")
 SERVE_PORT="${SERVE_PORT:-8765}"
 SERVE_READY_TIMEOUT="${SERVE_READY_TIMEOUT:-900}"
 SERVE_NODES="${SERVE_NODES:-1}"
-SERVE_LOG="/scratchspace/vllm_serve.log"   # serve nodes override with a per-node path
+SERVE_LOG="${SERVE_LOG:-/scratchspace/vllm_serve.log}"   # serve nodes override with a per-node path
 # Namespace rendezvous/sentinel files per Slurm job (SLURM_JOB_ID: same across an
 # allocation's nodes, unique across allocations) so concurrent allocations on the
 # shared mount don't clobber each other's addresses. Fixed token off-Slurm.

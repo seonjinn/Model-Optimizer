@@ -29,6 +29,12 @@ _DFLASH_RECIPE = (
 _DSPARK_RECIPE = (
     "--config modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/dspark.yaml"
 )
+_QWEN_DRAFTER_YAMLS = (
+    "examples/Qwen/Qwen3-30B-A3B/hf_streaming_dflash_multi_node.yaml",
+    "examples/Qwen/Qwen3-30B-A3B/hf_streaming_dspark_multi_node.yaml",
+    "examples/Qwen/Qwen3-235B-A22B/hf_streaming_dflash_multi_node.yaml",
+    "examples/Qwen/Qwen3-235B-A22B/hf_streaming_dspark_multi_node.yaml",
+)
 
 
 @pytest.mark.parametrize(
@@ -126,7 +132,7 @@ def test_qwen_drafter_launcher_contract(
     assert global_vars["hf_model"] == hf_model
     assert global_vars["hf_data"] == "/scratchspace/data/train.jsonl"
     assert global_vars["sample_size"] == "50000"
-    assert global_vars["modelopt_runtime"] == ""
+    assert "modelopt_runtime" not in global_vars
     assert global_vars["report_to"] == "wandb"
     assert global_vars["run_name"] == run_name
     assert global_vars["dflash_block_size"] == "8"
@@ -156,7 +162,7 @@ def test_qwen_drafter_launcher_contract(
         assert "dflash_loss_decay_factor" not in global_vars
         assert "dflash.dflash_loss_objective=dpace" in task["args"]
         assert "dflash.dflash_dpace_alpha=<<global_vars.dflash_dpace_alpha>>" in task["args"]
-        assert not any("dflash_loss_decay_factor=" in arg for arg in task["args"])
+        assert "dflash.dflash_loss_decay_factor=0" in task["args"]
     else:
         assert global_vars["dflash_loss_decay_factor"] == "4"
         assert "dflash_dpace_alpha" not in global_vars
@@ -185,6 +191,40 @@ def test_qwen_drafter_launcher_contract(
     assert "/lustre/" not in raw_yaml
 
 
+@pytest.mark.parametrize("relative_path", _QWEN_DRAFTER_YAMLS)
+def test_qwen_drafter_launcher_typed_resolution(relative_path: str, tmp_path: Path) -> None:
+    """The real NeMo Run CLI accepts and resolves every matrix launcher."""
+    resolved_path = tmp_path / "resolved.yaml"
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--frozen",
+            "python",
+            "launch.py",
+            "--yaml",
+            relative_path,
+            "--to-yaml",
+            str(resolved_path),
+        ],
+        cwd=_LAUNCHER_DIR,
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert resolved_path.is_file(), result.stderr
+    resolved = yaml.safe_load(resolved_path.read_text())
+    global_vars = resolved["pipeline"]["global_vars"]
+    assert global_vars["_target_"] == "modelopt_launcher.core.GlobalVariables"
+    assert global_vars["sample_size"] == "50000"
+    assert global_vars["num_spec_tokens"] in {"7", "8"}
+    if "dflash" in relative_path:
+        assert global_vars["dflash_dpace_alpha"] == "0.5"
+
+
 def test_make_dataset_uses_python3_for_vllm_images() -> None:
     """Use the interpreter available in vLLM deployment images."""
     script = (_LAUNCHER_DIR / "common" / "eagle3" / "make_dataset.sh").read_text()
@@ -211,12 +251,17 @@ def test_streaming_serve_uses_activated_runtime_python(tmp_path: Path) -> None:
     """The vLLM console script must not bypass the activated shared runtime."""
     runtime = tmp_path / "runtime"
     invocation_log = tmp_path / "invocations.log"
+    serve_ready = tmp_path / "serve-ready"
+    os.mkfifo(serve_ready)
     activate = runtime / "bin" / "activate"
     activate.parent.mkdir(parents=True)
     activate.write_text(f'export PATH="{runtime / "bin"}:$PATH"\n')
     fake_python = f"""#!/bin/sh
 printf 'runtime-python %s\\n' "$*" >> "{invocation_log}"
-[ "$1" = "-m" ] && sleep 1
+if [ "$1" = "-m" ]; then
+    printf 'ready\\n' > "{serve_ready}"
+    sleep 1
+fi
 exit 0
 """
     _write_executable(runtime / "bin" / "python", fake_python)
@@ -230,7 +275,8 @@ exit 0
     )
     _write_executable(
         runtime / "bin" / "curl",
-        """#!/bin/sh
+        f"""#!/bin/sh
+read -r _ < "{serve_ready}"
 exit 0
 """,
     )
@@ -255,6 +301,7 @@ printf '2\\n'
         "SERVE_TP": "1",
         "TRAIN_GPUS": "1",
         "SERVE_READY_TIMEOUT": "5",
+        "SERVE_LOG": str(tmp_path / "vllm-serve.log"),
     }
     result = subprocess.run(
         [

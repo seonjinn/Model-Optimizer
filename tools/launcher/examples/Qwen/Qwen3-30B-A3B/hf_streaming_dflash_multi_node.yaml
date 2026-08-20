@@ -44,7 +44,6 @@ pipeline:
     hf_model: /hf-local/Qwen/Qwen3-30B-A3B
     hf_data: /scratchspace/data/train.jsonl
     sample_size: "50000"
-    modelopt_runtime: ""
     report_to: wandb
     run_name: Qwen3-30B-A3B_DFlash_streaming_multi_node
     dflash_block_size: "8"
@@ -97,6 +96,7 @@ pipeline:
       - dflash.dflash_num_anchors=512
       - dflash.dflash_loss_objective=dpace
       - dflash.dflash_dpace_alpha=<<global_vars.dflash_dpace_alpha>>
+      - dflash.dflash_loss_decay_factor=0
       # Qwen3 has no tokenizer mask token; use a reserved vocab slot (151669).
       - dflash.dflash_mask_token_id=151669
       # Only the draft depth is overridden. Attention/MLP dimensions inherit the
