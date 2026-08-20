@@ -120,17 +120,9 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
     [[ -n "$old_venv" ]] || { echo "runtime archive has no VIRTUAL_ENV" >&2; exit 2; }
     grep -IlZ "$old_venv" "$node_root/runtime/bin"/* "$node_root/runtime/pyvenv.cfg" 2>/dev/null \
         | xargs -0 -r sed -i "s|$old_venv|$node_root/runtime|g"
-    if (( SLURM_NODEID < SERVE_NODES )); then
-        cp -aL "$TARGET_PATH" "$node_root/input/target"
-    else
+    cp -aL "$TARGET_PATH" "$node_root/input/target"
+    if (( SLURM_NODEID >= SERVE_NODES )); then
         cp -aL "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"
-        # Fake-base trainers still need the target configuration/tokenizer sidecars.
-        mkdir -p "$node_root/input/target"
-        for sidecar in config.json generation_config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do
-            if [[ -e "$TARGET_PATH/$sidecar" ]]; then
-                cp -aL "$TARGET_PATH/$sidecar" "$node_root/input/target/"
-            fi
-        done
     fi
     echo "host staging complete: node=${SLURM_NODEID}"
 '

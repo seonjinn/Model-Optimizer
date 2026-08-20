@@ -307,7 +307,7 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
         "PYTHONPATH",
         "--no-container-mount-home",
         "${OUTPUT_ROOT}:${OUTPUT_ROOT}",
-        "SLURM_NODEID < SERVE_NODES",
+        "SLURM_NODEID >= SERVE_NODES",
         "WANDB_PROJECT",
         "WANDB_RUN_GROUP",
         "WANDB_CACHE_DIR",
@@ -378,11 +378,13 @@ def test_host_staging_preserves_one_bounded_diagnostic_log_per_node() -> None:
 
 
 def test_missing_optional_target_sidecar_does_not_fail_host_staging() -> None:
-    """An absent final optional tokenizer file must still leave the subshell successful."""
+    """Every role gets the complete target checkpoint without optional-sidecar branching."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
-    assert 'if [[ -e "$TARGET_PATH/$sidecar" ]]; then' in runner
+    target_copy = 'cp -aL "$TARGET_PATH" "$node_root/input/target"'
+    assert runner.count(target_copy) == 1
     assert '[[ -e "$TARGET_PATH/$sidecar" ]] && cp' not in runner
+    assert 'for sidecar in config.json' not in runner
     assert 'echo "host staging complete: node=${SLURM_NODEID}"' in runner
 
 
