@@ -14,6 +14,7 @@ IMAGE_PATH=""
 SCRATCH_ROOT="/raid/scratch/${USER}/modelopt-runtime-probe-${SLURM_JOB_ID:-local}"
 ACCOUNT="nemotron_n3_post"
 PARTITION="batch"
+PROBE_LOG=""
 
 usage() {
     echo "usage: $0 --source-path /home/... --runtime-archive /lustre/... --runtime-sha256 SHA256 --image /lustre/... [--scratch-root /raid/scratch/...] [--account ACCOUNT] [--partition PARTITION]" >&2
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --scratch-root) SCRATCH_ROOT="$2"; shift 2 ;;
         --account) ACCOUNT="$2"; shift 2 ;;
         --partition) PARTITION="$2"; shift 2 ;;
+        --probe-log) PROBE_LOG="$2"; shift 2 ;;
         *) usage ;;
     esac
 done
@@ -40,10 +42,15 @@ if [[ "$MODE" == "outer" ]]; then
     [[ "$SCRIPT_PATH" == /home/* ]] || { echo "probe script must be run from /home source" >&2; exit 2; }
     [[ -f "$RUNTIME_ARCHIVE" && -f "$IMAGE_PATH" ]] || { echo "pinned archive or image is missing" >&2; exit 2; }
     [[ "$(sha256sum "$RUNTIME_ARCHIVE" | cut -d' ' -f1)" == "$RUNTIME_SHA256" ]] || { echo "runtime archive SHA-256 mismatch" >&2; exit 2; }
+    PROBE_LOG="${PROBE_LOG:-$(dirname "$RUNTIME_ARCHIVE")/probes/runtime-probe-%j.out}"
+    [[ "$PROBE_LOG" == /lustre/* ]] || usage
+    mkdir -p "$(dirname "$PROBE_LOG")"
     srun --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks=1 --gpus-per-node=4 --segment=1 --time=00:10:00 \
+        --job-name=modelopt-runtime-probe --output="$PROBE_LOG" \
         --no-container-mount-home --container-image="$IMAGE_PATH" \
         --container-mounts="${SCRIPT_PATH}:${SCRIPT_PATH},${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE}:${RUNTIME_ARCHIVE},/raid/scratch:/raid/scratch" \
         bash "$SCRIPT_PATH" --inside --source-path "$SOURCE_PATH" --runtime-archive "$RUNTIME_ARCHIVE" --runtime-sha256 "$RUNTIME_SHA256" --image "$IMAGE_PATH" --scratch-root "$SCRATCH_ROOT"
+    echo "runtime probe log: $PROBE_LOG"
     exit 0
 fi
 

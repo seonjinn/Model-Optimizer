@@ -167,6 +167,8 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
 
     for required in (
         "--segment=1",
+        "--job-name=modelopt-runtime-probe",
+        '--output="$PROBE_LOG"',
         "--revision",
         "/raid/scratch",
         "HF_HOME",
