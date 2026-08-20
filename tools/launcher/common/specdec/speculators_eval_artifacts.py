@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import hashlib
 import json
@@ -71,13 +72,13 @@ def _finite_float(row: dict[str, str], column: str) -> float:
 
 
 def _nonnegative_int(row: dict[str, str], column: str) -> int:
-    try:
-        value = int(row[column])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError(f"{row.get('subset', '<unknown>')}: invalid {column}") from error
-    if value < 0:
+    value = _finite_float(row, column)
+    if not value.is_integer():
+        raise ValueError(f"{row.get('subset', '<unknown>')}: fractional {column}")
+    integer = int(value)
+    if integer < 0:
         raise ValueError(f"{row.get('subset', '<unknown>')}: negative {column}")
-    return value
+    return integer
 
 
 def validate_acceptance(csv_path: Path, num_speculative_tokens: int) -> None:
@@ -162,7 +163,7 @@ def _dataset_provenance(manifest_path: Path, hf_home: Path) -> dict[str, object]
     if not isinstance(files, dict) or set(files) != set(STANDARD_SUBSETS):
         raise ValueError("dataset manifest must contain exactly the nine standard subsets")
     snapshot_root = (
-        resolved_home / "datasets--RedHatAI--speculator_benchmarks" / "snapshots" / revision
+        resolved_home / "hub" / "datasets--RedHatAI--speculator_benchmarks" / "snapshots" / revision
     ).resolve()
 
     verified_files: dict[str, dict[str, str]] = {}
@@ -170,11 +171,17 @@ def _dataset_provenance(manifest_path: Path, hf_home: Path) -> dict[str, object]
         entry = files[subset]
         if not isinstance(entry, dict):
             raise ValueError(f"invalid dataset file entry: {subset}")
-        path = Path(str(entry.get("path", ""))).resolve()
-        try:
-            path.relative_to(snapshot_root)
-        except ValueError as error:
-            raise ValueError(f"dataset file is outside the pinned snapshot: {path}") from error
+        path = Path(os.path.abspath(str(entry.get("path", ""))))
+        if path != snapshot_root / f"{subset}.jsonl":
+            raise ValueError(f"dataset file is not the pinned subset JSONL: {path}")
+        if path.is_symlink():
+            blobs_root = (snapshot_root.parents[1] / "blobs").resolve()
+            try:
+                path.resolve(strict=True).relative_to(blobs_root)
+            except (FileNotFoundError, ValueError) as error:
+                raise ValueError(
+                    f"dataset snapshot link escapes its blobs directory: {path}"
+                ) from error
         expected_sha = entry.get("sha256")
         if not path.is_file() or not _is_lower_hex(expected_sha, 64):
             raise ValueError(f"invalid staged dataset file: {path}")
@@ -191,7 +198,30 @@ def _dataset_provenance(manifest_path: Path, hf_home: Path) -> dict[str, object]
     }
 
 
-def _container_provenance(identity_path: Path, image_path: Path) -> dict[str, object]:
+def _resolved_slurm_container(launcher_config: Path) -> Path:
+    keys: list[tuple[int, str]] = []
+    for raw_line in launcher_config.read_text().splitlines():
+        content = raw_line.lstrip()
+        if not content or content.startswith("#") or ":" not in content:
+            continue
+        indentation = len(raw_line) - len(content)
+        key, value = content.split(":", 1)
+        while keys and keys[-1][0] >= indentation:
+            keys.pop()
+        keys.append((indentation, key.strip()))
+        if [item[1] for item in keys] == ["pipeline", "task_0", "slurm_config", "container"]:
+            scalar = value.strip()
+            if not scalar:
+                break
+            if scalar[0:1] in {'"', "'"}:
+                scalar = ast.literal_eval(scalar)
+            return Path(scalar).resolve()
+    raise ValueError("resolved launcher config has no pipeline.task_0.slurm_config.container")
+
+
+def _container_provenance(
+    identity_path: Path, image_path: Path, launcher_config: Path
+) -> dict[str, object]:
     identity = _load_json(identity_path)
     resolved_image = image_path.resolve()
     if Path(str(identity.get("path", ""))).resolve() != resolved_image:
@@ -204,6 +234,10 @@ def _container_provenance(identity_path: Path, image_path: Path) -> dict[str, ob
         raise ValueError(f"container image is missing: {resolved_image}")
     if resolved_image.stat().st_size != size_bytes:
         raise ValueError("container image size does not match its identity sidecar")
+    if _sha256(resolved_image) != digest:
+        raise ValueError("container image hash mismatch")
+    if _resolved_slurm_container(launcher_config) != resolved_image:
+        raise ValueError("resolved Slurm container does not match the configured image")
     return {
         "path": str(resolved_image),
         "sha256": digest,
@@ -216,7 +250,20 @@ def _container_provenance(identity_path: Path, image_path: Path) -> dict[str, ob
 def verify_inputs(args: argparse.Namespace) -> None:
     """Verify the offline dataset snapshot and immutable container identity."""
     _dataset_provenance(Path(args.dataset_manifest), Path(args.hf_home))
-    _container_provenance(Path(args.container_identity), Path(args.container_image))
+    _container_provenance(
+        Path(args.container_identity), Path(args.container_image), Path(args.launcher_config)
+    )
+
+
+def print_dataset_paths(args: argparse.Namespace) -> None:
+    """Print verified subset/path pairs for sequential local evaluation."""
+    dataset = _dataset_provenance(Path(args.dataset_manifest), Path(args.hf_home))
+    files = dataset["files"]
+    assert isinstance(files, dict)
+    for subset in STANDARD_SUBSETS:
+        entry = files[subset]
+        assert isinstance(entry, dict)
+        print(f"{subset}\t{entry['path']}")
 
 
 def write_manifest(args: argparse.Namespace) -> None:
@@ -227,7 +274,11 @@ def write_manifest(args: argparse.Namespace) -> None:
         "launcher": Path(args.launcher_config),
     }
     try:
-        container = _container_provenance(Path(args.container_identity), Path(args.container_image))
+        container = _container_provenance(
+            Path(args.container_identity),
+            Path(args.container_image),
+            Path(args.launcher_config),
+        )
         dataset = _dataset_provenance(Path(args.dataset_manifest), Path(args.hf_home))
     except ValueError as error:
         if args.status == "success":
@@ -308,6 +359,11 @@ def main() -> None:
     verify.add_argument("--hf-home", required=True)
     verify.add_argument("--container-identity", required=True)
     verify.add_argument("--container-image", required=True)
+    verify.add_argument("--launcher-config", required=True)
+
+    dataset_paths = subparsers.add_parser("dataset-paths")
+    dataset_paths.add_argument("--dataset-manifest", required=True)
+    dataset_paths.add_argument("--hf-home", required=True)
 
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("--output", required=True)
@@ -343,6 +399,8 @@ def main() -> None:
         validate_acceptance(Path(args.csv), args.num_speculative_tokens)
     elif args.command == "verify-inputs":
         verify_inputs(args)
+    elif args.command == "dataset-paths":
+        print_dataset_paths(args)
     else:
         write_manifest(args)
 

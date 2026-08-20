@@ -180,7 +180,8 @@ if ! python3 "${ARTIFACT_HELPER}" verify-inputs \
     --dataset-manifest "${DATASET_MANIFEST_PATH}" \
     --hf-home "${HF_HOME}" \
     --container-identity "${CONTAINER_IDENTITY_PATH}" \
-    --container-image "${CONTAINER_IMAGE}"; then
+    --container-image "${CONTAINER_IMAGE}" \
+    --launcher-config "${EVAL_CONFIG_PATH}"; then
     echo "ERROR: staged dataset or container identity verification failed" >&2
     exit 2
 fi
@@ -228,21 +229,26 @@ if [[ ${READY} -ne 1 ]]; then
     exit 3
 fi
 
-EVALUATOR_ARGS=("${SPECULATORS_REPO}/scripts/evaluate/evaluate.py"
-    --target "http://127.0.0.1:${PORT}/v1"
-    --dataset RedHatAI/speculator_benchmarks
-    --subsets "${STANDARD_SUBSETS}"
-    --output-dir "${RUN_DIR}"
-    --max-concurrency 128
-    --max-requests 200
-    --gen-kwargs '{"temperature":0}'
-    throughput)
-python3 "${EVALUATOR_ARGS[@]}"
-EVALUATOR_RC=$?
-if [[ ${EVALUATOR_RC} -ne 0 ]]; then
-    echo "ERROR: Speculators evaluator failed with status ${EVALUATOR_RC}" >&2
-    exit "${EVALUATOR_RC}"
-fi
+while IFS=$'\t' read -r subset dataset_path; do
+    subset_args=("${SPECULATORS_REPO}/scripts/evaluate/evaluate.py"
+        --target "http://127.0.0.1:${PORT}/v1"
+        --dataset "${dataset_path}"
+        --subsets "${subset}"
+        --output-dir "${RUN_DIR}"
+        --max-concurrency 128
+        --max-requests 200
+        --gen-kwargs '{"temperature":0}'
+        throughput)
+    EVALUATOR_ARGS+=(--invocation "${subset_args[@]}")
+    python3 "${subset_args[@]}"
+    EVALUATOR_RC=$?
+    if [[ ${EVALUATOR_RC} -ne 0 ]]; then
+        echo "ERROR: Speculators evaluator failed with status ${EVALUATOR_RC}" >&2
+        exit "${EVALUATOR_RC}"
+    fi
+done < <(python3 "${ARTIFACT_HELPER}" dataset-paths \
+    --dataset-manifest "${DATASET_MANIFEST_PATH}" \
+    --hf-home "${HF_HOME}")
 
 if ! python3 "${ARTIFACT_HELPER}" validate \
     --csv "${RUN_DIR}/acceptance.csv" \

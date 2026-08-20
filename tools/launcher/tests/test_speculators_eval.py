@@ -39,7 +39,7 @@ _RECIPE = _LAUNCHER_DIR / "examples/Qwen/Qwen3-30B-A3B/speculators_eval.yaml"
 _SPECULATORS_SHA = "0b08a89a83b92007be63f128e01497455b0209df"
 _MODELOPT_SHA = "a" * 40
 _DATASET_REVISION = "b" * 40
-_IMAGE_SHA256 = "c" * 64
+_IMAGE_SHA256 = hashlib.sha256(b"staged image fixture").hexdigest()
 _SUBSETS = (
     "HumanEval",
     "math_reasoning",
@@ -96,20 +96,23 @@ def _make_harness(
     (target / "config.json").write_text('{"model_type":"qwen3_moe"}\n')
     (draft / "config.json").write_text('{"architectures":["Qwen3DSparkModel"]}\n')
     launcher_config = tmp_path / "resolved.yaml"
-    launcher_config.write_text("job_name: fixture\n")
     hf_home = tmp_path / "shared-cache"
     hf_home.mkdir()
     dataset_files = {}
     for subset in _SUBSETS:
         dataset_file = (
             hf_home
+            / "hub"
             / "datasets--RedHatAI--speculator_benchmarks"
             / "snapshots"
             / _DATASET_REVISION
-            / f"{subset}.parquet"
+            / f"{subset}.jsonl"
         )
         dataset_file.parent.mkdir(parents=True, exist_ok=True)
-        dataset_file.write_text(f"fixture:{subset}\n")
+        dataset_blob = dataset_file.parents[2] / "blobs" / subset
+        dataset_blob.parent.mkdir(parents=True, exist_ok=True)
+        dataset_blob.write_text(json.dumps({"prompt": f"fixture:{subset}"}) + "\n")
+        dataset_file.symlink_to(dataset_blob)
         dataset_files[subset] = {"path": str(dataset_file), "sha256": _sha256(dataset_file)}
     dataset_manifest = tmp_path / "dataset-manifest.json"
     dataset_manifest.write_text(
@@ -124,6 +127,9 @@ def _make_harness(
     )
     container_image = tmp_path / "vllm-speculators.sqsh"
     container_image.write_bytes(b"staged image fixture")
+    launcher_config.write_text(
+        f"pipeline:\n  task_0:\n    slurm_config:\n      container: {container_image}\n"
+    )
     container_identity = tmp_path / "vllm-speculators.sqsh.identity.json"
     container_identity.write_text(
         json.dumps(
@@ -210,20 +216,28 @@ elif [[ "$1" == "{evaluator}" ]]; then
   [[ "${{PYTHONPATH%%:*}}" == "{repo / "src"}" ]] || exit 90
   [[ "$2" == "--target" ]] || exit 89
   [[ "${{@: -1}}" == "throughput" ]] || exit 88
-  [[ "$*" == *'--dataset RedHatAI/speculator_benchmarks'* ]] || exit 93
   [[ "$*" == *'--gen-kwargs {{"temperature":0}}'* ]] || exit 94
   [[ "$*" == *'--max-concurrency 128'* ]] || exit 87
   [[ "$*" == *'--max-requests 200'* ]] || exit 86
   while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--output-dir" ]]; then
-      shift
-      output_dir="$1"
-      break
-    fi
+    case "$1" in
+      --dataset) shift; dataset_path="$1" ;;
+      --subsets) shift; subset="$1" ;;
+      --output-dir) shift; output_dir="$1" ;;
+    esac
     shift
   done
+  [[ -f "$dataset_path" ]] || exit 93
+  expected_suffix="/hub/datasets--RedHatAI--speculator_benchmarks/snapshots/{_DATASET_REVISION}/${{subset}}.jsonl"
+  [[ "$dataset_path" == *"$expected_suffix" ]] || exit 85
   mkdir -p "$output_dir"
-  cp "{acceptance_fixture}" "$output_dir/acceptance.csv"
+  awk -F, -v subset="$subset" 'NR == 1 || $1 == subset' "{acceptance_fixture}" > "$output_dir/.acceptance-$subset.csv"
+  if [[ -f "$output_dir/acceptance.csv" ]]; then
+    tail -n +2 "$output_dir/.acceptance-$subset.csv" >> "$output_dir/acceptance.csv"
+    rm "$output_dir/.acceptance-$subset.csv"
+  else
+    mv "$output_dir/.acceptance-$subset.csv" "$output_dir/acceptance.csv"
+  fi
   touch "{evaluator_ready}"
   {"while true; do sleep 1; done" if evaluator_block else ":"}
   exit {evaluator_exit}
@@ -274,9 +288,8 @@ def _acceptance_csv_text(positions: int, drafts: int) -> str:
     accepted_tokens = int(drafts * positions * rate)
     acceptance_length = 1 + accepted_tokens / drafts if drafts else 1
     return header + "".join(
-        f"{subset},{drafts},{draft_tokens},{accepted_tokens},{acceptance_length},"
-        + ",".join(str(rate) for _ in range(positions))
-        + "\n"
+        f"{subset},{float(drafts)},{float(draft_tokens)},{float(accepted_tokens)},"
+        f"{acceptance_length}," + ",".join(str(rate) for _ in range(positions)) + "\n"
         for subset in _SUBSETS
     )
 
@@ -338,6 +351,7 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
         "serve",
     ]
     assert manifest["evaluator_args"][-1] == "throughput"
+    assert manifest["evaluator_args"].count("--invocation") == len(_SUBSETS)
     assert len(manifest["config_sha256"]) == 3
     assert all(len(value) == 64 for value in manifest["config_sha256"].values())
     assert (run_dir / "acceptance.csv").stat().st_size > 0
@@ -349,6 +363,11 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
     assert "/health" in invocations
     assert "/v1/models" in invocations
     assert "/metrics" in invocations
+    assert "--dataset RedHatAI/speculator_benchmarks" not in invocations
+    for subset in _SUBSETS:
+        dataset_path = manifest["dataset"]["files"][subset]["path"]
+        assert f"--dataset {dataset_path}" in invocations
+        assert dataset_path in manifest["evaluator_args"]
 
 
 @pytest.mark.parametrize(
@@ -403,6 +422,35 @@ def test_staged_identity_mismatch_fails_before_server_start(tmp_path: Path, iden
     result = _run(env, tmp_path)
 
     assert result.returncode != 0
+    assert not server_pid_file.exists()
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+
+
+def test_same_size_container_tamper_fails_before_server_start(tmp_path: Path) -> None:
+    """The recorded digest must be checked against the actual staged image bytes."""
+    env, run_dir, server_pid_file = _make_harness(tmp_path)
+    image = Path(env["CONTAINER_IMAGE"])
+    image.write_bytes(b"x" * image.stat().st_size)
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "container image hash mismatch" in result.stderr
+    assert not server_pid_file.exists()
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+
+
+def test_resolved_slurm_container_mismatch_fails_before_server_start(tmp_path: Path) -> None:
+    """Provenance must describe the exact image selected in the resolved Slurm config."""
+    env, run_dir, server_pid_file = _make_harness(tmp_path)
+    Path(env["EVAL_CONFIG_PATH"]).write_text(
+        f"pipeline:\n  task_0:\n    slurm_config:\n      container: {tmp_path / 'different.sqsh'}\n"
+    )
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "resolved Slurm container does not match" in result.stderr
     assert not server_pid_file.exists()
     assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
 
@@ -496,17 +544,42 @@ def test_invalid_acceptance_csv_fails_the_job(
     assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
 
 
+def test_acceptance_csv_accepts_upstream_integral_float_counters(tmp_path: Path) -> None:
+    """Prometheus counters serialized by upstream as 10.0 remain exact integers."""
+    csv_path = tmp_path / "acceptance.csv"
+    csv_path.write_text(_acceptance_csv_text(8, 10))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_LAUNCHER_DIR / "common/specdec/speculators_eval_artifacts.py"),
+            "validate",
+            "--csv",
+            str(csv_path),
+            "--num-speculative-tokens",
+            "8",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
         lambda text: text.replace(",0.4,", ",nan,", 1),
         lambda text: text.replace(",0.4,", ",not-a-number,", 1),
         lambda text: text.replace(",0.4,", ",1.1,", 1),
-        lambda text: text.replace(",80,32,", ",79,32,", 1),
-        lambda text: text.replace(",80,32,", ",80,31,", 1),
-        lambda text: text.replace(",32,4.2,", ",32,4.3,", 1),
+        lambda text: text.replace(",10.0,80.0,", ",10.5,80.0,", 1),
+        lambda text: text.replace(",10.0,80.0,", ",nan,80.0,", 1),
+        lambda text: text.replace(",80.0,32.0,", ",79.0,32.0,", 1),
+        lambda text: text.replace(",80.0,32.0,", ",80.0,31.0,", 1),
+        lambda text: text.replace(",32.0,4.2,", ",32.0,4.3,", 1),
         lambda text: text.replace(",0.4,0.4,", ",0.2,0.6,", 1),
-        lambda text: text.replace(",80,32,", ",80,-1,", 1),
+        lambda text: text.replace(",80.0,32.0,", ",80.0,-1.0,", 1),
     ],
 )
 def test_acceptance_csv_rejects_invalid_numeric_contract(
