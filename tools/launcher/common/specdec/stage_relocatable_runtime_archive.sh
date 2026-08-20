@@ -9,9 +9,11 @@ SOURCE_RUNTIME=""
 OUTPUT_ARCHIVE=""
 SCRATCH_ROOT="/raid/scratch"
 MODE="submit"
+ACCOUNT="nemotron_n3_post"
+PARTITION="batch"
 
 usage() {
-    echo "usage: $0 --source-runtime /lustre/... --output-archive /lustre/... [--scratch-root /raid/scratch/...]" >&2
+    echo "usage: $0 --source-runtime /lustre/... --output-archive /lustre/... [--scratch-root /raid/scratch/...] [--account ACCOUNT] [--partition PARTITION]" >&2
     exit 2
 }
 
@@ -20,16 +22,31 @@ while [[ $# -gt 0 ]]; do
         --source-runtime) SOURCE_RUNTIME="$2"; shift 2 ;;
         --output-archive) OUTPUT_ARCHIVE="$2"; shift 2 ;;
         --scratch-root) SCRATCH_ROOT="$2"; shift 2 ;;
+        --account) ACCOUNT="$2"; shift 2 ;;
+        --partition) PARTITION="$2"; shift 2 ;;
         --run-stage) MODE="run"; shift ;;
         *) usage ;;
     esac
 done
 
-[[ "$SOURCE_RUNTIME" == /lustre/* && "$OUTPUT_ARCHIVE" == /lustre/* && "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
+[[ "$SOURCE_RUNTIME" == /lustre/* && "$OUTPUT_ARCHIVE" == /lustre/*.tar.zst && "$SCRATCH_ROOT" == /raid/scratch/* && -n "$ACCOUNT" && -n "$PARTITION" ]] || usage
 
 if [[ "$MODE" == "submit" ]]; then
     [[ "${BASH_SOURCE[0]}" == /home/* ]] || { echo "staging script must run from /home source" >&2; exit 2; }
-    sbatch --test-only --nodes=1 --ntasks-per-node=1 --segment=1 "$0" --run-stage --source-runtime "$SOURCE_RUNTIME" --output-archive "$OUTPUT_ARCHIVE" --scratch-root "$SCRATCH_ROOT"
+    if [[ -f "$OUTPUT_ARCHIVE" && -f "${OUTPUT_ARCHIVE}.sha256" && -f "${OUTPUT_ARCHIVE}.provenance.json" ]]; then
+        (cd "$(dirname "$OUTPUT_ARCHIVE")" && sha256sum -c "$(basename "${OUTPUT_ARCHIVE}.sha256")")
+        echo "runtime archive already verified: $OUTPUT_ARCHIVE"
+        exit 0
+    fi
+    args=(
+        --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks-per-node=1
+        --gpus-per-node=4 --segment=1 --time=00:30:00 --job-name=modelopt-runtime-archive
+        --output="${OUTPUT_ARCHIVE}.stage-%j.out"
+    )
+    command=("$0" --run-stage --source-runtime "$SOURCE_RUNTIME" --output-archive "$OUTPUT_ARCHIVE" --scratch-root "$SCRATCH_ROOT")
+    sbatch --test-only "${args[@]}" "${command[@]}"
+    submitted="$(sbatch --parsable "${args[@]}" "${command[@]}")"
+    echo "${submitted%%;*}"
     exit 0
 fi
 
@@ -38,10 +55,11 @@ archive="${work_root}/runtime.tar.zst"
 checksum="${archive}.sha256"
 provenance="${archive}.provenance.json"
 mkdir -p "$work_root" "$(dirname "$OUTPUT_ARCHIVE")"
-tar --dereference --create --use-compress-program=zstd --file="$archive" -C "$(dirname "$SOURCE_RUNTIME")" "$(basename "$SOURCE_RUNTIME")"
+tar --dereference --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .
 tar --list --use-compress-program=zstd --file="$archive" | grep -q '/bin/activate$'
-sha256sum "$archive" >"$checksum"
-printf '{"source_runtime":"%s","sha256":"%s"}\n' "$SOURCE_RUNTIME" "$(cut -d' ' -f1 "$checksum")" >"$provenance"
+archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
+printf '%s  %s\n' "$archive_sha" "$(basename "$OUTPUT_ARCHIVE")" >"$checksum"
+printf '{"source_runtime":"%s","sha256":"%s"}\n' "$SOURCE_RUNTIME" "$archive_sha" >"$provenance"
 temporary="${OUTPUT_ARCHIVE}.partial-${SLURM_JOB_ID}"
 cp "$archive" "$temporary"
 mv "$temporary" "$OUTPUT_ARCHIVE"

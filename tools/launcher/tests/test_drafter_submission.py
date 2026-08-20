@@ -80,6 +80,7 @@ def _experiment() -> DrafterExperiment:
             source_sha="a" * 40,
             image_path="/lustre/images/vllm.sqsh",
             runtime_archive_path="/lustre/runtimes/modelopt-runtime.tar.zst",
+            runtime_archive_sha256="b" * 64,
             target_path="/lustre/models/Qwen3-30B-A3B",
             dataset_path="/lustre/datasets/open-perfectblend.parquet",
             output_root="/lustre/results/qwen3-30b-dflash-b8",
@@ -198,10 +199,24 @@ def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
         ".provenance.json",
         ".partial-",
         'mv "$temporary" "$OUTPUT_ARCHIVE"',
+        'tar --dereference --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .',
+        'submitted="$(sbatch --parsable',
+        '--account="$ACCOUNT"',
+        '--partition="$PARTITION"',
+        "--gpus-per-node=4",
     ):
         assert required in script
     for forbidden in ("pip install", "git clone", "find /lustre", "rm -rf"):
         assert forbidden not in script
+
+
+def test_training_wave_batches_scheduler_history_with_parseable_output() -> None:
+    """One scheduler snapshot must cover every tuple in a submission wave."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+
+    assert 'squeue -h -u "$USER"' in submitter
+    assert 'sacct -X -n -P -u "$USER"' in submitter
+    assert "--parsable2" in submitter or "-P" in submitter
 
 
 def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
@@ -267,8 +282,15 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
         "${OUTPUT_ROOT}:${OUTPUT_ROOT}",
         "SLURM_NODEID < SERVE_NODES",
         "WANDB_PROJECT",
+        "WANDB_RUN_GROUP",
         "WANDB_CACHE_DIR",
         "report_to=wandb",
+        'training.run_name="${RUN_NAME}-s${MAX_STEPS}"',
+        "SERVE_BLOCK_SIZE=32",
+        "SERVE_MAX_MODEL_LEN=8192",
+        "SERVE_READY_TIMEOUT=1800",
+        "HS_POOL_SLOTS=32",
+        "SERVE_MAX_NUM_SEQS=16",
         'training.save_steps="${MAX_STEPS}"',
         "training.save_total_limit=2",
         'cp -aL "$SOURCE_PATH"',
@@ -303,19 +325,41 @@ def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir()
 
 def test_runtime_relocation_accepts_exported_and_quoted_activate_assignments() -> None:
     """OCI virtualenv activation lines may use export and shell quotes."""
-    parser = re.compile(r"^\s*(?:export\s+)?VIRTUAL_ENV=[\"']?([^\"']+)[\"']?.*$")
-    unquoted = parser.match("VIRTUAL_ENV=/lustre/runtime")
+    parser = re.compile(r"^\s*export\s+VIRTUAL_ENV=(.*)$")
+    cygwin = parser.match("VIRTUAL_ENV=$(cygpath /lustre/wrong)")
+    unquoted = parser.match("export VIRTUAL_ENV=/lustre/runtime")
     quoted = parser.match('export VIRTUAL_ENV="/lustre/runtime"')
+    assert cygwin is None
     assert unquoted and unquoted.group(1) == "/lustre/runtime"
-    assert quoted and quoted.group(1) == "/lustre/runtime"
+    assert quoted and quoted.group(1).strip("\"'") == "/lustre/runtime"
 
     for script_name in (
         "run_drafter_training.sbatch",
         "probe_relocatable_runtime.sh",
+        "submit_drafter_resume_chain.sh",
     ):
         script = (_LAUNCHER_DIR / f"common/specdec/{script_name}").read_text()
-        assert "(export[[:space:]]+)?" in script
-        assert "VIRTUAL_ENV=[" in script
+        assert "export[[:space:]]+VIRTUAL_ENV=(.*)$" in script
+        assert 'old_venv="${old_venv%\\"}"' in script
+
+
+def test_training_mounts_existing_node_local_scratch_parent() -> None:
+    """Pyxis must not bind a job-specific scratch path before it is created."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+    probe = (_LAUNCHER_DIR / "common/specdec/probe_relocatable_runtime.sh").read_text()
+
+    assert "/raid/scratch:/raid/scratch" in runner
+    assert "${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT}" not in runner
+    assert "/raid/scratch:/raid/scratch" in probe
+
+
+def test_streaming_serve_logs_stay_on_node_local_scratch() -> None:
+    """Shared scratchspace carries only the few cross-node rendezvous files."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+    streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
+
+    assert 'SERVE_LOG_DIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/logs"' in runner
+    assert "${SERVE_LOG_DIR:-/scratchspace}/vllm_serve.${NODEID}.log" in streaming
 
 
 def test_cumulative_runner_writes_a_checkpoint_for_every_resume_boundary() -> None:
@@ -357,10 +401,22 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
         'cp -aL "$SOURCE_PATH"',
         "import accelerate, datasets, modelopt, wandb",
         "is_relative_to",
+        "--runtime-sha256",
+        "sha256sum",
     ):
         assert required in script
     assert "pip install" not in script
     assert "git clone" not in script
+
+
+def test_training_manifest_pins_and_verifies_runtime_archive_bytes() -> None:
+    """A mutable archive path cannot silently change the production runtime."""
+    manifest = PinnedPaths.__dataclass_fields__
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    assert "runtime_archive_sha256" in manifest
+    assert "RUNTIME_ARCHIVE_SHA256" in runner
+    assert 'sha256sum "$RUNTIME_ARCHIVE"' in runner
 
 
 def test_node_local_input_staging_dereferences_hf_blob_symlinks() -> None:

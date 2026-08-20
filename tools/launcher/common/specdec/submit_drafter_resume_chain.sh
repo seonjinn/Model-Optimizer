@@ -8,8 +8,11 @@ set -euo pipefail
 if [[ "${1:-}" == "--run-evaluation-container" ]]; then
     work_root="/raid/scratch/${SLURM_JOB_ID}/evaluation"
     mkdir -p "$work_root"
+    [[ "$(sha256sum "$EVAL_RUNTIME_ARCHIVE" | cut -d' ' -f1)" == "$EVAL_RUNTIME_SHA256" ]] || { echo "evaluator runtime SHA-256 mismatch" >&2; exit 2; }
     tar --extract --file="$EVAL_RUNTIME_ARCHIVE" --directory="$work_root"
-    old_venv="$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?VIRTUAL_ENV=[\\042\\047]?([^\\042\\047]+)[\\042\\047]?.*/\\2/p" "$work_root/bin/activate" | head -n 1)"
+    old_venv="$(sed -nE "s/^[[:space:]]*export[[:space:]]+VIRTUAL_ENV=(.*)$/\\1/p" "$work_root/bin/activate" | head -n 1)"
+    old_venv="${old_venv#\"}"
+    old_venv="${old_venv%\"}"
     [[ -n "$old_venv" ]] || { echo "runtime archive has no VIRTUAL_ENV" >&2; exit 1; }
     grep -IlZ "$old_venv" "$work_root/bin"/* "$work_root/pyvenv.cfg" 2>/dev/null | xargs -0 -r sed -i "s|$old_venv|$work_root|g"
     export VIRTUAL_ENV="$work_root" PATH="$work_root/bin:$PATH"
@@ -38,13 +41,14 @@ EVAL_OUTPUT_ROOT=""
 EXPORT_ROOT=""
 IMAGE=""
 RUNTIME_ARCHIVE=""
+RUNTIME_SHA256=""
 ACCOUNT="nemotron_n3_post"
 PARTITION="batch"
 DRY_RUN=0
 readonly PUBLIC_SUBSETS="HumanEval,math_reasoning,qa,question,rag,summarization,tool_call,translation,writing"
 
 usage() {
-    echo "usage: $0 --manifest /home/... --receipt-root /lustre/... --evaluator-script /home/... --evaluator-env /home/... --evaluator-config /home/... --eval-output-root /lustre/... --export-root /lustre/... --image /lustre/... --runtime-archive /lustre/... [--dry-run]" >&2
+    echo "usage: $0 --manifest /home/... --receipt-root /lustre/... --evaluator-script /home/... --evaluator-env /home/... --evaluator-config /home/... --eval-output-root /lustre/... --export-root /lustre/... --image /lustre/... --runtime-archive /lustre/... --runtime-sha256 SHA256 [--dry-run]" >&2
     exit 2
 }
 
@@ -59,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --export-root) EXPORT_ROOT="$2"; shift 2 ;;
         --image) IMAGE="$2"; shift 2 ;;
         --runtime-archive) RUNTIME_ARCHIVE="$2"; shift 2 ;;
+        --runtime-sha256) RUNTIME_SHA256="$2"; shift 2 ;;
         --account) ACCOUNT="$2"; shift 2 ;;
         --partition) PARTITION="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
@@ -67,8 +72,16 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$MANIFEST" == /home/* && -f "$MANIFEST" && "$EVALUATOR_SCRIPT" == /home/* && "$EVALUATOR_ENV" == /home/* && "$EVALUATOR_CONFIG" == /home/* ]] || usage
 [[ "$RECEIPT_ROOT" == /lustre/* && "$EVAL_OUTPUT_ROOT" == /lustre/* && "$EXPORT_ROOT" == /lustre/* && "$IMAGE" == /lustre/* && "$RUNTIME_ARCHIVE" == /lustre/* ]] || usage
+[[ "$RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]] || usage
 [[ -f "$IMAGE" && -f "$RUNTIME_ARCHIVE" ]] || { echo "missing pinned evaluator artifact" >&2; exit 2; }
 mkdir -p "$RECEIPT_ROOT"
+SCHEDULER_JOBS_SNAPSHOT="$(
+    {
+        squeue -h -u "$USER" -o "%j|%A"
+        sacct -X -n -P -u "$USER" -S today --format=JobName,JobIDRaw
+    } || true
+)"
+export SCHEDULER_JOBS_SNAPSHOT
 
 boundaries() {
     PYTHONPATH="$(cd "${SCRIPT_DIR}/../.." && pwd)${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST" <<'PY'
@@ -97,10 +110,9 @@ submit_evaluation() {
     local index="$1" identity="$2" boundary="$3" train_id="$4" method="$5" block_size="$6" num_tokens="$7" export_root="$8"
     local name="drafter-eval-${identity}-s${boundary}" train_export="${export_root}/exported-checkpoint-${boundary}"
     local run_output="${EVAL_OUTPUT_ROOT}/${identity}/step-${boundary}" receipt="${RECEIPT_ROOT}/evaluation-${identity}-s${boundary}.json"
-    local exports="ALL,EVAL_IMAGE=${IMAGE},EVAL_RUNTIME_ARCHIVE=${RUNTIME_ARCHIVE},EVAL_EVALUATOR_ENV=${EVALUATOR_ENV},EVAL_EVALUATOR_CONFIG=${EVALUATOR_CONFIG},EVAL_EVALUATOR_SCRIPT=${EVALUATOR_SCRIPT},EVAL_RUN_OUTPUT=${run_output},EVAL_TRAIN_EXPORT=${train_export},EVAL_METHOD=${method},EVAL_BLOCK_SIZE=${block_size},EVAL_NUM_SPEC_TOKENS=${num_tokens},EXPERIMENT_IDENTITY=${identity}"
+    local exports="ALL,EVAL_IMAGE=${IMAGE},EVAL_RUNTIME_ARCHIVE=${RUNTIME_ARCHIVE},EVAL_RUNTIME_SHA256=${RUNTIME_SHA256},EVAL_EVALUATOR_ENV=${EVALUATOR_ENV},EVAL_EVALUATOR_CONFIG=${EVALUATOR_CONFIG},EVAL_EVALUATOR_SCRIPT=${EVALUATOR_SCRIPT},EVAL_RUN_OUTPUT=${run_output},EVAL_TRAIN_EXPORT=${train_export},EVAL_METHOD=${method},EVAL_BLOCK_SIZE=${block_size},EVAL_NUM_SPEC_TOKENS=${num_tokens},EXPERIMENT_IDENTITY=${identity}"
     local args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks-per-node=1 --gpus-per-node=4 --segment=1 --time=03:55:00 --job-name="$name" --comment="${identity}:${boundary}" --dependency=afterok:"$train_id" --output="${RECEIPT_ROOT}/%x-%j.out" --export="$exports")
-    existing="$(squeue -h -n "$name" -o "%A" | head -n 1 || true)"
-    [[ -n "$existing" ]] || existing="$(sacct -X -n --name "$name" --format=JobIDRaw,State | awk 'NF {print $1; exit}' || true)"
+    existing="$(awk -F'|' -v job_name="$name" '$1 == job_name {print $2; exit}' <<<"$SCHEDULER_JOBS_SNAPSHOT")"
     if [[ -n "$existing" ]]; then
         printf '{"job_id":"%s","status":"already-queued","max_steps":%s}\n' "$existing" "$boundary" >"$receipt"
         printf '%s\n' "$existing"

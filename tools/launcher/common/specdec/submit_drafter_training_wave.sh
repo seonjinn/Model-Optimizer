@@ -55,12 +55,16 @@ PY
 }
 
 declare -A identities=()
-scheduler_jobs="$(
-    {
-        squeue -h -u "$USER" -o "%j|%A"
-        sacct -X -n -u "$USER" -S today --format=JobName,JobIDRaw | awk 'NF {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}'
-    } || true
-)"
+if [[ -n "${SCHEDULER_JOBS_SNAPSHOT+x}" ]]; then
+    scheduler_jobs="$SCHEDULER_JOBS_SNAPSHOT"
+else
+    scheduler_jobs="$(
+        {
+            squeue -h -u "$USER" -o "%j|%A"
+            sacct -X -n -P -u "$USER" -S today --format=JobName,JobIDRaw
+        } || true
+    )"
+fi
 while IFS=$'\t' read -r index identity boundary _run_name account partition; do
     [[ -n "$index" ]] || continue
     tuple_identity="${identity}:${boundary}"

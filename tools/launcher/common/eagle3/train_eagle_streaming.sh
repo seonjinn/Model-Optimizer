@@ -301,7 +301,7 @@ elif [ "$NODEID" -lt "$SERVE_NODES" ]; then
     # Each runs a whole-node vllm serve replica and publishes ${SERVE_ADDR_FILE}.${NODEID}.
     SERVE_GPU_MEM_UTIL="${SERVE_GPU_MEM_UTIL:-0.9}"     # dedicated node -> use most of it
     SERVE_TP="${SERVE_TP:-$(gpus_on_node)}"              # default: all GPUs on this node
-    SERVE_LOG="/scratchspace/vllm_serve.${NODEID}.log"  # per-node log (avoid collision)
+    SERVE_LOG="${SERVE_LOG_DIR:-/scratchspace}/vllm_serve.${NODEID}.log"  # per-node log (avoid collision)
     rm -f "${SERVE_ADDR_FILE}.${NODEID}"                 # clear own stale address
     [ "$NODEID" -eq 0 ] && rm -f "$DONE_FILE"            # node 0 clears the shared sentinel once
 

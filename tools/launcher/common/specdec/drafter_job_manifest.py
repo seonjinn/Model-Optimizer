@@ -27,6 +27,7 @@ __all__ = [
 ]
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HORIZONS = {("dflash", 8): 7, ("dflash", 16): 15, ("dspark", 8): 8, ("dspark", 16): 16}
 
 
@@ -51,10 +52,10 @@ def speculative_tokens(method: str, block_size: int) -> int:
 def _normalized_path(name: str, value: str, root: str) -> str:
     if not value or not Path(value).is_absolute():
         raise ValueError(f"{name} must be an absolute path under {root}")
-    normalized = Path(value).resolve(strict=False)
-    if not normalized.is_relative_to(Path(root).resolve(strict=False)):
+    lexical = Path(os.path.abspath(value))
+    if not lexical.resolve(strict=False).is_relative_to(Path(root).resolve(strict=False)):
         raise ValueError(f"{name} must be an absolute path under {root}")
-    return str(normalized)
+    return str(lexical)
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class PinnedPaths:
     source_sha: str
     image_path: str
     runtime_archive_path: str
+    runtime_archive_sha256: str
     target_path: str
     dataset_path: str
     output_root: str
@@ -75,6 +77,8 @@ class PinnedPaths:
         )
         if not _FULL_SHA.fullmatch(self.source_sha):
             raise ValueError("source_sha must be an exact 40-character lowercase commit SHA")
+        if not _FULL_SHA256.fullmatch(self.runtime_archive_sha256):
+            raise ValueError("runtime_archive_sha256 must be an exact lowercase SHA-256")
         for name in (
             "image_path",
             "runtime_archive_path",
