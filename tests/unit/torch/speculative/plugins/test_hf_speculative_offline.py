@@ -17,6 +17,7 @@
 
 import argparse
 import importlib.util
+import itertools
 import os
 
 # ---------------------------------------------------------------------------
@@ -26,6 +27,8 @@ import os
 # ---------------------------------------------------------------------------
 import sys
 import types
+from collections.abc import Iterator
+from typing import NoReturn
 from unittest.mock import MagicMock
 
 import pytest
@@ -589,6 +592,100 @@ def test_sample_size_no_pt_files_raises(tmp_path):
     tokenizer = MagicMock()
     with pytest.raises(ValueError, match=r"No .pt files found"):
         make_speculative_data_module(tokenizer, data_args, train_len=8)
+
+
+# ---------------------------------------------------------------------------
+# streaming sample_size loading
+# ---------------------------------------------------------------------------
+
+
+class _FiniteStreamingEntries:
+    """Streaming entries that reject reading beyond the requested prefix."""
+
+    def __init__(self, entries: list[dict], max_entries: int):
+        self.entries = entries
+        self.max_entries = max_entries
+        self.take_sizes: list[int] = []
+
+    def __iter__(self) -> Iterator[dict]:
+        for index, entry in enumerate(self.entries):
+            if index >= self.max_entries:
+                raise AssertionError("streaming source was read beyond sample_size")
+            yield entry
+
+    def take(self, n: int) -> Iterator[dict]:
+        self.take_sizes.append(n)
+        return itertools.islice(self, n)
+
+
+class _AllDataEntries(list[dict]):
+    """Map-style entries that reject accidental streaming truncation."""
+
+    def take(self, n: int) -> NoReturn:
+        raise AssertionError(f"all-data load must not call take({n})")
+
+
+def _make_streaming_data_args(sample_size: int) -> argparse.Namespace:
+    return argparse.Namespace(
+        mode="streaming",
+        data_path="training.jsonl",
+        sample_size=sample_size,
+        chat_template=None,
+        streaming_server_url="http://vllm:8000",
+        streaming_model_name="test-model",
+    )
+
+
+def test_streaming_sample_size_materializes_only_bounded_prefix(monkeypatch):
+    """A positive sample size must avoid preparing entries after its source-order prefix."""
+    sample_size = 3
+    entries = _FiniteStreamingEntries([{"id": index} for index in range(5)], sample_size)
+    load_calls: list[dict] = []
+
+    def fake_load_dataset(*args, **kwargs):
+        load_calls.append({"args": args, "kwargs": kwargs})
+        return entries
+
+    monkeypatch.setattr(_eagle_utils, "load_dataset", fake_load_dataset)
+
+    module = make_speculative_data_module(
+        MagicMock(), _make_streaming_data_args(sample_size), train_len=8
+    )
+
+    assert load_calls == [
+        {
+            "args": ("json",),
+            "kwargs": {
+                "data_files": "training.jsonl",
+                "split": "train",
+                "streaming": True,
+            },
+        }
+    ]
+    assert entries.take_sizes == [sample_size]
+    assert module["train_dataset"].entries == [{"id": 0}, {"id": 1}, {"id": 2}]
+
+
+def test_streaming_all_data_keeps_non_streaming_loader(monkeypatch):
+    """sample_size=-1 retains all source rows through the existing map-style path."""
+    entries = _AllDataEntries([{"id": index} for index in range(3)])
+    load_calls: list[dict] = []
+
+    def fake_load_dataset(*args, **kwargs):
+        load_calls.append({"args": args, "kwargs": kwargs})
+        return entries
+
+    monkeypatch.setattr(_eagle_utils, "load_dataset", fake_load_dataset)
+
+    module = make_speculative_data_module(MagicMock(), _make_streaming_data_args(-1), train_len=8)
+
+    assert load_calls == [
+        {
+            "args": ("json",),
+            "kwargs": {"data_files": "training.jsonl", "split": "train"},
+        }
+    ]
+    assert module["train_dataset"].entries == [{"id": 0}, {"id": 1}, {"id": 2}]
 
 
 # ---------------------------------------------------------------------------

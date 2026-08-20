@@ -94,9 +94,17 @@ def make_speculative_data_module(
 
         dataset_format, data_files = resolve_streaming_data_source(data_args.data_path)
         print_rank_0(f"Loading streaming {dataset_format} data from {data_args.data_path}")
-        ds = load_dataset(dataset_format, data_files=data_files, split="train")
         if data_args.sample_size > 0:
-            ds = ds.select(range(data_args.sample_size))
+            ds = list(
+                load_dataset(
+                    dataset_format,
+                    data_files=data_files,
+                    split="train",
+                    streaming=True,
+                ).take(data_args.sample_size)
+            )
+        else:
+            ds = load_dataset(dataset_format, data_files=data_files, split="train")
         # Map-style dataset: each rank fetches its own DistributedSampler shard.
         # Fetch concurrency comes from the DataLoader's num_workers, not a config knob;
         # shuffling/order is the sampler's job (seeded by training_args.seed).
