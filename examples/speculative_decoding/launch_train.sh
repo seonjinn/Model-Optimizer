@@ -72,8 +72,12 @@ fi
 
 export TOKENIZERS_PARALLELISM=False
 
-# argv array, not `sh -c` (which would word-split overrides and run embedded substitutions).
-CMD=(accelerate launch --mixed_precision bf16
+# The container's Accelerate console script can have a fixed system-Python
+# shebang, bypassing an activated shared runtime. Module invocation preserves
+# that runtime while retaining argv boundaries for config overrides. Use
+# python3 because supported fallback containers are not required to expose
+# an unversioned python executable.
+CMD=(python3 -m accelerate.commands.launch --mixed_precision bf16
      "${MULTI_NODE_ARGS[@]}"
      "${SCRIPT_DIR}/main.py" --config "$CONFIG_FILE" "${EXTRA_ARGS[@]}")
 

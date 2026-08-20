@@ -212,3 +212,54 @@ printf '2\\n'
 
     assert result.returncode == 0, result.stderr
     assert "runtime-python -m vllm.entrypoints.cli.main serve target-model" in invocation_log.read_text()
+
+
+def test_training_launcher_uses_activated_python_for_accelerate(tmp_path: Path) -> None:
+    """The Accelerate console script must not bypass the activated shared runtime."""
+    runtime_bin = tmp_path / "runtime/bin"
+    invocation_log = tmp_path / "invocations.log"
+    runtime_bin.mkdir(parents=True)
+    _write_executable(
+        runtime_bin / "python3",
+        f"""#!/bin/sh
+printf 'runtime-python3 %s\\n' "$*" >> "{invocation_log}"
+exit 0
+""",
+    )
+    _write_executable(
+        runtime_bin / "accelerate",
+        f"""#!/bin/sh
+printf 'console-script %s\\n' "$*" >> "{invocation_log}"
+exit 0
+""",
+    )
+
+    config = tmp_path / "config.yaml"
+    config.write_text("model: {}\n")
+    env = {
+        **os.environ,
+        "PATH": f"{runtime_bin}:{os.environ['PATH']}",
+        "GPU_PER_NODE": "1",
+        "SLURM_PROCID": "0",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            str(_LAUNCHER_DIR.parents[1] / "examples/speculative_decoding/launch_train.sh"),
+            "--config",
+            str(config),
+            "--num_nodes",
+            "2",
+            "--head_node_ip",
+            "127.0.0.1",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    invocations = invocation_log.read_text()
+    assert "runtime-python3 -m accelerate.commands.launch" in invocations
+    assert "console-script" not in invocations
