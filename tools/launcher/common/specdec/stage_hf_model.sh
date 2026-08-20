@@ -141,12 +141,12 @@ run_stage() (
 
     # shellcheck disable=SC2016 # The child shell expands these file-specific variables.
     find "$local_snapshot" -type f -print0 | xargs -0 -r -P 4 -n 1 sh -c '
-        source_file="$1"
-        relative_path="${source_file#"$2"/}"
-        target_file="$3/$relative_path"
+        source_file="$3"
+        relative_path="${source_file#"$1"/}"
+        target_file="$2/$relative_path"
         mkdir -p "$(dirname "$target_file")"
         cp --reflink=auto --preserve=mode,timestamps "$source_file" "$target_file"
-    ' sh {} "$local_snapshot" "$partial"
+    ' sh "$local_snapshot" "$partial"
     printf '{\n  "source_kind": "%s",\n  "source_identity": "%s"\n}\n' "$SOURCE_KIND" "$SOURCE_IDENTITY" >"${partial}/snapshot-manifest.json"
     cp "${partial}/snapshot-manifest.json" "${partial}/completion.json"
 

@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -237,6 +240,47 @@ def test_model_staging_rejects_broken_destinations_and_cleans_failed_publishes()
     assert "run_stage() (" in script
     assert "trap cleanup EXIT" in script
     assert "trap cleanup RETURN" not in script
+
+
+def test_model_staging_copy_pipeline_materializes_nested_files(tmp_path: Path) -> None:
+    """The exact xargs pipeline passes each discovered file as the child source argument."""
+    source = tmp_path / "snapshot"
+    artifact = tmp_path / "partial"
+    source_file = source / "nested" / "weights.bin"
+    source_file.parent.mkdir(parents=True)
+    artifact.mkdir()
+    source_file.write_bytes(b"weights")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_cp = fake_bin / "cp"
+    fake_cp.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "[[ $1 == --reflink=auto ]] && shift\n"
+        "[[ $1 == --preserve=mode,timestamps ]] && shift\n"
+        "exec /bin/cp \"$@\"\n"
+    )
+    fake_cp.chmod(0o755)
+    script = (_LAUNCHER_DIR / "common/specdec/stage_hf_model.sh").read_text()
+    start = script.index('    find "$local_snapshot" -type f -print0')
+    end = script.index('\n    printf ', start)
+    pipeline = textwrap.dedent(script[start:end])
+
+    completed = subprocess.run(
+        ["bash", "-c", f"set -euo pipefail\n{pipeline}"],
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "local_snapshot": str(source),
+            "partial": str(artifact),
+        },
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert (artifact / "nested" / "weights.bin").read_bytes() == b"weights"
 
 
 def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
