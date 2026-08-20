@@ -15,12 +15,11 @@ readonly TRAINER_NODES=2
 readonly GPUS_PER_NODE=4
 readonly GLOBAL_BATCH_SIZE=512
 readonly SCRATCH_JOB_ROOT="/raid/scratch/${SLURM_JOB_ID}"
-LAUNCHER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-readonly LAUNCHER_ROOT
 
-for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS; do
+for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
+readonly LAUNCHER_ROOT
 mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" <<'PY'
 import sys
 from pathlib import Path

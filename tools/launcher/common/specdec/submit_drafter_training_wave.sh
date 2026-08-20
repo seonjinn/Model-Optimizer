@@ -92,7 +92,7 @@ PY
         printf '{"job_id":"%s","status":"already-known","tuple_identity":"%s","max_steps":%s}\n' "$existing" "$tuple_identity" "$boundary" >>"$RECEIPT"
         continue
     fi
-    exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,MANIFEST_PATH=${MANIFEST},EXPERIMENT_INDEX=${index},MAX_STEPS=${boundary}"
+    exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,MANIFEST_PATH=${MANIFEST},EXPERIMENT_INDEX=${index},MAX_STEPS=${boundary},LAUNCHER_ROOT=${LAUNCHER_ROOT}"
     args=(--account="$account" --partition="$partition" -N4 --ntasks-per-node=1 --gpus-per-node=4 --segment=4 --time=03:55:00 --job-name="$job_name" --comment="$tuple_identity" --export="$exports")
     [[ -z "$DEPENDENCY" ]] || args+=(--dependency=afterok:"$DEPENDENCY")
     sbatch --test-only "${args[@]}" "$RUNNER"

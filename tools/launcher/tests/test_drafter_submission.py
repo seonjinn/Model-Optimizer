@@ -313,6 +313,16 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
     assert "EXTRA_MODELOPT_DOTLIST" not in runner
 
 
+def test_submitter_exports_the_home_launcher_root_to_the_spooled_runner() -> None:
+    """A copied Slurm batch script must not derive imports from its spool directory."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    assert "LAUNCHER_ROOT=${LAUNCHER_ROOT}" in submitter
+    assert 'for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT' in runner
+    assert 'LAUNCHER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"' not in runner
+
+
 def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir() -> None:
     """The staged source resolves recipe paths and all ranks rendezvous in one control mount."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
