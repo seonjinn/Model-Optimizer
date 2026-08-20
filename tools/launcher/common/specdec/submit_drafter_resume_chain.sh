@@ -78,7 +78,7 @@ mkdir -p "$RECEIPT_ROOT"
 SCHEDULER_JOBS_SNAPSHOT="$(
     {
         squeue -h -u "$USER" -o "%j|%A"
-        sacct -X -n -P -u "$USER" -S today --format=JobName,JobIDRaw
+        sacct -X -n -P -u "$USER" -S today --format=JobName%64,JobIDRaw
     } || true
 )"
 export SCHEDULER_JOBS_SNAPSHOT
@@ -110,7 +110,7 @@ submit_evaluation() {
     local index="$1" identity="$2" boundary="$3" train_id="$4" method="$5" block_size="$6" num_tokens="$7" export_root="$8"
     local name="drafter-eval-${identity}-s${boundary}" train_export="${export_root}/exported-checkpoint-${boundary}"
     local run_output="${EVAL_OUTPUT_ROOT}/${identity}/step-${boundary}" receipt="${RECEIPT_ROOT}/evaluation-${identity}-s${boundary}.json"
-    local exports="ALL,EVAL_IMAGE=${IMAGE},EVAL_RUNTIME_ARCHIVE=${RUNTIME_ARCHIVE},EVAL_RUNTIME_SHA256=${RUNTIME_SHA256},EVAL_EVALUATOR_ENV=${EVALUATOR_ENV},EVAL_EVALUATOR_CONFIG=${EVALUATOR_CONFIG},EVAL_EVALUATOR_SCRIPT=${EVALUATOR_SCRIPT},EVAL_RUN_OUTPUT=${run_output},EVAL_TRAIN_EXPORT=${train_export},EVAL_METHOD=${method},EVAL_BLOCK_SIZE=${block_size},EVAL_NUM_SPEC_TOKENS=${num_tokens},EXPERIMENT_IDENTITY=${identity}"
+    local exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,EVAL_IMAGE=${IMAGE},EVAL_RUNTIME_ARCHIVE=${RUNTIME_ARCHIVE},EVAL_RUNTIME_SHA256=${RUNTIME_SHA256},EVAL_EVALUATOR_ENV=${EVALUATOR_ENV},EVAL_EVALUATOR_CONFIG=${EVALUATOR_CONFIG},EVAL_EVALUATOR_SCRIPT=${EVALUATOR_SCRIPT},EVAL_RUN_OUTPUT=${run_output},EVAL_TRAIN_EXPORT=${train_export},EVAL_METHOD=${method},EVAL_BLOCK_SIZE=${block_size},EVAL_NUM_SPEC_TOKENS=${num_tokens},EXPERIMENT_IDENTITY=${identity}"
     local args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks-per-node=1 --gpus-per-node=4 --segment=1 --time=03:55:00 --job-name="$name" --comment="${identity}:${boundary}" --dependency=afterok:"$train_id" --output="${RECEIPT_ROOT}/%x-%j.out" --export="$exports")
     existing="$(awk -F'|' -v job_name="$name" '$1 == job_name {print $2; exit}' <<<"$SCHEDULER_JOBS_SNAPSHOT")"
     if [[ -n "$existing" ]]; then

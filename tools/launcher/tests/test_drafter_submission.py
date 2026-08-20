@@ -218,7 +218,9 @@ def test_training_wave_batches_scheduler_history_with_parseable_output() -> None
 
     assert 'squeue -h -u "$USER"' in submitter
     assert 'sacct -X -n -P -u "$USER"' in submitter
+    assert "JobName%64,JobIDRaw" in submitter
     assert "--parsable2" in submitter or "-P" in submitter
+    assert 'exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,MANIFEST_PATH=' in submitter
 
 
 def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
@@ -447,6 +449,8 @@ def test_resume_chain_gates_each_cumulative_wave_on_public_acceptance() -> None:
         "sacct -X -n --name",
         "--run-evaluation",
         "EXPERIMENT_IDENTITY",
+        "JobName%64,JobIDRaw",
+        "ALL,SCHEDULER_JOBS_SNAPSHOT=,EVAL_IMAGE=",
         "receipt",
     ):
         assert required in script
