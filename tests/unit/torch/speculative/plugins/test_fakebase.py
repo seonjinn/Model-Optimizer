@@ -67,6 +67,29 @@ def test_fakebase_local_happy_path(fake_checkpoint):
     assert model.embed_tokens.weight.shape == torch.Size([_VOCAB_SIZE, _HIDDEN_SIZE])
 
 
+@pytest.mark.parametrize("rope_attr", ["rope_parameters", "rope_scaling"])
+def test_fakebase_preserves_transformers5_rope_theta(fake_checkpoint, fake_config, rope_attr):
+    """A nested-only target RoPE base reaches the FakeBase config exactly."""
+    setattr(fake_config, rope_attr, {"rope_type": "default", "rope_theta": 1000000.0})
+    fake_config.rope_theta = None
+    fake_config.num_attention_heads = 4
+    fake_config.num_key_value_heads = 2
+    fake_config.intermediate_size = 32
+
+    fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
+    assert fake_base.config.rope_theta == 1000000.0
+
+
+def test_fakebase_prefers_legacy_rope_theta(fake_checkpoint, fake_config):
+    """A legacy top-level RoPE base remains authoritative over nested metadata."""
+    fake_config.rope_theta = 500000.0
+    fake_config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
+
+    fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
+
+    assert fake_base.config.rope_theta == 500000.0
+
+
 def test_fakebase_missing_index_raises(tmp_path, fake_config):
     with pytest.raises(FileNotFoundError, match="safetensors"):
         FakeBaseModel.from_source(str(tmp_path))

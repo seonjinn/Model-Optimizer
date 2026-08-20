@@ -72,6 +72,20 @@ _SAFETENSORS_INDEX_FILENAME = "model.safetensors.index.json"
 _SAFETENSORS_SINGLE_FILENAMES = ["model.safetensors", "consolidated.safetensors"]
 
 
+def _get_rope_theta(config: PretrainedConfig) -> float | int | None:
+    """Get RoPE theta from legacy or Transformers 5 config fields."""
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is not None:
+        return rope_theta
+
+    for attr in ("rope_parameters", "rope_scaling"):
+        rope_config = getattr(config, attr, None)
+        if isinstance(rope_config, dict) and rope_config.get("rope_theta") is not None:
+            return rope_config["rope_theta"]
+
+    return None
+
+
 class FakeBaseConfig(PretrainedConfig):
     """Minimal config for FakeBaseModel that supports offline speculative decoding training."""
 
@@ -203,7 +217,7 @@ class FakeBaseModel(PreTrainedModel):
             num_key_value_heads=getattr(base_cfg, "num_key_value_heads", None),
             intermediate_size=getattr(base_cfg, "intermediate_size", None),
             rms_norm_eps=getattr(base_cfg, "rms_norm_eps", 1e-6),
-            rope_theta=getattr(base_cfg, "rope_theta", None),
+            rope_theta=_get_rope_theta(base_cfg),
             final_norm_type=_select_final_norm_type(
                 getattr(base_cfg, "model_type", None), base_cfg
             ),

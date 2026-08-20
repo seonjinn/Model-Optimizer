@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 import torch
 
 from modelopt.torch.export.plugins.hf_spec_export import DFlashExporter, EagleExporter
+from modelopt.torch.speculative.plugins.modeling_fakebase import FakeBaseConfig
 
 DEFAULT_ROPE_SCALING = {
     "rope_type": "yarn",
@@ -139,6 +140,25 @@ def test_dflash_rope_theta_inherits_base():
     """rope_theta is inherited from the target/base config (draft drafts for the base)."""
     config = _make_dflash_exporter(base_rope_theta=5000000.0)._export_config()
     assert config["rope_theta"] == 5000000.0
+
+
+def test_dflash_rope_theta_inherits_fakebase_target():
+    """DFlash export preserves the FakeBase target RoPE base exactly."""
+    exporter = _make_dflash_exporter()
+    exporter.model.config = FakeBaseConfig(
+        num_hidden_layers=8,
+        hidden_size=128,
+        vocab_size=1000,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        intermediate_size=256,
+        max_position_embeddings=196608,
+        rope_theta=1000000.0,
+    )
+
+    config = exporter._export_config()
+
+    assert config["rope_theta"] == 1000000.0
 
 
 def test_dflash_rope_theta_inherits_base_rope_parameters():
