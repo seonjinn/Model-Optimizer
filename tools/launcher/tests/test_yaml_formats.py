@@ -142,6 +142,26 @@ slurm_config:
         assert pipeline.tasks[0].environment == [{"HF_MODEL": "/hf-local/Qwen/Qwen3-8B"}]
         assert pipeline.tasks[1].environment == [{"HF_MODEL": "/hf-local/Qwen/Qwen3-8B"}]
 
+    def test_dflash_global_vars(self):
+        """DFlash block settings resolve from shared global variables."""
+        pipeline = SandboxPipeline(
+            task_0=SandboxTask0(
+                script="train.sh",
+                args=[
+                    "dflash.dflash_block_size=<<global_vars.dflash_block_size>>",
+                    "dflash.dflash_loss_decay_factor=<<global_vars.dflash_loss_decay_factor>>",
+                ],
+            ),
+            global_vars=GlobalVariables(
+                dflash_block_size="8",
+                dflash_loss_decay_factor="4",
+            ),
+        )
+        assert pipeline.tasks[0].args == [
+            "dflash.dflash_block_size=8",
+            "dflash.dflash_loss_decay_factor=4",
+        ]
+
     def test_inline_task_and_global_vars(self):
         """A task can use `inline` instead of `script`, with global_vars resolved."""
         task = SandboxTask0(
