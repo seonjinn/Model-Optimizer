@@ -99,6 +99,8 @@ def test_qwen30_dflash_training_data_is_overridable() -> None:
 
     assert config["pipeline"]["global_vars"]["hf_data"] == "/scratchspace/data/train.jsonl"
     assert "data.data_path=<<global_vars.hf_data>>" in config["pipeline"]["task_1"]["args"]
+    assert "data.sample_size=50000" in config["pipeline"]["task_1"]["args"]
+    assert "training.seed=42" in config["pipeline"]["task_1"]["args"]
     environment = {
         key: value
         for item in config["pipeline"]["task_1"]["environment"]
