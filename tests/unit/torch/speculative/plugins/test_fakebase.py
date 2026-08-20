@@ -17,6 +17,7 @@
 
 import json
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import safetensors.torch
@@ -33,6 +34,20 @@ from modelopt.torch.speculative.utils import load_vlm_or_llm
 
 _HIDDEN_SIZE = 16
 _VOCAB_SIZE = 32
+
+
+def _legacy_config(rope_theta=None, rope_scaling=None):
+    """Build a pre-Transformers-5 config without a rope_parameters alias."""
+    return SimpleNamespace(
+        model_type="llama",
+        hidden_size=_HIDDEN_SIZE,
+        vocab_size=_VOCAB_SIZE,
+        num_hidden_layers=2,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
+    )
 
 
 @pytest.fixture
@@ -75,7 +90,6 @@ def test_fakebase_prefers_transformers5_rope_parameters(fake_checkpoint, fake_co
     """Canonical Transformers 5 RoPE metadata wins over a flat compatibility default."""
     fake_config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
     fake_config.rope_theta = 10000.0
-    fake_config.rope_scaling = {"rope_type": "default", "rope_theta": 500000.0}
     fake_config.num_attention_heads = 4
     fake_config.num_key_value_heads = 2
     fake_config.intermediate_size = 32
@@ -84,21 +98,23 @@ def test_fakebase_prefers_transformers5_rope_parameters(fake_checkpoint, fake_co
     assert fake_base.config.rope_theta == 1000000.0
 
 
-def test_fakebase_prefers_legacy_rope_theta(fake_checkpoint, fake_config):
+def test_fakebase_prefers_legacy_rope_theta(fake_checkpoint, monkeypatch):
     """A legacy top-level RoPE base remains authoritative over nested metadata."""
-    fake_config.rope_theta = 500000.0
-    fake_config.rope_scaling = {"rope_type": "default", "rope_theta": 1000000.0}
+    legacy_config = _legacy_config(
+        rope_theta=500000.0,
+        rope_scaling={"rope_type": "default", "rope_theta": 1000000.0},
+    )
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *a, **kw: legacy_config)
 
     fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
 
     assert fake_base.config.rope_theta == 500000.0
 
 
-def test_fakebase_reads_legacy_rope_scaling(fake_checkpoint, fake_config):
+def test_fakebase_reads_legacy_rope_scaling(fake_checkpoint, monkeypatch):
     """Legacy rope_scaling remains a fallback when canonical metadata is absent."""
-    fake_config.rope_theta = None
-    fake_config.rope_parameters = None
-    fake_config.rope_scaling = {"rope_type": "default", "rope_theta": 1000000.0}
+    legacy_config = _legacy_config(rope_scaling={"rope_type": "default", "rope_theta": 1000000.0})
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *a, **kw: legacy_config)
 
     fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
 

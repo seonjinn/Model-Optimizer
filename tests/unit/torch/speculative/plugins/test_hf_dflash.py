@@ -69,6 +69,25 @@ class TestDFlashConvert:
         model.dflash_module._maybe_init_rotary_emb(device="cpu")
         assert model.dflash_module.rotary_emb.config.rope_parameters["rope_theta"] == 1000000.0
 
+    def test_convert_legacy_architecture_rope_scaling_cannot_override_target(self):
+        """A legacy draft alias retains its metadata but cannot replace the target theta."""
+        model = get_tiny_llama(num_hidden_layers=4)
+        model.config.rope_theta = 10000.0
+        model.config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
+        config = get_dflash_config()
+        config["dflash_architecture_config"]["rope_scaling"] = {
+            "rope_type": "default",
+            "rope_theta": 500000.0,
+            "partial_rotary_factor": 0.5,
+        }
+
+        mtsp.convert(model, [("dflash", config)])
+
+        assert model.dflash_config.rope_parameters["rope_theta"] == 1000000.0
+        assert model.dflash_config.rope_parameters["partial_rotary_factor"] == 0.5
+        model.dflash_module._maybe_init_rotary_emb(device="cpu")
+        assert model.dflash_module.rotary_emb.config.rope_parameters["rope_theta"] == 1000000.0
+
     def test_convert_creates_dflash_model(self):
         """Test that convert produces an HFDFlashModel."""
         model = get_tiny_llama(num_hidden_layers=4)

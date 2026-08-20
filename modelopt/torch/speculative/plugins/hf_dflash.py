@@ -392,7 +392,8 @@ class HFDFlashModel(DFlashModel):
         dflash_architecture_config = dict(config.dflash_architecture_config)
         target_rope_theta = _get_rope_theta(base_config)
         if target_rope_theta is not None:
-            rope_parameters = dict(dflash_architecture_config.get("rope_parameters") or {})
+            rope_parameters = dict(dflash_architecture_config.pop("rope_scaling", None) or {})
+            rope_parameters.update(dflash_architecture_config.get("rope_parameters") or {})
             rope_parameters["rope_theta"] = target_rope_theta
             dflash_architecture_config["rope_parameters"] = rope_parameters
             dflash_architecture_config["rope_theta"] = target_rope_theta
