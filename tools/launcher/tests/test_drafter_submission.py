@@ -298,12 +298,11 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
         "SERVE_MAX_NUM_SEQS=16",
         'training.save_steps="${MAX_STEPS}"',
         "training.save_total_limit=2",
-        'cp -aL "$SOURCE_PATH"',
+        'cp -a "$SOURCE_PATH"',
         'cp -aL "$TARGET_PATH"',
         'cp -aL "$DATASET_PATH"',
         "import accelerate, datasets, modelopt, wandb",
         "is_relative_to",
-        'ln -s .. "$node_root/source/modules/Model-Optimizer"',
         "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml",
         "dflash.dflash_mask_token_id=151669",
         'data.sample_size="${SAMPLE_SIZE}"',
@@ -317,15 +316,19 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
 def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir() -> None:
     """The staged source resolves recipe paths and all ranks rendezvous in one control mount."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+    modelopt_link = _LAUNCHER_DIR / "modules/Model-Optimizer"
 
     for required in (
-        'mkdir -p "$node_root/source/modules"',
-        'ln -s .. "$node_root/source/modules/Model-Optimizer"',
+        'cp -a "$SOURCE_PATH"',
         'CONTROL_ROOT="${OUTPUT_ROOT}/control"',
         'mkdir -p "$OUTPUT_ROOT" "$CONTROL_ROOT"',
         "${CONTROL_ROOT}:/scratchspace",
     ):
         assert required in runner
+    assert modelopt_link.is_symlink()
+    assert modelopt_link.readlink() == Path("../../..")
+    assert 'cp -aL "$SOURCE_PATH"' not in runner
+    assert 'ln -s .. "$node_root/source/modules/Model-Optimizer"' not in runner
 
 
 def test_runtime_relocation_accepts_exported_and_quoted_activate_assignments() -> None:
@@ -402,7 +405,7 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
         "VIRTUAL_ENV",
         "sed -i",
         "PYTHONPATH",
-        'cp -aL "$SOURCE_PATH"',
+        'cp -a "$SOURCE_PATH"',
         "import accelerate, datasets, modelopt, wandb",
         "is_relative_to",
         "--runtime-sha256",
@@ -422,8 +425,9 @@ def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> 
     assert "pip install" not in script
     assert "git clone" not in script
     assert "${SCRIPT_PATH}:${SCRIPT_PATH}" not in script
-    assert "--no-container-mount-home" not in script
-    assert "${SOURCE_PATH}:${SOURCE_PATH}" not in script
+    assert "--no-container-mount-home" in script
+    assert "${SOURCE_PATH}:${SOURCE_PATH}" in script
+    assert 'cp -aL "$SOURCE_PATH"' not in script
 
 
 def test_training_manifest_pins_and_verifies_runtime_archive_bytes() -> None:
@@ -441,9 +445,11 @@ def test_node_local_input_staging_dereferences_hf_blob_symlinks() -> None:
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
     assert "srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '\n" in runner
-    for source in ("SOURCE_PATH", "TARGET_PATH", "DATASET_PATH"):
+    for source in ("TARGET_PATH", "DATASET_PATH"):
         assert f'cp -aL "${source}"' in runner
         assert f'cp -a "${source}"' not in runner
+    assert 'cp -a "$SOURCE_PATH"' in runner
+    assert 'cp -aL "$SOURCE_PATH"' not in runner
 
 
 def test_resume_chain_gates_each_cumulative_wave_on_public_acceptance() -> None:

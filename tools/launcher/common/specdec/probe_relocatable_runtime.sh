@@ -48,8 +48,9 @@ if [[ "$MODE" == "outer" ]]; then
     mkdir -p "$(dirname "$PROBE_LOG")"
     srun --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks=1 --gpus-per-node=4 --segment=1 --time=00:10:00 \
         --job-name=modelopt-runtime-probe --output="$PROBE_LOG" --error="$PROBE_LOG" \
+        --no-container-mount-home \
         --container-image="$IMAGE_PATH" \
-        --container-mounts="${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},/raid/scratch:/raid/scratch" \
+        --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},/raid/scratch:/raid/scratch" \
         bash "$SCRIPT_PATH" --inside --source-path "$SOURCE_PATH" --runtime-archive "$RUNTIME_ARCHIVE" --runtime-sha256 "$RUNTIME_SHA256" --image "$IMAGE_PATH" --scratch-root "$SCRATCH_ROOT"
     echo "runtime probe log: $PROBE_LOG"
     exit 0
@@ -61,7 +62,7 @@ set -x
 node_root="${SCRATCH_ROOT}/node-${SLURM_NODEID:-0}"
 rm -rf "$node_root"
 mkdir -p "$node_root/runtime"
-cp -aL "$SOURCE_PATH" "$node_root/source"
+cp -a "$SOURCE_PATH" "$node_root/source"
 tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
 old_venv="$(sed -nE "s/^[[:space:]]*export[[:space:]]+VIRTUAL_ENV=(.*)$/\\1/p" "$node_root/runtime/bin/activate" | head -n 1)"
 old_venv="${old_venv#\"}"

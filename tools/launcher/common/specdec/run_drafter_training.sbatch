@@ -109,9 +109,7 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
-    cp -aL "$SOURCE_PATH" "$node_root/source"
-    mkdir -p "$node_root/source/modules"
-    ln -s .. "$node_root/source/modules/Model-Optimizer"
+    cp -a "$SOURCE_PATH" "$node_root/source"
     tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
     old_venv=$(sed -nE "s/^[[:space:]]*export[[:space:]]+VIRTUAL_ENV=(.*)$/\\1/p" "$node_root/runtime/bin/activate" | head -n 1)
     old_venv="${old_venv#\"}"
