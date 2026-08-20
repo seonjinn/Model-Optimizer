@@ -43,12 +43,13 @@ if [[ "$MODE" == "outer" ]]; then
     [[ -f "$RUNTIME_ARCHIVE" && -f "$IMAGE_PATH" ]] || { echo "pinned archive or image is missing" >&2; exit 2; }
     [[ "$(sha256sum "$RUNTIME_ARCHIVE" | cut -d' ' -f1)" == "$RUNTIME_SHA256" ]] || { echo "runtime archive SHA-256 mismatch" >&2; exit 2; }
     PROBE_LOG="${PROBE_LOG:-$(dirname "$RUNTIME_ARCHIVE")/probes/runtime-probe-%j.out}"
+    RUNTIME_ARCHIVE_ROOT="$(dirname "$RUNTIME_ARCHIVE")"
     [[ "$PROBE_LOG" == /lustre/* ]] || usage
     mkdir -p "$(dirname "$PROBE_LOG")"
     srun --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks=1 --gpus-per-node=4 --segment=1 --time=00:10:00 \
-        --job-name=modelopt-runtime-probe --output="$PROBE_LOG" \
+        --job-name=modelopt-runtime-probe --output="$PROBE_LOG" --error="$PROBE_LOG" \
         --no-container-mount-home --container-image="$IMAGE_PATH" \
-        --container-mounts="${SCRIPT_PATH}:${SCRIPT_PATH},${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE}:${RUNTIME_ARCHIVE},/raid/scratch:/raid/scratch" \
+        --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},/raid/scratch:/raid/scratch" \
         bash "$SCRIPT_PATH" --inside --source-path "$SOURCE_PATH" --runtime-archive "$RUNTIME_ARCHIVE" --runtime-sha256 "$RUNTIME_SHA256" --image "$IMAGE_PATH" --scratch-root "$SCRATCH_ROOT"
     echo "runtime probe log: $PROBE_LOG"
     exit 0

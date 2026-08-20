@@ -169,6 +169,9 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
         "--segment=1",
         "--job-name=modelopt-runtime-probe",
         '--output="$PROBE_LOG"',
+        '--error="$PROBE_LOG"',
+        "${SOURCE_PATH}:${SOURCE_PATH}",
+        "${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT}",
         "--revision",
         "/raid/scratch",
         "HF_HOME",
@@ -184,6 +187,7 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
         assert required in script
     assert "pip install" not in script
     assert "git clone" not in script
+    assert "${SCRIPT_PATH}:${SCRIPT_PATH}" not in script
     assert "find /lustre" not in script
     assert "rm -rf /lustre" not in script
 
