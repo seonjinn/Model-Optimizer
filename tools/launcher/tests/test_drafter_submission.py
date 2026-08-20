@@ -235,6 +235,16 @@ def test_training_wave_batches_scheduler_history_with_parseable_output() -> None
     assert 'exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,MANIFEST_PATH=' in submitter
 
 
+def test_training_wave_writes_slurm_logs_beside_durable_experiment_outputs() -> None:
+    """Formal jobs must not leave default Slurm logs in the home checkout."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+
+    assert "experiment.paths.output_root" in submitter
+    assert 'mkdir -p "$output_root/logs"' in submitter
+    assert '--output="${output_root}/logs/slurm-%j.out"' in submitter
+    assert '--error="${output_root}/logs/slurm-%j.err"' in submitter
+
+
 def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
     """A wave renders unique tuple jobs with node-local mutable runtime state."""
     submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()

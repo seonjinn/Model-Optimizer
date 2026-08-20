@@ -50,7 +50,7 @@ for index, experiment in enumerate(load_manifest(Path(sys.argv[1]))):
     for boundary in experiment.cumulative_max_steps:
         if selected and boundary != int(selected):
             continue
-        print(f"{index}\t{experiment.experiment_id}\t{boundary}\t{experiment.run_name}\t{experiment.slurm.account}\t{experiment.slurm.partition}")
+        print(f"{index}\t{experiment.experiment_id}\t{boundary}\t{experiment.run_name}\t{experiment.slurm.account}\t{experiment.slurm.partition}\t{experiment.paths.output_root}")
 PY
 }
 
@@ -65,7 +65,7 @@ else
         } || true
     )"
 fi
-while IFS=$'\t' read -r index identity boundary _run_name account partition; do
+while IFS=$'\t' read -r index identity boundary _run_name account partition output_root; do
     [[ -n "$index" ]] || continue
     tuple_identity="${identity}:${boundary}"
     [[ -z "${identities[$tuple_identity]:-}" ]] || { echo "duplicate training tuple: $tuple_identity" >&2; exit 2; }
@@ -93,7 +93,8 @@ PY
         continue
     fi
     exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,MANIFEST_PATH=${MANIFEST},EXPERIMENT_INDEX=${index},MAX_STEPS=${boundary},LAUNCHER_ROOT=${LAUNCHER_ROOT}"
-    args=(--account="$account" --partition="$partition" -N4 --ntasks-per-node=1 --gpus-per-node=4 --segment=4 --time=03:55:00 --job-name="$job_name" --comment="$tuple_identity" --export="$exports")
+    mkdir -p "$output_root/logs"
+    args=(--account="$account" --partition="$partition" -N4 --ntasks-per-node=1 --gpus-per-node=4 --segment=4 --time=03:55:00 --job-name="$job_name" --comment="$tuple_identity" --export="$exports" --output="${output_root}/logs/slurm-%j.out" --error="${output_root}/logs/slurm-%j.err")
     [[ -z "$DEPENDENCY" ]] || args+=(--dependency=afterok:"$DEPENDENCY")
     sbatch --test-only "${args[@]}" "$RUNNER"
     if [[ "$DRY_RUN" -eq 1 ]]; then
