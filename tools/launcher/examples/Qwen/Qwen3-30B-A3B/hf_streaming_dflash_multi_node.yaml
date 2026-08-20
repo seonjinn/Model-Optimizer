@@ -36,6 +36,8 @@ pipeline:
 
   global_vars:
     hf_model: /hf-local/Qwen/Qwen3-30B-A3B
+    dflash_block_size: "8"
+    dflash_loss_decay_factor: "4"
 
   # Step 1: Build input conversations
   task_0:
@@ -77,9 +79,9 @@ pipeline:
       # dflash.yaml sets report_to=tensorboard, which hard-fails if tensorboard
       # isn't in the serve container; the streaming trainer doesn't need it.
       - training.report_to=none
-      - dflash.dflash_block_size=16
+      - dflash.dflash_block_size=<<global_vars.dflash_block_size>>
       - dflash.dflash_num_anchors=512
-      - dflash.dflash_loss_decay_factor=7
+      - dflash.dflash_loss_decay_factor=<<global_vars.dflash_loss_decay_factor>>
       # Qwen3 has no tokenizer mask token; use a reserved vocab slot (151669).
       - dflash.dflash_mask_token_id=151669
       - dflash.dflash_architecture_config.num_hidden_layers=5
