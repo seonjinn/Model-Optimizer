@@ -14,7 +14,6 @@ DEPENDENCY=""
 ONLY_STEP=""
 EXPERIMENT_INDEX=""
 DRY_RUN=0
-EXTRA_ARGS=()
 
 usage() {
     echo "usage: $0 --manifest /home/.../manifest.json --receipt /lustre/.../receipt.jsonl [--dependency JOBID] [--max-steps N] [--dry-run] [-- dotlist args]" >&2
@@ -29,7 +28,7 @@ while [[ $# -gt 0 ]]; do
         --max-steps) ONLY_STEP="$2"; shift 2 ;;
         --experiment-index) EXPERIMENT_INDEX="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
-        --) shift; EXTRA_ARGS=("$@"); break ;;
+        --) echo "extra ModelOpt dotlist arguments are not accepted for pinned production manifests" >&2; exit 2 ;;
         *) usage ;;
     esac
 done
@@ -37,8 +36,6 @@ done
 [[ "$RUNNER" == /home/* ]] || { echo "runner must be in /home source" >&2; exit 2; }
 [[ -z "$ONLY_STEP" || "$ONLY_STEP" =~ ^[1-9][0-9]*$ ]] || usage
 [[ -z "$EXPERIMENT_INDEX" || "$EXPERIMENT_INDEX" =~ ^[0-9]+$ ]] || usage
-EXTRA_ARGS=("${EXTRA_ARGS[@]:-}")
-
 render_waves() {
     PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST" "$ONLY_STEP" "$EXPERIMENT_INDEX" <<'PY'
 import sys
@@ -86,7 +83,7 @@ PY
         printf '{"job_id":"%s","status":"already-known","tuple_identity":"%s","max_steps":%s}\n' "$existing" "$tuple_identity" "$boundary" >>"$RECEIPT"
         continue
     fi
-    exports="ALL,MANIFEST_PATH=${MANIFEST},EXPERIMENT_INDEX=${index},MAX_STEPS=${boundary},EXTRA_MODELOPT_DOTLIST=${EXTRA_ARGS[*]:-}"
+    exports="ALL,MANIFEST_PATH=${MANIFEST},EXPERIMENT_INDEX=${index},MAX_STEPS=${boundary}"
     args=(--account="$account" --partition="$partition" -N4 --ntasks-per-node=1 --gpus-per-node=4 --segment=4 --time=03:55:00 --job-name="$job_name" --comment="$tuple_identity" --export="$exports")
     [[ -z "$DEPENDENCY" ]] || args+=(--dependency=afterok:"$DEPENDENCY")
     sbatch --test-only "${args[@]}" "$RUNNER"

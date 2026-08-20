@@ -234,6 +234,74 @@ def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
     assert "git clone" not in runner
 
 
+def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None:
+    """The pinned runtime and mounts remain valid after per-node extraction."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        "VIRTUAL_ENV",
+        "sed -i",
+        "PYTHONPATH",
+        "--no-container-mount-home",
+        "${OUTPUT_ROOT}:${OUTPUT_ROOT}",
+        "SLURM_NODEID < SERVE_NODES",
+        "WANDB_PROJECT",
+        "WANDB_CACHE_DIR",
+        "report_to=wandb",
+        "training.save_steps=\"${MAX_STEPS}\"",
+        "training.save_total_limit=2",
+        "cp -aL \"$SOURCE_PATH\"",
+        "cp -aL \"$TARGET_PATH\"",
+        "cp -aL \"$DATASET_PATH\"",
+        "import accelerate, datasets, modelopt, wandb",
+        "is_relative_to",
+    ):
+        assert required in runner
+    assert "training.global_batch_size=512" not in runner
+    assert "EXTRA_MODELOPT_DOTLIST" not in runner
+
+
+def test_cumulative_runner_writes_a_checkpoint_for_every_resume_boundary() -> None:
+    """Each same-output cumulative wave leaves get_last_checkpoint() an exact resume."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    assert 'training.output_dir="${OUTPUT_ROOT}"' in runner
+    assert 'training.save_steps="${MAX_STEPS}"' in runner
+    assert "training.save_total_limit=2" in runner
+
+
+def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> None:
+    """The reusable preflight verifies imports after the archive is moved to scratch."""
+    script = (_LAUNCHER_DIR / "common/specdec/probe_relocatable_runtime.sh").read_text()
+
+    for required in (
+        "/home",
+        "/lustre",
+        "/raid/scratch",
+        "--no-container-mount-home",
+        "--container-image",
+        "tar --extract",
+        "VIRTUAL_ENV",
+        "sed -i",
+        "PYTHONPATH",
+        "cp -aL \"$SOURCE_PATH\"",
+        "import accelerate, datasets, modelopt, wandb",
+        "is_relative_to",
+    ):
+        assert required in script
+    assert "pip install" not in script
+    assert "git clone" not in script
+
+
+def test_node_local_input_staging_dereferences_hf_blob_symlinks() -> None:
+    """HF cache links are materialized before their Lustre backing paths disappear."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for source in ("SOURCE_PATH", "TARGET_PATH", "DATASET_PATH"):
+        assert f'cp -aL "${source}"' in runner
+        assert f'cp -a "${source}"' not in runner
+
+
 def test_resume_chain_gates_each_cumulative_wave_on_public_acceptance() -> None:
     """Only a successful nine-subset evaluation releases the next stable-output wave."""
     script = (_LAUNCHER_DIR / "common/specdec/submit_drafter_resume_chain.sh").read_text()

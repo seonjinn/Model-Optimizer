@@ -98,23 +98,49 @@ export SERVE_NODES NUM_SPEC_TOKENS
 
 export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT SCRATCH_JOB_ROOT
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
-srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --container-image="$IMAGE_PATH" --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE}:${RUNTIME_ARCHIVE},${TARGET_PATH}:${TARGET_PATH},${DATASET_PATH}:${DATASET_PATH},${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT}" bash -c '
+srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE}:${RUNTIME_ARCHIVE},${TARGET_PATH}:${TARGET_PATH},${DATASET_PATH}:${DATASET_PATH},${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT}" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
-    cp -a "$SOURCE_PATH" "$node_root/source"
+    cp -aL "$SOURCE_PATH" "$node_root/source"
     tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
-    cp -a "$TARGET_PATH" "$node_root/input/target"
-    cp -a "$DATASET_PATH" "$node_root/input/dataset"
+    old_venv=$(sed -n "s/^VIRTUAL_ENV=//p" "$node_root/runtime/bin/activate" | head -n 1)
+    [[ -n "$old_venv" ]] || { echo "runtime archive has no VIRTUAL_ENV" >&2; exit 2; }
+    grep -IlZ "$old_venv" "$node_root/runtime/bin"/* "$node_root/runtime/pyvenv.cfg" 2>/dev/null \
+        | xargs -0 -r sed -i "s|$old_venv|$node_root/runtime|g"
+    if (( SLURM_NODEID < SERVE_NODES )); then
+        cp -aL "$TARGET_PATH" "$node_root/input/target"
+    else
+        cp -aL "$DATASET_PATH" "$node_root/input/dataset"
+        # Fake-base trainers still need the target configuration/tokenizer sidecars.
+        mkdir -p "$node_root/input/target"
+        for sidecar in config.json generation_config.json tokenizer.json tokenizer_config.json special_tokens_map.json; do
+            [[ -e "$TARGET_PATH/$sidecar" ]] && cp -aL "$TARGET_PATH/$sidecar" "$node_root/input/target/"
+        done
+    fi
 '
 
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS RUN_NAME
 
 # shellcheck disable=SC2016 # The child shell expands its Slurm-node environment.
-srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --container-image="$IMAGE_PATH" --container-mounts="${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT}" bash -c '
+srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT},${OUTPUT_ROOT}:${OUTPUT_ROOT}" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     export MODELOPT_RUNTIME="$node_root/runtime"
+    export VIRTUAL_ENV="$MODELOPT_RUNTIME"
+    export PATH="$VIRTUAL_ENV/bin:$PATH"
+    export PYTHONPATH="$node_root/source${PYTHONPATH:+:$PYTHONPATH}"
+    "$MODELOPT_RUNTIME/bin/python" - "$node_root/source" <<'PY'
+import sys
+from pathlib import Path
+
+import accelerate, datasets, modelopt, wandb
+
+source = Path(sys.argv[1]).resolve()
+origin = Path(modelopt.__file__).resolve()
+if not origin.is_relative_to(source):
+    raise RuntimeError(f"modelopt imported outside staged source: {origin}")
+PY
     export HF_MODEL_CKPT="$node_root/input/target"
     export EAGLE_CAPTURE_IDS
     export HF_HOME="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/hf"
@@ -124,8 +150,10 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --container-image="$IMAGE_PATH" --
     export XDG_CACHE_HOME="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/xdg"
     export SQLITE_TMPDIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/sqlite"
     export WANDB_DIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/wandb"
+    export WANDB_CACHE_DIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/wandb-cache"
+    export WANDB_PROJECT="sna-modelopt-specdec"
     export TMPDIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/tmp"
-    mkdir -p "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME" "$SQLITE_TMPDIR" "$WANDB_DIR" "$TMPDIR"
+    mkdir -p "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME" "$SQLITE_TMPDIR" "$WANDB_DIR" "$WANDB_CACHE_DIR" "$TMPDIR"
     export SERVE_NODES=2
     export EXPORT_PATH="${OUTPUT_ROOT}/exported-checkpoint-${MAX_STEPS}"
     loss_args=(
@@ -144,9 +172,11 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --container-image="$IMAGE_PATH" --
         data.data_path="$node_root/input/dataset" \
         training.output_dir="${OUTPUT_ROOT}" \
         training.max_steps="${MAX_STEPS}" \
-        training.global_batch_size=512 \
+        training.save_steps="${MAX_STEPS}" \
+        training.save_total_limit=2 \
         training.per_device_train_batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}" \
         training.gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}" \
+        training.report_to=wandb \
         training.run_name="${RUN_NAME}" \
         dflash.dflash_block_size="${BLOCK_SIZE}" \
         dflash.dflash_num_anchors=512 \
@@ -154,6 +184,5 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --container-image="$IMAGE_PATH" --
         dflash.dflash_architecture_config.num_key_value_heads="${NUM_KEY_VALUE_HEADS}" \
         dflash.dflash_architecture_config.head_dim="${HEAD_DIM}" \
         dflash.dflash_architecture_config.intermediate_size="${INTERMEDIATE_SIZE}" \
-        "${loss_args[@]}" \
-        ${EXTRA_MODELOPT_DOTLIST:-}
+        "${loss_args[@]}"
 '

@@ -64,3 +64,33 @@
   values and use a fixed self-reentry script rather than an interpolated
   `--wrap` command. Duplicate checks consult receipts, filtered `squeue`, and
   filtered `sacct`, including blank-`sbatch` fallback.
+
+## Controller integration fix round
+
+- Added RED/GREEN contract coverage for runtime relocation, pinned-container
+  imports, output mounting, role-specific staging, W&B configuration, and the
+  reusable runtime probe.
+- The runner now rewrites archived virtual-environment activation/wrapper paths
+  after extracting the runtime on each node's `/raid/scratch` directory, then
+  verifies `accelerate`, `datasets`, `modelopt`, and `wandb` with the relocated
+  `MODELOPT_RUNTIME/bin/python` and staged-source `PYTHONPATH`.
+- Added `probe_relocatable_runtime.sh`, a one-node pinned-image preflight that
+  requires `/home` source, Lustre image/archive, and `/raid/scratch` extraction
+  before asserting the same imports. It neither clones source nor builds on
+  Lustre.
+- Both Pyxis invocations use `--no-container-mount-home`; the training Pyxis
+  invocation explicitly mounts the Lustre output root. Serve nodes stage the
+  full target, trainers stage the dataset and only fake-base target sidecars.
+- Removed the invalid recipe override `training.global_batch_size=512`; GBS is
+  retained solely as the manifest arithmetic preflight. Production submitters
+  reject all extra dotlist arguments, so no unquoted override expansion remains.
+  The runner configures `training.report_to=wandb`, `WANDB_PROJECT`, and
+  node-local W&B cache/run paths.
+- Node-local source, target, dataset, and trainer sidecar copies use
+  `cp -aL`, materializing Q30/OPB Hugging Face blob symlinks before the
+  container runs without Lustre input mounts. The relocated runtime probe also
+  imports `modelopt` and rejects any import origin outside the staged source.
+- Every cumulative training boundary now passes `training.save_steps=$MAX_STEPS`
+  and `training.save_total_limit=2`, guaranteeing a real
+  `checkpoint-$MAX_STEPS` under the stable output root for the next wave's
+  automatic resume. Long-lived final archival remains a separate policy.
