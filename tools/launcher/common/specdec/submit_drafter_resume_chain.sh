@@ -5,6 +5,26 @@
 # Submit train -> public acceptance -> next-train dependencies for one manifest.
 set -euo pipefail
 
+if [[ "${1:-}" == "--run-evaluation-container" ]]; then
+    work_root="/raid/scratch/${SLURM_JOB_ID}/evaluation"
+    mkdir -p "$work_root"
+    tar --extract --file="$EVAL_RUNTIME_ARCHIVE" --directory="$work_root"
+    # shellcheck disable=SC1091
+    source "$work_root/bin/activate"
+    export HF_HOME="$work_root/hf" HF_HUB_CACHE="$work_root/hf/hub" HF_DATASETS_CACHE="$work_root/hf/datasets"
+    export XDG_CACHE_HOME="$work_root/xdg" SQLITE_TMPDIR="$work_root/sqlite" TMPDIR="$work_root/tmp"
+    # shellcheck disable=SC1090
+    source "$EVAL_EVALUATOR_ENV"
+    export EVAL_CONFIG_PATH="$EVAL_EVALUATOR_CONFIG" EVAL_OUTPUT_ROOT="$EVAL_RUN_OUTPUT"
+    export DRAFT_MODEL="$EVAL_TRAIN_EXPORT" SPEC_METHOD="$EVAL_METHOD" DFLASH_BLOCK_SIZE="$EVAL_BLOCK_SIZE" NUM_SPEC_TOKENS="$EVAL_NUM_SPEC_TOKENS"
+    "$EVAL_EVALUATOR_SCRIPT"
+    test -s "${EVAL_RUN_OUTPUT}/acceptance.csv"
+    exit 0
+fi
+if [[ "${1:-}" == "--run-evaluation" ]]; then
+    exec srun --nodes=1 --ntasks=1 --container-image="$EVAL_IMAGE" --container-mounts="/home:/home,/lustre:/lustre,/raid/scratch:/raid/scratch" bash "$0" --run-evaluation-container
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WAVE_SUBMITTER="${SCRIPT_DIR}/submit_drafter_training_wave.sh"
 MANIFEST=""
@@ -54,9 +74,9 @@ import sys
 from pathlib import Path
 from common.specdec.drafter_job_manifest import load_manifest
 
-for experiment in load_manifest(Path(sys.argv[1])):
+for index, experiment in enumerate(load_manifest(Path(sys.argv[1]))):
     for boundary in experiment.cumulative_max_steps:
-        print(boundary)
+        print(f"{index}\t{experiment.experiment_id}\t{boundary}\t{experiment.method}\t{experiment.block_size}\t{experiment.num_speculative_tokens}\t{experiment.paths.output_root}")
 PY
 }
 
@@ -72,44 +92,41 @@ PY
 }
 
 submit_evaluation() {
-    local boundary="$1"
-    local train_id="$2"
-    local name="drafter-eval-${boundary}"
-    local train_export="${EXPORT_ROOT}/exported-checkpoint-${boundary}"
-    local run_output="${EVAL_OUTPUT_ROOT}/step-${boundary}"
-    local receipt="${RECEIPT_ROOT}/evaluation-${boundary}.json"
-    local local_root="/raid/scratch/\${SLURM_JOB_ID}/evaluation"
-    local command
-    command="set -euo pipefail; mkdir -p ${local_root}; tar --extract --file=${RUNTIME_ARCHIVE} --directory=${local_root}; source ${local_root}/bin/activate; export HF_HOME=${local_root}/hf HF_HUB_CACHE=${local_root}/hf/hub HF_DATASETS_CACHE=${local_root}/hf/datasets XDG_CACHE_HOME=${local_root}/xdg SQLITE_TMPDIR=${local_root}/sqlite TMPDIR=${local_root}/tmp; source ${EVALUATOR_ENV}; export EVAL_CONFIG_PATH=${EVALUATOR_CONFIG} EVAL_OUTPUT_ROOT=${run_output} DRAFT_MODEL=${train_export} PUBLIC_SUBSETS=${PUBLIC_SUBSETS}; ${EVALUATOR_SCRIPT}; test -s ${run_output}/acceptance.csv"
-    local args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks-per-node=1 --gpus-per-node=4 --segment=1 --time=03:55:00 --job-name="$name" --dependency=afterok:"$train_id" --output="${RECEIPT_ROOT}/%x-%j.out")
+    local index="$1" identity="$2" boundary="$3" train_id="$4" method="$5" block_size="$6" num_tokens="$7" export_root="$8"
+    local name="drafter-eval-${identity}-s${boundary}" train_export="${export_root}/exported-checkpoint-${boundary}"
+    local run_output="${EVAL_OUTPUT_ROOT}/${identity}/step-${boundary}" receipt="${RECEIPT_ROOT}/evaluation-${identity}-s${boundary}.json"
+    local exports="ALL,EVAL_IMAGE=${IMAGE},EVAL_RUNTIME_ARCHIVE=${RUNTIME_ARCHIVE},EVAL_EVALUATOR_ENV=${EVALUATOR_ENV},EVAL_EVALUATOR_CONFIG=${EVALUATOR_CONFIG},EVAL_EVALUATOR_SCRIPT=${EVALUATOR_SCRIPT},EVAL_RUN_OUTPUT=${run_output},EVAL_TRAIN_EXPORT=${train_export},EVAL_METHOD=${method},EVAL_BLOCK_SIZE=${block_size},EVAL_NUM_SPEC_TOKENS=${num_tokens},EXPERIMENT_IDENTITY=${identity}"
+    local args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks-per-node=1 --gpus-per-node=4 --segment=1 --time=03:55:00 --job-name="$name" --comment="${identity}:${boundary}" --dependency=afterok:"$train_id" --output="${RECEIPT_ROOT}/%x-%j.out" --export="$exports")
     existing="$(squeue -h -n "$name" -o "%A" | head -n 1 || true)"
+    [[ -n "$existing" ]] || existing="$(sacct -X -n --name "$name" --format=JobIDRaw,State | awk 'NF {print $1; exit}' || true)"
     if [[ -n "$existing" ]]; then
         printf '{"job_id":"%s","status":"already-queued","max_steps":%s}\n' "$existing" "$boundary" >"$receipt"
         printf '%s\n' "$existing"
         return
     fi
-    sbatch --test-only "${args[@]}" --container-image="$IMAGE" --wrap "$command"
+    sbatch --test-only "${args[@]}" "$0" --run-evaluation
     if [[ "$DRY_RUN" -eq 1 ]]; then
         printf '{"status":"test-only","max_steps":%s,"subsets":"%s"}\n' "$boundary" "$PUBLIC_SUBSETS" >"$receipt"
         printf '\n'
         return
     fi
-    submitted="$(sbatch --parsable "${args[@]}" --container-image="$IMAGE" --wrap "$command" || true)"
+    submitted="$(sbatch --parsable "${args[@]}" "$0" --run-evaluation || true)"
     job_id="${submitted%%;*}"
     if [[ -z "$job_id" ]]; then
         job_id="$(squeue -h -n "$name" -o "%A" | head -n 1 || true)"
+        [[ -n "$job_id" ]] || job_id="$(sacct -X -n --name "$name" --format=JobIDRaw,State | awk 'NF {print $1; exit}' || true)"
     fi
     [[ -n "$job_id" ]] || { echo "scheduler did not confirm evaluator submission" >&2; exit 1; }
     printf '{"job_id":"%s","status":"submitted","max_steps":%s,"subsets":"%s"}\n' "$job_id" "$boundary" "$PUBLIC_SUBSETS" >"$receipt"
     printf '%s\n' "$job_id"
 }
 
-previous_evaluation=""
-while read -r boundary; do
+declare -A previous_evaluations=()
+while IFS=$'\t' read -r index identity boundary method block_size num_tokens output_root; do
     [[ -n "$boundary" ]] || continue
-    train_receipt="${RECEIPT_ROOT}/training-${boundary}.jsonl"
-    train_args=(--manifest "$MANIFEST" --receipt "$train_receipt" --max-steps "$boundary")
-    [[ -z "$previous_evaluation" ]] || train_args+=(--dependency "$previous_evaluation")
+    train_receipt="${RECEIPT_ROOT}/training-${identity}-s${boundary}.jsonl"
+    train_args=(--manifest "$MANIFEST" --receipt "$train_receipt" --experiment-index "$index" --max-steps "$boundary")
+    [[ -z "${previous_evaluations[$identity]:-}" ]] || train_args+=(--dependency "${previous_evaluations[$identity]}")
     [[ "$DRY_RUN" -eq 0 ]] || train_args+=(--dry-run)
     "$WAVE_SUBMITTER" "${train_args[@]}"
     train_id="$(receipt_job_id "$train_receipt")"
@@ -117,6 +134,6 @@ while read -r boundary; do
         continue
     fi
     [[ -n "$train_id" ]] || { echo "training receipt has no scheduler-confirmed job ID" >&2; exit 1; }
-    previous_evaluation="$(submit_evaluation "$boundary" "$train_id")"
-    [[ -n "$previous_evaluation" ]] || { echo "evaluation receipt has no scheduler-confirmed job ID" >&2; exit 1; }
+    previous_evaluations[$identity]="$(submit_evaluation "$index" "$identity" "$boundary" "$train_id" "$method" "$block_size" "$num_tokens" "$output_root")"
+    [[ -n "${previous_evaluations[$identity]}" ]] || { echo "evaluation receipt has no scheduler-confirmed job ID" >&2; exit 1; }
 done < <(boundaries)

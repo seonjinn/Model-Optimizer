@@ -10,6 +10,7 @@ import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ __all__ = [
     "DrafterExperiment",
     "PinnedPaths",
     "SlurmSettings",
+    "TargetTopology",
     "canonical_manifest",
     "load_manifest",
     "speculative_tokens",
@@ -46,9 +48,13 @@ def speculative_tokens(method: str, block_size: int) -> int:
         raise ValueError(f"unsupported method/block-size pair: {method}/{block_size}") from error
 
 
-def _require_path(name: str, value: str, root: str) -> None:
-    if not value or not Path(value).is_absolute() or not Path(value).is_relative_to(root):
+def _normalized_path(name: str, value: str, root: str) -> str:
+    if not value or not Path(value).is_absolute():
         raise ValueError(f"{name} must be an absolute path under {root}")
+    normalized = Path(value).resolve(strict=False)
+    if not normalized.is_relative_to(Path(root).resolve(strict=False)):
+        raise ValueError(f"{name} must be an absolute path under {root}")
+    return str(normalized)
 
 
 @dataclass(frozen=True)
@@ -64,7 +70,9 @@ class PinnedPaths:
     output_root: str
 
     def __post_init__(self) -> None:
-        _require_path("source_path", self.source_path, "/home")
+        object.__setattr__(
+            self, "source_path", _normalized_path("source_path", self.source_path, "/home")
+        )
         if not _FULL_SHA.fullmatch(self.source_sha):
             raise ValueError("source_sha must be an exact 40-character lowercase commit SHA")
         for name in (
@@ -74,7 +82,65 @@ class PinnedPaths:
             "dataset_path",
             "output_root",
         ):
-            _require_path(name, getattr(self, name), "/lustre")
+            object.__setattr__(self, name, _normalized_path(name, getattr(self, name), "/lustre"))
+
+
+@dataclass(frozen=True)
+class TargetTopology:
+    """Target-specific streaming and batch settings that are safe to execute verbatim."""
+
+    target_kind: str
+    capture_ids: tuple[int, ...]
+    serve_tp: int
+    per_device_train_batch_size: int
+    gradient_accumulation_steps: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    intermediate_size: int
+
+    @classmethod
+    def for_kind(cls, target_kind: str) -> TargetTopology:
+        """Return the only supported topology for a public Qwen3 target family."""
+        try:
+            return cls(target_kind=target_kind, **_TARGET_DEFAULTS[target_kind])
+        except KeyError as error:
+            raise ValueError(f"unsupported target kind: {target_kind}") from error
+
+    def __post_init__(self) -> None:
+        expected = _TARGET_DEFAULTS.get(self.target_kind)
+        if expected is None or any(
+            getattr(self, field) != value for field, value in expected.items()
+        ):
+            raise ValueError(f"target topology must use the pinned defaults for {self.target_kind}")
+        if self.per_device_train_batch_size * self.gradient_accumulation_steps * 2 * 4 != 512:
+            raise ValueError(
+                "target topology must produce global batch size 512 over eight trainer GPUs"
+            )
+
+
+_TARGET_DEFAULTS = {
+    "qwen3-30b-a3b": {
+        "capture_ids": (2, 13, 24, 35, 46, 48),
+        "serve_tp": 2,
+        "per_device_train_batch_size": 4,
+        "gradient_accumulation_steps": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "intermediate_size": 6144,
+    },
+    "qwen3-235b-a22b": {
+        "capture_ids": (2, 25, 47, 69, 92, 94),
+        "serve_tp": 4,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 32,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "intermediate_size": 12288,
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -105,6 +171,7 @@ class DrafterExperiment:
     block_size: int
     cumulative_max_steps: tuple[int, ...]
     run_name: str
+    topology: TargetTopology
     paths: PinnedPaths
     slurm: SlurmSettings
 
@@ -139,9 +206,26 @@ class DrafterExperiment:
             self.cumulative_max_steps[-1],
         )
 
+    @property
+    def experiment_id(self) -> str:
+        """Return a stable short identifier for receipts and scheduler job names."""
+        payload = json.dumps(
+            (
+                self.target,
+                self.dataset,
+                self.method,
+                self.block_size,
+                self.run_name,
+                self.paths.output_root,
+            ),
+            separators=(",", ":"),
+        )
+        return sha256(payload.encode()).hexdigest()[:16]
+
 
 def _manifest_entry(experiment: DrafterExperiment) -> dict[str, Any]:
     entry = asdict(experiment)
+    entry["experiment_id"] = experiment.experiment_id
     entry["num_speculative_tokens"] = experiment.num_speculative_tokens
     return entry
 
@@ -196,6 +280,7 @@ def load_manifest(path: Path) -> tuple[DrafterExperiment, ...]:
             block_size=entry["block_size"],
             cumulative_max_steps=tuple(entry["cumulative_max_steps"]),
             run_name=entry["run_name"],
+            topology=TargetTopology(**entry["topology"]),
             paths=PinnedPaths(**entry["paths"]),
             slurm=SlurmSettings(**entry["slurm"]),
         )

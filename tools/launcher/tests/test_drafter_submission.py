@@ -13,6 +13,7 @@ from common.specdec.drafter_job_manifest import (
     DrafterExperiment,
     PinnedPaths,
     SlurmSettings,
+    TargetTopology,
     canonical_manifest,
     speculative_tokens,
     validate_topology,
@@ -62,6 +63,17 @@ def _experiment() -> DrafterExperiment:
         block_size=8,
         cumulative_max_steps=(500, 1000),
         run_name="qwen3-30b-dflash-b8",
+        topology=TargetTopology(
+            target_kind="qwen3-30b-a3b",
+            capture_ids=(2, 13, 24, 35, 46, 48),
+            serve_tp=2,
+            per_device_train_batch_size=4,
+            gradient_accumulation_steps=16,
+            num_attention_heads=32,
+            num_key_value_heads=4,
+            head_dim=128,
+            intermediate_size=6144,
+        ),
         paths=PinnedPaths(
             source_path="/home/user/ModelOpt",
             source_sha="a" * 40,
@@ -104,6 +116,38 @@ def test_pinned_paths_require_exact_absolute_values(field: str, value: str) -> N
     values[field] = value
     with pytest.raises(ValueError):
         PinnedPaths(**values)
+
+
+def test_pinned_paths_reject_normalized_traversal_outside_the_declared_root() -> None:
+    """Canonical path validation closes lexical ``..`` containment escapes."""
+    values = _experiment().paths.__dict__.copy()
+    values["target_path"] = "/lustre/models/../../home/other"
+    with pytest.raises(ValueError):
+        PinnedPaths(**values)
+
+
+@pytest.mark.parametrize(
+    ("kind", "per_device", "accumulation", "capture_ids", "serve_tp"),
+    [
+        ("qwen3-30b-a3b", 4, 16, (2, 13, 24, 35, 46, 48), 2),
+        ("qwen3-235b-a22b", 2, 32, (2, 25, 47, 69, 92, 94), 4),
+    ],
+)
+def test_target_topology_pins_capture_ids_and_global_batch_arithmetic(
+    kind: str,
+    per_device: int,
+    accumulation: int,
+    capture_ids: tuple[int, ...],
+    serve_tp: int,
+) -> None:
+    """Both targets resolve to world-size eight and an exact global batch of 512."""
+    topology = TargetTopology.for_kind(kind)
+
+    assert topology.capture_ids == capture_ids
+    assert topology.serve_tp == serve_tp
+    assert topology.per_device_train_batch_size == per_device
+    assert topology.gradient_accumulation_steps == accumulation
+    assert topology.per_device_train_batch_size * topology.gradient_accumulation_steps * 8 == 512
 
 
 def test_run_name_cannot_be_blank() -> None:
@@ -150,6 +194,8 @@ def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
         "sbatch --test-only",
         "squeue -h -n",
         "duplicate training tuple",
+        "sacct -X -n --name",
+        "identity",
         "--dependency=afterok:",
         "receipt",
     ):
@@ -158,10 +204,15 @@ def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
         "#SBATCH -N 4",
         "#SBATCH --segment=4",
         "SERVE_NODES=2",
+        "EAGLE_CAPTURE_IDS",
+        "IMAGE_PATH",
+        "--container-image",
+        "gradient_accumulation_steps",
+        "num_attention_heads",
         "GLOBAL_BATCH_SIZE=512",
         "TRAINER_NODES=2",
         "GPUS_PER_NODE=4",
-        "GLOBAL_BATCH_SIZE / (TRAINER_NODES * GPUS_PER_NODE)",
+        "PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE",
         "/home",
         "rev-parse HEAD",
         "status --porcelain",
@@ -197,9 +248,13 @@ def test_resume_chain_gates_each_cumulative_wave_on_public_acceptance() -> None:
         "HumanEval,math_reasoning,qa,question,rag,summarization,tool_call,translation,writing",
         "--time=03:55:00",
         "squeue -h -n",
+        "sacct -X -n --name",
+        "--run-evaluation",
+        "EXPERIMENT_IDENTITY",
         "receipt",
     ):
         assert required in script
+    assert "--wrap" not in script
     for required in (
         "Qwen3-30B-A3B",
         "Qwen3-235B-A22B",

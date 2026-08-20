@@ -43,3 +43,24 @@
 - The production scripts intentionally require `/home` source/configuration,
   `/lustre` durable large artifacts, and `/raid/scratch` mutable runtime/cache/
   lock/database/temp paths.
+
+## Fast-review fix round
+
+- Added pinned target topology to every manifest: Q30 uses capture IDs
+  `[2,13,24,35,46,48]`, serve TP 2, per-device batch 4, and accumulation 16;
+  Q235 uses `[2,25,47,69,92,94]`, serve TP 4, per-device batch 2, and
+  accumulation 32. Both explicitly assert `per-device * accumulation * 8 =
+  512`.
+- The training runner now consumes the manifest-pinned image and capture IDs,
+  copies `/home` source plus immutable inputs/runtime to per-node
+  `/raid/scratch`, and launches training in the pinned image without cloning or
+  building on Lustre.
+- Added normalized realpath containment for pinned paths, so `..` traversal and
+  symlink-resolved escapes outside `/home` or `/lustre` are rejected.
+- Receipts, job names/comments, evaluation outputs, and exports now carry a
+  stable experiment identity. Resume chains process each manifest index
+  independently even when experiments share cumulative boundaries.
+- Evaluator submissions pass method, B, and K through exported environment
+  values and use a fixed self-reentry script rather than an interpolated
+  `--wrap` command. Duplicate checks consult receipts, filtered `squeue`, and
+  filtered `sacct`, including blank-`sbatch` fallback.
