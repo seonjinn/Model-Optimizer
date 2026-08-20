@@ -428,6 +428,7 @@ def test_node_local_input_staging_dereferences_hf_blob_symlinks() -> None:
     """HF cache links are materialized before their Lustre backing paths disappear."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
+    assert "srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '\n" in runner
     for source in ("SOURCE_PATH", "TARGET_PATH", "DATASET_PATH"):
         assert f'cp -aL "${source}"' in runner
         assert f'cp -a "${source}"' not in runner

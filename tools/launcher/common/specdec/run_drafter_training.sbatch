@@ -105,7 +105,7 @@ export SERVE_NODES NUM_SPEC_TOKENS
 
 export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT SCRATCH_JOB_ROOT
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
-srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE}:${RUNTIME_ARCHIVE},${TARGET_PATH}:${TARGET_PATH},${DATASET_PATH}:${DATASET_PATH},/raid/scratch:/raid/scratch" bash -c '
+srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
