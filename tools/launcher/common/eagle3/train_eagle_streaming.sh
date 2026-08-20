@@ -172,7 +172,10 @@ launch_vllm() {
     # pre-registered pinned pool per serve, a tiny HTTP sidecar hands out per-request
     # transfer descriptors. Replicated across TP ranks, so only rank 0 owns the pool.
     KVCFG="{\"kv_connector\":\"RdmaHiddenStatesConnector\",\"kv_connector_module_path\":\"modelopt.torch.speculative.plugins.rdma_hidden_states_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"sidecar_port\":\"${HS_SIDECAR_PORT:-18999}\",\"pool_slots\":\"${HS_POOL_SLOTS:-16}\",\"max_tokens\":\"${HS_MAX_TOKENS:-4096}\"}}"
-    "${gpu_env[@]}" vllm serve "$HF_MODEL_CKPT" \
+    # The container's /usr/local/bin/vllm has a fixed /usr/bin/python3 shebang,
+    # which bypasses an activated MODELOPT_RUNTIME. Launch the CLI as a module so
+    # its connector and dependencies come from the selected runtime instead.
+    "${gpu_env[@]}" python -m vllm.entrypoints.cli.main serve "$HF_MODEL_CKPT" \
         --host "$bind_host" \
         --port "$SERVE_PORT" \
         --tensor-parallel-size "$tp" \
