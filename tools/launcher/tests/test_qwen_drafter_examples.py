@@ -99,3 +99,16 @@ def test_qwen30_dflash_training_data_is_overridable() -> None:
 
     assert config["pipeline"]["global_vars"]["hf_data"] == "/scratchspace/data/train.jsonl"
     assert "data.data_path=<<global_vars.hf_data>>" in config["pipeline"]["task_1"]["args"]
+    environment = {
+        key: value
+        for item in config["pipeline"]["task_1"]["environment"]
+        for key, value in item.items()
+    }
+    assert environment["MODELOPT_RUNTIME"] == "<<global_vars.modelopt_runtime>>"
+
+
+def test_streaming_training_can_reuse_shared_runtime() -> None:
+    script = (_LAUNCHER_DIR / "common" / "eagle3" / "train_eagle_streaming.sh").read_text()
+
+    assert 'source "$MODELOPT_RUNTIME/bin/activate"' in script
+    assert 'if [ -n "${MODELOPT_RUNTIME:-}" ]; then' in script

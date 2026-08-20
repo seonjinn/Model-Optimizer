@@ -60,9 +60,17 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/../service_utils.sh"
 
 ###################################################################################################
-# Container provisioning: the vllm image lacks modelopt's .dist-info and the real
-# pyproject, so synthesize a minimal pyproject (scoped `include` avoids setuptools'
-# flat-layout error) and `pip install -e .`.
+# Container provisioning. Production jobs reuse one immutable shared runtime to avoid
+# creating package inodes on every node and every launch. The fallback keeps existing
+# ad-hoc examples working when MODELOPT_RUNTIME is not configured.
+
+if [ -n "${MODELOPT_RUNTIME:-}" ]; then
+    if [ ! -x "$MODELOPT_RUNTIME/bin/python" ]; then
+        echo "ERROR: MODELOPT_RUNTIME is not a Python environment: $MODELOPT_RUNTIME" >&2
+        exit 1
+    fi
+    source "$MODELOPT_RUNTIME/bin/activate"
+else
 
 TOML=modules/Model-Optimizer/pyproject.toml
 if [ ! -f "$TOML" ]; then
@@ -95,6 +103,7 @@ fi
 pip install --no-cache-dir -e modules/Model-Optimizer/
 pip install --no-cache-dir -r modules/Model-Optimizer/examples/speculative_decoding/requirements.txt
 pip install --no-cache-dir 'datasets' 'huggingface-hub>=1.2.1'
+fi
 export PATH=$PATH:/workspace/.local/bin
 
 ###################################################################################################

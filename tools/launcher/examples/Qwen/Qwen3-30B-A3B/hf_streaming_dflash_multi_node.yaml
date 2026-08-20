@@ -37,6 +37,7 @@ pipeline:
   global_vars:
     hf_model: /hf-local/Qwen/Qwen3-30B-A3B
     hf_data: /scratchspace/data/train.jsonl
+    modelopt_runtime: ""
     dflash_block_size: "8"
     dflash_loss_decay_factor: "4"
 
@@ -88,6 +89,7 @@ pipeline:
       - dflash.dflash_architecture_config.num_hidden_layers=5
     environment:
       - HF_MODEL_CKPT: <<global_vars.hf_model>>
+      - MODELOPT_RUNTIME: <<global_vars.modelopt_runtime>>
       # No spaces: nemo_run emits `export FOO=value` unquoted.
       - EAGLE_CAPTURE_IDS: "[2,13,24,35,46,48]"
       - SERVE_TP: "2"
