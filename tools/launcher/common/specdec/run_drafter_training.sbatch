@@ -182,7 +182,7 @@ PY
     if [[ "$METHOD" == dflash ]]; then
         loss_args+=("dflash.dflash_dpace_alpha=${DFLASH_DPACE_ALPHA}")
     fi
-    cd "$node_root/source"
+    cd "$node_root/source/tools/launcher"
     exec bash tools/launcher/common/eagle3/train_eagle_streaming.sh \
         --config "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml" \
         model.model_name_or_path="$HF_MODEL_CKPT" \

@@ -361,6 +361,8 @@ def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir()
     assert modelopt_link.readlink() == Path("../../..")
     assert 'cp -aL "$SOURCE_PATH"' not in runner
     assert 'ln -s .. "$node_root/source/modules/Model-Optimizer"' not in runner
+    assert 'cd "$node_root/source/tools/launcher"' in runner
+    assert 'cd "$node_root/source"' not in runner
 
 
 def test_host_staging_preserves_one_bounded_diagnostic_log_per_node() -> None:
