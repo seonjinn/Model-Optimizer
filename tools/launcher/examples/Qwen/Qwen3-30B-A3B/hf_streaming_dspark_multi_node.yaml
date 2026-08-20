@@ -13,6 +13,8 @@ pipeline:
     hf_model: /hf-local/Qwen/Qwen3-30B-A3B
     hf_data: /scratchspace/data/train.jsonl
     modelopt_runtime: ""
+    report_to: wandb
+    run_name: Qwen3-30B-A3B_DSpark_streaming_multi_node
     dflash_block_size: "8"
     dflash_loss_decay_factor: "4"
 
@@ -43,7 +45,8 @@ pipeline:
       - training.num_train_epochs=1
       - training.max_steps=2000
       - training.seed=42
-      - training.report_to=none
+      - training.report_to=<<global_vars.report_to>>
+      - training.run_name=<<global_vars.run_name>>
       - dflash.dflash_block_size=<<global_vars.dflash_block_size>>
       # DSpark's paper loss applies static exp(-k/gamma) position weights to
       # CE, TVD, and confidence BCE. Make that objective explicit.
@@ -58,6 +61,10 @@ pipeline:
     environment:
       - HF_MODEL_CKPT: <<global_vars.hf_model>>
       - MODELOPT_RUNTIME: <<global_vars.modelopt_runtime>>
+      - WANDB_PROJECT: "sna-modelopt-specdec"
+      - WANDB_LOG_MODEL: "false"
+      - WANDB_WATCH: "false"
+      - WANDB_DIR: "/tmp/wandb"
       - EAGLE_CAPTURE_IDS: "[2,13,24,35,46,48]"
       - SERVE_TP: "2"
       - SERVE_NODES: "2"

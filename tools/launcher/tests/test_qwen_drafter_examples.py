@@ -134,6 +134,31 @@ def test_qwen30_dspark_uses_shared_opb_runtime_and_paper_loss() -> None:
     assert environment["SERVE_READY_TIMEOUT"] == "1800"
 
 
+def test_qwen30_dspark_wandb_is_overrideable_and_inode_safe() -> None:
+    """Keep W&B metadata overrideable without writing its cache to Lustre."""
+    path = "examples/Qwen/Qwen3-30B-A3B/hf_streaming_dspark_multi_node.yaml"
+    with (_LAUNCHER_DIR / path).open() as yaml_file:
+        config = yaml.safe_load(yaml_file)
+
+    global_vars = config["pipeline"]["global_vars"]
+    task = config["pipeline"]["task_1"]
+    environment = {
+        key: value
+        for item in task["environment"]
+        for key, value in item.items()
+    }
+
+    assert global_vars["report_to"] == "wandb"
+    assert global_vars["run_name"] == "Qwen3-30B-A3B_DSpark_streaming_multi_node"
+    assert "training.report_to=<<global_vars.report_to>>" in task["args"]
+    assert "training.run_name=<<global_vars.run_name>>" in task["args"]
+    assert environment["WANDB_PROJECT"] == "sna-modelopt-specdec"
+    assert environment["WANDB_LOG_MODEL"] == "false"
+    assert environment["WANDB_WATCH"] == "false"
+    assert environment["WANDB_DIR"] == "/tmp/wandb"
+    assert "WANDB_API_KEY" not in environment
+
+
 def test_streaming_training_can_reuse_shared_runtime() -> None:
     script = (_LAUNCHER_DIR / "common" / "eagle3" / "train_eagle_streaming.sh").read_text()
 
