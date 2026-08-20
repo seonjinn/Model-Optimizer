@@ -40,9 +40,12 @@ consecutive-failure circuit breaker, loss_mask alignment); subclasses override
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import TypedDict
 
 import httpx
@@ -60,9 +63,49 @@ __all__ = [
     "EagleVllmStreamingDataset",
     "StreamingConfig",
     "StreamingDataset",
+    "normalize_streaming_entry",
+    "resolve_streaming_data_source",
 ]
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+
+
+def resolve_streaming_data_source(data_path: str | Path) -> tuple[str, str | list[str]]:
+    """Resolve JSONL or Parquet streaming input without materializing a converted copy."""
+    path = Path(data_path)
+    if path.is_dir():
+        jsonl_files = sorted(str(item) for item in path.glob("*.jsonl"))
+        parquet_files = sorted(str(item) for item in path.glob("*.parquet"))
+        if jsonl_files and parquet_files:
+            raise ValueError(f"Mixed JSONL and Parquet shards in {path}")
+        if jsonl_files:
+            return "json", jsonl_files
+        if parquet_files:
+            return "parquet", parquet_files
+        raise ValueError(f"No .jsonl or .parquet files found in directory {path}")
+    return ("parquet" if str(data_path).endswith(".parquet") else "json", str(data_path))
+
+
+def normalize_streaming_entry(entry: dict) -> tuple[str, list[dict[str, str]]] | None:
+    """Normalize OpenAI or ShareGPT-style conversations and derive a stable ID if needed."""
+    conversations = entry.get("conversations") or entry.get("messages")
+    if not conversations or not isinstance(conversations, list):
+        return None
+
+    role_map = {"human": "user", "gpt": "assistant"}
+    normalized = []
+    for turn in conversations:
+        role = turn.get("role") or turn.get("from")
+        content = turn.get("content") if "content" in turn else turn.get("value")
+        if role is None or content is None:
+            return None
+        normalized.append({"role": role_map.get(role, role), "content": content})
+
+    cid = entry.get("conversation_id") or entry.get("uuid")
+    if cid is None:
+        payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+        cid = hashlib.sha256(payload.encode()).hexdigest()
+    return str(cid), normalized
 
 
 def nixl_backends_from_env() -> list[str]:
@@ -287,15 +330,10 @@ class StreamingDataset(Dataset):
         right-truncation to ``max_seq_len`` drops the entire supervised span
         (``answer_only_loss`` mode with the assistant turn at the tail).
         """
-        cid = entry.get("conversation_id") or entry.get("uuid")
-        # Prefer ``conversations``, fall back to ``messages`` (the documented default format;
-        # see examples README). The order matters: some corpora (e.g. Spec-Decoding-Dataset-v2)
-        # carry a degenerate user-only ``messages`` stub (no assistant turn) alongside the real
-        # dialogue in ``conversations`` — preferring ``conversations`` picks the real dialogue
-        # there, while a ``messages``-only corpus still works via the fallback.
-        convs = entry.get("conversations") or entry.get("messages")
-        if cid is None or not convs or not isinstance(convs, list):
+        normalized = normalize_streaming_entry(entry)
+        if normalized is None:
             return None
+        cid, convs = normalized
         input_ids, loss_mask = _tokenize_with_loss_mask(
             self.tokenizer,
             convs,

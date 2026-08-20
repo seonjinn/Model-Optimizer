@@ -43,12 +43,48 @@ from modelopt.torch.speculative.plugins.hf_streaming_dataset import (
     EagleVllmStreamingDataset,
     StreamingConfig,
     StreamingDataset,
+    normalize_streaming_entry,
+    resolve_streaming_data_source,
 )
 
 
 def _entries(n: int) -> list[dict]:
     """Minimal entry shape; ``id`` is the only field tests read back."""
     return [{"id": i} for i in range(n)]
+
+
+def test_resolve_streaming_parquet_directory_without_conversion(tmp_path):
+    (tmp_path / "part-01.parquet").touch()
+    (tmp_path / "part-00.parquet").touch()
+
+    dataset_format, data_files = resolve_streaming_data_source(tmp_path)
+
+    assert dataset_format == "parquet"
+    assert data_files == [
+        str(tmp_path / "part-00.parquet"),
+        str(tmp_path / "part-01.parquet"),
+    ]
+
+
+def test_normalize_openperfectblend_entry_has_stable_id_and_roles():
+    entry = {
+        "conversations": [
+            {"from": "human", "value": "Question"},
+            {"from": "gpt", "value": "Answer"},
+        ]
+    }
+
+    first = normalize_streaming_entry(entry)
+    second = normalize_streaming_entry(entry)
+
+    assert first == second
+    assert first is not None
+    cid, conversations = first
+    assert len(cid) == 64
+    assert conversations == [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "Answer"},
+    ]
 
 
 def test_empty_corpus_raises():

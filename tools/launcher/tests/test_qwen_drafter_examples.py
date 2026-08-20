@@ -90,3 +90,12 @@ def test_make_dataset_uses_python3_for_vllm_images() -> None:
 
     assert "${PYTHON_BIN:-python3}" in script
     assert '-m pip install --no-cache-dir "datasets"' in script
+
+
+def test_qwen30_dflash_training_data_is_overridable() -> None:
+    path = "examples/Qwen/Qwen3-30B-A3B/hf_streaming_dflash_multi_node.yaml"
+    with (_LAUNCHER_DIR / path).open() as yaml_file:
+        config = yaml.safe_load(yaml_file)
+
+    assert config["pipeline"]["global_vars"]["hf_data"] == "/scratchspace/data/train.jsonl"
+    assert "data.data_path=<<global_vars.hf_data>>" in config["pipeline"]["task_1"]["args"]

@@ -36,6 +36,7 @@ pipeline:
 
   global_vars:
     hf_model: /hf-local/Qwen/Qwen3-30B-A3B
+    hf_data: /scratchspace/data/train.jsonl
     dflash_block_size: "8"
     dflash_loss_decay_factor: "4"
 
@@ -66,7 +67,7 @@ pipeline:
       # embed_tokens only). Consistent with the gpt-oss streaming examples.
       - model.use_fake_base_for_offline=true
       - data.mode=streaming
-      - data.data_path=/scratchspace/data/train.jsonl
+      - data.data_path=<<global_vars.hf_data>>
       - training.output_dir=/scratchspace/dflash
       - training.training_seq_len=4096
       - training.disable_tqdm=true
