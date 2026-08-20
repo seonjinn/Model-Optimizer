@@ -83,3 +83,9 @@ def test_qwen_drafter_launcher_contract(
     assert recipe in task["args"]
     for dimension in dspark_dimensions:
         assert dimension in task["args"]
+
+
+def test_make_dataset_uses_python3_for_vllm_images() -> None:
+    script = (_LAUNCHER_DIR / "common" / "eagle3" / "make_dataset.sh").read_text()
+
+    assert "${PYTHON_BIN:-python3}" in script
