@@ -56,7 +56,7 @@ checksum="${archive}.sha256"
 provenance="${archive}.provenance.json"
 listing="${work_root}/runtime.list"
 mkdir -p "$work_root" "$(dirname "$OUTPUT_ARCHIVE")"
-tar --dereference --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .
+tar --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .
 tar --list --use-compress-program=zstd --file="$archive" >"$listing"
 grep -q '/bin/activate$' "$listing"
 archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"

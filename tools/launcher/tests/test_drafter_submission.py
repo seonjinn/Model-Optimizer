@@ -205,7 +205,7 @@ def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
     for required in (
         "--segment=1",
         "/raid/scratch",
-        "tar --dereference --create",
+        "tar --create",
         "tar --list",
         'tar --list --use-compress-program=zstd --file="$archive" >"$listing"',
         "grep -q '/bin/activate$' \"$listing\"",
@@ -213,7 +213,7 @@ def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
         ".provenance.json",
         ".partial-",
         'mv "$temporary" "$OUTPUT_ARCHIVE"',
-        'tar --dereference --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .',
+        'tar --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .',
         'submitted="$(sbatch --parsable',
         '--account="$ACCOUNT"',
         '--partition="$PARTITION"',
@@ -222,6 +222,7 @@ def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
         assert required in script
     for forbidden in ("pip install", "git clone", "find /lustre", "rm -rf"):
         assert forbidden not in script
+    assert "tar --dereference" not in script
 
 
 def test_training_wave_batches_scheduler_history_with_parseable_output() -> None:
