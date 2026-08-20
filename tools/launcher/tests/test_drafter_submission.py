@@ -189,6 +189,7 @@ def test_model_staging_is_pinned_and_node_local_until_completion() -> None:
 def test_runtime_archive_staging_is_bounded_and_atomically_published() -> None:
     """The legacy Lustre venv becomes one checksummed archive without a rebuild."""
     script = (_LAUNCHER_DIR / "common/specdec/stage_relocatable_runtime_archive.sh").read_text()
+    assert 'SCRATCH_ROOT="/raid/scratch/${USER}"' in script
 
     for required in (
         "--segment=1",

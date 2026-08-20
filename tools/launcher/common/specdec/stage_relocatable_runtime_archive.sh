@@ -7,7 +7,7 @@ set -euo pipefail
 
 SOURCE_RUNTIME=""
 OUTPUT_ARCHIVE=""
-SCRATCH_ROOT="/raid/scratch"
+SCRATCH_ROOT="/raid/scratch/${USER}"
 MODE="submit"
 ACCOUNT="nemotron_n3_post"
 PARTITION="batch"
