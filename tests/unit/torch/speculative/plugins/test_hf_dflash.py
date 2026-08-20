@@ -54,6 +54,21 @@ SEQ_LEN = 16  # must be multiple of BLOCK_SIZE
 class TestDFlashConvert:
     """Test DFlash model conversion."""
 
+    def test_convert_uses_canonical_target_rope_parameters_for_rotary(self):
+        """Canonical target RoPE updates the active Qwen3 draft and rotary config."""
+        model = get_tiny_llama(num_hidden_layers=4)
+        model.config.rope_theta = 10000.0
+        model.config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
+        config = get_dflash_config()
+        config["dflash_architecture_config"]["rope_parameters"] = {"rope_type": "default"}
+
+        mtsp.convert(model, [("dflash", config)])
+
+        assert model.dflash_config.rope_parameters["rope_type"] == "default"
+        assert model.dflash_config.rope_parameters["rope_theta"] == 1000000.0
+        model.dflash_module._maybe_init_rotary_emb(device="cpu")
+        assert model.dflash_module.rotary_emb.config.rope_parameters["rope_theta"] == 1000000.0
+
     def test_convert_creates_dflash_model(self):
         """Test that convert produces an HFDFlashModel."""
         model = get_tiny_llama(num_hidden_layers=4)

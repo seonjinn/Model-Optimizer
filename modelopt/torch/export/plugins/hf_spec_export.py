@@ -32,16 +32,17 @@ ALL_SPEC_MODES = ["eagle", "dflash"]
 
 def _get_rope_theta(config, default=None):
     """Get RoPE theta from either legacy or Transformers 5 config fields."""
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and rope_parameters.get("rope_theta") is not None:
+        return rope_parameters["rope_theta"]
+
     rope_theta = getattr(config, "rope_theta", None)
     if rope_theta is not None:
         return rope_theta
 
-    # Transformers 5 stores this under rope_parameters (and exposes the same
-    # data through rope_scaling for backwards compatibility).
-    for attr in ("rope_parameters", "rope_scaling"):
-        rope_config = getattr(config, attr, None)
-        if isinstance(rope_config, dict) and rope_config.get("rope_theta") is not None:
-            return rope_config["rope_theta"]
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict) and rope_scaling.get("rope_theta") is not None:
+        return rope_scaling["rope_theta"]
 
     return default
 

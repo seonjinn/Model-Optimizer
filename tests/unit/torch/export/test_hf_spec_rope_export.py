@@ -172,3 +172,16 @@ def test_dflash_rope_theta_inherits_base_rope_parameters():
     config = exporter._export_config()
 
     assert config["rope_theta"] == 5000000.0
+
+
+def test_dflash_rope_parameters_override_flat_compatibility_default():
+    """Canonical Transformers 5 RoPE metadata wins over a flat compatibility default."""
+    exporter = _make_dflash_exporter(base_rope_theta=10000.0)
+    exporter.model.config.rope_parameters = {
+        "rope_type": "default",
+        "rope_theta": 1000000.0,
+    }
+
+    config = exporter._export_config()
+
+    assert config["rope_theta"] == 1000000.0

@@ -95,6 +95,7 @@ from .modeling_fakebase import (
     _EMBED_TOKENS_PATHS,
     _FINAL_NORM_PATHS,
     _LM_HEAD_PATHS,
+    _get_rope_theta,
 )
 
 logger = logging.getLogger(__name__)
@@ -388,9 +389,16 @@ class HFDFlashModel(DFlashModel):
         super().modify(config)
 
         base_config = self._base_llm_config
+        dflash_architecture_config = dict(config.dflash_architecture_config)
+        target_rope_theta = _get_rope_theta(base_config)
+        if target_rope_theta is not None:
+            rope_parameters = dict(dflash_architecture_config.get("rope_parameters") or {})
+            rope_parameters["rope_theta"] = target_rope_theta
+            dflash_architecture_config["rope_parameters"] = rope_parameters
+            dflash_architecture_config["rope_theta"] = target_rope_theta
         # Use Qwen3Config (not generic PretrainedConfig) so rope_parameters is
-        # auto-populated from rope_theta. DFlash draft uses Qwen3 components.
-        self.dflash_config = _Qwen3Config(**config.dflash_architecture_config)
+        # populated with the target theta before its rotary module is built.
+        self.dflash_config = _Qwen3Config(**dflash_architecture_config)
 
         # hidden_size and vocab_size MUST match the base model.
         self.dflash_config.hidden_size = base_config.hidden_size
@@ -420,9 +428,14 @@ class HFDFlashModel(DFlashModel):
         # DFlash uses standard Qwen3 RotaryEmbedding; the long-context YaRN scaling is
         # added only at export via dflash_export_rope_scaling.)
         for attr in ("rope_theta", "rope_type", "rope_interleaved"):
-            if not hasattr(base_config, attr):
+            if attr == "rope_theta":
+                base_val = target_rope_theta
+            elif hasattr(base_config, attr):
+                base_val = getattr(base_config, attr)
+            else:
                 continue
-            base_val = getattr(base_config, attr)
+            if base_val is None:
+                continue
             user_val = getattr(self.dflash_config, attr, None)
             if user_val is not None and user_val != base_val:
                 logger.warning(

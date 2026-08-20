@@ -16,14 +16,18 @@
 """Unit tests for FakeBaseModel and the fake-base / offline paths in load_vlm_or_llm."""
 
 import json
+from copy import deepcopy
 
 import pytest
 import safetensors.torch
 import torch
+from _test_utils.torch.speculative.dflash import get_dflash_config
 
 pytest.importorskip("transformers")
 import transformers
 
+import modelopt.torch.speculative as mtsp
+from modelopt.torch.speculative.config import DFLASH_DEFAULT_CFG
 from modelopt.torch.speculative.plugins.modeling_fakebase import FakeBaseModel
 from modelopt.torch.speculative.utils import load_vlm_or_llm
 
@@ -67,11 +71,11 @@ def test_fakebase_local_happy_path(fake_checkpoint):
     assert model.embed_tokens.weight.shape == torch.Size([_VOCAB_SIZE, _HIDDEN_SIZE])
 
 
-@pytest.mark.parametrize("rope_attr", ["rope_parameters", "rope_scaling"])
-def test_fakebase_preserves_transformers5_rope_theta(fake_checkpoint, fake_config, rope_attr):
-    """A nested-only target RoPE base reaches the FakeBase config exactly."""
-    setattr(fake_config, rope_attr, {"rope_type": "default", "rope_theta": 1000000.0})
-    fake_config.rope_theta = None
+def test_fakebase_prefers_transformers5_rope_parameters(fake_checkpoint, fake_config):
+    """Canonical Transformers 5 RoPE metadata wins over a flat compatibility default."""
+    fake_config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
+    fake_config.rope_theta = 10000.0
+    fake_config.rope_scaling = {"rope_type": "default", "rope_theta": 500000.0}
     fake_config.num_attention_heads = 4
     fake_config.num_key_value_heads = 2
     fake_config.intermediate_size = 32
@@ -83,11 +87,82 @@ def test_fakebase_preserves_transformers5_rope_theta(fake_checkpoint, fake_confi
 def test_fakebase_prefers_legacy_rope_theta(fake_checkpoint, fake_config):
     """A legacy top-level RoPE base remains authoritative over nested metadata."""
     fake_config.rope_theta = 500000.0
-    fake_config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
+    fake_config.rope_scaling = {"rope_type": "default", "rope_theta": 1000000.0}
 
     fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
 
     assert fake_base.config.rope_theta == 500000.0
+
+
+def test_fakebase_reads_legacy_rope_scaling(fake_checkpoint, fake_config):
+    """Legacy rope_scaling remains a fallback when canonical metadata is absent."""
+    fake_config.rope_theta = None
+    fake_config.rope_parameters = None
+    fake_config.rope_scaling = {"rope_type": "default", "rope_theta": 1000000.0}
+
+    fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
+
+    assert fake_base.config.rope_theta == 1000000.0
+
+
+def test_fakebase_reads_qwen3_vlm_text_config_rope_parameters(
+    fake_checkpoint, fake_config, monkeypatch
+):
+    """VLM FakeBase construction reads canonical RoPE from its Qwen3-MoE text config."""
+    fake_config.model_type = "qwen3_moe"
+    fake_config.rope_theta = 10000.0
+    fake_config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
+    vlm_config = transformers.PretrainedConfig()
+    vlm_config.model_type = "qwen3_vl"
+    vlm_config.text_config = fake_config
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda *a, **kw: vlm_config)
+
+    fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
+
+    assert fake_base.config.rope_theta == 1000000.0
+
+
+@pytest.mark.parametrize("projector_type", ["dflash", "dspark"])
+def test_fakebase_nested_rope_theta_reaches_draft_rotary_and_export(
+    fake_checkpoint, fake_config, projector_type, tmp_path
+):
+    """Nested target RoPE survives FakeBase, DFlash/DSpark conversion, and export."""
+    fake_config.model_type = "qwen3_moe"
+    fake_config.rope_theta = 10000.0
+    fake_config.rope_parameters = {"rope_type": "default", "rope_theta": 1000000.0}
+    fake_config.num_attention_heads = 4
+    fake_config.num_key_value_heads = 2
+    fake_config.intermediate_size = 32
+    fake_base = FakeBaseModel.from_source(str(fake_checkpoint))
+
+    config = get_dflash_config(offline=True)
+    if projector_type == "dspark":
+        config = deepcopy(DFLASH_DEFAULT_CFG["config"])
+        config.update(
+            {
+                "dflash_block_size": 4,
+                "dflash_use_torch_compile": False,
+                "dflash_mask_token_id": 0,
+                "dflash_offline": True,
+                "dflash_architecture_config": {
+                    "num_hidden_layers": 2,
+                    "projector_type": "dspark",
+                    "markov_rank": 4,
+                },
+            }
+        )
+    mtsp.convert(fake_base, [("dflash", config)])
+
+    assert fake_base.config.rope_theta == 1000000.0
+    assert fake_base.dflash_config.rope_parameters["rope_theta"] == 1000000.0
+    fake_base.dflash_module._maybe_init_rotary_emb(device="cpu")
+    assert fake_base.dflash_module.rotary_emb.config.rope_parameters["rope_theta"] == 1000000.0
+
+    export_dir = tmp_path / projector_type
+    fake_base.get_exporter().export(export_dir)
+    with open(export_dir / "config.json") as f:
+        exported_config = json.load(f)
+    assert exported_config["rope_theta"] == 1000000.0
 
 
 def test_fakebase_missing_index_raises(tmp_path, fake_config):
