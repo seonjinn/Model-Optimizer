@@ -89,3 +89,4 @@ def test_make_dataset_uses_python3_for_vllm_images() -> None:
     script = (_LAUNCHER_DIR / "common" / "eagle3" / "make_dataset.sh").read_text()
 
     assert "${PYTHON_BIN:-python3}" in script
+    assert '-m pip install --no-cache-dir "datasets"' in script

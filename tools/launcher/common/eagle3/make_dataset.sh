@@ -23,9 +23,12 @@ source ${SCRIPT_DIR}/../service_utils.sh
 
 trap 'error_handler $0 $LINENO' ERR # ERROR HANDLER
 
-"${PYTHON_BIN:-python3}" modules/Model-Optimizer/examples/dataset/make_dataset.py \
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+"$PYTHON_BIN" -c "import datasets" 2>/dev/null || \
+    "$PYTHON_BIN" -m pip install --no-cache-dir "datasets"
+
+"$PYTHON_BIN" modules/Model-Optimizer/examples/dataset/make_dataset.py \
     "$@"
 
 mkdir -p /scratchspace/data
 mv input_conversations/train.jsonl /scratchspace/data/train.jsonl
-
