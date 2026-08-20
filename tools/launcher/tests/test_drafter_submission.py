@@ -363,6 +363,8 @@ def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir()
     assert 'ln -s .. "$node_root/source/modules/Model-Optimizer"' not in runner
     assert 'cd "$node_root/source/tools/launcher"' in runner
     assert 'cd "$node_root/source"' not in runner
+    assert "exec bash common/eagle3/train_eagle_streaming.sh" in runner
+    assert "exec bash tools/launcher/common/eagle3/train_eagle_streaming.sh" not in runner
 
 
 def test_host_staging_preserves_one_bounded_diagnostic_log_per_node() -> None:

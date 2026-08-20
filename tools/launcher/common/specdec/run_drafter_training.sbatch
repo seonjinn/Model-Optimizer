@@ -183,7 +183,7 @@ PY
         loss_args+=("dflash.dflash_dpace_alpha=${DFLASH_DPACE_ALPHA}")
     fi
     cd "$node_root/source/tools/launcher"
-    exec bash tools/launcher/common/eagle3/train_eagle_streaming.sh \
+    exec bash common/eagle3/train_eagle_streaming.sh \
         --config "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml" \
         model.model_name_or_path="$HF_MODEL_CKPT" \
         model.use_fake_base_for_offline=true \
