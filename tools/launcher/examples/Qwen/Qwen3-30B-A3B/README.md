@@ -116,17 +116,59 @@ For DSpark-B8 use block size 8, gamma 4, and `num_spec_tokens=8`. To run 235B,
 select the matching 235B YAML and 235B base or Thinking target path. The direct
 Nemotron experiment changes only `DATA_PATH` and `RUN_NAME`.
 
+## Reusable OCI-HSG waves
+
+For production runs, create the canonical JSON manifest under `/home` with the
+typed `drafter_job_manifest.py` API, then render each four-node wave from that
+manifest. The manifest pins the clean `/home` source SHA, image/runtime archive,
+model, dataset, stable training output root, and cumulative boundaries.
+
+```bash
+export MANIFEST=/home/$USER/drafter-manifests/qwen3-30b-base-dflash-b8.json
+export RECEIPT=/lustre/$USER/specdec/receipts/qwen3-30b-base-dflash-b8.jsonl
+bash common/specdec/submit_drafter_training_wave.sh \
+  --manifest "$MANIFEST" --receipt "$RECEIPT" --dry-run
+```
+
+Remove `--dry-run` only after the command's built-in `sbatch --test-only`
+passes. Every production training allocation is exactly `-N4 --segment=4`:
+nodes 0--1 are the two four-GPU vLLM serve replicas and nodes 2--3 are the two
+four-GPU trainer nodes. The global batch size is 512, so each trainer GPU uses
+`512 / (2 * 4) = 64` samples. `segment=4` keeps this allocation within one
+OCI-HSG NVL72 segment; staging and public evaluation use `--segment=1`.
+
+Use the matching target and manifest identity for each public case:
+
+| Case | Target path | Method mapping |
+| --- | --- | --- |
+| Q30 Base | `/lustre/models/Qwen/Qwen3-30B-A3B` | DFlash B8/K7, B16/K15; DSpark B8/K8, B16/K16 |
+| Q30 Thinking | `/lustre/models/Qwen/Qwen3-30B-A3B-Thinking-2507` | DFlash B8/K7, B16/K15; DSpark B8/K8, B16/K16 |
+| Q235 Base | `/lustre/models/Qwen/Qwen3-235B-A22B` | DFlash B8/K7, B16/K15; DSpark B8/K8, DSpark B16/K16 |
+| Q235 Thinking | `/lustre/models/Qwen/Qwen3-235B-A22B-Thinking-2507` | DFlash B8/K7, B16/K15; DSpark B8/K8, DSpark B16/K16 |
+
+The resume-chain entrypoint retains the same Lustre training `output_root`; it
+submits `train -> 9-subset acceptance evaluation -> next train` with `afterok`
+links. Each chunk requests `--time=03:55:00`, exports only its corresponding
+`exported-checkpoint-<cumulative-step>`, and requires an `acceptance.csv`
+before the next chunk becomes eligible. Store chain receipts beneath
+`/lustre/$USER/specdec/receipts/`; they are the authoritative scheduler job-ID
+record, including scheduler lookup when `sbatch` returns blank output.
+
 ## Cache and inode policy
 
-- Keep `HF_HOME`, `UV_CACHE_DIR`, and `PIP_CACHE_DIR` in stable shared cache
-  directories that do not contain a Slurm job ID. Reuse them across launches.
-- Reuse the immutable `.sqsh` and `MODELOPT_RUNTIME_PATH`; do not create a new
-  environment or install packages for every job or node.
-- Keep writable W&B and Triton state node-local. The launchers set
-  `WANDB_DIR=/tmp/wandb`; configure `WANDB_CACHE_DIR` and `TRITON_CACHE_DIR`
-  under node-local `/tmp` as well. Do not place per-job W&B, Triton, Ray, or
-  temporary-environment trees in a shared Lustre `.cache` directory.
-- Never delete the shared content caches from a training job.
+- Keep source and JSON configuration under `/home`. Keep only immutable images,
+  staged datasets/models, checkpoints, acceptance CSVs, and durable receipts on
+  Lustre.
+- Every mutable runtime extraction, Hugging Face cache, W&B/Triton/TorchInductor
+  cache, SQLite database and locks, and temporary file belongs under
+  `/raid/scratch/$SLURM_JOB_ID` on each node. A shared Lustre virtualenv or
+  cache is forbidden.
+- Inputs are copied once per node to `/raid/scratch` before ranks start. Do not
+  recursively scan a Lustre tree, clone source, or build/install packages in a
+  job.
+- The staging and submission scripts query only the relevant scheduler job
+  names/IDs and are intended to be monitored no more often than once every 60
+  seconds.
 
 ## Benchmark output
 
