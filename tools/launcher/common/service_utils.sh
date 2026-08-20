@@ -82,8 +82,3 @@ function util_install_extra_dep {
 
 LOCAL_NUM_GPUS=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | head -n 1)
 printf "RANK ${mpi_rank} GPU count: ${LOCAL_NUM_GPUS}\n"
-
-# Increase the modelopt version number manually
-if [[ "$mpi_local_rank" -eq 0 ]]; then
-    echo "__version__ = '1.0.0'" >> ./modules/Model-Optimizer/modelopt/__init__.py
-fi
