@@ -3,7 +3,9 @@
 
 """Structural contracts for Qwen3 DFlash and DSpark streaming launchers."""
 
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 import yaml
@@ -114,3 +116,75 @@ def test_streaming_training_can_reuse_shared_runtime() -> None:
 
     assert 'source "$MODELOPT_RUNTIME/bin/activate"' in script
     assert 'if [ -n "${MODELOPT_RUNTIME:-}" ]; then' in script
+
+
+def _write_executable(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    path.chmod(0o755)
+
+
+def test_streaming_serve_uses_activated_runtime_python(tmp_path: Path) -> None:
+    """The vLLM console script must not bypass the activated shared runtime."""
+    runtime = tmp_path / "runtime"
+    invocation_log = tmp_path / "invocations.log"
+    activate = runtime / "bin" / "activate"
+    activate.parent.mkdir(parents=True)
+    activate.write_text(f'export PATH="{runtime / "bin"}:$PATH"\n')
+    fake_python = f"""#!/bin/sh
+printf 'runtime-python %s\\n' "$*" >> "{invocation_log}"
+exit 0
+"""
+    _write_executable(runtime / "bin" / "python", fake_python)
+    _write_executable(runtime / "bin" / "python3", fake_python)
+    _write_executable(
+        runtime / "bin" / "vllm",
+        f"""#!/bin/sh
+printf 'console-script %s\\n' "$*" >> "{invocation_log}"
+exit 0
+""",
+    )
+    _write_executable(
+        runtime / "bin" / "curl",
+        """#!/bin/sh
+exit 0
+""",
+    )
+    _write_executable(
+        runtime / "bin" / "nvidia-smi",
+        """#!/bin/sh
+printf '2\\n'
+""",
+    )
+
+    trainer = tmp_path / "modules/Model-Optimizer/examples/speculative_decoding/launch_train.sh"
+    _write_executable(trainer, "#!/bin/sh\nexit 0\n")
+
+    env = {
+        **os.environ,
+        "MODELOPT_RUNTIME": str(runtime),
+        "HF_MODEL_CKPT": "target-model",
+        "EAGLE_CAPTURE_IDS": "[2,10,18,26,34,36]",
+        "SLURM_NNODES": "1",
+        "SLURM_NODEID": "0",
+        "SERVE_GPU": "0",
+        "SERVE_TP": "1",
+        "TRAIN_GPUS": "1",
+        "SERVE_READY_TIMEOUT": "5",
+    }
+    result = subprocess.run(
+        [
+            "bash",
+            str(_LAUNCHER_DIR / "common" / "eagle3" / "train_eagle_streaming.sh"),
+            "training.output_dir=/scratchspace/dflash",
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "runtime-python -m vllm.entrypoints.cli.main serve target-model" in invocation_log.read_text()
