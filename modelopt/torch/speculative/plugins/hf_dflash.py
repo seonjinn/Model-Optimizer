@@ -390,6 +390,26 @@ class HFDFlashModel(DFlashModel):
 
         base_config = self._base_llm_config
         dflash_architecture_config = dict(config.dflash_architecture_config)
+
+        # Inherit before Qwen3Config fills non-None defaults. Existing keys remain
+        # authoritative explicit draft overrides.
+        for attr in (
+            "max_position_embeddings",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "rms_norm_eps",
+        ):
+            if attr not in dflash_architecture_config and hasattr(base_config, attr):
+                base_value = getattr(base_config, attr)
+                if base_value is not None:
+                    dflash_architecture_config[attr] = base_value
+
+        # These dimensions must always match the target model.
+        dflash_architecture_config["hidden_size"] = base_config.hidden_size
+        dflash_architecture_config["vocab_size"] = base_config.vocab_size
+
         target_rope_theta = _get_rope_theta(base_config)
         if target_rope_theta is not None:
             rope_parameters = dict(dflash_architecture_config.pop("rope_scaling", None) or {})
@@ -400,25 +420,6 @@ class HFDFlashModel(DFlashModel):
         # Use Qwen3Config (not generic PretrainedConfig) so rope_parameters is
         # populated with the target theta before its rotary module is built.
         self.dflash_config = _Qwen3Config(**dflash_architecture_config)
-
-        # hidden_size and vocab_size MUST match the base model.
-        self.dflash_config.hidden_size = base_config.hidden_size
-        self.dflash_config.vocab_size = base_config.vocab_size
-
-        # Inherit architecture settings from base model when not specified by user
-        # (setdefault). Static defaults (hidden_act, attention_bias, etc.) are in
-        # dflash/default_config.py.
-        _setdefault_attrs = [
-            "max_position_embeddings",
-            "intermediate_size",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "rms_norm_eps",
-        ]
-        for attr in _setdefault_attrs:
-            if not hasattr(self.dflash_config, attr) or getattr(self.dflash_config, attr) is None:
-                if hasattr(base_config, attr):
-                    setattr(self.dflash_config, attr, getattr(base_config, attr))
 
         # RoPE base settings are ENFORCED to match the base model (not setdefault): the
         # DFlash draft injects the target's KV into every layer, so its RoPE base must

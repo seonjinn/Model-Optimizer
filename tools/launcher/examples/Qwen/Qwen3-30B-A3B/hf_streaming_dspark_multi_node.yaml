@@ -54,7 +54,7 @@ pipeline:
       - dflash.dflash_loss_decay_factor=<<global_vars.dflash_loss_decay_factor>>
       - dflash.dflash_mask_token_id=151669
       - dflash.dflash_architecture_config.num_hidden_layers=5
-      - dflash.dflash_architecture_config.num_attention_heads=16
+      - dflash.dflash_architecture_config.num_attention_heads=32
       - dflash.dflash_architecture_config.num_key_value_heads=4
       - dflash.dflash_architecture_config.head_dim=128
       - dflash.dflash_architecture_config.intermediate_size=6144

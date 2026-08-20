@@ -46,6 +46,8 @@ pipeline:
       - dflash.dflash_num_anchors=512
       - dflash.dflash_loss_decay_factor=<<global_vars.dflash_loss_decay_factor>>
       - dflash.dflash_mask_token_id=151669
+      # Only the draft depth is overridden. Attention/MLP dimensions inherit the
+      # target config (Q64/KV4, head_dim=128, intermediate_size=12288).
       - dflash.dflash_architecture_config.num_hidden_layers=5
     environment:
       - HF_MODEL_CKPT: <<global_vars.hf_model>>

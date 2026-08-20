@@ -54,6 +54,63 @@ SEQ_LEN = 16  # must be multiple of BLOCK_SIZE
 class TestDFlashConvert:
     """Test DFlash model conversion."""
 
+    @pytest.mark.parametrize(
+        ("num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size"),
+        [
+            pytest.param(32, 4, 128, 6144, id="qwen3-30b-a3b"),
+            pytest.param(64, 4, 128, 12288, id="qwen3-235b-a22b"),
+        ],
+    )
+    def test_convert_inherits_target_architecture_before_qwen3_defaults(
+        self,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        intermediate_size,
+    ):
+        """Missing draft dimensions inherit the target instead of Qwen3 defaults."""
+        model = get_tiny_llama(num_hidden_layers=4, hidden_size=64)
+        model.config.num_attention_heads = num_attention_heads
+        model.config.num_key_value_heads = num_key_value_heads
+        model.config.head_dim = head_dim
+        model.config.intermediate_size = intermediate_size
+        model.config.max_position_embeddings = 40960
+
+        mtsp.convert(model, [("dflash", get_dflash_config())])
+
+        assert model.dflash_config.num_attention_heads == num_attention_heads
+        assert model.dflash_config.num_key_value_heads == num_key_value_heads
+        assert model.dflash_config.head_dim == head_dim
+        assert model.dflash_config.intermediate_size == intermediate_size
+        assert model.dflash_config.max_position_embeddings == 40960
+
+    def test_convert_preserves_explicit_draft_architecture_overrides(self):
+        """Explicit draft dimensions take precedence over inherited target dimensions."""
+        model = get_tiny_llama(num_hidden_layers=4, hidden_size=64)
+        model.config.num_attention_heads = 32
+        model.config.num_key_value_heads = 4
+        model.config.head_dim = 128
+        model.config.intermediate_size = 6144
+        model.config.max_position_embeddings = 40960
+        config = get_dflash_config()
+        config["dflash_architecture_config"].update(
+            {
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "intermediate_size": 256,
+                "max_position_embeddings": 8192,
+            }
+        )
+
+        mtsp.convert(model, [("dflash", config)])
+
+        assert model.dflash_config.num_attention_heads == 8
+        assert model.dflash_config.num_key_value_heads == 2
+        assert model.dflash_config.head_dim == 16
+        assert model.dflash_config.intermediate_size == 256
+        assert model.dflash_config.max_position_embeddings == 8192
+
     def test_convert_uses_canonical_target_rope_parameters_for_rotary(self):
         """Canonical target RoPE updates the active Qwen3 draft and rotary config."""
         model = get_tiny_llama(num_hidden_layers=4)
