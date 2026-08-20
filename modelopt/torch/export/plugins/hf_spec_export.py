@@ -510,18 +510,43 @@ class DominoExporter(DFlashExporter):
 class DSparkExporter(DFlashExporter):
     """Draft model exporter for DSpark (DFlash backbone + sequential Markov head).
 
-    Same z-lab-compatible format as DFlash, plus the DSpark head weights
-    (``markov_w1.*`` / ``markov_w2.*`` / ``gate_proj.*`` / ``joint_proj.*`` /
-    ``confidence_proj.*``, already captured by the inherited ``dflash_module.``
-    stripping) and the extra config fields the loader needs to rebuild the head
-    (``projector_type``, ``markov_rank``, ``markov_head_type``,
-    ``use_confidence_head``, ``shift_label``).
+    The Qwen3 DSpark loader supports only the vanilla Markov head, whose head
+    tensors use Qwen3-specific names. The nested DFlash config is retained for
+    backward compatibility with existing consumers.
     """
+
+    def _extract_state_dict(self, full_state_dict: dict):
+        """Extract DSpark weights using the Qwen3 DSpark head names."""
+        markov_head_type = getattr(self.model.dflash_config, "markov_head_type", "vanilla")
+        if markov_head_type != "vanilla":
+            raise ValueError(
+                "vLLM's Qwen3 DSpark exporter only supports the vanilla Markov head; "
+                f"got {markov_head_type!r}."
+            )
+
+        export_sd = super()._extract_state_dict(full_state_dict)
+        for source_key, target_key in {
+            "markov_w1.weight": "markov_head.markov_w1.weight",
+            "markov_w2.weight": "markov_head.markov_w2.weight",
+            "confidence_proj.weight": "confidence_head.proj.weight",
+            "confidence_proj.bias": "confidence_head.proj.bias",
+        }.items():
+            if source_key in export_sd:
+                export_sd[target_key] = export_sd.pop(source_key)
+        return export_sd
 
     def _export_config(self):
         """Extend the DFlash config with the DSpark head fields."""
         config = super()._export_config()
         draft_config = self.model.dflash_config
+
+        config.update(
+            {
+                "architectures": ["Qwen3DSparkModel"],
+                "markov_rank": draft_config.markov_rank,
+                "markov_head_type": getattr(draft_config, "markov_head_type", "vanilla"),
+            }
+        )
 
         config["dflash_config"].update(
             {

@@ -18,9 +18,7 @@
 DSpark reuses the DFlash mode/pipeline and adds a lightweight sequential (Markov)
 head plus an optional confidence head. These tests cover conversion routing for
 the three head variants, the three-term training forward (CE + TVD + confidence
-BCE), and the export format (head weights + config) against the z-lab-compatible
-layout (``markov_w1.*`` / ``markov_w2.*`` / ``gate_proj.*`` / ``joint_proj.*`` /
-``confidence_proj.*``).
+BCE), and the Qwen3 DSpark export contract used by vLLM.
 """
 
 import json
@@ -260,7 +258,7 @@ class TestDSparkSwa:
 
 
 class TestDSparkExporter:
-    """Test the DSpark checkpoint export format (z-lab-compatible layout)."""
+    """Test the DSpark checkpoint export format used by vLLM's Qwen3 loader."""
 
     def _export(self, tmp_path, head_type="vanilla", use_confidence_head=False):
         model = get_tiny_llama(num_hidden_layers=4)
@@ -279,35 +277,39 @@ class TestDSparkExporter:
         model.get_exporter().export(export_dir)
         return export_dir
 
-    @pytest.mark.parametrize("head_type", HEAD_TYPES)
-    def test_export_weight_keys_match_reference(self, tmp_path, head_type):
-        """Exported weights carry the head tensors under reference names, no prefix."""
-        sd = load_file(str(self._export(tmp_path, head_type=head_type) / "model.safetensors"))
+    def test_export_matches_qwen3_dspark_contract(self, tmp_path):
+        """Vanilla DSpark exports the Qwen3 config and canonical head weight names."""
+        export_dir = self._export(tmp_path, use_confidence_head=True)
+        sd = load_file(str(export_dir / "model.safetensors"))
         for key in sd:
             assert "dflash_module." not in key
             assert "rotary_emb" not in key
-        assert "markov_w1.weight" in sd
-        assert "markov_w2.weight" in sd
-        assert ("gate_proj.weight" in sd) == (head_type == "gated")
-        assert ("joint_proj.weight" in sd) == (head_type == "rnn")
+        assert "markov_head.markov_w1.weight" in sd
+        assert "markov_head.markov_w2.weight" in sd
+        assert "confidence_head.proj.weight" in sd
+        assert "confidence_head.proj.bias" in sd
+        assert "markov_w1.weight" not in sd
+        assert "markov_w2.weight" not in sd
+        assert "confidence_proj.weight" not in sd
+        assert "confidence_proj.bias" not in sd
 
-    def test_export_includes_confidence_weights(self, tmp_path):
-        """The confidence head weights are exported when enabled."""
-        sd = load_file(str(self._export(tmp_path, use_confidence_head=True) / "model.safetensors"))
-        assert "confidence_proj.weight" in sd
-
-    def test_export_config_has_dspark_fields(self, tmp_path):
-        """config.json carries the dflash_config DSpark head fields."""
-        export_dir = self._export(tmp_path, head_type="gated")
         with open(export_dir / "config.json") as f:
             cfg = json.load(f)
 
-        assert cfg["architectures"] == ["DFlashDraftModel"]
+        assert cfg["architectures"] == ["Qwen3DSparkModel"]
+        assert cfg["markov_rank"] == MARKOV_RANK
+        assert cfg["markov_head_type"] == "vanilla"
         dc = cfg["dflash_config"]
         assert dc["projector_type"] == "dspark"
         assert dc["markov_rank"] == MARKOV_RANK
-        assert dc["markov_head_type"] == "gated"
-        assert dc["use_confidence_head"] is False
+        assert dc["markov_head_type"] == "vanilla"
+        assert dc["use_confidence_head"] is True
         assert dc["shift_label"] is True
         assert "mask_token_id" in dc
         assert "target_layer_ids" in dc
+
+    @pytest.mark.parametrize("head_type", ["gated", "rnn"])
+    def test_export_rejects_unsupported_markov_head_types(self, tmp_path, head_type):
+        """vLLM's Qwen3 DSpark loader cannot load gated or RNN heads."""
+        with pytest.raises(ValueError, match="only supports the vanilla Markov head"):
+            self._export(tmp_path, head_type=head_type)
