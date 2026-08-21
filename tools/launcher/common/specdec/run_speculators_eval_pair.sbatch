@@ -83,8 +83,11 @@ run_cell() {
 
     local cell_root="${JOB_ROOT}/${label}"
     local output_root="${RESULT_ROOT}/${label}"
+    local resolved_config="${cell_root}/resolved.yaml"
     mkdir -p "${cell_root}/hf-datasets" "${cell_root}/triton" \
         "${cell_root}/torchinductor" "${cell_root}/xdg" "${output_root}"
+    printf 'pipeline:\n  task_0:\n    slurm_config:\n      container: %s\n' \
+        "${CONTAINER_IMAGE}" >"${resolved_config}"
 
     local mounts
     mounts="${MODELOPT_REPO}:${MODELOPT_REPO},${SPECULATORS_REPO}:${SPECULATORS_REPO}"
@@ -131,7 +134,7 @@ run_cell() {
         XDG_CACHE_HOME="${cell_root}/xdg" \
         EVAL_OUTPUT_ROOT="${output_root}" \
         EVAL_RUN_ID="${label}" \
-        EVAL_CONFIG_PATH="${EVAL_CONFIG_PATH}" \
+        EVAL_CONFIG_PATH="${resolved_config}" \
         DATASET_MANIFEST_PATH="${DATASET_MANIFEST_PATH}" \
         CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
         CONTAINER_IDENTITY_PATH="${CONTAINER_IDENTITY_PATH}" \
