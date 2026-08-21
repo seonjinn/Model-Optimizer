@@ -889,9 +889,9 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
         "SERVE_MAX_NUM_SEQS=16",
         'training.save_steps="${SAVE_STEPS}"',
         "training.save_total_limit=2",
-        'cp -a "$SOURCE_PATH"',
-        'cp -aL "$TARGET_PATH"',
-        'cp -aL "$DATASET_PATH"',
+        'cp -rP --no-preserve=all -- "$SOURCE_PATH"',
+        'cp -rL --no-preserve=all -- "$TARGET_PATH"',
+        'cp -rL --no-preserve=all -- "$DATASET_PATH"',
         "import accelerate, datasets, modelopt, wandb",
         "is_relative_to",
         "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml",
@@ -920,7 +920,7 @@ def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir()
     modelopt_link = _LAUNCHER_DIR / "modules/Model-Optimizer"
 
     for required in (
-        'cp -a "$SOURCE_PATH"',
+        'cp -rP --no-preserve=all -- "$SOURCE_PATH"',
         'CONTROL_ROOT="${OUTPUT_ROOT}/control"',
         'mkdir -p "$OUTPUT_ROOT" "$CONTROL_ROOT"',
         "${CONTROL_ROOT}:/scratchspace",
@@ -928,7 +928,7 @@ def test_training_runner_stages_pattern_packager_layout_and_shared_control_dir()
         assert required in runner
     assert modelopt_link.is_symlink()
     assert modelopt_link.readlink() == Path("../../..")
-    assert 'cp -aL "$SOURCE_PATH"' not in runner
+    assert 'cp -rL --no-preserve=all -- "$SOURCE_PATH"' not in runner
     assert 'ln -s .. "$node_root/source/modules/Model-Optimizer"' not in runner
     assert 'cd "$node_root/source/tools/launcher"' in runner
     assert 'cd "$node_root/source"' not in runner
@@ -944,6 +944,21 @@ def test_host_staging_preserves_one_bounded_diagnostic_log_per_node() -> None:
     assert 'mkdir -p "$STAGE_LOG_ROOT"' in runner
     assert 'exec >"${STAGE_LOG_ROOT}/node-${SLURM_NODEID}.log" 2>&1' in runner
     assert "set -x" in runner
+
+
+def test_host_staging_avoids_unsupported_metadata_preservation() -> None:
+    """Node-local staging must not require archive metadata support."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        'cp -rP --no-preserve=all -- "$SOURCE_PATH" "$node_root/source"',
+        'cp -rL --no-preserve=all -- "$TARGET_PATH" "$node_root/input/target"',
+        'cp -rL --no-preserve=all -- "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"',
+    ):
+        assert required in runner
+    assert 'cp -a "$SOURCE_PATH"' not in runner
+    assert 'cp -aL "$TARGET_PATH"' not in runner
+    assert 'cp -aL "$DATASET_PATH"' not in runner
 
 
 def test_requeued_host_staging_reuses_only_a_completed_node_local_copy() -> None:
@@ -966,7 +981,7 @@ def test_missing_optional_target_sidecar_does_not_fail_host_staging() -> None:
     """Every role gets the complete target checkpoint without optional-sidecar branching."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
-    target_copy = 'cp -aL "$TARGET_PATH" "$node_root/input/target"'
+    target_copy = 'cp -rL --no-preserve=all -- "$TARGET_PATH" "$node_root/input/target"'
     assert runner.count(target_copy) == 1
     assert '[[ -e "$TARGET_PATH/$sidecar" ]] && cp' not in runner
     assert "for sidecar in config.json" not in runner
@@ -1266,10 +1281,10 @@ def test_node_local_input_staging_dereferences_hf_blob_symlinks() -> None:
         in runner
     )
     for source in ("TARGET_PATH", "DATASET_PATH"):
-        assert f'cp -aL "${source}"' in runner
-        assert f'cp -a "${source}"' not in runner
-    assert 'cp -a "$SOURCE_PATH"' in runner
-    assert 'cp -aL "$SOURCE_PATH"' not in runner
+        assert f'cp -rL --no-preserve=all -- "${source}"' in runner
+        assert f'cp -rP --no-preserve=all -- "${source}"' not in runner
+    assert 'cp -rP --no-preserve=all -- "$SOURCE_PATH"' in runner
+    assert 'cp -rL --no-preserve=all -- "$SOURCE_PATH"' not in runner
 
 
 def test_resume_chain_gates_each_cumulative_wave_on_public_acceptance() -> None:

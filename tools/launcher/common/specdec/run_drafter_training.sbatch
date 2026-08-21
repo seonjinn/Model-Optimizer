@@ -242,7 +242,7 @@ staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntas
         rm -rf -- "$node_root"
     fi
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
-    cp -a "$SOURCE_PATH" "$node_root/source"
+    cp -rP --no-preserve=all -- "$SOURCE_PATH" "$node_root/source"
     tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
     old_venv=$(sed -nE "s/^[[:space:]]*export[[:space:]]+VIRTUAL_ENV=(.*)$/\\1/p" "$node_root/runtime/bin/activate" | head -n 1)
     old_venv="${old_venv#\"}"
@@ -250,9 +250,9 @@ staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntas
     [[ -n "$old_venv" ]] || { echo "runtime archive has no VIRTUAL_ENV" >&2; exit 2; }
     grep -IlZ "$old_venv" "$node_root/runtime/bin"/* "$node_root/runtime/pyvenv.cfg" 2>/dev/null \
         | xargs -0 -r sed -i "s|$old_venv|$node_root/runtime|g"
-    cp -aL "$TARGET_PATH" "$node_root/input/target"
+    cp -rL --no-preserve=all -- "$TARGET_PATH" "$node_root/input/target"
     if (( SLURM_NODEID >= SERVE_NODES )); then
-        cp -aL "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"
+        cp -rL --no-preserve=all -- "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"
     fi
     stage_marker_tmp="${stage_marker}.tmp.$$"
     printf "%s\n" "$stage_fingerprint" >"$stage_marker_tmp"
