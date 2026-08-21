@@ -32,6 +32,9 @@ pipeline:
     spec_method: dspark
     dflash_block_size: "8"
     num_spec_tokens: "8"
+    max_concurrency: "32"
+    max_requests: "200"
+    eval_mode: sweep
 
   task_0:
     script: common/specdec/run_speculators_eval.sh
@@ -50,6 +53,9 @@ pipeline:
       - SPEC_METHOD: <<global_vars.spec_method>>
       - DFLASH_BLOCK_SIZE: <<global_vars.dflash_block_size>>
       - NUM_SPEC_TOKENS: <<global_vars.num_spec_tokens>>
+      - MAX_CONCURRENCY: <<global_vars.max_concurrency>>
+      - MAX_REQUESTS: <<global_vars.max_requests>>
+      - EVAL_MODE: <<global_vars.eval_mode>>
       - TP_SIZE: "2"
       - SERVE_READY_TIMEOUT: "1800"
     slurm_config:

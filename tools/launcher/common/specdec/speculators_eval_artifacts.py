@@ -43,6 +43,17 @@ STANDARD_SUBSETS = (
 )
 ACCEPTANCE_TOLERANCE = 1e-6
 DATASET_ID = "RedHatAI/speculator_benchmarks"
+PERF_COLUMNS = (
+    "subset",
+    "strategy",
+    "target_rate",
+    "rps_median",
+    "latency_median_s",
+    "itl_median_ms",
+    "ttft_median_ms",
+    "output_tps_median",
+    "total_output_tokens",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -138,6 +149,24 @@ def validate_acceptance(csv_path: Path, num_speculative_tokens: int) -> None:
             acceptance_length, position_length, abs_tol=ACCEPTANCE_TOLERANCE, rel_tol=0
         ):
             raise ValueError(f"{subset}: acceptance_length disagrees with position rates")
+
+
+def validate_performance(csv_path: Path) -> None:
+    """Require finite task-wise performance rows for all standard subsets."""
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        raise ValueError(f"missing or empty performance CSV: {csv_path}")
+    with csv_path.open(newline="") as file:
+        reader = csv.DictReader(file)
+        if not set(PERF_COLUMNS).issubset(reader.fieldnames or ()):
+            raise ValueError("performance CSV is missing required columns")
+        rows = list(reader)
+    subsets = {row.get("subset", "") for row in rows}
+    if subsets != set(STANDARD_SUBSETS):
+        raise ValueError(f"expected exactly the nine standard subsets, got {sorted(subsets)}")
+    for row in rows:
+        for column in PERF_COLUMNS[2:]:
+            if _finite_float(row, column) < 0:
+                raise ValueError(f"{row['subset']}: negative {column}")
 
 
 def _load_json(path: Path) -> dict[str, object]:
@@ -270,9 +299,10 @@ def write_manifest(args: argparse.Namespace) -> None:
     """Atomically write immutable inputs and the run's final status."""
     config_paths = {
         "target": Path(args.target_model) / "config.json",
-        "draft": Path(args.draft_model) / "config.json",
         "launcher": Path(args.launcher_config),
     }
+    if args.draft_model:
+        config_paths["draft"] = Path(args.draft_model) / "config.json"
     try:
         container = _container_provenance(
             Path(args.container_identity),
@@ -302,7 +332,7 @@ def write_manifest(args: argparse.Namespace) -> None:
         "block_size": args.block_size,
         "num_speculative_tokens": args.num_speculative_tokens,
         "target_model": args.target_model,
-        "draft_model": args.draft_model,
+        "draft_model": args.draft_model or None,
         "speculators_repo": args.speculators_repo,
         "speculators_sha": args.speculators_sha,
         "modelopt_repo": args.modelopt_repo,
@@ -326,6 +356,8 @@ def write_manifest(args: argparse.Namespace) -> None:
             "dataset": DATASET_ID,
             "subsets": list(STANDARD_SUBSETS),
             "temperature": 0,
+            "top_p": 1,
+            "mode": args.evaluation_mode,
             "max_concurrency": args.max_concurrency,
             "max_requests": args.max_requests,
             "tensor_parallel_size": args.tensor_parallel_size,
@@ -353,6 +385,9 @@ def main() -> None:
     validate = subparsers.add_parser("validate")
     validate.add_argument("--csv", required=True)
     validate.add_argument("--num-speculative-tokens", type=int, required=True)
+
+    validate_perf = subparsers.add_parser("validate-perf")
+    validate_perf.add_argument("--csv", required=True)
 
     verify = subparsers.add_parser("verify-inputs")
     verify.add_argument("--dataset-manifest", required=True)
@@ -393,10 +428,13 @@ def main() -> None:
     manifest.add_argument("--max-concurrency", type=int, required=True)
     manifest.add_argument("--max-requests", type=int, required=True)
     manifest.add_argument("--tensor-parallel-size", type=int, required=True)
+    manifest.add_argument("--evaluation-mode", choices=("throughput", "sweep"), required=True)
     args = parser.parse_args()
 
     if args.command == "validate":
         validate_acceptance(Path(args.csv), args.num_speculative_tokens)
+    elif args.command == "validate-perf":
+        validate_performance(Path(args.csv))
     elif args.command == "verify-inputs":
         verify_inputs(args)
     elif args.command == "dataset-paths":

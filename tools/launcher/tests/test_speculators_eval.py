@@ -23,6 +23,7 @@ import os
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 _LAUNCHER_DIR = Path(__file__).resolve().parents[1]
 _WRAPPER = _LAUNCHER_DIR / "common/specdec/run_speculators_eval.sh"
 _RECIPE = _LAUNCHER_DIR / "examples/Qwen/Qwen3-30B-A3B/speculators_eval.yaml"
+_RUNTIME_STAGER = _LAUNCHER_DIR / "common/specdec/stage_speculators_eval_runtime.sh"
 _SPECULATORS_SHA = "0b08a89a83b92007be63f128e01497455b0209df"
 _MODELOPT_SHA = "a" * 40
 _DATASET_REVISION = "b" * 40
@@ -78,6 +80,9 @@ def _make_harness(
     server_exit: int | None = None,
     stale_after_spawn: bool = False,
     evaluator_block: bool = False,
+    max_concurrency: int = 32,
+    max_requests: int = 200,
+    eval_mode: str = "throughput",
 ) -> tuple[dict[str, str], Path, Path]:
     runtime = tmp_path / "runtime"
     runtime_bin = runtime / "bin"
@@ -215,10 +220,10 @@ elif [[ "$1" == "{evaluator}" ]]; then
   [[ "${{HF_DATASETS_OFFLINE:-}}" == "1" ]] || exit 92
   [[ "${{PYTHONPATH%%:*}}" == "{repo / "src"}" ]] || exit 90
   [[ "$2" == "--target" ]] || exit 89
-  [[ "${{@: -1}}" == "throughput" ]] || exit 88
-  [[ "$*" == *'--gen-kwargs {{"temperature":0}}'* ]] || exit 94
-  [[ "$*" == *'--max-concurrency 128'* ]] || exit 87
-  [[ "$*" == *'--max-requests 200'* ]] || exit 86
+  [[ "${{@: -1}}" == "{eval_mode}" ]] || exit 88
+  [[ "$*" == *'--gen-kwargs {{"temperature":0,"top_p":1}}'* ]] || exit 94
+  [[ "$*" == *'--max-concurrency {max_concurrency}'* ]] || exit 87
+  [[ "$*" == *'--max-requests {max_requests}'* ]] || exit 86
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dataset) shift; dataset_path="$1" ;;
@@ -231,16 +236,27 @@ elif [[ "$1" == "{evaluator}" ]]; then
   expected_suffix="/hub/datasets--RedHatAI--speculator_benchmarks/snapshots/{_DATASET_REVISION}/${{subset}}.jsonl"
   [[ "$dataset_path" == *"$expected_suffix" ]] || exit 85
   mkdir -p "$output_dir"
-  awk -F, -v subset="$subset" 'NR == 1 || $1 == subset' "{acceptance_fixture}" > "$output_dir/.acceptance-$subset.csv"
-  if [[ -f "$output_dir/acceptance.csv" ]]; then
-    tail -n +2 "$output_dir/.acceptance-$subset.csv" >> "$output_dir/acceptance.csv"
-    rm "$output_dir/.acceptance-$subset.csv"
-  else
-    mv "$output_dir/.acceptance-$subset.csv" "$output_dir/acceptance.csv"
+  if [[ "{method}" != "baseline" ]]; then
+    awk -F, -v subset="$subset" 'NR == 1 || $1 == subset' "{acceptance_fixture}" > "$output_dir/.acceptance-$subset.csv"
+    if [[ -f "$output_dir/acceptance.csv" ]]; then
+      tail -n +2 "$output_dir/.acceptance-$subset.csv" >> "$output_dir/acceptance.csv"
+      rm "$output_dir/.acceptance-$subset.csv"
+    else
+      mv "$output_dir/.acceptance-$subset.csv" "$output_dir/acceptance.csv"
+    fi
+  fi
+  if [[ "{eval_mode}" == "sweep" ]]; then
+    if [[ ! -f "$output_dir/perf_results.csv" ]]; then
+      printf '%s%s\n' \
+        'subset,strategy,target_rate,rps_median,latency_median_s,itl_median_ms,' \
+        'ttft_median_ms,output_tps_median,total_output_tokens' \
+        > "$output_dir/perf_results.csv"
+    fi
+    printf '%s,constant,1,1.0,0.5,2.0,10.0,100.0,2048\n' "$subset" >> "$output_dir/perf_results.csv"
   fi
   touch "{evaluator_ready}"
   {"while true; do sleep 1; done" if evaluator_block else ":"}
-  exit {evaluator_exit}
+  exit {1 if method == "baseline" and eval_mode == "sweep" else evaluator_exit}
 elif [[ "$1" == "--version" ]]; then
   printf 'Python 3.12.9\\n'
 elif [[ "$1" == "-c" && "$2" == *'importlib.metadata'* ]]; then
@@ -261,6 +277,9 @@ fi
         "SPEC_METHOD": method,
         "DFLASH_BLOCK_SIZE": str(block_size),
         "NUM_SPEC_TOKENS": str(num_spec_tokens),
+        "MAX_CONCURRENCY": str(max_concurrency),
+        "MAX_REQUESTS": str(max_requests),
+        "EVAL_MODE": eval_mode,
         "TP_SIZE": "2",
         "VLLM_PORT": "8123",
         "SERVE_READY_TIMEOUT": "3",
@@ -306,6 +325,65 @@ def _run(env: dict[str, str], tmp_path: Path) -> subprocess.CompletedProcess[str
     )
 
 
+def test_runtime_archive_stages_once_under_job_local_scratch(tmp_path: Path) -> None:
+    """A pinned evaluator runtime must be relocated into job-local scratch without installs."""
+    archived_runtime = tmp_path / "archived-runtime"
+    _write_executable(archived_runtime / "bin/python3", "#!/bin/bash\nexit 0\n")
+    _write_executable(archived_runtime / "bin/guidellm", "#!/bin/bash\nexit 0\n")
+    (archived_runtime / "bin/activate").write_text(
+        f'export VIRTUAL_ENV="{archived_runtime}"\nexport PATH="$VIRTUAL_ENV/bin:$PATH"\n'
+    )
+    archive = tmp_path / "runtime.tar.gz"
+    with tarfile.open(archive, "w:gz") as file:
+        for path in archived_runtime.rglob("*"):
+            file.add(path, arcname=path.relative_to(archived_runtime))
+    scratch_root = tmp_path / "raid/scratch"
+    destination = scratch_root / "12345/speculators-runtime"
+    env = {
+        **os.environ,
+        "SLURM_JOB_ID": "12345",
+        "MARS_SCRATCH_ROOT": str(scratch_root),
+        "SPECULATORS_RUNTIME_ARCHIVE": str(archive),
+        "SPECULATORS_RUNTIME_ARCHIVE_SHA256": _sha256(archive),
+        "SPECULATORS_RUNTIME": str(destination),
+    }
+
+    first = subprocess.run(
+        ["bash", str(_RUNTIME_STAGER)], env=env, capture_output=True, text=True, check=False
+    )
+    second = subprocess.run(
+        ["bash", str(_RUNTIME_STAGER)], env=env, capture_output=True, text=True, check=False
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert str(destination) in (destination / "bin/activate").read_text()
+    assert first.stdout.strip() == str(destination)
+    assert second.stdout.strip() == str(destination)
+
+
+def test_runtime_archive_stager_rejects_unpinned_or_nonlocal_destination(tmp_path: Path) -> None:
+    """The stager must fail before extraction when checksum or MARS placement is invalid."""
+    archive = tmp_path / "runtime.tar.gz"
+    archive.write_bytes(b"fixture")
+    env = {
+        **os.environ,
+        "SLURM_JOB_ID": "12345",
+        "MARS_SCRATCH_ROOT": str(tmp_path / "raid/scratch"),
+        "SPECULATORS_RUNTIME_ARCHIVE": str(archive),
+        "SPECULATORS_RUNTIME_ARCHIVE_SHA256": "0" * 64,
+        "SPECULATORS_RUNTIME": str(tmp_path / "lustre/runtime"),
+    }
+
+    result = subprocess.run(
+        ["bash", str(_RUNTIME_STAGER)], env=env, capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert "must be job-local" in result.stderr
+    assert not Path(env["SPECULATORS_RUNTIME"]).exists()
+
+
 @pytest.mark.parametrize(
     ("method", "block_size", "num_spec_tokens"),
     [("dflash", 8, 7), ("dflash", 16, 15), ("dspark", 8, 8), ("dspark", 16, 16)],
@@ -342,7 +420,8 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
         "vllm": "0.27.1",
     }
     assert manifest["evaluation"]["temperature"] == 0
-    assert manifest["evaluation"]["max_concurrency"] == 128
+    assert manifest["evaluation"]["top_p"] == 1
+    assert manifest["evaluation"]["max_concurrency"] == 32
     assert manifest["evaluation"]["max_requests"] == 200
     assert manifest["evaluation"]["tensor_parallel_size"] == 2
     assert manifest["server_args"][0:3] == [
@@ -368,6 +447,84 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
         dataset_path = manifest["dataset"]["files"][subset]["path"]
         assert f"--dataset {dataset_path}" in invocations
         assert dataset_path in manifest["evaluator_args"]
+
+
+@pytest.mark.parametrize("max_concurrency", [1, 8, 32, 128])
+def test_sweep_uses_configured_concurrency_and_validates_performance(
+    tmp_path: Path, max_concurrency: int
+) -> None:
+    """Each approved concurrency must produce task-wise sweep performance."""
+    env, run_dir, _ = _make_harness(
+        tmp_path,
+        max_concurrency=max_concurrency,
+        max_requests=512 if max_concurrency == 128 else 200,
+        eval_mode="sweep",
+    )
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["evaluation"]["mode"] == "sweep"
+    assert manifest["evaluation"]["max_concurrency"] == max_concurrency
+    assert manifest["evaluation"]["max_requests"] == (512 if max_concurrency == 128 else 200)
+    assert manifest["evaluator_args"][-1] == "sweep"
+    assert (run_dir / "acceptance.csv").is_file()
+    assert (run_dir / "perf_results.csv").is_file()
+
+
+def test_baseline_sweep_omits_speculation_and_requires_only_performance(tmp_path: Path) -> None:
+    """The AR baseline must use the same sweep without draft or acceptance requirements."""
+    env, run_dir, _ = _make_harness(
+        tmp_path,
+        method="baseline",
+        block_size=0,
+        num_spec_tokens=0,
+        max_concurrency=8,
+        eval_mode="sweep",
+        spec_metrics_ready=False,
+    )
+    env.pop("DRAFT_MODEL")
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["method"] == "baseline"
+    assert manifest["draft_model"] is None
+    assert manifest["config_sha256"].keys() == {"launcher", "target"}
+    assert (run_dir / "perf_results.csv").is_file()
+    assert not (run_dir / "acceptance.csv").exists()
+    assert "--speculative-config" not in manifest["server_args"]
+
+
+@pytest.mark.parametrize("max_concurrency", [0, 2, 64])
+def test_unapproved_concurrency_fails_before_server_start(
+    tmp_path: Path, max_concurrency: int
+) -> None:
+    """Only the formal 1/8/32/128 concurrency cells may launch a server."""
+    env, run_dir, server_pid_file = _make_harness(tmp_path, max_concurrency=max_concurrency)
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "invalid MAX_CONCURRENCY" in result.stderr
+    assert not server_pid_file.exists()
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+
+
+def test_concurrency_128_rejects_underfilled_request_budget(tmp_path: Path) -> None:
+    """The saturation cell must not silently benchmark fewer than four waves."""
+    env, run_dir, server_pid_file = _make_harness(
+        tmp_path, max_concurrency=128, max_requests=200, eval_mode="sweep"
+    )
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "MAX_REQUESTS must be at least 512" in result.stderr
+    assert not server_pid_file.exists()
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
 
 
 @pytest.mark.parametrize(

@@ -28,6 +28,12 @@ PYTHON_VERSION="unknown"
 VLLM_VERSION="unknown"
 GUIDELLM_VERSION="unknown"
 TP="${TP_SIZE:-1}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-32}"
+MAX_REQUESTS="${MAX_REQUESTS:-200}"
+EVAL_MODE="${EVAL_MODE:-throughput}"
+DRAFT_MODEL="${DRAFT_MODEL:-}"
+DFLASH_BLOCK_SIZE="${DFLASH_BLOCK_SIZE:-0}"
+NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-0}"
 SERVER_ARGS=()
 EVALUATOR_ARGS=()
 
@@ -39,11 +45,14 @@ require_var() {
     fi
 }
 
-for name in SPECULATORS_RUNTIME SPECULATORS_REPO HF_MODEL_CKPT DRAFT_MODEL SPEC_METHOD \
-    DFLASH_BLOCK_SIZE NUM_SPEC_TOKENS HF_HOME EVAL_OUTPUT_ROOT EVAL_CONFIG_PATH CONTAINER_IMAGE \
+for name in SPECULATORS_RUNTIME SPECULATORS_REPO HF_MODEL_CKPT SPEC_METHOD \
+    HF_HOME EVAL_OUTPUT_ROOT EVAL_CONFIG_PATH CONTAINER_IMAGE \
     CONTAINER_IDENTITY_PATH DATASET_MANIFEST_PATH MODELOPT_REPO; do
     require_var "$name"
 done
+if [[ "${SPEC_METHOD}" != "baseline" ]]; then
+    require_var DRAFT_MODEL
+fi
 
 if [[ ! -f "${SPECULATORS_RUNTIME}/bin/activate" ]]; then
     echo "ERROR: shared runtime is missing: ${SPECULATORS_RUNTIME}" >&2
@@ -99,8 +108,9 @@ write_manifest() {
         --python-version "${PYTHON_VERSION}" \
         --vllm-version "${VLLM_VERSION}" \
         --guidellm-version "${GUIDELLM_VERSION}" \
-        --max-concurrency 128 \
-        --max-requests 200 \
+        --max-concurrency "${MAX_CONCURRENCY}" \
+        --max-requests "${MAX_REQUESTS}" \
+        --evaluation-mode "${EVAL_MODE}" \
         --tensor-parallel-size "${TP}")
     local arg
     if [[ ${#SERVER_ARGS[@]} -gt 0 ]]; then
@@ -140,8 +150,12 @@ trap cleanup EXIT
 trap 'handle_signal 2' INT
 trap 'handle_signal 15' TERM
 
-for path in "${SPECULATORS_REPO}/scripts/evaluate/evaluate.py" \
-    "${HF_MODEL_CKPT}/config.json" "${DRAFT_MODEL}/config.json" "${EVAL_CONFIG_PATH}"; do
+required_paths=("${SPECULATORS_REPO}/scripts/evaluate/evaluate.py"
+    "${HF_MODEL_CKPT}/config.json" "${EVAL_CONFIG_PATH}")
+if [[ "${SPEC_METHOD}" != "baseline" ]]; then
+    required_paths+=("${DRAFT_MODEL}/config.json")
+fi
+for path in "${required_paths[@]}"; do
     if [[ ! -f "${path}" ]]; then
         echo "ERROR: required staged file is missing: ${path}" >&2
         exit 2
@@ -149,11 +163,27 @@ for path in "${SPECULATORS_REPO}/scripts/evaluate/evaluate.py" \
 done
 
 case "${SPEC_METHOD}:${DFLASH_BLOCK_SIZE}:${NUM_SPEC_TOKENS}" in
-    dflash:8:7|dflash:16:15|dspark:8:8|dspark:16:16) ;;
+    baseline:0:0|dflash:8:7|dflash:16:15|dspark:8:8|dspark:16:16) ;;
     *)
         echo "ERROR: invalid method/B/K mapping: ${SPEC_METHOD}/${DFLASH_BLOCK_SIZE}/${NUM_SPEC_TOKENS}" >&2
         exit 2
         ;;
+esac
+case "${MAX_CONCURRENCY}" in
+    1|8|32|128) ;;
+    *) echo "ERROR: invalid MAX_CONCURRENCY: ${MAX_CONCURRENCY}; expected 1, 8, 32, or 128" >&2; exit 2 ;;
+esac
+if [[ ! "${MAX_REQUESTS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MAX_REQUESTS must be a positive integer: ${MAX_REQUESTS}" >&2
+    exit 2
+fi
+if [[ "${MAX_CONCURRENCY}" == "128" && ${MAX_REQUESTS} -lt 512 ]]; then
+    echo "ERROR: MAX_REQUESTS must be at least 512 for MAX_CONCURRENCY=128" >&2
+    exit 2
+fi
+case "${EVAL_MODE}" in
+    throughput|sweep) ;;
+    *) echo "ERROR: invalid EVAL_MODE: ${EVAL_MODE}; expected throughput or sweep" >&2; exit 2 ;;
 esac
 
 SPECULATORS_ACTUAL_SHA="$(git -C "${SPECULATORS_REPO}" rev-parse HEAD 2>/dev/null || true)"
@@ -195,12 +225,14 @@ if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; the
     echo "ERROR: port ${PORT} is already serving health before vLLM launch" >&2
     exit 5
 fi
-SPEC_CONFIG="$(printf '{\"method\":\"%s\",\"model\":\"%s\",\"num_speculative_tokens\":%s}' \
-    "${SPEC_METHOD}" "${DRAFT_MODEL}" "${NUM_SPEC_TOKENS}")"
 SERVER_ARGS=(-m vllm.entrypoints.cli.main serve "${HF_MODEL_CKPT}"
-    --speculative-config "${SPEC_CONFIG}"
     --tensor-parallel-size "${TP}"
     --port "${PORT}")
+if [[ "${SPEC_METHOD}" != "baseline" ]]; then
+    SPEC_CONFIG="$(printf '{\"method\":\"%s\",\"model\":\"%s\",\"num_speculative_tokens\":%s}' \
+        "${SPEC_METHOD}" "${DRAFT_MODEL}" "${NUM_SPEC_TOKENS}")"
+    SERVER_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+fi
 python3 "${SERVER_ARGS[@]}" \
     >"${RUN_DIR}/vllm.log" 2>&1 &
 SERVER_PID=$!
@@ -217,7 +249,7 @@ for ((attempt = 1; attempt <= ${SERVE_READY_TIMEOUT:-1800}; attempt++)); do
             | python3 -c 'import json,sys; data=json.load(sys.stdin).get("data", []); sys.exit(0 if any(item.get("id") == sys.argv[1] for item in data) else 1)' "${HF_MODEL_CKPT}" \
             >/dev/null 2>&1 \
         && curl -fsS "http://127.0.0.1:${PORT}/metrics" 2>/dev/null \
-            | grep -q 'vllm:spec_decode' \
+            | grep -q "vllm:$([[ "${SPEC_METHOD}" == "baseline" ]] && printf num_requests || printf spec_decode)" \
         && kill -0 "${SERVER_PID}" 2>/dev/null; then
         READY=1
         break
@@ -235,14 +267,16 @@ while IFS=$'\t' read -r subset dataset_path; do
         --dataset "${dataset_path}"
         --subsets "${subset}"
         --output-dir "${RUN_DIR}"
-        --max-concurrency 128
-        --max-requests 200
-        --gen-kwargs '{"temperature":0}'
-        throughput)
+        --max-concurrency "${MAX_CONCURRENCY}"
+        --max-requests "${MAX_REQUESTS}"
+        --gen-kwargs '{"temperature":0,"top_p":1}'
+        "${EVAL_MODE}")
     EVALUATOR_ARGS+=(--invocation "${subset_args[@]}")
     python3 "${subset_args[@]}"
     EVALUATOR_RC=$?
-    if [[ ${EVALUATOR_RC} -ne 0 ]]; then
+    if [[ ${EVALUATOR_RC} -ne 0 \
+        && !( "${SPEC_METHOD}" == "baseline" && "${EVAL_MODE}" == "sweep" \
+            && ${EVALUATOR_RC} -eq 1 ) ]]; then
         echo "ERROR: Speculators evaluator failed with status ${EVALUATOR_RC}" >&2
         exit "${EVALUATOR_RC}"
     fi
@@ -250,11 +284,20 @@ done < <(python3 "${ARTIFACT_HELPER}" dataset-paths \
     --dataset-manifest "${DATASET_MANIFEST_PATH}" \
     --hf-home "${HF_HOME}")
 
-if ! python3 "${ARTIFACT_HELPER}" validate \
-    --csv "${RUN_DIR}/acceptance.csv" \
-    --num-speculative-tokens "${NUM_SPEC_TOKENS}"; then
-    echo "ERROR: invalid Speculators acceptance output" >&2
-    exit 4
+if [[ "${SPEC_METHOD}" != "baseline" ]]; then
+    if ! python3 "${ARTIFACT_HELPER}" validate \
+        --csv "${RUN_DIR}/acceptance.csv" \
+        --num-speculative-tokens "${NUM_SPEC_TOKENS}"; then
+        echo "ERROR: invalid Speculators acceptance output" >&2
+        exit 4
+    fi
+fi
+if [[ "${EVAL_MODE}" == "sweep" ]]; then
+    if ! python3 "${ARTIFACT_HELPER}" validate-perf \
+        --csv "${RUN_DIR}/perf_results.csv"; then
+        echo "ERROR: invalid Speculators performance output" >&2
+        exit 4
+    fi
 fi
 
 FINAL_STATUS="success"
