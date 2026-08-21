@@ -6,10 +6,58 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import replace
 from pathlib import Path
 
-from common.specdec.drafter_job_manifest import DrafterExperiment, load_manifest, write_manifest
+from common.specdec.drafter_job_manifest import (
+    DrafterExperiment,
+    legacy_training_fingerprint,
+    load_manifest,
+    write_manifest,
+)
+
+
+def validate_legacy_seed_identity(
+    identity: dict[str, object],
+    expected_experiment_id: str,
+    expected_fingerprint: str,
+    expected_source_sha: str,
+) -> None:
+    """Reject a legacy checkpoint whose immutable training identity is not selected."""
+    actual_source_sha = identity.get("adopted_from_source_sha", identity.get("source_sha"))
+    expected = {
+        "experiment_id": expected_experiment_id,
+        "training_fingerprint": expected_fingerprint,
+    }
+    if actual_source_sha != expected_source_sha or any(
+        identity.get(key) != value for key, value in expected.items()
+    ):
+        raise ValueError("legacy checkpoint training identity does not match selected experiment")
+
+
+def legacy_q30_seed_expectations(experiment: DrafterExperiment) -> tuple[str, str, str]:
+    """Derive the exact legacy identity and tuple allowed to seed a Q30 ``-2n`` run."""
+    suffix = "-2n"
+    if (
+        experiment.topology.target_kind != "qwen3-30b-a3b"
+        or not experiment.run_name.endswith(suffix)
+        or not experiment.paths.output_root.endswith(suffix)
+    ):
+        raise ValueError("legacy seed expectations require a Q30 -2n experiment")
+    legacy = replace(
+        experiment,
+        run_name=experiment.run_name[: -len(suffix)],
+        paths=replace(
+            experiment.paths,
+            output_root=experiment.paths.output_root[: -len(suffix)],
+        ),
+    )
+    selected_tuple = json.dumps(
+        (experiment.target, experiment.dataset, experiment.method, experiment.block_size),
+        separators=(",", ":"),
+    )
+    return legacy.experiment_id, legacy_training_fingerprint(legacy), selected_tuple
 
 
 def full_convergence_boundaries(target_kind: str, block_size: int) -> tuple[int, ...]:
@@ -60,7 +108,11 @@ def select_experiments(
 
 
 def build_full_manifest(
-    template: Path, output: Path, source_path: str, source_sha: str
+    template: Path,
+    output: Path,
+    source_path: str,
+    source_sha: str,
+    image_sha256: str,
 ) -> tuple[DrafterExperiment, ...]:
     """Rewrite only source provenance and convergence stages of the trusted template."""
 
@@ -84,6 +136,7 @@ def build_full_manifest(
                 source_path=source_path,
                 source_sha=source_sha,
                 output_root=output_root,
+                image_sha256=image_sha256,
             ),
         )
 
@@ -151,8 +204,15 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-path", required=True)
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--image-sha256", required=True)
     args = parser.parse_args()
-    experiments = build_full_manifest(args.template, args.output, args.source_path, args.source_sha)
+    experiments = build_full_manifest(
+        args.template,
+        args.output,
+        args.source_path,
+        args.source_sha,
+        args.image_sha256,
+    )
     print(f"wrote {len(experiments)} experiments to {args.output}")
 
 

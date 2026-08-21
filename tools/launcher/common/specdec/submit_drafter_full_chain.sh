@@ -68,7 +68,11 @@ render_plan() {
 import sys
 from pathlib import Path
 
-from common.specdec.build_drafter_full_manifest import readable_job_name, select_experiments
+from common.specdec.build_drafter_full_manifest import (
+    legacy_q30_seed_expectations,
+    readable_job_name,
+    select_experiments,
+)
 from common.specdec.drafter_job_manifest import load_manifest
 
 experiments = load_manifest(Path(sys.argv[1]))
@@ -81,6 +85,11 @@ for index, experiment in enumerate(experiments):
     if experiment.experiment_id not in selected_by_id:
         continue
     for boundary in experiment.cumulative_max_steps:
+        legacy_id = legacy_fingerprint = selected_tuple = ""
+        if experiment.topology.target_kind == "qwen3-30b-a3b":
+            legacy_id, legacy_fingerprint, selected_tuple = legacy_q30_seed_expectations(
+                experiment
+            )
         print(
             "\t".join(
                 (
@@ -96,6 +105,9 @@ for index, experiment in enumerate(experiments):
                     ),
                     experiment.paths.output_root,
                     experiment.topology.target_kind,
+                    legacy_id,
+                    legacy_fingerprint,
+                    selected_tuple,
                 )
             )
         )
@@ -104,7 +116,8 @@ PY
 
 verify_seeded_output() {
     local output_root="$1" legacy_output_root="$2" source_sha="$3"
-    python3 - "$output_root" "$legacy_output_root" "$source_sha" <<'PY'
+    local expected_legacy_id="$4" expected_legacy_fingerprint="$5" selected_tuple="$6"
+    PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$output_root" "$legacy_output_root" "$source_sha" "$expected_legacy_id" "$expected_legacy_fingerprint" "$selected_tuple" <<'PY'
 import hashlib
 import json
 import sys
@@ -113,6 +126,9 @@ from pathlib import Path
 output_root = Path(sys.argv[1])
 legacy_output_root = Path(sys.argv[2])
 source_sha = sys.argv[3]
+expected_legacy_id = sys.argv[4]
+expected_legacy_fingerprint = sys.argv[5]
+selected_tuple = sys.argv[6]
 provenance_path = output_root / "control/checkpoint-seed.json"
 legacy_identity_path = legacy_output_root / "control/training-identity.json"
 
@@ -138,6 +154,14 @@ try:
     legacy_identity = json.loads(legacy_identity_path.read_text())
 except (OSError, json.JSONDecodeError) as error:
     raise SystemExit(f"invalid Q30 seed provenance: {error}") from error
+from common.specdec.build_drafter_full_manifest import validate_legacy_seed_identity
+
+try:
+    validate_legacy_seed_identity(
+        legacy_identity, expected_legacy_id, expected_legacy_fingerprint, source_sha
+    )
+except ValueError as error:
+    raise SystemExit(str(error)) from error
 identity_source_sha = legacy_identity.get(
     "adopted_from_source_sha", legacy_identity.get("source_sha")
 )
@@ -150,6 +174,9 @@ expected = {
     "source_output_root": str(legacy_output_root),
     "source_sha": identity_source_sha,
     "source_identity_sha256": sha256(legacy_identity_path),
+    "source_experiment_id": expected_legacy_id,
+    "source_training_fingerprint": expected_legacy_fingerprint,
+    "selected_experiment_tuple": selected_tuple,
 }
 if any(provenance.get(key) != value for key, value in expected.items()):
     raise SystemExit("Q30 checkpoint seed provenance mismatch")
@@ -165,14 +192,15 @@ PY
 }
 
 seed_q30_checkpoint() {
-    local output_root="$1" source_sha="$2"
+    local output_root="$1" source_sha="$2" expected_legacy_id="$3"
+    local expected_legacy_fingerprint="$4" selected_tuple="$5"
     local legacy_output_root="${output_root%-2n}"
     [[ "$legacy_output_root" != "$output_root" ]] || {
         echo "Q30 seed output must use the -2n namespace: $output_root" >&2
         return 2
     }
     if [[ -e "$output_root" ]]; then
-        verify_seeded_output "$output_root" "$legacy_output_root" "$source_sha"
+        verify_seeded_output "$output_root" "$legacy_output_root" "$source_sha" "$expected_legacy_id" "$expected_legacy_fingerprint" "$selected_tuple"
         return 0
     fi
     local checkpoint_record source_checkpoint checkpoint_step
@@ -181,7 +209,7 @@ seed_q30_checkpoint() {
         return 1
     }
     IFS=$'\t' read -r source_checkpoint checkpoint_step <<<"$checkpoint_record"
-    python3 - "$source_checkpoint" "$legacy_output_root" "$output_root" "$checkpoint_step" "$source_sha" <<'PY'
+    PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$source_checkpoint" "$legacy_output_root" "$output_root" "$checkpoint_step" "$source_sha" "$expected_legacy_id" "$expected_legacy_fingerprint" "$selected_tuple" <<'PY'
 import errno
 import hashlib
 import json
@@ -195,6 +223,9 @@ legacy_output_root = Path(sys.argv[2])
 output_root = Path(sys.argv[3])
 checkpoint_step = int(sys.argv[4])
 source_sha = sys.argv[5]
+expected_legacy_id = sys.argv[6]
+expected_legacy_fingerprint = sys.argv[7]
+selected_tuple = sys.argv[8]
 temporary = Path(f"{output_root}.seed-partial-{os.getpid()}")
 legacy_identity_path = legacy_output_root / "control/training-identity.json"
 
@@ -219,6 +250,14 @@ try:
     legacy_identity = json.loads(legacy_identity_path.read_text())
 except (OSError, json.JSONDecodeError) as error:
     raise SystemExit(f"invalid legacy Q30 training identity: {error}") from error
+from common.specdec.build_drafter_full_manifest import validate_legacy_seed_identity
+
+try:
+    validate_legacy_seed_identity(
+        legacy_identity, expected_legacy_id, expected_legacy_fingerprint, source_sha
+    )
+except ValueError as error:
+    raise SystemExit(str(error)) from error
 identity_source_sha = legacy_identity.get(
     "adopted_from_source_sha", legacy_identity.get("source_sha")
 )
@@ -272,8 +311,11 @@ try:
         "fingerprint_schema": "topology-v2",
         "source_checkpoint": str(source_checkpoint),
         "source_identity_sha256": sha256(legacy_identity_path),
+        "source_experiment_id": expected_legacy_id,
         "source_output_root": str(legacy_output_root),
         "source_sha": identity_source_sha,
+        "source_training_fingerprint": expected_legacy_fingerprint,
+        "selected_experiment_tuple": selected_tuple,
         "storage": storage,
     }
     (control / "checkpoint-seed.json").write_text(json.dumps(provenance, sort_keys=True) + "\n")
@@ -282,19 +324,19 @@ except BaseException:
     shutil.rmtree(temporary, ignore_errors=True)
     raise
 PY
-    verify_seeded_output "$output_root" "$legacy_output_root" "$source_sha"
+    verify_seeded_output "$output_root" "$legacy_output_root" "$source_sha" "$expected_legacy_id" "$expected_legacy_fingerprint" "$selected_tuple"
 }
 
 previous_index=""
 previous_job=""
 legacy_step=""
-while IFS=$'\t' read -r index identity boundary job_name output_root target_kind; do
+while IFS=$'\t' read -r index identity boundary job_name output_root target_kind expected_legacy_id expected_legacy_fingerprint selected_tuple; do
     if [[ "$index" != "$previous_index" ]]; then
         previous_index="$index"
         previous_job=""
         legacy_step=""
         if [[ "$target_kind" == "qwen3-30b-a3b" && "$SEED_Q30_FROM_LEGACY" -eq 1 && "$DRY_RUN" -eq 0 && ! -f "$output_root/control/training-identity.json" ]]; then
-            seed_q30_checkpoint "$output_root" "$LEGACY_SOURCE_SHA"
+            seed_q30_checkpoint "$output_root" "$LEGACY_SOURCE_SHA" "$expected_legacy_id" "$expected_legacy_fingerprint" "$selected_tuple"
         fi
         if [[ ! -f "$output_root/control/training-identity.json" ]]; then
             expected_rng_states=8

@@ -27,14 +27,17 @@ readonly SCRATCH_ROOT
 readonly SCRATCH_JOB_ROOT="${SCRATCH_ROOT%/}/${SLURM_JOB_ID}"
 
 mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" "$CLUSTER_PROFILE_PATH" "${READINESS_RECEIPT:-}" "$CLUSTER_NAME" "$SCRATCH_ROOT" <<'PY'
-import hashlib
 import json
 import sys
 from pathlib import Path
 
 manifest = Path(sys.argv[1])
 from common.specdec.cluster_profile import load_cluster_profile, validate_scratch_root
-from common.specdec.drafter_job_manifest import load_manifest
+from common.specdec.drafter_job_manifest import (
+    legacy_training_fingerprint,
+    load_manifest,
+    topology_v2_training_fingerprint,
+)
 
 experiment = load_manifest(manifest)[int(sys.argv[2])]
 profile = load_cluster_profile(Path(sys.argv[3]))
@@ -56,39 +59,19 @@ if receipt_path is not None:
     if receipt.get("profile") != profile.name or Path(receipt["scratch_root"]) != scratch_root:
         raise SystemExit("readiness receipt identity mismatch")
 
-legacy_fingerprint_payload = (
-    experiment.target, experiment.dataset, experiment.method,
-    experiment.block_size, experiment.run_name, experiment.paths.target_path,
-    experiment.paths.dataset_path, experiment.paths.output_root,
-    experiment.topology.target_kind, experiment.topology.capture_ids,
-    experiment.topology.serve_tp,
-)
 if experiment.topology.target_kind == "qwen3-30b-a3b":
     fingerprint_schema = "topology-v2"
-    fingerprint_payload = (
-        *legacy_fingerprint_payload,
-        experiment.topology.per_device_train_batch_size,
-        experiment.topology.gradient_accumulation_steps,
-        experiment.topology.num_attention_heads,
-        experiment.topology.num_key_value_heads,
-        experiment.topology.head_dim,
-        experiment.topology.intermediate_size,
-        experiment.slurm.nodes,
-        experiment.slurm.gpus_per_node,
-        experiment.slurm.segment,
-        "" if cluster_name == "oci-hsg" else cluster_name,
+    fingerprint = topology_v2_training_fingerprint(
+        experiment,
+        cluster_name,
     )
 else:
     fingerprint_schema = "legacy-v1"
-    fingerprint_payload = legacy_fingerprint_payload
-fingerprint = hashlib.sha256(
-    json.dumps(fingerprint_payload, separators=(",", ":")).encode()
-).hexdigest()
-if fingerprint_schema == "topology-v2":
-    fingerprint = f"{fingerprint_schema}:{fingerprint}"
+    fingerprint = legacy_training_fingerprint(experiment)
 for value in (
     experiment.paths.source_path, experiment.paths.source_sha, experiment.paths.image_path, experiment.paths.runtime_archive_path,
     experiment.paths.runtime_archive_sha256,
+    experiment.paths.image_sha256 or "",
     experiment.paths.target_path, experiment.paths.dataset_path, experiment.paths.output_root,
     experiment.method, experiment.block_size, experiment.run_name, experiment.sample_size,
     ",".join(map(str, experiment.topology.capture_ids)), experiment.topology.serve_tp,
@@ -104,35 +87,36 @@ for value in (
     print(value)
 PY
 )
-(( ${#manifest_values[@]} == 27 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
+(( ${#manifest_values[@]} == 28 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
 SOURCE_PATH="${manifest_values[0]}"
 SOURCE_SHA="${manifest_values[1]}"
 IMAGE_PATH="${manifest_values[2]}"
 RUNTIME_ARCHIVE="${manifest_values[3]}"
 RUNTIME_ARCHIVE_SHA256="${manifest_values[4]}"
-TARGET_PATH="${manifest_values[5]}"
-DATASET_PATH="${manifest_values[6]}"
+IMAGE_SHA256="${manifest_values[5]}"
+TARGET_PATH="${manifest_values[6]}"
+DATASET_PATH="${manifest_values[7]}"
 DATASET_LOCAL_NAME="$(basename "$DATASET_PATH")"
-OUTPUT_ROOT="${manifest_values[7]}"
-METHOD="${manifest_values[8]}"
-BLOCK_SIZE="${manifest_values[9]}"
-RUN_NAME="${manifest_values[10]}"
-SAMPLE_SIZE="${manifest_values[11]}"
-EAGLE_CAPTURE_IDS="[${manifest_values[12]}]"
-SERVE_TP="${manifest_values[13]}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${manifest_values[14]}"
-GRADIENT_ACCUMULATION_STEPS="${manifest_values[15]}"
-NUM_ATTENTION_HEADS="${manifest_values[16]}"
-NUM_KEY_VALUE_HEADS="${manifest_values[17]}"
-HEAD_DIM="${manifest_values[18]}"
-INTERMEDIATE_SIZE="${manifest_values[19]}"
-TARGET_KIND="${manifest_values[20]}"
-ALLOCATED_NODES="${manifest_values[21]}"
-ALLOCATION_SEGMENT="${manifest_values[22]}"
-GPUS_PER_NODE="${manifest_values[23]}"
-TRAINING_IDENTITY="${manifest_values[24]}"
-TRAINING_FINGERPRINT="${manifest_values[25]}"
-TRAINING_FINGERPRINT_SCHEMA="${manifest_values[26]}"
+OUTPUT_ROOT="${manifest_values[8]}"
+METHOD="${manifest_values[9]}"
+BLOCK_SIZE="${manifest_values[10]}"
+RUN_NAME="${manifest_values[11]}"
+SAMPLE_SIZE="${manifest_values[12]}"
+EAGLE_CAPTURE_IDS="[${manifest_values[13]}]"
+SERVE_TP="${manifest_values[14]}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${manifest_values[15]}"
+GRADIENT_ACCUMULATION_STEPS="${manifest_values[16]}"
+NUM_ATTENTION_HEADS="${manifest_values[17]}"
+NUM_KEY_VALUE_HEADS="${manifest_values[18]}"
+HEAD_DIM="${manifest_values[19]}"
+INTERMEDIATE_SIZE="${manifest_values[20]}"
+TARGET_KIND="${manifest_values[21]}"
+ALLOCATED_NODES="${manifest_values[22]}"
+ALLOCATION_SEGMENT="${manifest_values[23]}"
+GPUS_PER_NODE="${manifest_values[24]}"
+TRAINING_IDENTITY="${manifest_values[25]}"
+TRAINING_FINGERPRINT="${manifest_values[26]}"
+TRAINING_FINGERPRINT_SCHEMA="${manifest_values[27]}"
 SERVE_NODES=$((ALLOCATED_NODES / 2))
 TRAINER_NODES=$((ALLOCATED_NODES - SERVE_NODES))
 EXPECTED_RNG_STATES=$((TRAINER_NODES * GPUS_PER_NODE))
@@ -150,6 +134,10 @@ done
 [[ -z "$(git -C "$SOURCE_PATH" status --porcelain)" ]] || { echo "source checkout is dirty" >&2; exit 2; }
 [[ -f "$RUNTIME_ARCHIVE" ]] || { echo "runtime archive is missing" >&2; exit 2; }
 [[ "$(sha256sum "$RUNTIME_ARCHIVE" | cut -d' ' -f1)" == "$RUNTIME_ARCHIVE_SHA256" ]] || { echo "runtime archive SHA-256 mismatch" >&2; exit 2; }
+if [[ -n "$IMAGE_SHA256" ]]; then
+    [[ "$IMAGE_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "IMAGE_SHA256 must be exact" >&2; exit 2; }
+    [[ "$(sha256sum "$IMAGE_PATH" | cut -d' ' -f1)" == "$IMAGE_SHA256" ]] || { echo "image SHA-256 mismatch" >&2; exit 2; }
+fi
 [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_STEPS must be positive" >&2; exit 2; }
 SAVE_STEPS="${SAVE_STEPS:-$MAX_STEPS}"
 [[ "$SAVE_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "SAVE_STEPS must be positive" >&2; exit 2; }

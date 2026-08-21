@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,8 +17,10 @@ from pathlib import Path
 import pytest
 from common.specdec.build_drafter_full_manifest import (
     full_convergence_boundaries,
+    legacy_q30_seed_expectations,
     readable_job_name,
     select_experiments,
+    validate_legacy_seed_identity,
 )
 from common.specdec.drafter_job_manifest import (
     DrafterExperiment,
@@ -25,8 +28,10 @@ from common.specdec.drafter_job_manifest import (
     SlurmSettings,
     TargetTopology,
     canonical_manifest,
+    legacy_training_fingerprint,
     load_manifest,
     speculative_tokens,
+    topology_v2_training_fingerprint,
     validate_topology,
     write_manifest,
 )
@@ -114,6 +119,7 @@ def test_canonical_manifest_is_stable_and_written_atomically(tmp_path: Path) -> 
     write_manifest(output, (experiment,))
 
     assert output.read_text() == expected
+    assert "image_sha256" not in expected
     assert json.loads(expected)["experiments"][0]["num_speculative_tokens"] == 7
     assert json.loads(expected)["experiments"][0]["sample_size"] == 1_300_000
     assert not list(tmp_path.glob(".manifest.json.*"))
@@ -389,7 +395,7 @@ def test_training_wave_uses_the_target_specific_streaming_topology() -> None:
         "num_attention_heads",
         "GLOBAL_BATCH_SIZE=512",
         "TRAINER_NODES",
-        'GPUS_PER_NODE="${manifest_values[23]}"',
+        'GPUS_PER_NODE="${manifest_values[24]}"',
         "PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE",
         "/home",
         "rev-parse HEAD",
@@ -444,6 +450,75 @@ def test_training_fingerprint_includes_batch_and_scheduler_topology() -> None:
     assert 'if target_kind != "qwen3-30b-a3b"' in runner
 
 
+def test_q235_fingerprint_remains_the_exact_legacy_hash() -> None:
+    """The topology migration must not invalidate any healthy Q235 output."""
+    q235 = replace(
+        _experiment(),
+        target="q235-base",
+        topology=TargetTopology.for_kind("qwen3-235b-a22b"),
+        slurm=replace(_experiment().slurm, nodes=4, segment=4),
+    )
+    payload = (
+        q235.target,
+        q235.dataset,
+        q235.method,
+        q235.block_size,
+        q235.run_name,
+        q235.paths.target_path,
+        q235.paths.dataset_path,
+        q235.paths.output_root,
+        q235.topology.target_kind,
+        q235.topology.capture_ids,
+        q235.topology.serve_tp,
+    )
+    expected = hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+    assert legacy_training_fingerprint(q235) == expected
+
+
+def test_q30_topology_v2_fingerprint_binds_all_execution_inputs() -> None:
+    """Changing image, runtime, or sampled data invalidates a Q30 training identity."""
+    experiment = replace(_experiment(), paths=replace(_experiment().paths, image_sha256="c" * 64))
+    original = topology_v2_training_fingerprint(experiment, "oci-hsg")
+
+    variants = (
+        replace(
+            experiment,
+            paths=replace(experiment.paths, image_path="/lustre/images/other.sqsh"),
+        ),
+        replace(
+            experiment,
+            paths=replace(
+                experiment.paths,
+                runtime_archive_path="/lustre/runtimes/other.tar.zst",
+            ),
+        ),
+        replace(
+            experiment,
+            paths=replace(experiment.paths, runtime_archive_sha256="d" * 64),
+        ),
+    )
+    for variant in variants:
+        assert topology_v2_training_fingerprint(variant, "oci-hsg") != original
+    changed_image = replace(experiment, paths=replace(experiment.paths, image_sha256="d" * 64))
+    assert topology_v2_training_fingerprint(changed_image, "oci-hsg") != original
+    changed_sample = replace(experiment)
+    object.__setattr__(changed_sample, "sample_size", experiment.sample_size - 1)
+    assert topology_v2_training_fingerprint(changed_sample, "oci-hsg") != original
+
+
+def test_q30_topology_v2_requires_builder_pinned_image_digest() -> None:
+    """Legacy manifests remain readable, but a new Q30 identity cannot omit image bytes."""
+    with pytest.raises(ValueError, match="pinned image SHA-256"):
+        topology_v2_training_fingerprint(_experiment(), "oci-hsg")
+
+    builder = (_LAUNCHER_DIR / "common/specdec/build_drafter_full_manifest.py").read_text()
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+    assert 'parser.add_argument("--image-sha256", required=True)' in builder
+    assert "image_sha256=image_sha256" in builder
+    assert 'sha256sum "$IMAGE_PATH"' in runner
+
+
 def test_q30_checkpoint_seed_is_explicit_atomic_and_accepts_extra_rng_ranks() -> None:
     """Legacy world-eight checkpoints seed a new root without mutating old output."""
     chain = (_LAUNCHER_DIR / "common/specdec/submit_drafter_full_chain.sh").read_text()
@@ -460,6 +535,10 @@ def test_q30_checkpoint_seed_is_explicit_atomic_and_accepts_extra_rng_ranks() ->
         'legacy_identity_path = legacy_output_root / "control/training-identity.json"',
         '"source_identity_sha256"',
         '"checkpoint_files_sha256"',
+        '"source_experiment_id"',
+        '"source_training_fingerprint"',
+        '"selected_experiment_tuple"',
+        "validate_legacy_seed_identity(",
         'verify_seeded_output "$output_root" "$legacy_output_root" "$source_sha"',
     ):
         assert required in chain
@@ -467,6 +546,56 @@ def test_q30_checkpoint_seed_is_explicit_atomic_and_accepts_extra_rng_ranks() ->
     assert (
         "len(" not in lifecycle[lifecycle.index("for rank in range(expected_rng_states)") :][:300]
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong"),
+    [("experiment_id", "wrong-id"), ("training_fingerprint", "0" * 64)],
+)
+def test_q30_seed_rejects_wrong_legacy_experiment_identity(field: str, wrong: str) -> None:
+    """A neighboring Q30 checkpoint cannot seed the selected experiment tuple."""
+    identity = {
+        "experiment_id": "legacy-id",
+        "source_sha": "a" * 40,
+        "training_fingerprint": "b" * 64,
+    }
+    identity[field] = wrong
+
+    with pytest.raises(ValueError):
+        validate_legacy_seed_identity(identity, "legacy-id", "b" * 64, "a" * 40)
+
+
+def test_q30_seed_expectations_bind_current_tuple_to_legacy_namespace() -> None:
+    """The selected new run derives one exact old identity instead of trusting its path."""
+    experiment = replace(
+        _experiment(),
+        run_name=f"{_experiment().run_name}-2n",
+        paths=replace(
+            _experiment().paths,
+            output_root=f"{_experiment().paths.output_root}-2n",
+        ),
+    )
+
+    legacy_id, legacy_fingerprint, selected_tuple = legacy_q30_seed_expectations(experiment)
+
+    assert legacy_id == _experiment().experiment_id
+    assert legacy_fingerprint == legacy_training_fingerprint(_experiment())
+    assert json.loads(selected_tuple) == ["Qwen/Qwen3-30B-A3B", "open-perfectblend", "dflash", 8]
+
+
+def test_q30_seed_accepts_the_adopted_legacy_source_lineage() -> None:
+    """An adopted checkpoint binds to its original source SHA, not the adopting checkout."""
+    identity = {
+        "adopted_from_source_sha": "a" * 40,
+        "experiment_id": "legacy-id",
+        "source_sha": "c" * 40,
+        "training_fingerprint": "b" * 64,
+    }
+
+    validate_legacy_seed_identity(identity, "legacy-id", "b" * 64, "a" * 40)
+
+    with pytest.raises(ValueError):
+        validate_legacy_seed_identity(identity, "legacy-id", "b" * 64, "c" * 40)
 
 
 def test_training_wave_renders_scheduler_flags_from_an_immutable_cluster_profile() -> None:

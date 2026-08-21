@@ -20,8 +20,10 @@ __all__ = [
     "SlurmSettings",
     "TargetTopology",
     "canonical_manifest",
+    "legacy_training_fingerprint",
     "load_manifest",
     "speculative_tokens",
+    "topology_v2_training_fingerprint",
     "validate_topology",
     "write_manifest",
 ]
@@ -74,6 +76,7 @@ class PinnedPaths:
     target_path: str
     dataset_path: str
     output_root: str
+    image_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -83,6 +86,8 @@ class PinnedPaths:
             raise ValueError("source_sha must be an exact 40-character lowercase commit SHA")
         if not _FULL_SHA256.fullmatch(self.runtime_archive_sha256):
             raise ValueError("runtime_archive_sha256 must be an exact lowercase SHA-256")
+        if self.image_sha256 is not None and not _FULL_SHA256.fullmatch(self.image_sha256):
+            raise ValueError("image_sha256 must be an exact lowercase SHA-256 when provided")
         for name in (
             "image_path",
             "runtime_archive_path",
@@ -245,8 +250,57 @@ class DrafterExperiment:
         return sha256(payload.encode()).hexdigest()[:16]
 
 
+def legacy_training_fingerprint(experiment: DrafterExperiment) -> str:
+    """Return the exact pre-topology-migration training fingerprint."""
+    payload = (
+        experiment.target,
+        experiment.dataset,
+        experiment.method,
+        experiment.block_size,
+        experiment.run_name,
+        experiment.paths.target_path,
+        experiment.paths.dataset_path,
+        experiment.paths.output_root,
+        experiment.topology.target_kind,
+        experiment.topology.capture_ids,
+        experiment.topology.serve_tp,
+    )
+    return sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
+def topology_v2_training_fingerprint(experiment: DrafterExperiment, cluster_name: str) -> str:
+    """Bind a Q30 identity to its topology and immutable execution artifacts."""
+    image_sha256 = experiment.paths.image_sha256
+    if image_sha256 is None:
+        raise ValueError("topology-v2 requires a pinned image SHA-256")
+    if not _FULL_SHA256.fullmatch(image_sha256):
+        raise ValueError("topology-v2 requires an exact image SHA-256")
+    payload = (
+        legacy_training_fingerprint(experiment),
+        experiment.topology.per_device_train_batch_size,
+        experiment.topology.gradient_accumulation_steps,
+        experiment.topology.num_attention_heads,
+        experiment.topology.num_key_value_heads,
+        experiment.topology.head_dim,
+        experiment.topology.intermediate_size,
+        experiment.slurm.nodes,
+        experiment.slurm.gpus_per_node,
+        experiment.slurm.segment,
+        "" if cluster_name == "oci-hsg" else cluster_name,
+        experiment.paths.image_path,
+        image_sha256,
+        experiment.paths.runtime_archive_path,
+        experiment.paths.runtime_archive_sha256,
+        experiment.sample_size,
+    )
+    digest = sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+    return f"topology-v2:{digest}"
+
+
 def _manifest_entry(experiment: DrafterExperiment) -> dict[str, Any]:
     entry = asdict(experiment)
+    if entry["paths"]["image_sha256"] is None:
+        del entry["paths"]["image_sha256"]
     entry["experiment_id"] = experiment.experiment_id
     entry["num_speculative_tokens"] = experiment.num_speculative_tokens
     return entry
