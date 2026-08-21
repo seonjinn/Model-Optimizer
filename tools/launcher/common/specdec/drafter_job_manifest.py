@@ -36,7 +36,10 @@ _TARGET_SLURM_DEFAULTS = {
         {"nodes": 2, "segment": 2},
         {"nodes": 16, "segment": 16},
     ),
-    "qwen3-235b-a22b": ({"nodes": 4, "segment": 4},),
+    "qwen3-235b-a22b": (
+        {"nodes": 4, "segment": 4},
+        {"nodes": 16, "segment": 16},
+    ),
 }
 
 
@@ -125,9 +128,7 @@ class TargetTopology:
 
     def __post_init__(self) -> None:
         expected = _TARGET_DEFAULTS.get(self.target_kind)
-        variable_fields = (
-            {"gradient_accumulation_steps"} if self.target_kind == "qwen3-30b-a3b" else set()
-        )
+        variable_fields = {"gradient_accumulation_steps"}
         if expected is None or any(
             getattr(self, field) != value
             for field, value in expected.items()
@@ -139,6 +140,11 @@ class TargetTopology:
             32,
         ):
             raise ValueError("Q30 accumulation must match the pinned 2/16-node topology")
+        if self.target_kind == "qwen3-235b-a22b" and self.gradient_accumulation_steps not in (
+            8,
+            32,
+        ):
+            raise ValueError("Q235 accumulation must match the pinned 4/16-node topology")
 
 
 _TARGET_DEFAULTS = {

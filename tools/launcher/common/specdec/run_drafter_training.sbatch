@@ -59,7 +59,10 @@ if receipt_path is not None:
     if receipt.get("profile") != profile.name or Path(receipt["scratch_root"]) != scratch_root:
         raise SystemExit("readiness receipt identity mismatch")
 
-if experiment.topology.target_kind == "qwen3-30b-a3b":
+uses_topology_v2 = (
+    experiment.topology.target_kind == "qwen3-30b-a3b" or experiment.slurm.nodes != 4
+)
+if uses_topology_v2:
     fingerprint_schema = "topology-v2"
     fingerprint = topology_v2_training_fingerprint(
         experiment,
@@ -200,15 +203,13 @@ from pathlib import Path
 path = Path(sys.argv[1])
 target_kind = sys.argv[2]
 schema = sys.argv[3]
-if target_kind != "qwen3-30b-a3b":
-    if schema != "legacy-v1":
-        raise SystemExit("Q235 training fingerprint schema changed")
+if target_kind != "qwen3-30b-a3b" and schema == "legacy-v1":
     raise SystemExit(0)
 if schema != "topology-v2":
-    raise SystemExit("Q30 training requires topology-v2 fingerprinting")
+    raise SystemExit("scaled training requires topology-v2 fingerprinting")
 identity = json.loads(path.read_text())
 if identity.get("fingerprint_schema") not in (None, schema):
-    raise SystemExit("Q30 training fingerprint schema mismatch")
+    raise SystemExit("training fingerprint schema mismatch")
 if "fingerprint_schema" not in identity:
     identity["fingerprint_schema"] = schema
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")

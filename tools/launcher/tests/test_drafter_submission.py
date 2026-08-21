@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 from common.specdec.build_drafter_full_manifest import (
+    build_full_manifest,
     full_convergence_boundaries,
     legacy_q30_seed_expectations,
     readable_job_name,
@@ -436,7 +437,7 @@ def test_q30_manifest_topology_is_two_nodes_and_uses_a_distinct_output_namespace
     for required in (
         '{"nodes": 2, "segment": 2}',
         '{"nodes": 16, "segment": 16}',
-        '"qwen3-235b-a22b": ({"nodes": 4, "segment": 4},)',
+        '{"nodes": 4, "segment": 4}',
         'gradient_accumulation_steps": 32',
     ):
         assert required in manifest
@@ -477,6 +478,109 @@ def test_q30_sixteen_node_topology_keeps_global_batch_512(tmp_path: Path) -> Non
         in chain
     )
     assert "expected_rng_states=4" not in chain
+
+
+def test_q235_sixteen_node_topology_keeps_global_batch_512() -> None:
+    """A sixteen-node Q235 run uses world32 and accumulation eight."""
+    topology = replace(
+        TargetTopology.for_kind("qwen3-235b-a22b"),
+        gradient_accumulation_steps=8,
+    )
+    experiment = replace(
+        _experiment(),
+        target="q235-base",
+        topology=topology,
+        slurm=replace(_experiment().slurm, nodes=16, segment=16),
+        paths=replace(_experiment().paths, image_sha256="c" * 64),
+    )
+
+    assert (
+        topology.per_device_train_batch_size
+        * topology.gradient_accumulation_steps
+        * (experiment.slurm.nodes // 2)
+        * experiment.slurm.gpus_per_node
+        == 512
+    )
+    assert experiment.slurm.nodes == 16
+
+
+def test_full_builder_supports_q235_sixteen_nodes() -> None:
+    """The canonical builder exposes an explicit Q235 4/16-node choice."""
+    builder = (_LAUNCHER_DIR / "common/specdec/build_drafter_full_manifest.py").read_text()
+
+    assert 'parser.add_argument("--q235-nodes", type=int, choices=(4, 16), default=4)' in builder
+    assert "gradient_accumulation_steps=128 // q235_nodes" in builder
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+    assert "uses_topology_v2 = (" in runner
+    assert (
+        'experiment.topology.target_kind == "qwen3-30b-a3b" or experiment.slurm.nodes != 4'
+        in runner
+    )
+
+
+def test_full_builder_rewrites_q235_sixteen_nodes_without_changing_q30(tmp_path: Path) -> None:
+    """A real 32-entry build scales only Q235 and preserves the default matrix."""
+    template_entries = []
+    for target, target_kind in (
+        ("q30-base", "qwen3-30b-a3b"),
+        ("q30-thinking", "qwen3-30b-a3b"),
+        ("q235-base", "qwen3-235b-a22b"),
+        ("q235-thinking", "qwen3-235b-a22b"),
+    ):
+        topology = TargetTopology.for_kind(target_kind)
+        nodes = 2 if target_kind == "qwen3-30b-a3b" else 4
+        for dataset in ("opb-direct", "nemo-direct"):
+            for method in ("dflash", "dspark"):
+                for block_size in (8, 16):
+                    slug = f"{target}-{dataset}-{method}-b{block_size}"
+                    template_entries.append(
+                        replace(
+                            _experiment(),
+                            target=target,
+                            dataset=dataset,
+                            method=method,
+                            block_size=block_size,
+                            run_name=slug,
+                            topology=topology,
+                            paths=replace(
+                                _experiment().paths,
+                                target_path=f"/lustre/models/{target}",
+                                dataset_path=f"/lustre/datasets/{dataset}",
+                                output_root=f"/lustre/results/{slug}",
+                            ),
+                            slurm=replace(_experiment().slurm, nodes=nodes, segment=nodes),
+                        )
+                    )
+    template = tmp_path / "template.json"
+    write_manifest(template, tuple(template_entries))
+    default_path = tmp_path / "default.json"
+    scaled_path = tmp_path / "scaled.json"
+
+    default = build_full_manifest(template, default_path, "/home/source", "d" * 40, "e" * 64)
+    scaled = build_full_manifest(
+        template,
+        scaled_path,
+        "/home/source",
+        "d" * 40,
+        "e" * 64,
+        q235_nodes=16,
+    )
+
+    assert len(default) == len(scaled) == 32
+    default_q30 = [entry for entry in default if entry.target.startswith("q30-")]
+    scaled_q30 = [entry for entry in scaled if entry.target.startswith("q30-")]
+    assert default_q30 == scaled_q30
+    default_q235 = [entry for entry in default if entry.target.startswith("q235-")]
+    scaled_q235 = [entry for entry in scaled if entry.target.startswith("q235-")]
+    assert {
+        (entry.slurm.nodes, entry.topology.gradient_accumulation_steps) for entry in default_q235
+    } == {(4, 32)}
+    assert {
+        (entry.slurm.nodes, entry.topology.gradient_accumulation_steps) for entry in scaled_q235
+    } == {(16, 8)}
+    default_ids = {entry.experiment_id for entry in default_q235}
+    assert all(entry.paths.output_root.endswith("-16n") for entry in scaled_q235)
+    assert all(entry.experiment_id not in default_ids for entry in scaled_q235)
 
 
 def test_training_fingerprint_includes_batch_and_scheduler_topology() -> None:

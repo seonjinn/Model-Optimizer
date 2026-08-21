@@ -122,6 +122,7 @@ def build_full_manifest(
     source_sha: str,
     image_sha256: str,
     q30_nodes: int = 2,
+    q235_nodes: int = 4,
 ) -> tuple[DrafterExperiment, ...]:
     """Rewrite only source provenance and convergence stages of the trusted template."""
 
@@ -142,6 +143,17 @@ def build_full_manifest(
                 gradient_accumulation_steps=64 // q30_nodes,
             )
             slurm = replace(slurm, nodes=q30_nodes, segment=q30_nodes)
+        elif experiment.topology.target_kind == "qwen3-235b-a22b" and q235_nodes == 16:
+            suffix = f"-{q235_nodes}n"
+            if not run_name.endswith(suffix):
+                run_name = f"{run_name}{suffix}"
+            if not output_root.endswith(suffix):
+                output_root = f"{output_root}{suffix}"
+            topology = replace(
+                topology,
+                gradient_accumulation_steps=128 // q235_nodes,
+            )
+            slurm = replace(slurm, nodes=q235_nodes, segment=q235_nodes)
         return replace(
             experiment,
             run_name=run_name,
@@ -161,6 +173,8 @@ def build_full_manifest(
 
     if q30_nodes not in (2, 16):
         raise ValueError("Q30 training nodes must be 2 or 16")
+    if q235_nodes not in (4, 16):
+        raise ValueError("Q235 training nodes must be 4 or 16")
     experiments = tuple(
         rewrite(experiment)
         for experiment in load_manifest(template, migrate_legacy_q30_topology=True)
@@ -193,7 +207,7 @@ def build_full_manifest(
         raise ValueError("target label does not match its pinned topology family")
     expected_slurm = {
         "qwen3-30b-a3b": ("nemotron_n3_post", "batch", q30_nodes, 4, q30_nodes),
-        "qwen3-235b-a22b": ("nemotron_n3_post", "batch", 4, 4, 4),
+        "qwen3-235b-a22b": ("nemotron_n3_post", "batch", q235_nodes, 4, q235_nodes),
     }
     if any(
         (
@@ -227,6 +241,7 @@ def main() -> None:
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--image-sha256", required=True)
     parser.add_argument("--q30-nodes", type=int, choices=(2, 16), default=2)
+    parser.add_argument("--q235-nodes", type=int, choices=(4, 16), default=4)
     args = parser.parse_args()
     experiments = build_full_manifest(
         args.template,
@@ -235,6 +250,7 @@ def main() -> None:
         args.source_sha,
         args.image_sha256,
         args.q30_nodes,
+        args.q235_nodes,
     )
     print(f"wrote {len(experiments)} experiments to {args.output}")
 
