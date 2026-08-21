@@ -434,14 +434,49 @@ def test_q30_manifest_topology_is_two_nodes_and_uses_a_distinct_output_namespace
     manifest = (_LAUNCHER_DIR / "common/specdec/drafter_job_manifest.py").read_text()
 
     for required in (
-        '"qwen3-30b-a3b": {"nodes": 2, "segment": 2}',
-        '"qwen3-235b-a22b": {"nodes": 4, "segment": 4}',
+        '{"nodes": 2, "segment": 2}',
+        '{"nodes": 16, "segment": 16}',
+        '"qwen3-235b-a22b": ({"nodes": 4, "segment": 4},)',
         'gradient_accumulation_steps": 32',
     ):
         assert required in manifest
     assert 'suffix = "-2n"' in module
     assert "run_name.endswith(suffix)" in module
     assert "output_root.endswith(suffix)" in module
+
+
+def test_q30_sixteen_node_topology_keeps_global_batch_512(tmp_path: Path) -> None:
+    """A sixteen-node Q30 run uses world32 and accumulation four in a new namespace."""
+    topology = replace(
+        TargetTopology.for_kind("qwen3-30b-a3b"),
+        gradient_accumulation_steps=4,
+    )
+    experiment = replace(
+        _experiment(),
+        topology=topology,
+        slurm=replace(_experiment().slurm, nodes=16, segment=16),
+        paths=replace(_experiment().paths, image_sha256="c" * 64),
+    )
+
+    assert (
+        topology.per_device_train_batch_size
+        * topology.gradient_accumulation_steps
+        * (experiment.slurm.nodes // 2)
+        * experiment.slurm.gpus_per_node
+        == 512
+    )
+    builder = (_LAUNCHER_DIR / "common/specdec/build_drafter_full_manifest.py").read_text()
+    assert 'parser.add_argument("--q30-nodes", type=int, choices=(2, 16), default=2)' in builder
+    assert 'suffix = f"-{q30_nodes}n"' in builder
+
+    chain = (_LAUNCHER_DIR / "common/specdec/submit_drafter_full_chain.sh").read_text()
+    assert 'python3 - "$MANIFEST" "$SEED_Q30_FROM_LEGACY"' in chain
+    assert 'if seed_q30_from_legacy and experiment.topology.target_kind == "qwen3-30b-a3b"' in chain
+    assert (
+        "expected_rng_states = (experiment.slurm.nodes // 2) * experiment.slurm.gpus_per_node"
+        in chain
+    )
+    assert "expected_rng_states=4" not in chain
 
 
 def test_training_fingerprint_includes_batch_and_scheduler_topology() -> None:
@@ -723,7 +758,7 @@ def test_full_chain_exact_experiment_filter_selects_only_requested_chains() -> N
 
     chain = (_LAUNCHER_DIR / "common/specdec/submit_drafter_full_chain.sh").read_text()
     assert "--experiment-id" in chain
-    assert "selected_ids = set(sys.argv[2:])" in chain
+    assert "selected_ids = set(sys.argv[3:])" in chain
 
 
 def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None:
@@ -933,6 +968,10 @@ def test_full_chain_job_names_are_readable_unique_and_bounded() -> None:
     assert len(experiments) == len(set(experiments)) == 32
     assert max(map(len, experiments)) <= 64
     assert "q235t" in readable_job_name("q235-thinking", "nemo-direct", "dspark", 16, 4166)
+    assert readable_job_name("q30-base", "opb-direct", "dflash", 8, 4166, nodes=16).endswith("-n16")
+    assert not readable_job_name("q30-base", "opb-direct", "dflash", 8, 4166, nodes=2).endswith(
+        "-n2"
+    )
 
 
 def test_full_chain_submitter_presubmits_safe_afterok_stages() -> None:

@@ -32,8 +32,11 @@ _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HORIZONS = {("dflash", 8): 7, ("dflash", 16): 15, ("dspark", 8): 8, ("dspark", 16): 16}
 _TARGET_SLURM_DEFAULTS = {
-    "qwen3-30b-a3b": {"nodes": 2, "segment": 2},
-    "qwen3-235b-a22b": {"nodes": 4, "segment": 4},
+    "qwen3-30b-a3b": (
+        {"nodes": 2, "segment": 2},
+        {"nodes": 16, "segment": 16},
+    ),
+    "qwen3-235b-a22b": ({"nodes": 4, "segment": 4},),
 }
 
 
@@ -122,18 +125,20 @@ class TargetTopology:
 
     def __post_init__(self) -> None:
         expected = _TARGET_DEFAULTS.get(self.target_kind)
+        variable_fields = (
+            {"gradient_accumulation_steps"} if self.target_kind == "qwen3-30b-a3b" else set()
+        )
         if expected is None or any(
-            getattr(self, field) != value for field, value in expected.items()
+            getattr(self, field) != value
+            for field, value in expected.items()
+            if field not in variable_fields
         ):
             raise ValueError(f"target topology must use the pinned defaults for {self.target_kind}")
-        trainer_world_size = 4 if self.target_kind == "qwen3-30b-a3b" else 8
-        if (
-            self.per_device_train_batch_size * self.gradient_accumulation_steps * trainer_world_size
-            != 512
+        if self.target_kind == "qwen3-30b-a3b" and self.gradient_accumulation_steps not in (
+            4,
+            32,
         ):
-            raise ValueError(
-                f"target topology must produce global batch size 512 over {trainer_world_size} trainer GPUs"
-            )
+            raise ValueError("Q30 accumulation must match the pinned 2/16-node topology")
 
 
 _TARGET_DEFAULTS = {
@@ -199,15 +204,27 @@ class DrafterExperiment:
         method = self.method.lower()
         object.__setattr__(self, "method", method)
         speculative_tokens(method, self.block_size)
-        expected_slurm = _TARGET_SLURM_DEFAULTS.get(self.topology.target_kind)
-        if expected_slurm is None or any(
-            getattr(self.slurm, field) != value for field, value in expected_slurm.items()
+        expected_slurm = _TARGET_SLURM_DEFAULTS.get(self.topology.target_kind, ())
+        if not any(
+            all(getattr(self.slurm, field) == value for field, value in candidate.items())
+            for candidate in expected_slurm
         ):
             raise ValueError(
                 f"training topology does not match target family {self.topology.target_kind}"
             )
         if self.slurm.gpus_per_node != 4:
             raise ValueError("training requires four GPUs per allocated node")
+        trainer_world_size = (self.slurm.nodes // 2) * self.slurm.gpus_per_node
+        if (
+            self.slurm.nodes % 2
+            or self.topology.per_device_train_batch_size
+            * self.topology.gradient_accumulation_steps
+            * trainer_world_size
+            != 512
+        ):
+            raise ValueError(
+                f"target topology must produce global batch size 512 over {trainer_world_size} trainer GPUs"
+            )
         if not self.cumulative_max_steps or any(step < 1 for step in self.cumulative_max_steps):
             raise ValueError("cumulative_max_steps must contain positive boundaries")
         if self.sample_size != 1_300_000:

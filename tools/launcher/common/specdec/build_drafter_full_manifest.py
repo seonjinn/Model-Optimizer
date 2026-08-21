@@ -70,7 +70,13 @@ def full_convergence_boundaries(target_kind: str, block_size: int) -> tuple[int,
 
 
 def readable_job_name(
-    target: str, dataset: str, method: str, block_size: int, boundary: int
+    target: str,
+    dataset: str,
+    method: str,
+    block_size: int,
+    boundary: int,
+    *,
+    nodes: int | None = None,
 ) -> str:
     """Render a unique scheduler name that remains understandable in ``squeue``."""
     targets = {
@@ -87,6 +93,8 @@ def readable_job_name(
         )
     except KeyError as error:
         raise ValueError(f"unsupported readable job identity: {error.args[0]}") from error
+    if nodes not in (None, 2, 4):
+        name = f"{name}-n{nodes}"
     if len(name) > 64:
         raise ValueError(f"job name exceeds Slurm limit: {name}")
     return name
@@ -113,11 +121,12 @@ def build_full_manifest(
     source_path: str,
     source_sha: str,
     image_sha256: str,
+    q30_nodes: int = 2,
 ) -> tuple[DrafterExperiment, ...]:
     """Rewrite only source provenance and convergence stages of the trusted template."""
 
     def rewrite(experiment: DrafterExperiment) -> DrafterExperiment:
-        suffix = "-2n"
+        suffix = f"-{q30_nodes}n"
         is_q30 = experiment.topology.target_kind == "qwen3-30b-a3b"
         run_name = experiment.run_name
         output_root = experiment.paths.output_root
@@ -125,9 +134,19 @@ def build_full_manifest(
             run_name = f"{run_name}{suffix}"
         if is_q30 and not output_root.endswith(suffix):
             output_root = f"{output_root}{suffix}"
+        topology = experiment.topology
+        slurm = experiment.slurm
+        if is_q30:
+            topology = replace(
+                topology,
+                gradient_accumulation_steps=64 // q30_nodes,
+            )
+            slurm = replace(slurm, nodes=q30_nodes, segment=q30_nodes)
         return replace(
             experiment,
             run_name=run_name,
+            topology=topology,
+            slurm=slurm,
             cumulative_max_steps=full_convergence_boundaries(
                 experiment.topology.target_kind, experiment.block_size
             ),
@@ -140,6 +159,8 @@ def build_full_manifest(
             ),
         )
 
+    if q30_nodes not in (2, 16):
+        raise ValueError("Q30 training nodes must be 2 or 16")
     experiments = tuple(
         rewrite(experiment)
         for experiment in load_manifest(template, migrate_legacy_q30_topology=True)
@@ -171,7 +192,7 @@ def build_full_manifest(
     ):
         raise ValueError("target label does not match its pinned topology family")
     expected_slurm = {
-        "qwen3-30b-a3b": ("nemotron_n3_post", "batch", 2, 4, 2),
+        "qwen3-30b-a3b": ("nemotron_n3_post", "batch", q30_nodes, 4, q30_nodes),
         "qwen3-235b-a22b": ("nemotron_n3_post", "batch", 4, 4, 4),
     }
     if any(
@@ -205,6 +226,7 @@ def main() -> None:
     parser.add_argument("--source-path", required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--image-sha256", required=True)
+    parser.add_argument("--q30-nodes", type=int, choices=(2, 16), default=2)
     args = parser.parse_args()
     experiments = build_full_manifest(
         args.template,
@@ -212,6 +234,7 @@ def main() -> None:
         args.source_path,
         args.source_sha,
         args.image_sha256,
+        args.q30_nodes,
     )
     print(f"wrote {len(experiments)} experiments to {args.output}")
 

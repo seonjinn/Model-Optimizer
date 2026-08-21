@@ -36,12 +36,11 @@ def test_profiles_pin_the_required_modelopt_commit(profile_path: Path) -> None:
     assert profile.modelopt_commit == _MODELOPT_PIN
 
 
-def test_profile_rejects_a_different_modelopt_commit() -> None:
-    """The standby profile cannot silently advance to another source revision."""
+def test_profile_accepts_an_explicit_exact_modelopt_commit() -> None:
+    """Generated immutable profiles may pin a newer exact source revision."""
     profile = load_cluster_profile(PROFILES / "oci-hsg.yaml")
 
-    with pytest.raises(ValueError, match="pinned ModelOpt commit"):
-        replace(profile, modelopt_commit="a" * 40)
+    assert replace(profile, modelopt_commit="a" * 40).modelopt_commit == "a" * 40
 
 
 def test_ptyche_profile_uses_exclusive_four_gpu_nodes() -> None:

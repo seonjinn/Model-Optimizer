@@ -28,7 +28,6 @@ __all__ = [
 _MAX_SEGMENT_NODES = 18
 _SLURM_TMPDIR = Path("$SLURM_TMPDIR")
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
-_MODELOPT_COMMIT = "e3febcbe1319f018eea81fa4d42e2e36cb54494e"
 _REQUIRED_FIELDS = frozenset(
     {
         "name",
@@ -76,8 +75,6 @@ class ClusterProfile:
                 raise ValueError(f"{field} must be non-empty")
         if not _COMMIT_SHA.fullmatch(self.modelopt_commit):
             raise ValueError("modelopt_commit must be an exact 40-character lowercase commit SHA")
-        if self.modelopt_commit != _MODELOPT_COMMIT:
-            raise ValueError("profiles must use the pinned ModelOpt commit")
         if self.fallback_partition is not None and not self.fallback_partition.strip():
             raise ValueError("fallback_partition must be non-empty when provided")
         if not self.durable_root.is_absolute():

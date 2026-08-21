@@ -64,7 +64,7 @@ scheduler_jobs="$({
 } || true)"
 
 render_plan() {
-    PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST" "${EXPERIMENT_IDS[@]}" <<'PY'
+    PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST" "$SEED_Q30_FROM_LEGACY" "${EXPERIMENT_IDS[@]}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -78,7 +78,8 @@ from common.specdec.drafter_job_manifest import load_manifest
 experiments = load_manifest(Path(sys.argv[1]))
 if len(experiments) != 32:
     raise SystemExit("full chain manifest must contain exactly 32 experiments")
-selected_ids = set(sys.argv[2:])
+seed_q30_from_legacy = bool(int(sys.argv[2]))
+selected_ids = set(sys.argv[3:])
 selected = select_experiments(experiments, selected_ids)
 selected_by_id = {experiment.experiment_id for experiment in selected}
 for index, experiment in enumerate(experiments):
@@ -86,10 +87,11 @@ for index, experiment in enumerate(experiments):
         continue
     for boundary in experiment.cumulative_max_steps:
         legacy_id = legacy_fingerprint = selected_tuple = ""
-        if experiment.topology.target_kind == "qwen3-30b-a3b":
+        if seed_q30_from_legacy and experiment.topology.target_kind == "qwen3-30b-a3b":
             legacy_id, legacy_fingerprint, selected_tuple = legacy_q30_seed_expectations(
                 experiment
             )
+        expected_rng_states = (experiment.slurm.nodes // 2) * experiment.slurm.gpus_per_node
         print(
             "\t".join(
                 (
@@ -102,9 +104,11 @@ for index, experiment in enumerate(experiments):
                         experiment.method,
                         experiment.block_size,
                         boundary,
+                        nodes=experiment.slurm.nodes,
                     ),
                     experiment.paths.output_root,
                     experiment.topology.target_kind,
+                    str(expected_rng_states),
                     legacy_id,
                     legacy_fingerprint,
                     selected_tuple,
@@ -330,7 +334,7 @@ PY
 previous_index=""
 previous_job=""
 legacy_step=""
-while IFS=$'\t' read -r index identity boundary job_name output_root target_kind expected_legacy_id expected_legacy_fingerprint selected_tuple; do
+while IFS=$'\t' read -r index identity boundary job_name output_root target_kind expected_rng_states expected_legacy_id expected_legacy_fingerprint selected_tuple; do
     if [[ "$index" != "$previous_index" ]]; then
         previous_index="$index"
         previous_job=""
@@ -339,8 +343,6 @@ while IFS=$'\t' read -r index identity boundary job_name output_root target_kind
             seed_q30_checkpoint "$output_root" "$LEGACY_SOURCE_SHA" "$expected_legacy_id" "$expected_legacy_fingerprint" "$selected_tuple"
         fi
         if [[ ! -f "$output_root/control/training-identity.json" ]]; then
-            expected_rng_states=8
-            [[ "$target_kind" != "qwen3-30b-a3b" ]] || expected_rng_states=4
             checkpoint_record="$(EXPECTED_RNG_STATES="$expected_rng_states" bash "${SCRIPT_DIR}/drafter_requeue_lifecycle.sh" latest-complete "$output_root" 2>/dev/null || true)"
             if [[ -n "$checkpoint_record" ]]; then
                 [[ -n "$LEGACY_SOURCE_SHA" ]] || {
