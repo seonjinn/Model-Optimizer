@@ -244,9 +244,72 @@ record = {
     "status": sys.argv[2],
     "target_step": int(sys.argv[7]),
 }
+
 temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
 temporary.write_text(json.dumps(record, sort_keys=True) + "\n")
 os.replace(temporary, path)
+PY
+}
+
+drafter_prepare_training_output() {
+    [[ -n "${OUTPUT_ROOT:-}" && -n "${TRAINING_IDENTITY:-}" && -n "${TRAINING_FINGERPRINT:-}" && -n "${SOURCE_SHA:-}" && -n "${SLURM_JOB_ID:-}" ]] || {
+        echo "output, experiment, fingerprint, source SHA, and Slurm job ID are required" >&2
+        return 2
+    }
+    mkdir -p "$OUTPUT_ROOT/control"
+    local checkpoints=("$OUTPUT_ROOT"/checkpoint-*)
+    local resume_step=""
+    if [[ -e "${checkpoints[0]}" ]]; then
+        local attempt="${SLURM_RESTART_COUNT:-0}"
+        local quarantine="$OUTPUT_ROOT/control/preflight/job-${SLURM_JOB_ID}-attempt-${attempt}/quarantine"
+        local checkpoint_record
+        if ! checkpoint_record="$(drafter_latest_complete_checkpoint "$OUTPUT_ROOT" "$quarantine")"; then
+            echo "training output contains checkpoints but none is completely resumable" >&2
+            return 1
+        fi
+        resume_step="${checkpoint_record##*$'\t'}"
+    fi
+    python3 - "$OUTPUT_ROOT/control/training-identity.json" "$TRAINING_IDENTITY" \
+        "$TRAINING_FINGERPRINT" "$SOURCE_SHA" "$resume_step" \
+        "${LEGACY_ADOPTION_SOURCE_SHA:-}" "${LEGACY_ADOPTION_CHECKPOINT_STEP:-}" <<'PY'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+identity = sys.argv[2]
+fingerprint = sys.argv[3]
+source_sha = sys.argv[4]
+resume_step = int(sys.argv[5]) if sys.argv[5] else None
+legacy_source_sha = sys.argv[6]
+legacy_checkpoint_step = int(sys.argv[7]) if sys.argv[7] else None
+expected = {
+    "experiment_id": identity,
+    "source_sha": source_sha,
+    "training_fingerprint": fingerprint,
+}
+if path.exists():
+    try:
+        existing = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid training identity marker: {path}: {error}")
+    if any(existing.get(key) != value for key, value in expected.items()):
+        raise SystemExit(f"training output identity mismatch: {path}")
+else:
+    if resume_step is not None:
+        if not re.fullmatch(r"[0-9a-f]{40}", legacy_source_sha):
+            raise SystemExit("legacy checkpoint adoption requires an exact source SHA")
+        if legacy_checkpoint_step != resume_step:
+            raise SystemExit(
+                f"legacy checkpoint adoption step mismatch: {legacy_checkpoint_step}/{resume_step}"
+            )
+        expected["adopted_checkpoint_step"] = resume_step
+        expected["adopted_from_source_sha"] = legacy_source_sha
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(expected, sort_keys=True) + "\n")
+    os.replace(temporary, path)
 PY
 }
 

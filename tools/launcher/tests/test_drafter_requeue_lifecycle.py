@@ -12,8 +12,6 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
-
 
 _LAUNCHER_DIR = Path(__file__).resolve().parents[1]
 _LIFECYCLE = _LAUNCHER_DIR / "common/specdec/drafter_requeue_lifecycle.sh"
@@ -53,7 +51,7 @@ def _start_lifecycle(
     target_step: int,
     restart_count: int = 0,
     max_requeues: int = 3,
-    child_command: Optional[str] = None,
+    child_command: str | None = None,
     terminate_grace_seconds: int = 1,
     scontrol_kills_caller: bool = False,
     milestone_steps: str = "4166,25391",
@@ -511,3 +509,98 @@ def test_checkpoint_missing_a_trainer_rank_rng_state_is_not_resumable(tmp_path: 
 
     assert completed.returncode != 0
     assert completed.stdout == ""
+
+
+def test_resume_preflight_quarantines_incomplete_newer_checkpoint(tmp_path: Path) -> None:
+    """Transformers cannot select a newer partial checkpoint after preflight."""
+    output_root = tmp_path / "output"
+    complete = _write_checkpoint(output_root, 20)
+    incomplete = output_root / "checkpoint-40"
+    incomplete.mkdir()
+    (incomplete / "trainer_state.json").write_text(json.dumps({"global_step": 40}))
+    command = f'source "{_LIFECYCLE}"; drafter_prepare_training_output'
+
+    completed = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "OUTPUT_ROOT": str(output_root),
+            "TRAINING_IDENTITY": "experiment-1",
+            "TRAINING_FINGERPRINT": "fingerprint-1",
+            "SOURCE_SHA": "a" * 40,
+            "LEGACY_ADOPTION_SOURCE_SHA": "b" * 40,
+            "LEGACY_ADOPTION_CHECKPOINT_STEP": "20",
+            "SLURM_JOB_ID": "4242",
+            "SLURM_RESTART_COUNT": "0",
+        },
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert complete.is_dir()
+    assert not incomplete.exists()
+    assert (
+        output_root
+        / "control/preflight/job-4242-attempt-0/quarantine/checkpoint-40/trainer_state.json"
+    ).is_file()
+
+
+def test_resume_preflight_rejects_output_identity_mismatch(tmp_path: Path) -> None:
+    """A different experiment cannot adopt an existing output namespace."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    command = f'source "{_LIFECYCLE}"; drafter_prepare_training_output'
+    base_env = {
+        **os.environ,
+        "OUTPUT_ROOT": str(output_root),
+        "SLURM_JOB_ID": "4242",
+        "SLURM_RESTART_COUNT": "0",
+        "TRAINING_FINGERPRINT": "fingerprint-1",
+        "SOURCE_SHA": "a" * 40,
+    }
+    first = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        check=False,
+        env={**base_env, "TRAINING_IDENTITY": "experiment-1"},
+        text=True,
+    )
+    second = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        check=False,
+        env={**base_env, "TRAINING_IDENTITY": "experiment-2"},
+        text=True,
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode != 0
+    assert "identity mismatch" in second.stderr
+
+
+def test_resume_preflight_rejects_unapproved_legacy_checkpoint(tmp_path: Path) -> None:
+    """A complete legacy checkpoint still requires explicit source provenance."""
+    output_root = tmp_path / "output"
+    _write_checkpoint(output_root, 20)
+    command = f'source "{_LIFECYCLE}"; drafter_prepare_training_output'
+    completed = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        check=False,
+        env={
+            **os.environ,
+            "OUTPUT_ROOT": str(output_root),
+            "TRAINING_IDENTITY": "experiment-1",
+            "TRAINING_FINGERPRINT": "fingerprint-1",
+            "SOURCE_SHA": "a" * 40,
+            "SLURM_JOB_ID": "4242",
+            "SLURM_RESTART_COUNT": "0",
+        },
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "legacy checkpoint adoption requires" in completed.stderr
+    assert not (output_root / "control/training-identity.json").exists()

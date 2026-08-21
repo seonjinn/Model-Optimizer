@@ -22,6 +22,8 @@ for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT; do
 done
 readonly LAUNCHER_ROOT
 mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" <<'PY'
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -38,11 +40,24 @@ for value in (
     experiment.topology.per_device_train_batch_size, experiment.topology.gradient_accumulation_steps,
     experiment.topology.num_attention_heads, experiment.topology.num_key_value_heads,
     experiment.topology.head_dim, experiment.topology.intermediate_size,
+    experiment.experiment_id,
+    hashlib.sha256(
+        json.dumps(
+            (
+                experiment.target, experiment.dataset, experiment.method,
+                experiment.block_size, experiment.run_name, experiment.paths.target_path,
+                experiment.paths.dataset_path, experiment.paths.output_root,
+                experiment.topology.target_kind, experiment.topology.capture_ids,
+                experiment.topology.serve_tp,
+            ),
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest(),
 ):
     print(value)
 PY
 )
-(( ${#manifest_values[@]} == 20 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
+(( ${#manifest_values[@]} == 22 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
 SOURCE_PATH="${manifest_values[0]}"
 SOURCE_SHA="${manifest_values[1]}"
 IMAGE_PATH="${manifest_values[2]}"
@@ -64,6 +79,8 @@ NUM_ATTENTION_HEADS="${manifest_values[16]}"
 NUM_KEY_VALUE_HEADS="${manifest_values[17]}"
 HEAD_DIM="${manifest_values[18]}"
 INTERMEDIATE_SIZE="${manifest_values[19]}"
+TRAINING_IDENTITY="${manifest_values[20]}"
+TRAINING_FINGERPRINT="${manifest_values[21]}"
 for name in SOURCE_PATH SOURCE_SHA RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT METHOD BLOCK_SIZE RUN_NAME; do
     [[ -n "${!name:-}" ]] || { echo "missing manifest value: $name" >&2; exit 2; }
 done
@@ -122,11 +139,12 @@ esac
 export SERVE_NODES NUM_SPEC_TOKENS
 export SERVE_REPLICAS_PER_NODE
 
-export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES
+export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES TRAINING_IDENTITY TRAINING_FINGERPRINT
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     # shellcheck source=tools/launcher/common/specdec/drafter_requeue_lifecycle.sh
     source "$LAUNCHER_ROOT/common/specdec/drafter_requeue_lifecycle.sh"
     drafter_requeue_init
+    drafter_prepare_training_output
 fi
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
 staging_step=(srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '

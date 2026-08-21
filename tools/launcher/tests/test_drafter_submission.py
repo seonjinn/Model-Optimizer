@@ -13,6 +13,10 @@ import textwrap
 from pathlib import Path
 
 import pytest
+from common.specdec.build_drafter_full_manifest import (
+    full_convergence_boundaries,
+    readable_job_name,
+)
 from common.specdec.drafter_job_manifest import (
     DrafterExperiment,
     PinnedPaths,
@@ -258,12 +262,12 @@ def test_model_staging_copy_pipeline_materializes_nested_files(tmp_path: Path) -
         "set -euo pipefail\n"
         "[[ $1 == --reflink=auto ]] && shift\n"
         "[[ $1 == --preserve=mode,timestamps ]] && shift\n"
-        "exec /bin/cp \"$@\"\n"
+        'exec /bin/cp "$@"\n'
     )
     fake_cp.chmod(0o755)
     script = (_LAUNCHER_DIR / "common/specdec/stage_hf_model.sh").read_text()
     start = script.index('    find "$local_snapshot" -type f -print0')
-    end = script.index('\n    printf ', start)
+    end = script.index("\n    printf ", start)
     pipeline = textwrap.dedent(script[start:end])
 
     completed = subprocess.run(
@@ -427,7 +431,7 @@ def test_submitter_exports_the_home_launcher_root_to_the_spooled_runner() -> Non
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
     assert "LAUNCHER_ROOT=${LAUNCHER_ROOT}" in submitter
-    assert 'for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT' in runner
+    assert "for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT" in runner
     assert 'LAUNCHER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"' not in runner
 
 
@@ -486,7 +490,7 @@ def test_missing_optional_target_sidecar_does_not_fail_host_staging() -> None:
     target_copy = 'cp -aL "$TARGET_PATH" "$node_root/input/target"'
     assert runner.count(target_copy) == 1
     assert '[[ -e "$TARGET_PATH/$sidecar" ]] && cp' not in runner
-    assert 'for sidecar in config.json' not in runner
+    assert "for sidecar in config.json" not in runner
     assert 'echo "host staging complete: node=${SLURM_NODEID}"' in runner
 
 
@@ -563,6 +567,54 @@ def test_self_requeue_is_opt_in_and_configures_slurm_signal_delivery() -> None:
         assert required in submitter
 
 
+def test_full_convergence_boundaries_keep_every_family_below_restart_budget() -> None:
+    """Every target family uses the approved bounded stage schedule."""
+    assert full_convergence_boundaries("qwen3-30b-a3b", 8) == (4166, 14500, 25391)
+    assert full_convergence_boundaries("qwen3-30b-a3b", 16) == (4166, 14500, 25391)
+    assert full_convergence_boundaries("qwen3-235b-a22b", 8) == (4166, 14500, 25391)
+    assert full_convergence_boundaries("qwen3-235b-a22b", 16) == (
+        4166,
+        10500,
+        17000,
+        23500,
+        25391,
+    )
+
+
+def test_full_chain_job_names_are_readable_unique_and_bounded() -> None:
+    """Readable scheduler names encode every dimension without collisions."""
+    experiments = [
+        readable_job_name(target, dataset, method, block_size, 25391)
+        for target in ("q30-base", "q30-thinking", "q235-base", "q235-thinking")
+        for dataset in ("opb-direct", "nemo-direct")
+        for method in ("dflash", "dspark")
+        for block_size in (8, 16)
+    ]
+    assert len(experiments) == len(set(experiments)) == 32
+    assert max(map(len, experiments)) <= 64
+    assert "q235t" in readable_job_name("q235-thinking", "nemo-direct", "dspark", 16, 4166)
+
+
+def test_full_chain_submitter_presubmits_safe_afterok_stages() -> None:
+    """The orchestrator pins lifecycle settings and dependency submission."""
+    chain = (_LAUNCHER_DIR / "common/specdec/submit_drafter_full_chain.sh").read_text()
+    wave = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+
+    for required in (
+        "squeue -h -u",
+        "sacct -X -n -P -u",
+        "SCHEDULER_JOBS_SNAPSHOT",
+        "--dependency",
+        "--save-steps 50",
+        "--self-requeue",
+        "--max-requeues 50",
+        "--experiment-index",
+        "--job-name",
+    ):
+        assert required in chain
+    assert 'wandb_run_id="sd-${identity}"' in wave
+
+
 def test_self_requeue_runner_uses_checkpoint_gated_lifecycle() -> None:
     """The runner resumes one W&B identity and requeues only through the tested helper."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
@@ -624,7 +676,7 @@ def test_streaming_serve_replicas_have_disjoint_devices_and_ports() -> None:
         "replica_api_port=$((SERVE_PORT + replica))",
         "replica_sidecar_port=$((HS_SIDECAR_PORT + replica))",
         'launch_vllm "0.0.0.0" "$SERVE_TP" "$replica_cvd"',
-        'vllm_serve.${NODEID}.${replica}.log',
+        "vllm_serve.${NODEID}.${replica}.log",
     ):
         assert required in streaming
 
@@ -634,11 +686,11 @@ def test_streaming_rendezvous_publishes_and_checks_every_replica() -> None:
     streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
 
     for required in (
-        '${SERVE_ADDR_FILE}.${NODEID}.${replica}',
+        "${SERVE_ADDR_FILE}.${NODEID}.${replica}",
         'mv "$addr_tmp" "$addr_file"',
         "for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++))",
-        '${SERVE_ADDR_FILE}.${s}.${replica}',
-        "wait_vllm_ready \"$surl\"",
+        "${SERVE_ADDR_FILE}.${s}.${replica}",
+        'wait_vllm_ready "$surl"',
     ):
         assert required in streaming
 
