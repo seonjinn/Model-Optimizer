@@ -714,6 +714,7 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
         "#SBATCH --gpus-per-node=4",
         "#SBATCH --segment=1",
         'JOB_ROOT="${MARS_SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
+        'readonly JOB_RUNTIME="${JOB_ROOT}/speculators-runtime"',
         "EVAL_MODE=throughput",
         "srun --exclusive --nodes=1 --ntasks=1 --gpus=2",
         'run_cell "${CELL_A}" 8000',
@@ -722,8 +723,8 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
         "CLUSTER_PROFILE CLUSTER_READINESS_RECEIPT",
         'CLUSTER_PROFILE="${CLUSTER_PROFILE}"',
         'CLUSTER_READINESS_RECEIPT="${CLUSTER_READINESS_RECEIPT}"',
-        '${CLUSTER_PROFILE}:${CLUSTER_PROFILE}',
-        '${CLUSTER_READINESS_RECEIPT}:${CLUSTER_READINESS_RECEIPT}',
+        "${CLUSTER_PROFILE}:${CLUSTER_PROFILE}",
+        "${CLUSTER_READINESS_RECEIPT}:${CLUSTER_READINESS_RECEIPT}",
         'MARS_SCRATCH_ROOT="${MARS_SCRATCH_ROOT}"',
         'validate_label "${PAIR_LABEL}"',
         'validate_label "${label}"',
@@ -735,6 +736,7 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
     ):
         assert required in runner
     assert "EVAL_MODE=sweep" not in runner
+    assert "readonly SPECULATORS_RUNTIME=" not in runner
     assert "pip install" not in runner
     assert "git clone" not in runner
 

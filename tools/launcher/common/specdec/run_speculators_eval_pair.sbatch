@@ -35,7 +35,7 @@ validate_label "${PAIR_LABEL}"
 
 MARS_SCRATCH_ROOT="${MARS_SCRATCH_ROOT:-/raid/scratch}"
 readonly JOB_ROOT="${MARS_SCRATCH_ROOT%/}/${SLURM_JOB_ID}"
-readonly SPECULATORS_RUNTIME="${JOB_ROOT}/speculators-runtime"
+readonly JOB_RUNTIME="${JOB_ROOT}/speculators-runtime"
 readonly WRAPPER="${MODELOPT_REPO}/tools/launcher/common/specdec/run_speculators_eval.sh"
 readonly STAGER="${MODELOPT_REPO}/tools/launcher/common/specdec/stage_speculators_eval_runtime.sh"
 readonly RESULT_ROOT="${EVAL_OUTPUT_ROOT%/}/${PAIR_LABEL}"
@@ -53,7 +53,7 @@ done
 mkdir -p "${JOB_ROOT}" "${RESULT_ROOT}"
 SPECULATORS_RUNTIME_ARCHIVE="${RUNTIME_ARCHIVE}" \
 SPECULATORS_RUNTIME_ARCHIVE_SHA256="${RUNTIME_ARCHIVE_SHA256}" \
-SPECULATORS_RUNTIME="${SPECULATORS_RUNTIME}" \
+SPECULATORS_RUNTIME="${JOB_RUNTIME}" \
 CLUSTER_PROFILE="${CLUSTER_PROFILE}" \
 CLUSTER_READINESS_RECEIPT="${CLUSTER_READINESS_RECEIPT}" \
 MARS_SCRATCH_ROOT="${MARS_SCRATCH_ROOT}" \
@@ -88,7 +88,7 @@ run_cell() {
 
     local mounts
     mounts="${MODELOPT_REPO}:${MODELOPT_REPO},${SPECULATORS_REPO}:${SPECULATORS_REPO}"
-    mounts+=",${SPECULATORS_RUNTIME}:${SPECULATORS_RUNTIME},${HF_MODEL_CKPT}:${HF_MODEL_CKPT}"
+    mounts+=",${JOB_RUNTIME}:${JOB_RUNTIME},${HF_MODEL_CKPT}:${HF_MODEL_CKPT}"
     mounts+=",${HF_HOME_DURABLE}:${HF_HOME_DURABLE},${DATASET_MANIFEST_PATH}:${DATASET_MANIFEST_PATH}"
     mounts+=",${CONTAINER_IDENTITY_PATH}:${CONTAINER_IDENTITY_PATH},${CONTAINER_IMAGE}:${CONTAINER_IMAGE}"
     mounts+=",${EVAL_CONFIG_PATH}:${EVAL_CONFIG_PATH},${output_root}:${output_root},${cell_root}:${cell_root}"
@@ -105,7 +105,7 @@ run_cell() {
         --container-workdir="${MODELOPT_REPO}/tools/launcher" \
         --no-container-mount-home \
         env \
-        SPECULATORS_RUNTIME="${SPECULATORS_RUNTIME}" \
+        SPECULATORS_RUNTIME="${JOB_RUNTIME}" \
         SPECULATORS_RUNTIME_ARCHIVE_SHA256="${RUNTIME_ARCHIVE_SHA256}" \
         SPECULATORS_REPO="${SPECULATORS_REPO}" \
         MODELOPT_REPO="${MODELOPT_REPO}" \
