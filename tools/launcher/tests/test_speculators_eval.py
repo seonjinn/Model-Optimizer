@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -152,6 +153,42 @@ def _make_harness(
     positions = num_spec_tokens if csv_positions is None else csv_positions
     acceptance_fixture = tmp_path / "acceptance-fixture.csv"
     acceptance_fixture.write_text(_acceptance_csv_text(positions, drafts))
+    throughput_fixture = tmp_path / "throughput-fixture.json"
+    throughput_fixture.write_text(
+        json.dumps(
+            {
+                "benchmarks": [
+                    {
+                        "config": {
+                            "strategy": {
+                                "type_": "throughput",
+                                "max_concurrency": max_concurrency,
+                            }
+                        },
+                        "scheduler_state": {
+                            "successful_requests": max_requests,
+                            "errored_requests": 0,
+                            "cancelled_requests": 0,
+                        },
+                        "metrics": {
+                            "request_totals": {
+                                "successful": max_requests,
+                                "errored": 0,
+                                "incomplete": 0,
+                                "total": max_requests,
+                            },
+                            "requests_per_second": {"successful": {"median": 1.0}},
+                            "request_latency": {"successful": {"median": 0.5}},
+                            "inter_token_latency_ms": {"successful": {"median": 2.0}},
+                            "time_to_first_token_ms": {"successful": {"median": 10.0}},
+                            "output_tokens_per_second": {"successful": {"median": 100.0}},
+                            "text": {"tokens": {"output": {"successful": {"total_sum": 2048.0}}}},
+                        },
+                    }
+                ]
+            }
+        )
+    )
 
     activate = runtime_bin / "activate"
     activate.parent.mkdir(parents=True)
@@ -245,6 +282,8 @@ elif [[ "$1" == "{evaluator}" ]]; then
       mv "$output_dir/.acceptance-$subset.csv" "$output_dir/acceptance.csv"
     fi
   fi
+  mkdir -p "$output_dir/artifacts"
+  cp "{throughput_fixture}" "$output_dir/artifacts/run_${{subset}}.json"
   if [[ "{eval_mode}" == "sweep" ]]; then
     if [[ ! -f "$output_dir/perf_results.csv" ]]; then
       printf '%s%s\n' \
@@ -434,6 +473,12 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
     assert len(manifest["config_sha256"]) == 3
     assert all(len(value) == 64 for value in manifest["config_sha256"].values())
     assert (run_dir / "acceptance.csv").stat().st_size > 0
+    performance_rows = list(csv.DictReader((run_dir / "perf_results.csv").open()))
+    assert len(performance_rows) == len(_SUBSETS)
+    assert {row["subset"] for row in performance_rows} == set(_SUBSETS)
+    assert {row["strategy"] for row in performance_rows} == {"throughput"}
+    assert {int(row["max_concurrency"]) for row in performance_rows} == {32}
+    assert {int(row["completed_requests"]) for row in performance_rows} == {200}
     server_pid = int(server_pid_file.read_text())
     assert subprocess.run(["kill", "-0", str(server_pid)], check=False).returncode != 0
     invocations = (tmp_path / "invocations.log").read_text()
@@ -450,7 +495,7 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
 
 
 @pytest.mark.parametrize("max_concurrency", [1, 8, 32, 128])
-def test_sweep_uses_configured_concurrency_and_validates_performance(
+def test_fixed_throughput_uses_configured_concurrency_and_validates_performance(
     tmp_path: Path, max_concurrency: int
 ) -> None:
     """Each approved concurrency must produce task-wise sweep performance."""
@@ -458,30 +503,32 @@ def test_sweep_uses_configured_concurrency_and_validates_performance(
         tmp_path,
         max_concurrency=max_concurrency,
         max_requests=512 if max_concurrency == 128 else 200,
-        eval_mode="sweep",
+        eval_mode="throughput",
     )
 
     result = _run(env, tmp_path)
 
     assert result.returncode == 0, result.stderr
     manifest = json.loads((run_dir / "manifest.json").read_text())
-    assert manifest["evaluation"]["mode"] == "sweep"
+    assert manifest["evaluation"]["mode"] == "throughput"
     assert manifest["evaluation"]["max_concurrency"] == max_concurrency
     assert manifest["evaluation"]["max_requests"] == (512 if max_concurrency == 128 else 200)
-    assert manifest["evaluator_args"][-1] == "sweep"
+    assert manifest["evaluator_args"][-1] == "throughput"
     assert (run_dir / "acceptance.csv").is_file()
     assert (run_dir / "perf_results.csv").is_file()
 
 
-def test_baseline_sweep_omits_speculation_and_requires_only_performance(tmp_path: Path) -> None:
-    """The AR baseline must use the same sweep without draft or acceptance requirements."""
+def test_baseline_throughput_omits_speculation_and_requires_only_performance(
+    tmp_path: Path,
+) -> None:
+    """The AR baseline must use the same fixed throughput without acceptance."""
     env, run_dir, _ = _make_harness(
         tmp_path,
         method="baseline",
         block_size=0,
         num_spec_tokens=0,
         max_concurrency=8,
-        eval_mode="sweep",
+        eval_mode="throughput",
         spec_metrics_ready=False,
     )
     env.pop("DRAFT_MODEL")
@@ -496,6 +543,30 @@ def test_baseline_sweep_omits_speculation_and_requires_only_performance(tmp_path
     assert (run_dir / "perf_results.csv").is_file()
     assert not (run_dir / "acceptance.csv").exists()
     assert "--speculative-config" not in manifest["server_args"]
+
+
+def test_resume_skips_atomically_validated_completed_subsets(tmp_path: Path) -> None:
+    """A retry must reuse durable subset outputs without issuing duplicate requests."""
+    env, run_dir, _ = _make_harness(tmp_path)
+    evaluator_prefix = f"python3 {env['SPECULATORS_REPO']}/scripts/evaluate/evaluate.py "
+
+    first = _run(env, tmp_path)
+    first_evaluations = sum(
+        line.startswith(evaluator_prefix)
+        for line in (tmp_path / "invocations.log").read_text().splitlines()
+    )
+    second = _run(env, tmp_path)
+    second_evaluations = sum(
+        line.startswith(evaluator_prefix)
+        for line in (tmp_path / "invocations.log").read_text().splitlines()
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+    assert first_evaluations == len(_SUBSETS)
+    assert second_evaluations == first_evaluations
+    assert "Reusing validated completed subset" in second.stdout
+    assert (run_dir / "perf_results.csv").is_file()
 
 
 @pytest.mark.parametrize("max_concurrency", [0, 2, 64])

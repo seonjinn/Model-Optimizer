@@ -34,7 +34,7 @@ pipeline:
     num_spec_tokens: "8"
     max_concurrency: "32"
     max_requests: "200"
-    eval_mode: sweep
+    eval_mode: throughput
 
   task_0:
     script: common/specdec/run_speculators_eval.sh

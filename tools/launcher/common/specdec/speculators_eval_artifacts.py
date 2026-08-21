@@ -46,7 +46,9 @@ DATASET_ID = "RedHatAI/speculator_benchmarks"
 PERF_COLUMNS = (
     "subset",
     "strategy",
-    "target_rate",
+    "max_concurrency",
+    "request_budget",
+    "completed_requests",
     "rps_median",
     "latency_median_s",
     "itl_median_ms",
@@ -118,37 +120,39 @@ def validate_acceptance(csv_path: Path, num_speculative_tokens: int) -> None:
     if len(rows) != len(STANDARD_SUBSETS) or set(subsets) != set(STANDARD_SUBSETS):
         raise ValueError(f"expected exactly the nine standard subsets, got {subsets}")
     for row in rows:
-        subset = row["subset"]
-        drafts = _nonnegative_int(row, "num_drafts")
-        draft_tokens = _nonnegative_int(row, "num_draft_tokens")
-        accepted_tokens = _nonnegative_int(row, "num_accepted_tokens")
-        acceptance_length = _finite_float(row, "acceptance_length")
-        if drafts == 0:
-            raise ValueError(f"{subset}: num_drafts must be > 0")
-        if draft_tokens != drafts * num_speculative_tokens:
-            raise ValueError(f"{subset}: num_draft_tokens must equal num_drafts * K")
-        if accepted_tokens > draft_tokens:
-            raise ValueError(f"{subset}: accepted tokens exceed drafted tokens")
+        _validate_acceptance_row(row, num_speculative_tokens)
 
-        rates = [
-            _finite_float(row, f"acceptance_at_pos_{position}")
-            for position in range(num_speculative_tokens)
-        ]
-        if any(rate < 0 or rate > 1 for rate in rates):
-            raise ValueError(f"{subset}: position acceptance must be within [0, 1]")
-        if any(current > previous + ACCEPTANCE_TOLERANCE for previous, current in pairwise(rates)):
-            raise ValueError(f"{subset}: position acceptance must be monotone nonincreasing")
 
-        counter_length = 1 + accepted_tokens / drafts
-        position_length = 1 + sum(rates)
-        if not math.isclose(
-            acceptance_length, counter_length, abs_tol=ACCEPTANCE_TOLERANCE, rel_tol=0
-        ):
-            raise ValueError(f"{subset}: acceptance_length disagrees with accepted-token counters")
-        if not math.isclose(
-            acceptance_length, position_length, abs_tol=ACCEPTANCE_TOLERANCE, rel_tol=0
-        ):
-            raise ValueError(f"{subset}: acceptance_length disagrees with position rates")
+def _validate_acceptance_row(row: dict[str, str], num_speculative_tokens: int) -> None:
+    subset = row["subset"]
+    drafts = _nonnegative_int(row, "num_drafts")
+    draft_tokens = _nonnegative_int(row, "num_draft_tokens")
+    accepted_tokens = _nonnegative_int(row, "num_accepted_tokens")
+    acceptance_length = _finite_float(row, "acceptance_length")
+    if drafts == 0:
+        raise ValueError(f"{subset}: num_drafts must be > 0")
+    if draft_tokens != drafts * num_speculative_tokens:
+        raise ValueError(f"{subset}: num_draft_tokens must equal num_drafts * K")
+    if accepted_tokens > draft_tokens:
+        raise ValueError(f"{subset}: accepted tokens exceed drafted tokens")
+
+    rates = [
+        _finite_float(row, f"acceptance_at_pos_{position}")
+        for position in range(num_speculative_tokens)
+    ]
+    if any(rate < 0 or rate > 1 for rate in rates):
+        raise ValueError(f"{subset}: position acceptance must be within [0, 1]")
+    if any(current > previous + ACCEPTANCE_TOLERANCE for previous, current in pairwise(rates)):
+        raise ValueError(f"{subset}: position acceptance must be monotone nonincreasing")
+
+    counter_length = 1 + accepted_tokens / drafts
+    position_length = 1 + sum(rates)
+    if not math.isclose(acceptance_length, counter_length, abs_tol=ACCEPTANCE_TOLERANCE, rel_tol=0):
+        raise ValueError(f"{subset}: acceptance_length disagrees with accepted-token counters")
+    if not math.isclose(
+        acceptance_length, position_length, abs_tol=ACCEPTANCE_TOLERANCE, rel_tol=0
+    ):
+        raise ValueError(f"{subset}: acceptance_length disagrees with position rates")
 
 
 def validate_performance(csv_path: Path) -> None:
@@ -161,12 +165,230 @@ def validate_performance(csv_path: Path) -> None:
             raise ValueError("performance CSV is missing required columns")
         rows = list(reader)
     subsets = {row.get("subset", "") for row in rows}
-    if subsets != set(STANDARD_SUBSETS):
+    if len(rows) != len(STANDARD_SUBSETS) or subsets != set(STANDARD_SUBSETS):
         raise ValueError(f"expected exactly the nine standard subsets, got {sorted(subsets)}")
+    concurrencies: set[int] = set()
+    budgets: set[int] = set()
     for row in rows:
-        for column in PERF_COLUMNS[2:]:
-            if _finite_float(row, column) < 0:
-                raise ValueError(f"{row['subset']}: negative {column}")
+        concurrency, budget = _validate_performance_row(row)
+        concurrencies.add(concurrency)
+        budgets.add(budget)
+    if len(concurrencies) != 1 or len(budgets) != 1:
+        raise ValueError("performance rows must use one concurrency and request budget")
+
+
+def _validate_performance_row(
+    row: dict[str, str],
+    expected_concurrency: int | None = None,
+    expected_budget: int | None = None,
+) -> tuple[int, int]:
+    if row.get("strategy") != "throughput":
+        raise ValueError(f"{row.get('subset', '<unknown>')}: strategy must be throughput")
+    for column in PERF_COLUMNS[2:]:
+        if _finite_float(row, column) < 0:
+            raise ValueError(f"{row['subset']}: negative {column}")
+    concurrency = _nonnegative_int(row, "max_concurrency")
+    budget = _nonnegative_int(row, "request_budget")
+    completed = _nonnegative_int(row, "completed_requests")
+    if concurrency not in {1, 8, 32, 128}:
+        raise ValueError(f"{row['subset']}: invalid max_concurrency")
+    if budget == 0 or completed != budget:
+        raise ValueError(f"{row['subset']}: completed requests do not match budget")
+    if expected_concurrency is not None and concurrency != expected_concurrency:
+        raise ValueError(f"{row['subset']}: max_concurrency mismatch")
+    if expected_budget is not None and budget != expected_budget:
+        raise ValueError(f"{row['subset']}: request budget mismatch")
+    return concurrency, budget
+
+
+def _successful_median(metrics: dict[str, object], metric_name: str) -> float:
+    metric = metrics.get(metric_name)
+    if not isinstance(metric, dict):
+        raise ValueError(f"missing GuideLLM metric: {metric_name}")
+    successful = metric.get("successful")
+    if not isinstance(successful, dict):
+        raise ValueError(f"missing successful GuideLLM metric: {metric_name}")
+    try:
+        value = float(successful["median"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid GuideLLM median: {metric_name}") from error
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"invalid GuideLLM median: {metric_name}")
+    return value
+
+
+def append_fixed_performance(
+    json_path: Path,
+    csv_path: Path,
+    subset: str,
+    max_concurrency: int,
+    max_requests: int,
+) -> None:
+    """Append one validated fixed-concurrency GuideLLM throughput result."""
+    if subset not in STANDARD_SUBSETS:
+        raise ValueError(f"unexpected subset: {subset}")
+    data = _load_json(json_path)
+    benchmarks = data.get("benchmarks")
+    if not isinstance(benchmarks, list) or len(benchmarks) != 1:
+        raise ValueError("fixed throughput output must contain exactly one benchmark")
+    benchmark = benchmarks[0]
+    if not isinstance(benchmark, dict):
+        raise ValueError("invalid GuideLLM benchmark")
+    config = benchmark.get("config")
+    state = benchmark.get("scheduler_state")
+    metrics = benchmark.get("metrics")
+    if not isinstance(config, dict) or not isinstance(state, dict) or not isinstance(metrics, dict):
+        raise ValueError("incomplete GuideLLM benchmark")
+    strategy = config.get("strategy")
+    if not isinstance(strategy, dict) or strategy.get("type_") != "throughput":
+        raise ValueError("GuideLLM benchmark is not fixed throughput")
+    if strategy.get("max_concurrency") != max_concurrency:
+        raise ValueError("GuideLLM max concurrency does not match configuration")
+    successful = state.get("successful_requests")
+    if successful != max_requests:
+        raise ValueError("GuideLLM completed requests do not match the request budget")
+    if state.get("errored_requests") != 0 or state.get("cancelled_requests") != 0:
+        raise ValueError("GuideLLM benchmark contains failed requests")
+
+    text = metrics.get("text")
+    try:
+        output = text["tokens"]["output"]["successful"]  # type: ignore[index]
+        total_output_tokens = float(output["total_sum"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid GuideLLM total output tokens") from error
+    if not math.isfinite(total_output_tokens) or total_output_tokens < 0:
+        raise ValueError("invalid GuideLLM total output tokens")
+
+    row: dict[str, object] = {
+        "subset": subset,
+        "strategy": "throughput",
+        "max_concurrency": max_concurrency,
+        "request_budget": max_requests,
+        "completed_requests": successful,
+        "rps_median": _successful_median(metrics, "requests_per_second"),
+        "latency_median_s": _successful_median(metrics, "request_latency"),
+        "itl_median_ms": _successful_median(metrics, "inter_token_latency_ms"),
+        "ttft_median_ms": _successful_median(metrics, "time_to_first_token_ms"),
+        "output_tps_median": _successful_median(metrics, "output_tokens_per_second"),
+        "total_output_tokens": total_output_tokens,
+    }
+    existing: list[dict[str, str]] = []
+    if csv_path.exists():
+        with csv_path.open(newline="") as file:
+            reader = csv.DictReader(file)
+            if tuple(reader.fieldnames or ()) != PERF_COLUMNS:
+                raise ValueError("performance CSV schema mismatch")
+            existing = list(reader)
+        if any(item.get("subset") == subset for item in existing):
+            raise ValueError(f"duplicate performance subset: {subset}")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{csv_path.name}.", dir=csv_path.parent)
+    try:
+        with os.fdopen(fd, "w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=PERF_COLUMNS)
+            writer.writeheader()
+            writer.writerows(existing)
+            writer.writerow(row)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, csv_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def validate_fixed_subset(
+    subset_dir: Path,
+    subset: str,
+    method: str,
+    num_speculative_tokens: int,
+    max_concurrency: int,
+    max_requests: int,
+) -> None:
+    """Validate one durable subset so a resumed job can safely skip it."""
+    perf_path = subset_dir / "perf_results.csv"
+    with perf_path.open(newline="") as file:
+        perf_reader = csv.DictReader(file)
+        if tuple(perf_reader.fieldnames or ()) != PERF_COLUMNS:
+            raise ValueError("performance CSV schema mismatch")
+        perf_rows = list(perf_reader)
+    if len(perf_rows) != 1 or perf_rows[0].get("subset") != subset:
+        raise ValueError(f"{subset}: expected exactly one performance row")
+    _validate_performance_row(perf_rows[0], max_concurrency, max_requests)
+    if method == "baseline":
+        if (subset_dir / "acceptance.csv").exists():
+            raise ValueError(f"{subset}: baseline must not have acceptance output")
+        return
+    with (subset_dir / "acceptance.csv").open(newline="") as file:
+        acceptance_reader = csv.DictReader(file)
+        rows = list(acceptance_reader)
+    expected_positions = {
+        f"acceptance_at_pos_{position}" for position in range(num_speculative_tokens)
+    }
+    actual_positions = {
+        column
+        for column in (acceptance_reader.fieldnames or ())
+        if column.startswith("acceptance_at_pos_")
+    }
+    if len(rows) != 1 or rows[0].get("subset") != subset:
+        raise ValueError(f"{subset}: expected exactly one acceptance row")
+    if actual_positions != expected_positions:
+        raise ValueError(f"{subset}: acceptance positions mismatch")
+    _validate_acceptance_row(rows[0], num_speculative_tokens)
+
+
+def consolidate_fixed_results(
+    run_dir: Path,
+    method: str,
+    num_speculative_tokens: int,
+    max_concurrency: int,
+    max_requests: int,
+) -> None:
+    """Atomically consolidate nine validated durable subset results."""
+    perf_rows: list[dict[str, str]] = []
+    acceptance_rows: list[dict[str, str]] = []
+    acceptance_fields: list[str] | None = None
+    for subset in STANDARD_SUBSETS:
+        subset_dir = run_dir / "subsets" / subset
+        validate_fixed_subset(
+            subset_dir,
+            subset,
+            method,
+            num_speculative_tokens,
+            max_concurrency,
+            max_requests,
+        )
+        with (subset_dir / "perf_results.csv").open(newline="") as file:
+            perf_rows.extend(csv.DictReader(file))
+        if method != "baseline":
+            with (subset_dir / "acceptance.csv").open(newline="") as file:
+                reader = csv.DictReader(file)
+                fields = list(reader.fieldnames or ())
+                if acceptance_fields is None:
+                    acceptance_fields = fields
+                elif fields != acceptance_fields:
+                    raise ValueError("acceptance CSV schema mismatch across subsets")
+                acceptance_rows.extend(reader)
+
+    outputs: list[tuple[Path, tuple[str, ...] | list[str], list[dict[str, str]]]] = [
+        (run_dir / "perf_results.csv", PERF_COLUMNS, perf_rows)
+    ]
+    if method != "baseline":
+        assert acceptance_fields is not None
+        outputs.append((run_dir / "acceptance.csv", acceptance_fields, acceptance_rows))
+    for output, fields, rows in outputs:
+        fd, temporary = tempfile.mkstemp(prefix=f".{output.name}.", dir=output.parent)
+        try:
+            with os.fdopen(fd, "w", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(rows)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, output)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
 
 def _load_json(path: Path) -> dict[str, object]:
@@ -389,6 +611,28 @@ def main() -> None:
     validate_perf = subparsers.add_parser("validate-perf")
     validate_perf.add_argument("--csv", required=True)
 
+    append_perf = subparsers.add_parser("append-fixed-perf")
+    append_perf.add_argument("--json", required=True)
+    append_perf.add_argument("--csv", required=True)
+    append_perf.add_argument("--subset", required=True)
+    append_perf.add_argument("--max-concurrency", type=int, required=True)
+    append_perf.add_argument("--max-requests", type=int, required=True)
+
+    validate_subset = subparsers.add_parser("validate-fixed-subset")
+    validate_subset.add_argument("--dir", required=True)
+    validate_subset.add_argument("--subset", required=True)
+    validate_subset.add_argument("--method", required=True)
+    validate_subset.add_argument("--num-speculative-tokens", type=int, required=True)
+    validate_subset.add_argument("--max-concurrency", type=int, required=True)
+    validate_subset.add_argument("--max-requests", type=int, required=True)
+
+    consolidate = subparsers.add_parser("consolidate-fixed")
+    consolidate.add_argument("--run-dir", required=True)
+    consolidate.add_argument("--method", required=True)
+    consolidate.add_argument("--num-speculative-tokens", type=int, required=True)
+    consolidate.add_argument("--max-concurrency", type=int, required=True)
+    consolidate.add_argument("--max-requests", type=int, required=True)
+
     verify = subparsers.add_parser("verify-inputs")
     verify.add_argument("--dataset-manifest", required=True)
     verify.add_argument("--hf-home", required=True)
@@ -435,6 +679,31 @@ def main() -> None:
         validate_acceptance(Path(args.csv), args.num_speculative_tokens)
     elif args.command == "validate-perf":
         validate_performance(Path(args.csv))
+    elif args.command == "append-fixed-perf":
+        append_fixed_performance(
+            Path(args.json),
+            Path(args.csv),
+            args.subset,
+            args.max_concurrency,
+            args.max_requests,
+        )
+    elif args.command == "validate-fixed-subset":
+        validate_fixed_subset(
+            Path(args.dir),
+            args.subset,
+            args.method,
+            args.num_speculative_tokens,
+            args.max_concurrency,
+            args.max_requests,
+        )
+    elif args.command == "consolidate-fixed":
+        consolidate_fixed_results(
+            Path(args.run_dir),
+            args.method,
+            args.num_speculative_tokens,
+            args.max_concurrency,
+            args.max_requests,
+        )
     elif args.command == "verify-inputs":
         verify_inputs(args)
     elif args.command == "dataset-paths":

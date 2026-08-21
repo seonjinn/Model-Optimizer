@@ -78,9 +78,10 @@ fi
 
 RUN_ID="${EVAL_RUN_ID:-${SLURM_JOB_ID:-manual}-$(date -u +%Y%m%dT%H%M%SZ)-$$-${SPEC_METHOD}-b${DFLASH_BLOCK_SIZE}}"
 RUN_DIR="${EVAL_OUTPUT_ROOT%/}/${RUN_ID}"
-mkdir -p "${EVAL_OUTPUT_ROOT}"
-if ! mkdir "${RUN_DIR}"; then
-    echo "ERROR: evaluation output already exists: ${RUN_DIR}" >&2
+LOCK_DIR="${RUN_DIR}/.active"
+mkdir -p "${RUN_DIR}/subsets" "${RUN_DIR}/.attempts"
+if ! mkdir "${LOCK_DIR}"; then
+    echo "ERROR: evaluation output is active: ${RUN_DIR}" >&2
     exit 2
 fi
 
@@ -133,6 +134,7 @@ cleanup() {
         kill "${SERVER_PID}" 2>/dev/null || true
         wait "${SERVER_PID}" 2>/dev/null || true
     fi
+    rmdir "${LOCK_DIR}" 2>/dev/null || true
     if ! write_manifest "${FINAL_STATUS}"; then
         echo "ERROR: failed to write evaluation manifest" >&2
         [[ ${rc} -ne 0 ]] || rc=1
@@ -262,11 +264,26 @@ if [[ ${READY} -ne 1 ]]; then
 fi
 
 while IFS=$'\t' read -r subset dataset_path; do
+    subset_dir="${RUN_DIR}/subsets/${subset}"
+    subset_args_common=(--subset "${subset}" --method "${SPEC_METHOD}"
+        --num-speculative-tokens "${NUM_SPEC_TOKENS}"
+        --max-concurrency "${MAX_CONCURRENCY}" --max-requests "${MAX_REQUESTS}")
+    if python3 "${ARTIFACT_HELPER}" validate-fixed-subset \
+        --dir "${subset_dir}" "${subset_args_common[@]}" >/dev/null 2>&1; then
+        echo "[INFO] [${subset}] Reusing validated completed subset"
+        continue
+    fi
+    if [[ -e "${subset_dir}" ]]; then
+        echo "ERROR: invalid durable subset output requires manual quarantine: ${subset_dir}" >&2
+        exit 4
+    fi
+    attempt_dir="${RUN_DIR}/.attempts/${subset}-${SLURM_JOB_ID:-manual}-$$"
+    mkdir "${attempt_dir}"
     subset_args=("${SPECULATORS_REPO}/scripts/evaluate/evaluate.py"
         --target "http://127.0.0.1:${PORT}/v1"
         --dataset "${dataset_path}"
         --subsets "${subset}"
-        --output-dir "${RUN_DIR}"
+        --output-dir "${attempt_dir}"
         --max-concurrency "${MAX_CONCURRENCY}"
         --max-requests "${MAX_REQUESTS}"
         --gen-kwargs '{"temperature":0,"top_p":1}'
@@ -275,15 +292,31 @@ while IFS=$'\t' read -r subset dataset_path; do
     python3 "${subset_args[@]}"
     EVALUATOR_RC=$?
     if [[ ${EVALUATOR_RC} -ne 0 \
-        && !( "${SPEC_METHOD}" == "baseline" && "${EVAL_MODE}" == "sweep" \
-            && ${EVALUATOR_RC} -eq 1 ) ]]; then
+        && !( "${SPEC_METHOD}" == "baseline" && ${EVALUATOR_RC} -eq 1 ) ]]; then
         echo "ERROR: Speculators evaluator failed with status ${EVALUATOR_RC}" >&2
         exit "${EVALUATOR_RC}"
     fi
+    if [[ "${EVAL_MODE}" == "throughput" ]]; then
+        python3 "${ARTIFACT_HELPER}" append-fixed-perf \
+            --json "${attempt_dir}/artifacts/run_${subset}.json" \
+            --csv "${attempt_dir}/perf_results.csv" \
+            --subset "${subset}" \
+            --max-concurrency "${MAX_CONCURRENCY}" \
+            --max-requests "${MAX_REQUESTS}"
+    fi
+    python3 "${ARTIFACT_HELPER}" validate-fixed-subset \
+        --dir "${attempt_dir}" "${subset_args_common[@]}"
+    mv "${attempt_dir}" "${subset_dir}"
 done < <(python3 "${ARTIFACT_HELPER}" dataset-paths \
     --dataset-manifest "${DATASET_MANIFEST_PATH}" \
     --hf-home "${HF_HOME}")
 
+if [[ "${EVAL_MODE}" == "throughput" ]]; then
+    python3 "${ARTIFACT_HELPER}" consolidate-fixed \
+        --run-dir "${RUN_DIR}" --method "${SPEC_METHOD}" \
+        --num-speculative-tokens "${NUM_SPEC_TOKENS}" \
+        --max-concurrency "${MAX_CONCURRENCY}" --max-requests "${MAX_REQUESTS}"
+fi
 if [[ "${SPEC_METHOD}" != "baseline" ]]; then
     if ! python3 "${ARTIFACT_HELPER}" validate \
         --csv "${RUN_DIR}/acceptance.csv" \
@@ -292,7 +325,7 @@ if [[ "${SPEC_METHOD}" != "baseline" ]]; then
         exit 4
     fi
 fi
-if [[ "${EVAL_MODE}" == "sweep" ]]; then
+if [[ "${EVAL_MODE}" == "sweep" || "${EVAL_MODE}" == "throughput" ]]; then
     if ! python3 "${ARTIFACT_HELPER}" validate-perf \
         --csv "${RUN_DIR}/perf_results.csv"; then
         echo "ERROR: invalid Speculators performance output" >&2
