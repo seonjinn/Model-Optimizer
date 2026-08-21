@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,6 +24,8 @@ from common.specdec.cluster_profile import (
 _LAUNCHER_DIR = Path(__file__).resolve().parents[1]
 PROFILES = _LAUNCHER_DIR / "common/specdec/profiles"
 _MODELOPT_PIN = "e3febcbe1319f018eea81fa4d42e2e36cb54494e"
+_PROBE = _LAUNCHER_DIR / "common/specdec/probe_cluster_profile.sh"
+_BASH = shutil.which("bash")
 
 
 @pytest.mark.parametrize("profile_path", sorted(PROFILES.glob("*.yaml")))
@@ -87,12 +92,165 @@ def test_select_scratch_prefers_slurm_tmpdir(tmp_path: Path) -> None:
     assert selected == tmp_path
 
 
+def test_select_scratch_rejects_relative_slurm_tmpdir() -> None:
+    """A relative allocation scratch value cannot be made absolute from the login cwd."""
+    with pytest.raises(ValueError, match="no configured scratch candidate"):
+        select_scratch_root(
+            candidates=(Path("$SLURM_TMPDIR"),),
+            environ={"SLURM_TMPDIR": "relative-scratch"},
+            writable=lambda path: True,
+        )
+
+
 def test_lyris_render_has_no_gres_or_gpu_flag() -> None:
     """Lyris requests its exclusive allocation without incompatible GPU flags."""
     argv = render_probe_sbatch(load_cluster_profile(PROFILES / "lyris.yaml"))
 
     assert "--segment=1" in argv
     assert not any(arg.startswith(("--gres", "--gpus-per-node")) for arg in argv)
+
+
+def test_probe_submits_once_after_test_only_when_sbatch_output_is_blank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blank scheduler response is recovered without submitting a duplicate probe."""
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    calls = tmp_path / "sbatch-calls"
+    _write_command(command_dir / "sacctmgr", 'printf "coreai_dlalgo_llm|36x2-a01r|\\n"\n')
+    _write_command(command_dir / "scontrol", "exit 0\n")
+    _write_command(
+        command_dir / "sbatch",
+        'printf "%s\\n" "$*" >> "$SBATCH_CALLS"\n[[ "$1" == "--test-only" ]] && exit 0\n',
+    )
+    _write_command(command_dir / "squeue", 'printf "4242\\n"\n')
+    monkeypatch.setenv("SBATCH_CALLS", str(calls))
+    monkeypatch.setenv("PATH", f"{command_dir}{os.pathsep}{os.environ['PATH']}")
+
+    result = subprocess.run(
+        [
+            _BASH,
+            str(_PROBE),
+            "--profile",
+            str(PROFILES / "ptyche.yaml"),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/readiness.json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "4242"
+    expected_common = (
+        "--account=coreai_dlalgo_llm --partition=36x2-a01r --nodes=1 "
+        "--ntasks-per-node=1 --segment=1 --time=00:10:00 "
+        "--job-name=drafter-profile-probe-ptyche "
+        f"{_PROBE} --inside --profile {PROFILES / 'ptyche.yaml'} "
+        "--output /lustre/fsw/coreai_dlalgo_llm/users/sna/"
+        "modelopt-qwen3-drafter-training/readiness.json"
+    )
+    assert calls.read_text().splitlines() == [
+        f"--test-only {expected_common}",
+        f"--parsable {expected_common}",
+    ]
+
+
+def test_probe_dry_run_stops_after_test_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicit dry-run gate renders the allocation without submitting a probe job."""
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    calls = tmp_path / "sbatch-calls"
+    _write_command(command_dir / "sacctmgr", 'printf "coreai_dlalgo_llm|36x2-a01r|\\n"\n')
+    _write_command(command_dir / "scontrol", "exit 0\n")
+    _write_command(command_dir / "sbatch", 'printf "%s\\n" "$*" >> "$SBATCH_CALLS"\n')
+    monkeypatch.setenv("SBATCH_CALLS", str(calls))
+    monkeypatch.setenv("PATH", f"{command_dir}{os.pathsep}{os.environ['PATH']}")
+
+    result = subprocess.run(
+        [
+            _BASH,
+            str(_PROBE),
+            "--dry-run",
+            "--profile",
+            str(PROFILES / "ptyche.yaml"),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/readiness.json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().splitlines()[0].startswith("--test-only ")
+    assert len(calls.read_text().splitlines()) == 1
+
+
+def test_probe_rejects_non_aarch64_compute_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ARM aliases cannot qualify a node whose kernel architecture is not aarch64."""
+    profile = tmp_path / "profile.yaml"
+    scratch = tmp_path / "scratch"
+    durable = tmp_path / "durable"
+    profile.write_text(
+        "\n".join(
+            (
+                "name: test",
+                f"modelopt_commit: {_MODELOPT_PIN}",
+                "ssh_host: login-test",
+                "account: account",
+                "partition: batch",
+                "fallback_partition: null",
+                f"durable_root: {durable}",
+                "scratch_candidates:",
+                f"  - {scratch}",
+                "training_nodes: 4",
+                "training_segment: 4",
+                "evaluation_nodes: 1",
+                "evaluation_segment: 1",
+                "gpus_per_node: 4",
+                "explicit_gpu_flag: false",
+                'walltime: "00:10:00"',
+                "",
+            )
+        )
+    )
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    _write_command(command_dir / "nvidia-smi", "printf 'GPU 0\\nGPU 1\\nGPU 2\\nGPU 3\\n'\n")
+    _write_command(command_dir / "uname", "printf 'arm64\\n'\n")
+    _write_command(command_dir / "srun", "printf '%s\\n' '--container-image'\n")
+    monkeypatch.setenv("PATH", f"{command_dir}{os.pathsep}{os.environ['PATH']}")
+
+    result = subprocess.run(
+        [
+            _BASH,
+            str(_PROBE),
+            "--inside",
+            "--profile",
+            str(profile),
+            "--output",
+            str(durable / "readiness.json"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "expected aarch64 compute node" in result.stderr
+
+
+def _write_command(path: Path, body: str) -> None:
+    path.write_text(f"#!/usr/bin/env bash\nset -euo pipefail\n{body}")
+    path.chmod(0o755)
 
 
 def test_profile_rejects_nonexclusive_gpu_semantics() -> None:

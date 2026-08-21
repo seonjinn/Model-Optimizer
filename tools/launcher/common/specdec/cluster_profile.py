@@ -191,7 +191,10 @@ def _resolved_scratch_candidates(profile: ClusterProfile) -> tuple[Path, ...]:
 def _expand_scratch_candidate(candidate: Path, environ: Mapping[str, str]) -> Path | None:
     if candidate == _SLURM_TMPDIR:
         value = environ.get("SLURM_TMPDIR")
-        return Path(value).resolve(strict=False) if value else None
+        if not value:
+            return None
+        path = Path(value)
+        return path.resolve(strict=False) if path.is_absolute() else None
     return candidate.resolve(strict=False) if candidate.is_absolute() else None
 
 

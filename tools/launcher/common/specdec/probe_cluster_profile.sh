@@ -10,9 +10,10 @@ LAUNCHER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODE="outer"
 PROFILE=""
 OUTPUT=""
+DRY_RUN=0
 
 usage() {
-    echo "usage: $0 --profile PATH --output PATH [--inside]" >&2
+    echo "usage: $0 --profile PATH --output PATH [--dry-run] [--inside]" >&2
     exit 2
 }
 
@@ -20,6 +21,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile) PROFILE="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
         --inside) MODE="inside"; shift ;;
         *) usage ;;
     esac
@@ -47,7 +49,10 @@ for argument in render_probe_sbatch(profile):
     print(argument)
 PY
 )"
-mapfile -t profile_lines <<<"$profile_data"
+profile_lines=()
+while IFS= read -r profile_line; do
+    profile_lines+=("$profile_line")
+done <<<"$profile_data"
 [[ "${#profile_lines[@]}" -gt 6 ]] || { echo "invalid profile data" >&2; exit 1; }
 PROFILE="${profile_lines[0]}"
 OUTPUT="${profile_lines[1]}"
@@ -61,6 +66,14 @@ if [[ "$MODE" == "outer" ]]; then
         | awk -F'|' -v account="$ACCOUNT" -v partition="$PARTITION" '$1 == account && ($2 == partition || $2 == "") { found = 1 } END { exit !found }'
     scontrol show partition "$PARTITION" >/dev/null
     sbatch --test-only "${SBATCH_ARGS[@]}" "$0" --inside --profile "$PROFILE" --output "$OUTPUT"
+    [[ "$DRY_RUN" -eq 0 ]] || exit 0
+    submitted="$(sbatch --parsable "${SBATCH_ARGS[@]}" "$0" --inside --profile "$PROFILE" --output "$OUTPUT" || true)"
+    job_id="${submitted%%;*}"
+    if [[ -z "$job_id" ]]; then
+        job_id="$(squeue -h -n "drafter-profile-probe-${PROFILE_NAME}" -o "%A" | head -n 1 || true)"
+    fi
+    [[ "$job_id" =~ ^[0-9]+$ ]] || { echo "scheduler did not confirm profile probe submission" >&2; exit 1; }
+    printf '%s\n' "$job_id"
     exit 0
 fi
 
@@ -89,8 +102,8 @@ PY
 mkdir -p "$scratch_root"
 [[ "$(nvidia-smi -L | wc -l | tr -d ' ')" == "4" ]] || { echo "expected four visible GPUs" >&2; exit 1; }
 case "$(uname -m)" in
-    aarch64|arm64) ;;
-    *) echo "expected ARM64 compute node" >&2; exit 1 ;;
+    aarch64) ;;
+    *) echo "expected aarch64 compute node" >&2; exit 1 ;;
 esac
 srun --help | grep -q -- '--container-image' || { echo "Pyxis is unavailable" >&2; exit 1; }
 
@@ -111,7 +124,7 @@ receipt = {
     "partition": sys.argv[5],
     "pyxis_available": True,
     "gpu_count": 4,
-    "architecture": "arm64",
+    "architecture": "aarch64",
     "hostname": socket.gethostname(),
     "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
 }
