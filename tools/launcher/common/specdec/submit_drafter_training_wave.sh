@@ -230,7 +230,6 @@ PY
         exports+=",MAX_REQUEUES=${MAX_REQUEUES},WANDB_RUN_ID=${wandb_run_id}"
         requeue_args=(--requeue "--signal=B:USR1@${REQUEUE_SIGNAL_LEAD}")
     fi
-    mkdir -p "$output_root/logs"
     account="$PROFILE_ACCOUNT"
     partition="$PROFILE_PARTITION"
     scheduler_args=(--account="$account" --partition="$partition" "--nodes=${nodes}" --ntasks-per-node=1 "--segment=${segment}" "--time=${profile_values[5]}")
@@ -245,6 +244,7 @@ PY
         printf '{"cluster":"%s","job_name":"%s","status":"test-only","tuple_identity":"%s","max_steps":%s}\n' "$CLUSTER_NAME" "$job_name" "$tuple_identity" "$boundary" >>"$RECEIPT"
         continue
     fi
+    mkdir -p "$output_root/logs"
     submitted="$(sbatch --parsable "${args[@]}" "$RUNNER" || true)"
     job_id="${submitted%%;*}"
     if [[ -z "$job_id" ]]; then

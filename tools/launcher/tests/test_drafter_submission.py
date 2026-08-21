@@ -367,6 +367,16 @@ def test_training_wave_writes_slurm_logs_beside_durable_experiment_outputs() -> 
     assert '--error="${output_root}/logs/slurm-%j.err"' in submitter
 
 
+def test_training_wave_dry_run_does_not_create_experiment_output_namespace() -> None:
+    """Scheduler test-only must not poison a later atomic checkpoint seed."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+
+    dry_run = submitter.index('if [[ "$DRY_RUN" -eq 1 ]]')
+    create_logs = submitter.index('mkdir -p "$output_root/logs"')
+
+    assert dry_run < create_logs
+
+
 def test_training_wave_uses_the_target_specific_streaming_topology() -> None:
     """Q30 uses 2 nodes while Q235 retains the proven 4-node allocation."""
     submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
