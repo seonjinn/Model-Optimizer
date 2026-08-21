@@ -62,7 +62,7 @@ PARTITION="${profile_lines[4]}"
 SBATCH_ARGS=("${profile_lines[@]:5}")
 
 if [[ "$MODE" == "outer" ]]; then
-    sacctmgr --noheader --parsable2 show assoc "where user=$USER account=$ACCOUNT" format=Account,Partition \
+    sacctmgr --noheader --parsable2 show assoc where "user=$USER" "account=$ACCOUNT" format=Account,Partition \
         | awk -F'|' -v account="$ACCOUNT" -v partition="$PARTITION" '$1 == account && ($2 == partition || $2 == "") { found = 1 } END { exit !found }'
     scontrol show partition "$PARTITION" >/dev/null
     sbatch --test-only "${SBATCH_ARGS[@]}" "$0" --inside --profile "$PROFILE" --output "$OUTPUT"

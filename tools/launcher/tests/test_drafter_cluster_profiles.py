@@ -192,6 +192,51 @@ def test_probe_dry_run_stops_after_test_only(
     assert len(calls.read_text().splitlines()) == 1
 
 
+def test_probe_passes_sacctmgr_conditions_as_separate_arguments(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live account query uses sacctmgr's tokenized condition grammar."""
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    calls = tmp_path / "sacctmgr-calls"
+    _write_command(
+        command_dir / "sacctmgr",
+        'printf "%s\\n" "$@" > "$SACCTMGR_CALLS"\nprintf "coreai_dlalgo_llm||\\n"\n',
+    )
+    _write_command(command_dir / "scontrol", "exit 0\n")
+    _write_command(command_dir / "sbatch", "exit 0\n")
+    monkeypatch.setenv("SACCTMGR_CALLS", str(calls))
+    monkeypatch.setenv("PATH", f"{command_dir}{os.pathsep}{os.environ['PATH']}")
+
+    result = subprocess.run(
+        [
+            _BASH,
+            str(_PROBE),
+            "--dry-run",
+            "--profile",
+            str(PROFILES / "lyris.yaml"),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-specdec/readiness.json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().splitlines() == [
+        "--noheader",
+        "--parsable2",
+        "show",
+        "assoc",
+        "where",
+        f"user={os.environ.get('USER', '')}",
+        "account=coreai_dlalgo_llm",
+        "format=Account,Partition",
+    ]
+
+
 def test_probe_rejects_non_aarch64_compute_node(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
