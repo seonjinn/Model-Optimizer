@@ -1,36 +1,91 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#SBATCH -N 4
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
-#SBATCH --segment=4
 #SBATCH --time=03:55:00
 
 # Execute one pinned streaming-drafter wave. The submitter supplies all inputs.
 set -euo pipefail
 
-readonly SERVE_NODES=2
-readonly TRAINER_NODES=2
-readonly GPUS_PER_NODE=4
 readonly GLOBAL_BATCH_SIZE=512
-readonly SCRATCH_JOB_ROOT="/raid/scratch/${SLURM_JOB_ID}"
-readonly EXPECTED_RNG_STATES=$((TRAINER_NODES * GPUS_PER_NODE))
 
-for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT; do
+for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT CLUSTER_NAME CLUSTER_PROFILE_PATH CLUSTER_PROFILE_SHA256 SCRATCH_ROOT; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
 readonly LAUNCHER_ROOT
-mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" <<'PY'
+[[ "$CLUSTER_PROFILE_PATH" == /home/* && -f "$CLUSTER_PROFILE_PATH" ]] || { echo "cluster profile is missing" >&2; exit 2; }
+[[ "$(sha256sum "$CLUSTER_PROFILE_PATH" | cut -d' ' -f1)" == "$CLUSTER_PROFILE_SHA256" ]] || { echo "cluster profile SHA-256 mismatch" >&2; exit 2; }
+if [[ -n "${READINESS_RECEIPT:-}" ]]; then
+    [[ "$READINESS_RECEIPT" == /lustre/* && -f "$READINESS_RECEIPT" && -n "${READINESS_RECEIPT_SHA256:-}" ]] || { echo "readiness receipt is missing" >&2; exit 2; }
+    [[ "$(sha256sum "$READINESS_RECEIPT" | cut -d' ' -f1)" == "$READINESS_RECEIPT_SHA256" ]] || { echo "readiness receipt SHA-256 mismatch" >&2; exit 2; }
+elif [[ "$CLUSTER_NAME" != "oci-hsg" ]]; then
+    echo "non-OCI training requires a readiness receipt" >&2
+    exit 2
+fi
+[[ "$SCRATCH_ROOT" == /* && "$SCRATCH_ROOT" != /lustre* && "$SCRATCH_ROOT" != /home* ]] || { echo "scratch root must be node-local" >&2; exit 2; }
+readonly SCRATCH_ROOT
+readonly SCRATCH_JOB_ROOT="${SCRATCH_ROOT%/}/${SLURM_JOB_ID}"
+
+mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" "$CLUSTER_PROFILE_PATH" "${READINESS_RECEIPT:-}" "$CLUSTER_NAME" "$SCRATCH_ROOT" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
 manifest = Path(sys.argv[1])
+from common.specdec.cluster_profile import load_cluster_profile, validate_scratch_root
 from common.specdec.drafter_job_manifest import load_manifest
 
 experiment = load_manifest(manifest)[int(sys.argv[2])]
+profile = load_cluster_profile(Path(sys.argv[3]))
+receipt_path = Path(sys.argv[4]) if sys.argv[4] else None
+cluster_name = sys.argv[5]
+scratch_root = Path(sys.argv[6])
+if profile.name != cluster_name or experiment.paths.source_sha != profile.modelopt_commit:
+    raise SystemExit("cluster profile identity mismatch")
+if (
+    experiment.slurm.nodes > profile.training_nodes
+    or profile.training_nodes % experiment.slurm.nodes
+    or experiment.slurm.gpus_per_node != profile.gpus_per_node
+    or experiment.slurm.segment > profile.training_segment
+):
+    raise SystemExit("manifest allocation is incompatible with the cluster profile")
+validate_scratch_root(profile, scratch_root)
+if receipt_path is not None:
+    receipt = json.loads(receipt_path.read_text())
+    if receipt.get("profile") != profile.name or Path(receipt["scratch_root"]) != scratch_root:
+        raise SystemExit("readiness receipt identity mismatch")
+
+legacy_fingerprint_payload = (
+    experiment.target, experiment.dataset, experiment.method,
+    experiment.block_size, experiment.run_name, experiment.paths.target_path,
+    experiment.paths.dataset_path, experiment.paths.output_root,
+    experiment.topology.target_kind, experiment.topology.capture_ids,
+    experiment.topology.serve_tp,
+)
+if experiment.topology.target_kind == "qwen3-30b-a3b":
+    fingerprint_schema = "topology-v2"
+    fingerprint_payload = (
+        *legacy_fingerprint_payload,
+        experiment.topology.per_device_train_batch_size,
+        experiment.topology.gradient_accumulation_steps,
+        experiment.topology.num_attention_heads,
+        experiment.topology.num_key_value_heads,
+        experiment.topology.head_dim,
+        experiment.topology.intermediate_size,
+        experiment.slurm.nodes,
+        experiment.slurm.gpus_per_node,
+        experiment.slurm.segment,
+        "" if cluster_name == "oci-hsg" else cluster_name,
+    )
+else:
+    fingerprint_schema = "legacy-v1"
+    fingerprint_payload = legacy_fingerprint_payload
+fingerprint = hashlib.sha256(
+    json.dumps(fingerprint_payload, separators=(",", ":")).encode()
+).hexdigest()
+if fingerprint_schema == "topology-v2":
+    fingerprint = f"{fingerprint_schema}:{fingerprint}"
 for value in (
     experiment.paths.source_path, experiment.paths.source_sha, experiment.paths.image_path, experiment.paths.runtime_archive_path,
     experiment.paths.runtime_archive_sha256,
@@ -40,24 +95,16 @@ for value in (
     experiment.topology.per_device_train_batch_size, experiment.topology.gradient_accumulation_steps,
     experiment.topology.num_attention_heads, experiment.topology.num_key_value_heads,
     experiment.topology.head_dim, experiment.topology.intermediate_size,
+    experiment.topology.target_kind,
+    experiment.slurm.nodes, experiment.slurm.segment, experiment.slurm.gpus_per_node,
     experiment.experiment_id,
-    hashlib.sha256(
-        json.dumps(
-            (
-                experiment.target, experiment.dataset, experiment.method,
-                experiment.block_size, experiment.run_name, experiment.paths.target_path,
-                experiment.paths.dataset_path, experiment.paths.output_root,
-                experiment.topology.target_kind, experiment.topology.capture_ids,
-                experiment.topology.serve_tp,
-            ),
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest(),
+    fingerprint,
+    fingerprint_schema,
 ):
     print(value)
 PY
 )
-(( ${#manifest_values[@]} == 22 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
+(( ${#manifest_values[@]} == 27 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
 SOURCE_PATH="${manifest_values[0]}"
 SOURCE_SHA="${manifest_values[1]}"
 IMAGE_PATH="${manifest_values[2]}"
@@ -79,8 +126,19 @@ NUM_ATTENTION_HEADS="${manifest_values[16]}"
 NUM_KEY_VALUE_HEADS="${manifest_values[17]}"
 HEAD_DIM="${manifest_values[18]}"
 INTERMEDIATE_SIZE="${manifest_values[19]}"
-TRAINING_IDENTITY="${manifest_values[20]}"
-TRAINING_FINGERPRINT="${manifest_values[21]}"
+TARGET_KIND="${manifest_values[20]}"
+ALLOCATED_NODES="${manifest_values[21]}"
+ALLOCATION_SEGMENT="${manifest_values[22]}"
+GPUS_PER_NODE="${manifest_values[23]}"
+TRAINING_IDENTITY="${manifest_values[24]}"
+TRAINING_FINGERPRINT="${manifest_values[25]}"
+TRAINING_FINGERPRINT_SCHEMA="${manifest_values[26]}"
+SERVE_NODES=$((ALLOCATED_NODES / 2))
+TRAINER_NODES=$((ALLOCATED_NODES - SERVE_NODES))
+EXPECTED_RNG_STATES=$((TRAINER_NODES * GPUS_PER_NODE))
+readonly ALLOCATED_NODES ALLOCATION_SEGMENT GPUS_PER_NODE SERVE_NODES TRAINER_NODES EXPECTED_RNG_STATES TRAINING_FINGERPRINT_SCHEMA
+[[ "${SLURM_NNODES:-}" == "$ALLOCATED_NODES" ]] || { echo "Slurm allocation does not match manifest nodes" >&2; exit 2; }
+echo "training allocation: nodes=${ALLOCATED_NODES} segment=${ALLOCATION_SEGMENT} serve=${SERVE_NODES} trainer=${TRAINER_NODES}"
 for name in SOURCE_PATH SOURCE_SHA RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT METHOD BLOCK_SIZE RUN_NAME; do
     [[ -n "${!name:-}" ]] || { echo "missing manifest value: $name" >&2; exit 2; }
 done
@@ -145,9 +203,33 @@ if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     source "$LAUNCHER_ROOT/common/specdec/drafter_requeue_lifecycle.sh"
     drafter_requeue_init
     drafter_prepare_training_output
+    python3 - "$OUTPUT_ROOT/control/training-identity.json" "$TARGET_KIND" "$TRAINING_FINGERPRINT_SCHEMA" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+target_kind = sys.argv[2]
+schema = sys.argv[3]
+if target_kind != "qwen3-30b-a3b":
+    if schema != "legacy-v1":
+        raise SystemExit("Q235 training fingerprint schema changed")
+    raise SystemExit(0)
+if schema != "topology-v2":
+    raise SystemExit("Q30 training requires topology-v2 fingerprinting")
+identity = json.loads(path.read_text())
+if identity.get("fingerprint_schema") not in (None, schema):
+    raise SystemExit("Q30 training fingerprint schema mismatch")
+if "fingerprint_schema" not in identity:
+    identity["fingerprint_schema"] = schema
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+PY
 fi
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
-staging_step=(srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
+staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntasks-per-node=1 bash -c '
     set -euo pipefail
     exec >"${STAGE_LOG_ROOT}/node-${SLURM_NODEID}.log" 2>&1
     set -x
@@ -163,7 +245,7 @@ staging_step=(srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
         echo "reusing completed host staging: node=${SLURM_NODEID}"
         exit 0
     fi
-    [[ "$node_root" == "/raid/scratch/${SLURM_JOB_ID}/node-${SLURM_NODEID}" ]] || {
+    [[ "$node_root" == "${SCRATCH_ROOT%/}/${SLURM_JOB_ID}/node-${SLURM_NODEID}" ]] || {
         echo "refusing to clean unexpected scratch path: $node_root" >&2
         exit 2
     }
@@ -195,6 +277,7 @@ else
 fi
 
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS SAVE_STEPS RUN_NAME SAMPLE_SIZE
+export SERVE_NODES CLUSTER_NAME
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     export WANDB_RUN_ID="${WANDB_RUN_ID}"
     export WANDB_RESUME=allow
@@ -209,7 +292,7 @@ for ((serve_node = 0; serve_node < SERVE_NODES; serve_node++)); do
 done
 
 # shellcheck disable=SC2016,SC2026 # The child shell expands its Slurm-node environment.
-training_step=(srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="/raid/scratch:/raid/scratch,${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
+training_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SCRATCH_ROOT}:${SCRATCH_ROOT},${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     export MODELOPT_RUNTIME="$node_root/runtime"
@@ -239,10 +322,14 @@ PY
     export WANDB_CACHE_DIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/wandb-cache"
     export WANDB_PROJECT="sna-modelopt-specdec"
     export WANDB_RUN_GROUP="$RUN_NAME"
+    TRAINING_RUN_NAME="$RUN_NAME"
+    if [[ "$CLUSTER_NAME" != "oci-hsg" ]]; then
+        export WANDB_RUN_GROUP="${RUN_NAME}-${CLUSTER_NAME}"
+        TRAINING_RUN_NAME="${RUN_NAME}-${CLUSTER_NAME}"
+    fi
     export SERVE_LOG_DIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/logs"
     export TMPDIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/tmp"
     mkdir -p "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME" "$SQLITE_TMPDIR" "$WANDB_DIR" "$WANDB_CACHE_DIR" "$SERVE_LOG_DIR" "$TMPDIR"
-    export SERVE_NODES=2
     export SERVE_MODEL_NAME="modelopt-${RUN_NAME}"
     export SERVE_BLOCK_SIZE=32 SERVE_MAX_MODEL_LEN=8192 SERVE_READY_TIMEOUT=1800
     export HS_POOL_SLOTS=32 SERVE_MAX_NUM_SEQS=16
@@ -272,7 +359,7 @@ PY
         training.per_device_train_batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}" \
         training.gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS}" \
         training.report_to=wandb \
-        training.run_name="${RUN_NAME}-s${MAX_STEPS}" \
+        training.run_name="${TRAINING_RUN_NAME}-s${MAX_STEPS}" \
         dflash.dflash_block_size="${BLOCK_SIZE}" \
         dflash.dflash_num_anchors=512 \
         dflash.dflash_mask_token_id=151669 \

@@ -10,12 +10,14 @@ import os
 import re
 import subprocess
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from common.specdec.build_drafter_full_manifest import (
     full_convergence_boundaries,
     readable_job_name,
+    select_experiments,
 )
 from common.specdec.drafter_job_manifest import (
     DrafterExperiment,
@@ -77,7 +79,7 @@ def _experiment() -> DrafterExperiment:
             capture_ids=(2, 13, 24, 35, 46, 48),
             serve_tp=2,
             per_device_train_batch_size=4,
-            gradient_accumulation_steps=16,
+            gradient_accumulation_steps=32,
             num_attention_heads=32,
             num_key_value_heads=4,
             head_dim=128,
@@ -96,9 +98,9 @@ def _experiment() -> DrafterExperiment:
         slurm=SlurmSettings(
             account="nemotron_n3_post",
             partition="batch",
-            nodes=4,
+            nodes=2,
             gpus_per_node=4,
-            segment=4,
+            segment=2,
         ),
     )
 
@@ -115,6 +117,25 @@ def test_canonical_manifest_is_stable_and_written_atomically(tmp_path: Path) -> 
     assert json.loads(expected)["experiments"][0]["num_speculative_tokens"] == 7
     assert json.loads(expected)["experiments"][0]["sample_size"] == 1_300_000
     assert not list(tmp_path.glob(".manifest.json.*"))
+
+
+def test_legacy_q30_template_migration_is_explicit_and_target_scoped(tmp_path: Path) -> None:
+    """Only the builder opt-in can translate the former Q30 world-eight topology."""
+    document = json.loads(canonical_manifest((_experiment(),)))
+    entry = document["experiments"][0]
+    entry["topology"]["gradient_accumulation_steps"] = 16
+    entry["slurm"]["nodes"] = 4
+    entry["slurm"]["segment"] = 4
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError):
+        load_manifest(path)
+    migrated = load_manifest(path, migrate_legacy_q30_topology=True)
+
+    assert migrated[0].topology.gradient_accumulation_steps == 32
+    assert migrated[0].slurm.nodes == 2
+    assert migrated[0].slurm.segment == 2
 
 
 def test_written_manifest_round_trips_tuple_topology_fields(tmp_path: Path) -> None:
@@ -148,10 +169,10 @@ def test_pinned_paths_reject_normalized_traversal_outside_the_declared_root() ->
 
 
 @pytest.mark.parametrize(
-    ("kind", "per_device", "accumulation", "capture_ids", "serve_tp"),
+    ("kind", "per_device", "accumulation", "capture_ids", "serve_tp", "trainer_world"),
     [
-        ("qwen3-30b-a3b", 4, 16, (2, 13, 24, 35, 46, 48), 2),
-        ("qwen3-235b-a22b", 2, 32, (2, 25, 47, 69, 92, 94), 4),
+        ("qwen3-30b-a3b", 4, 32, (2, 13, 24, 35, 46, 48), 2, 4),
+        ("qwen3-235b-a22b", 2, 32, (2, 25, 47, 69, 92, 94), 4, 8),
     ],
 )
 def test_target_topology_pins_capture_ids_and_global_batch_arithmetic(
@@ -160,6 +181,7 @@ def test_target_topology_pins_capture_ids_and_global_batch_arithmetic(
     accumulation: int,
     capture_ids: tuple[int, ...],
     serve_tp: int,
+    trainer_world: int,
 ) -> None:
     """Both targets resolve to world-size eight and an exact global batch of 512."""
     topology = TargetTopology.for_kind(kind)
@@ -168,7 +190,10 @@ def test_target_topology_pins_capture_ids_and_global_batch_arithmetic(
     assert topology.serve_tp == serve_tp
     assert topology.per_device_train_batch_size == per_device
     assert topology.gradient_accumulation_steps == accumulation
-    assert topology.per_device_train_batch_size * topology.gradient_accumulation_steps * 8 == 512
+    assert (
+        topology.per_device_train_batch_size * topology.gradient_accumulation_steps * trainer_world
+        == 512
+    )
 
 
 def test_run_name_cannot_be_blank() -> None:
@@ -336,14 +361,14 @@ def test_training_wave_writes_slurm_logs_beside_durable_experiment_outputs() -> 
     assert '--error="${output_root}/logs/slurm-%j.err"' in submitter
 
 
-def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
-    """A wave renders unique tuple jobs with node-local mutable runtime state."""
+def test_training_wave_uses_the_target_specific_streaming_topology() -> None:
+    """Q30 uses 2 nodes while Q235 retains the proven 4-node allocation."""
     submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
     for required in (
-        "-N4",
-        "--segment=4",
+        "experiment.slurm.nodes",
+        "experiment.slurm.segment",
         "sbatch --test-only",
         "squeue -h -n",
         "duplicate training tuple",
@@ -354,29 +379,29 @@ def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
     ):
         assert required in submitter
     for required in (
-        "#SBATCH -N 4",
-        "#SBATCH --segment=4",
-        "SERVE_NODES=2",
+        "ALLOCATED_NODES",
+        "SERVE_NODES=$((ALLOCATED_NODES / 2))",
+        "TRAINER_NODES=$((ALLOCATED_NODES - SERVE_NODES))",
         "EAGLE_CAPTURE_IDS",
         "IMAGE_PATH",
         "--container-image",
         "gradient_accumulation_steps",
         "num_attention_heads",
         "GLOBAL_BATCH_SIZE=512",
-        "TRAINER_NODES=2",
-        "GPUS_PER_NODE=4",
+        "TRAINER_NODES",
+        'GPUS_PER_NODE="${manifest_values[23]}"',
         "PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE",
         "/home",
         "rev-parse HEAD",
         "status --porcelain",
-        "/raid/scratch/${SLURM_JOB_ID}",
+        'SCRATCH_JOB_ROOT="${SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
         "RUNTIME_ARCHIVE",
         "tar --extract",
         "HF_HOME",
         "TRITON_CACHE_DIR",
         "XDG_CACHE_HOME",
         "SQLITE_TMPDIR",
-        "srun --nodes=4 --ntasks=4 --ntasks-per-node=1",
+        'srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntasks-per-node=1',
         "training.output_dir",
         "LOSS_OBJECTIVE=dpace",
         "LOSS_OBJECTIVE=decay",
@@ -385,6 +410,181 @@ def test_training_wave_uses_the_fixed_four_node_streaming_topology() -> None:
     assert "/lustre/.cache" not in runner
     assert "pip install" not in runner
     assert "git clone" not in runner
+
+
+def test_q30_manifest_topology_is_two_nodes_and_uses_a_distinct_output_namespace() -> None:
+    """The builder never points a world-four Q30 run at legacy world-eight output."""
+    module = (_LAUNCHER_DIR / "common/specdec/build_drafter_full_manifest.py").read_text()
+    manifest = (_LAUNCHER_DIR / "common/specdec/drafter_job_manifest.py").read_text()
+
+    for required in (
+        '"qwen3-30b-a3b": {"nodes": 2, "segment": 2}',
+        '"qwen3-235b-a22b": {"nodes": 4, "segment": 4}',
+        'gradient_accumulation_steps": 32',
+    ):
+        assert required in manifest
+    assert 'suffix = "-2n"' in module
+    assert "run_name.endswith(suffix)" in module
+    assert "output_root.endswith(suffix)" in module
+
+
+def test_training_fingerprint_includes_batch_and_scheduler_topology() -> None:
+    """A topology migration cannot silently reuse an incompatible identity marker."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        "experiment.topology.per_device_train_batch_size",
+        "experiment.topology.gradient_accumulation_steps",
+        "experiment.slurm.nodes",
+        "experiment.slurm.gpus_per_node",
+        "experiment.slurm.segment",
+    ):
+        assert required in runner
+    assert 'identity["fingerprint_schema"] = schema' in runner
+    assert 'if target_kind != "qwen3-30b-a3b"' in runner
+
+
+def test_q30_checkpoint_seed_is_explicit_atomic_and_accepts_extra_rng_ranks() -> None:
+    """Legacy world-eight checkpoints seed a new root without mutating old output."""
+    chain = (_LAUNCHER_DIR / "common/specdec/submit_drafter_full_chain.sh").read_text()
+    lifecycle = (_LAUNCHER_DIR / "common/specdec/drafter_requeue_lifecycle.sh").read_text()
+
+    for required in (
+        "--seed-q30-from-legacy",
+        'legacy_output_root="${output_root%-2n}"',
+        'temporary = Path(f"{output_root}.seed-partial-',
+        "os.link",
+        "shutil.copy2",
+        "os.rename(temporary, output_root)",
+        '"source_checkpoint"',
+        'legacy_identity_path = legacy_output_root / "control/training-identity.json"',
+        '"source_identity_sha256"',
+        '"checkpoint_files_sha256"',
+        'verify_seeded_output "$output_root" "$legacy_output_root" "$source_sha"',
+    ):
+        assert required in chain
+    assert "for rank in range(expected_rng_states)" in lifecycle
+    assert (
+        "len(" not in lifecycle[lifecycle.index("for rank in range(expected_rng_states)") :][:300]
+    )
+
+
+def test_training_wave_renders_scheduler_flags_from_an_immutable_cluster_profile() -> None:
+    """OCI keeps its GPU request while exclusive GB200 profiles omit it."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        "--cluster-profile",
+        "--readiness-receipt",
+        "DEFAULT_CLUSTER_PROFILE",
+        "load_cluster_profile",
+        "scheduler_gpu_args",
+        'CLUSTER_PROFILE_SHA256="$(sha256sum "$CLUSTER_PROFILE"',
+        "profile.training_nodes",
+        "profile.training_segment",
+        "profile.walltime",
+    ):
+        assert required in submitter
+    assert "--gpus-per-node=4" not in runner
+    assert 'scheduler_args+=("--gpus-per-node=${gpus_per_node}")' in submitter
+
+
+def test_cluster_profile_allocation_is_a_capacity_not_an_exact_node_count() -> None:
+    """One profile can safely schedule both 2-node Q30 and 4-node Q235 experiments."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+
+    assert "experiment.slurm.nodes > profile.training_nodes" in submitter
+    assert "profile.training_nodes % experiment.slurm.nodes" in submitter
+    assert "experiment.slurm.segment > profile.training_segment" in submitter
+    assert "experiment.slurm.nodes != profile.training_nodes" not in submitter
+
+
+def test_non_oci_training_requires_a_pinned_readiness_receipt_and_local_scratch() -> None:
+    """A stale or Lustre-backed readiness artifact must fail before GPU startup."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        '[[ "$CLUSTER_NAME" == "oci-hsg" || -n "$READINESS_RECEIPT" ]]',
+        'READINESS_RECEIPT_SHA256="$(sha256sum "$READINESS_RECEIPT"',
+        "validate_scratch_root",
+        'receipt["profile"] != profile.name',
+        'receipt["scratch_root"]',
+        'scratch.is_relative_to(Path("/lustre"))',
+    ):
+        assert required in submitter
+    for required in (
+        "CLUSTER_PROFILE_PATH",
+        "CLUSTER_PROFILE_SHA256",
+        "READINESS_RECEIPT_SHA256",
+        'SCRATCH_JOB_ROOT="${SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
+        '"$SCRATCH_ROOT" != /lustre*',
+        "${SCRATCH_ROOT}:${SCRATCH_ROOT}",
+    ):
+        assert required in runner
+
+
+def test_non_oci_training_namespaces_scheduler_wandb_and_receipt_identity() -> None:
+    """Independent clusters cannot share a logical job or W&B resume identity."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        'cluster_tuple_identity="${CLUSTER_NAME}:${identity}:${boundary}"',
+        'wandb_run_id="sd-${identity}-${CLUSTER_NAME}"',
+        "CLUSTER_NAME=${CLUSTER_NAME}",
+        '"cluster":"%s"',
+    ):
+        assert required in submitter
+    assert 'WANDB_RUN_GROUP="${RUN_NAME}-${CLUSTER_NAME}"' in runner
+    assert 'TRAINING_RUN_NAME="${RUN_NAME}-${CLUSTER_NAME}"' in runner
+    assert 'training.run_name="${TRAINING_RUN_NAME}-s${MAX_STEPS}"' in runner
+
+
+def test_runner_exports_computed_serve_nodes_and_cluster_name_to_child_shell() -> None:
+    """The child shell must see the target-specific role split and cluster namespace."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    assert "export SERVE_NODES CLUSTER_NAME" in runner
+    assert "export SERVE_NODES=2" not in runner
+
+
+def test_full_chain_forwards_profile_and_readiness_to_every_wave() -> None:
+    """All dependent stages use the same immutable cluster placement receipt."""
+    chain = (_LAUNCHER_DIR / "common/specdec/submit_drafter_full_chain.sh").read_text()
+
+    for required in (
+        "--cluster-profile",
+        "--readiness-receipt",
+        '--cluster-profile "$CLUSTER_PROFILE"',
+        '--readiness-receipt "$READINESS_RECEIPT"',
+        'CHAIN_CLUSTER_NAME="oci-hsg"',
+        'tuple_identity="${CHAIN_CLUSTER_NAME}:${identity}:${boundary}"',
+    ):
+        assert required in chain
+
+
+def test_full_chain_exact_experiment_filter_selects_only_requested_chains() -> None:
+    """Three exact experiment IDs render only their nine cumulative stages."""
+    base = replace(_experiment(), cumulative_max_steps=(4166, 14500, 25391))
+    experiments = (
+        base,
+        replace(base, target="q30-thinking"),
+        replace(base, dataset="nemo-direct"),
+        replace(base, method="dspark"),
+    )
+    selected_ids = {experiment.experiment_id for experiment in experiments[:3]}
+
+    selected = select_experiments(experiments, selected_ids)
+
+    assert {experiment.experiment_id for experiment in selected} == selected_ids
+    assert sum(len(experiment.cumulative_max_steps) for experiment in selected) == 9
+    assert experiments[3].experiment_id not in selected_ids
+
+    chain = (_LAUNCHER_DIR / "common/specdec/submit_drafter_full_chain.sh").read_text()
+    assert "--experiment-id" in chain
+    assert "selected_ids = set(sys.argv[2:])" in chain
 
 
 def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None:
@@ -402,7 +602,8 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
         "WANDB_RUN_GROUP",
         "WANDB_CACHE_DIR",
         "report_to=wandb",
-        'training.run_name="${RUN_NAME}-s${MAX_STEPS}"',
+        'TRAINING_RUN_NAME="$RUN_NAME"',
+        'training.run_name="${TRAINING_RUN_NAME}-s${MAX_STEPS}"',
         "SERVE_BLOCK_SIZE=32",
         "SERVE_MAX_MODEL_LEN=8192",
         "SERVE_READY_TIMEOUT=1800",
@@ -475,7 +676,7 @@ def test_requeued_host_staging_reuses_only_a_completed_node_local_copy() -> None
         'stage_marker="$node_root/staging.complete"',
         'stage_fingerprint="${SOURCE_SHA}|${RUNTIME_ARCHIVE_SHA256}|${TARGET_PATH}|${DATASET_PATH}|${stage_role}"',
         'if [[ -f "$stage_marker" && "$(<"$stage_marker")" == "$stage_fingerprint" ]]',
-        '[[ "$node_root" == "/raid/scratch/${SLURM_JOB_ID}/node-${SLURM_NODEID}" ]]',
+        '[[ "$node_root" == "${SCRATCH_ROOT%/}/${SLURM_JOB_ID}/node-${SLURM_NODEID}" ]]',
         'rm -rf -- "$node_root"',
         'printf "%s\\n" "$stage_fingerprint" >"$stage_marker_tmp"',
         'mv "$stage_marker_tmp" "$stage_marker"',
@@ -519,7 +720,7 @@ def test_training_mounts_existing_node_local_scratch_parent() -> None:
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
     probe = (_LAUNCHER_DIR / "common/specdec/probe_relocatable_runtime.sh").read_text()
 
-    assert "/raid/scratch:/raid/scratch" in runner
+    assert "${SCRATCH_ROOT}:${SCRATCH_ROOT}" in runner
     assert "${SCRATCH_JOB_ROOT}:${SCRATCH_JOB_ROOT}" not in runner
     assert "/raid/scratch:/raid/scratch" in probe
 
@@ -778,7 +979,10 @@ def test_node_local_input_staging_dereferences_hf_blob_symlinks() -> None:
     """HF cache links are materialized before their Lustre backing paths disappear."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
-    assert "srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '\n" in runner
+    assert (
+        'srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntasks-per-node=1 bash -c \'\n'
+        in runner
+    )
     for source in ("TARGET_PATH", "DATASET_PATH"):
         assert f'cp -aL "${source}"' in runner
         assert f'cp -a "${source}"' not in runner

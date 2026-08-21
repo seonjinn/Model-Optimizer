@@ -29,6 +29,10 @@ __all__ = [
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _HORIZONS = {("dflash", 8): 7, ("dflash", 16): 15, ("dspark", 8): 8, ("dspark", 16): 16}
+_TARGET_SLURM_DEFAULTS = {
+    "qwen3-30b-a3b": {"nodes": 2, "segment": 2},
+    "qwen3-235b-a22b": {"nodes": 4, "segment": 4},
+}
 
 
 def validate_topology(nodes: int, segment: int, role: str) -> None:
@@ -117,9 +121,13 @@ class TargetTopology:
             getattr(self, field) != value for field, value in expected.items()
         ):
             raise ValueError(f"target topology must use the pinned defaults for {self.target_kind}")
-        if self.per_device_train_batch_size * self.gradient_accumulation_steps * 2 * 4 != 512:
+        trainer_world_size = 4 if self.target_kind == "qwen3-30b-a3b" else 8
+        if (
+            self.per_device_train_batch_size * self.gradient_accumulation_steps * trainer_world_size
+            != 512
+        ):
             raise ValueError(
-                "target topology must produce global batch size 512 over eight trainer GPUs"
+                f"target topology must produce global batch size 512 over {trainer_world_size} trainer GPUs"
             )
 
 
@@ -128,7 +136,7 @@ _TARGET_DEFAULTS = {
         "capture_ids": (2, 13, 24, 35, 46, 48),
         "serve_tp": 2,
         "per_device_train_batch_size": 4,
-        "gradient_accumulation_steps": 16,
+        "gradient_accumulation_steps": 32,
         "num_attention_heads": 32,
         "num_key_value_heads": 4,
         "head_dim": 128,
@@ -186,8 +194,15 @@ class DrafterExperiment:
         method = self.method.lower()
         object.__setattr__(self, "method", method)
         speculative_tokens(method, self.block_size)
-        if self.slurm.nodes != 4 or self.slurm.segment != 4:
-            raise ValueError("training requires exactly four nodes with --segment=4")
+        expected_slurm = _TARGET_SLURM_DEFAULTS.get(self.topology.target_kind)
+        if expected_slurm is None or any(
+            getattr(self.slurm, field) != value for field, value in expected_slurm.items()
+        ):
+            raise ValueError(
+                f"training topology does not match target family {self.topology.target_kind}"
+            )
+        if self.slurm.gpus_per_node != 4:
+            raise ValueError("training requires four GPUs per allocated node")
         if not self.cumulative_max_steps or any(step < 1 for step in self.cumulative_max_steps):
             raise ValueError("cumulative_max_steps must contain positive boundaries")
         if self.sample_size != 1_300_000:
@@ -270,15 +285,34 @@ def write_manifest(output: Path, experiments: tuple[DrafterExperiment, ...]) -> 
         temporary.unlink(missing_ok=True)
 
 
-def load_manifest(path: Path) -> tuple[DrafterExperiment, ...]:
+def load_manifest(
+    path: Path, *, migrate_legacy_q30_topology: bool = False
+) -> tuple[DrafterExperiment, ...]:
     """Load and validate a canonical manifest before submission."""
     try:
-        document = json.loads(path.read_text())
+        content = path.read_text()
+        document = json.loads(content)
         raw_experiments = document["experiments"]
     except (OSError, TypeError, json.JSONDecodeError, KeyError) as error:
         raise ValueError(f"invalid manifest: {path}") from error
     if not isinstance(raw_experiments, list) or not raw_experiments:
         raise ValueError("manifest must contain a non-empty experiments list")
+    if migrate_legacy_q30_topology:
+        for entry in raw_experiments:
+            topology = entry.get("topology", {})
+            slurm = entry.get("slurm", {})
+            if topology.get("target_kind") != "qwen3-30b-a3b":
+                continue
+            if (
+                topology.get("per_device_train_batch_size") != 4
+                or topology.get("gradient_accumulation_steps") not in (16, 32)
+                or slurm.get("gpus_per_node") != 4
+                or (slurm.get("nodes"), slurm.get("segment")) not in ((4, 4), (2, 2))
+            ):
+                raise ValueError("legacy Q30 template has an unsupported topology")
+            topology["gradient_accumulation_steps"] = 32
+            slurm["nodes"] = 2
+            slurm["segment"] = 2
     experiments = tuple(
         DrafterExperiment(
             target=entry["target"],
@@ -299,6 +333,6 @@ def load_manifest(path: Path) -> tuple[DrafterExperiment, ...]:
         )
         for entry in raw_experiments
     )
-    if canonical_manifest(experiments) != path.read_text():
+    if not migrate_legacy_q30_topology and canonical_manifest(experiments) != content:
         raise ValueError("manifest is not canonical")
     return experiments

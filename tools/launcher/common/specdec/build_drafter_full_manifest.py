@@ -44,13 +44,38 @@ def readable_job_name(
     return name
 
 
+def select_experiments(
+    experiments: tuple[DrafterExperiment, ...], selected_ids: set[str]
+) -> tuple[DrafterExperiment, ...]:
+    """Select exact manifest identities while preserving canonical manifest order."""
+    if not selected_ids:
+        return experiments
+    available = {experiment.experiment_id for experiment in experiments}
+    unknown = selected_ids - available
+    if unknown:
+        raise ValueError(f"unknown experiment IDs: {','.join(sorted(unknown))}")
+    return tuple(
+        experiment for experiment in experiments if experiment.experiment_id in selected_ids
+    )
+
+
 def build_full_manifest(
     template: Path, output: Path, source_path: str, source_sha: str
 ) -> tuple[DrafterExperiment, ...]:
     """Rewrite only source provenance and convergence stages of the trusted template."""
-    experiments = tuple(
-        replace(
+
+    def rewrite(experiment: DrafterExperiment) -> DrafterExperiment:
+        suffix = "-2n"
+        is_q30 = experiment.topology.target_kind == "qwen3-30b-a3b"
+        run_name = experiment.run_name
+        output_root = experiment.paths.output_root
+        if is_q30 and not run_name.endswith(suffix):
+            run_name = f"{run_name}{suffix}"
+        if is_q30 and not output_root.endswith(suffix):
+            output_root = f"{output_root}{suffix}"
+        return replace(
             experiment,
+            run_name=run_name,
             cumulative_max_steps=full_convergence_boundaries(
                 experiment.topology.target_kind, experiment.block_size
             ),
@@ -58,9 +83,13 @@ def build_full_manifest(
                 experiment.paths,
                 source_path=source_path,
                 source_sha=source_sha,
+                output_root=output_root,
             ),
         )
-        for experiment in load_manifest(template)
+
+    experiments = tuple(
+        rewrite(experiment)
+        for experiment in load_manifest(template, migrate_legacy_q30_topology=True)
     )
     matrix = {
         (experiment.target, experiment.dataset, experiment.method, experiment.block_size)
@@ -88,6 +117,10 @@ def build_full_manifest(
         for experiment in experiments
     ):
         raise ValueError("target label does not match its pinned topology family")
+    expected_slurm = {
+        "qwen3-30b-a3b": ("nemotron_n3_post", "batch", 2, 4, 2),
+        "qwen3-235b-a22b": ("nemotron_n3_post", "batch", 4, 4, 4),
+    }
     if any(
         (
             experiment.slurm.account,
@@ -96,10 +129,10 @@ def build_full_manifest(
             experiment.slurm.gpus_per_node,
             experiment.slurm.segment,
         )
-        != ("nemotron_n3_post", "batch", 4, 4, 4)
+        != expected_slurm[experiment.topology.target_kind]
         for experiment in experiments
     ):
-        raise ValueError("full convergence requires nemotron_n3_post batch 4x4 segment-4")
+        raise ValueError("full convergence Slurm topology must match each target family")
     for label, values in (
         ("output_root", [experiment.paths.output_root for experiment in experiments]),
         ("run_name", [experiment.run_name for experiment in experiments]),
