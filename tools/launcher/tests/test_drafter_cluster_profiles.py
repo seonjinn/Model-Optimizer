@@ -12,7 +12,9 @@ import pytest
 from common.specdec.cluster_profile import (
     ClusterProfile,
     load_cluster_profile,
+    render_probe_sbatch,
     scheduler_gpu_args,
+    select_scratch_root,
     validate_scratch_root,
 )
 
@@ -72,6 +74,25 @@ def test_lyris_profile_uses_verified_scratch_candidates() -> None:
         Path("/tmp"),
     )
     assert scheduler_gpu_args(profile) == ()
+
+
+def test_select_scratch_prefers_slurm_tmpdir(tmp_path: Path) -> None:
+    """An allocated node uses SLURM_TMPDIR before static scratch fallbacks."""
+    selected = select_scratch_root(
+        candidates=(Path("$SLURM_TMPDIR"), Path("/raid/scratch"), Path("/tmp")),
+        environ={"SLURM_TMPDIR": str(tmp_path)},
+        writable=lambda path: path == tmp_path,
+    )
+
+    assert selected == tmp_path
+
+
+def test_lyris_render_has_no_gres_or_gpu_flag() -> None:
+    """Lyris requests its exclusive allocation without incompatible GPU flags."""
+    argv = render_probe_sbatch(load_cluster_profile(PROFILES / "lyris.yaml"))
+
+    assert "--segment=1" in argv
+    assert not any(arg.startswith(("--gres", "--gpus-per-node")) for arg in argv)
 
 
 def test_profile_rejects_nonexclusive_gpu_semantics() -> None:

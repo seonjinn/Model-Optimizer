@@ -9,14 +9,19 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
 
 __all__ = [
     "ClusterProfile",
     "load_cluster_profile",
+    "render_probe_sbatch",
     "scheduler_gpu_args",
+    "select_scratch_root",
     "validate_scratch_root",
 ]
 
@@ -125,6 +130,33 @@ def scheduler_gpu_args(profile: ClusterProfile) -> tuple[str, ...]:
     return ()
 
 
+def render_probe_sbatch(profile: ClusterProfile) -> tuple[str, ...]:
+    """Render the scheduler arguments for one four-GPU readiness allocation."""
+    return (
+        f"--account={profile.account}",
+        f"--partition={profile.partition}",
+        "--nodes=1",
+        "--ntasks-per-node=1",
+        *scheduler_gpu_args(profile),
+        "--segment=1",
+        "--time=00:10:00",
+        f"--job-name=drafter-profile-probe-{profile.name}",
+    )
+
+
+def select_scratch_root(
+    candidates: tuple[Path, ...],
+    environ: Mapping[str, str],
+    writable: Callable[[Path], bool],
+) -> Path:
+    """Return the first expanded writable scratch candidate."""
+    for candidate in candidates:
+        expanded = _expand_scratch_candidate(candidate, environ)
+        if expanded is not None and writable(expanded):
+            return expanded
+    raise ValueError("no configured scratch candidate is writable")
+
+
 def validate_scratch_root(profile: ClusterProfile, path: Path) -> None:
     """Reject a selected scratch path that is not rooted in the profile candidates."""
     if not path.is_absolute():
@@ -154,6 +186,13 @@ def _resolved_scratch_candidates(profile: ClusterProfile) -> tuple[Path, ...]:
         if expanded.is_absolute():
             candidates.append(expanded.resolve(strict=False))
     return tuple(candidates)
+
+
+def _expand_scratch_candidate(candidate: Path, environ: Mapping[str, str]) -> Path | None:
+    if candidate == _SLURM_TMPDIR:
+        value = environ.get("SLURM_TMPDIR")
+        return Path(value).resolve(strict=False) if value else None
+    return candidate.resolve(strict=False) if candidate.is_absolute() else None
 
 
 def _string(values: dict[str, Any], field: str) -> str:
