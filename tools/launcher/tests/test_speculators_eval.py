@@ -39,10 +39,14 @@ _LAUNCHER_DIR = Path(__file__).resolve().parents[1]
 _WRAPPER = _LAUNCHER_DIR / "common/specdec/run_speculators_eval.sh"
 _RECIPE = _LAUNCHER_DIR / "examples/Qwen/Qwen3-30B-A3B/speculators_eval.yaml"
 _RUNTIME_STAGER = _LAUNCHER_DIR / "common/specdec/stage_speculators_eval_runtime.sh"
+_HF_STAGER = _LAUNCHER_DIR / "common/specdec/stage_hf_model.sh"
+_MODELOPT_RUNTIME_STAGER = _LAUNCHER_DIR / "common/specdec/stage_relocatable_runtime_archive.sh"
+_MODELOPT_RUNTIME_PROBE = _LAUNCHER_DIR / "common/specdec/probe_relocatable_runtime.sh"
 _SPECULATORS_SHA = "0b08a89a83b92007be63f128e01497455b0209df"
 _MODELOPT_SHA = "a" * 40
 _DATASET_REVISION = "b" * 40
 _IMAGE_SHA256 = hashlib.sha256(b"staged image fixture").hexdigest()
+_RUNTIME_SHA256 = "c" * 64
 _SUBSETS = (
     "HumanEval",
     "math_reasoning",
@@ -64,6 +68,54 @@ def _write_executable(path: Path, body: str) -> None:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_cluster_contract(tmp_path: Path, *, name: str = "lyris") -> tuple[Path, Path, Path]:
+    durable = tmp_path / "durable"
+    scratch = tmp_path / "scratch"
+    durable.mkdir()
+    scratch.mkdir()
+    profile = tmp_path / f"{name}.yaml"
+    profile.write_text(
+        "\n".join(
+            (
+                f"name: {name}",
+                "modelopt_commit: e3febcbe1319f018eea81fa4d42e2e36cb54494e",
+                f"ssh_host: login-{name}",
+                "account: coreai_dlalgo_llm",
+                "partition: gb200",
+                "fallback_partition: null",
+                f"durable_root: {durable}",
+                "scratch_candidates:",
+                f"  - {scratch}",
+                "training_nodes: 4",
+                "training_segment: 4",
+                "evaluation_nodes: 1",
+                "evaluation_segment: 1",
+                "gpus_per_node: 4",
+                "explicit_gpu_flag: false",
+                'walltime: "05:00:00"',
+                "",
+            )
+        )
+    )
+    receipt = tmp_path / f"{name}-readiness.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "profile": name,
+                "scratch_root": str(scratch),
+                "account": "coreai_dlalgo_llm",
+                "partition": "gb200",
+                "pyxis_available": True,
+                "gpu_count": 4,
+                "architecture": "aarch64",
+                "hostname": f"{name}0001",
+                "timestamp": "2026-08-21T00:00:00Z",
+            }
+        )
+    )
+    return profile, receipt, durable
 
 
 def _make_harness(
@@ -193,6 +245,7 @@ def _make_harness(
     activate = runtime_bin / "activate"
     activate.parent.mkdir(parents=True)
     activate.write_text(f'export PATH="{runtime_bin}:$PATH"\n')
+    (runtime / ".archive.sha256").write_text(f"{_RUNTIME_SHA256}\n")
     _write_executable(runtime_bin / "guidellm", "#!/bin/bash\nexit 0\n")
 
     _write_executable(
@@ -423,6 +476,100 @@ def test_runtime_archive_stager_rejects_unpinned_or_nonlocal_destination(tmp_pat
     assert not Path(env["SPECULATORS_RUNTIME"]).exists()
 
 
+def test_runtime_stager_accepts_matching_profile_readiness_contract(tmp_path: Path) -> None:
+    """Evaluator runtime extraction uses the compute-verified profile scratch root."""
+    profile, receipt, durable = _write_cluster_contract(tmp_path)
+    archived_runtime = tmp_path / "archived-runtime"
+    _write_executable(archived_runtime / "bin/python3", "#!/bin/bash\nexit 0\n")
+    _write_executable(archived_runtime / "bin/guidellm", "#!/bin/bash\nexit 0\n")
+    (archived_runtime / "bin/activate").write_text(
+        f'export VIRTUAL_ENV="{archived_runtime}"\nexport PATH="$VIRTUAL_ENV/bin:$PATH"\n'
+    )
+    archive = durable / "runtime.tar.gz"
+    with tarfile.open(archive, "w:gz") as file:
+        for path in archived_runtime.rglob("*"):
+            file.add(path, arcname=path.relative_to(archived_runtime))
+    scratch = tmp_path / "scratch"
+    destination = scratch / "12345/speculators-runtime"
+    env = {
+        **os.environ,
+        "SLURM_JOB_ID": "12345",
+        "MARS_SCRATCH_ROOT": str(scratch),
+        "SPECULATORS_RUNTIME_ARCHIVE": str(archive),
+        "SPECULATORS_RUNTIME_ARCHIVE_SHA256": _sha256(archive),
+        "SPECULATORS_RUNTIME": str(destination),
+        "CLUSTER_PROFILE": str(profile),
+        "CLUSTER_READINESS_RECEIPT": str(receipt),
+    }
+
+    result = subprocess.run(
+        ["bash", str(_RUNTIME_STAGER)], env=env, capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert destination.is_dir()
+
+
+def test_runtime_stager_rejects_mismatched_readiness_before_extraction(tmp_path: Path) -> None:
+    """A receipt for another profile cannot authorize node-local extraction."""
+    profile, receipt, durable = _write_cluster_contract(tmp_path)
+    payload = json.loads(receipt.read_text())
+    payload["profile"] = "ptyche"
+    receipt.write_text(json.dumps(payload))
+    archive = durable / "runtime.tar.gz"
+    archive.write_bytes(b"fixture")
+    destination = tmp_path / "scratch/12345/speculators-runtime"
+    env = {
+        **os.environ,
+        "SLURM_JOB_ID": "12345",
+        "MARS_SCRATCH_ROOT": str(tmp_path / "scratch"),
+        "SPECULATORS_RUNTIME_ARCHIVE": str(archive),
+        "SPECULATORS_RUNTIME_ARCHIVE_SHA256": _sha256(archive),
+        "SPECULATORS_RUNTIME": str(destination),
+        "CLUSTER_PROFILE": str(profile),
+        "CLUSTER_READINESS_RECEIPT": str(receipt),
+    }
+
+    result = subprocess.run(
+        ["bash", str(_RUNTIME_STAGER)], env=env, capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert "readiness" in result.stderr.lower()
+    assert not destination.exists()
+
+
+def test_profile_aware_staging_entrypoints_share_the_readiness_contract() -> None:
+    """All staging/probe entrypoints consume one profile and readiness receipt contract."""
+    for script in (_HF_STAGER, _MODELOPT_RUNTIME_STAGER, _MODELOPT_RUNTIME_PROBE):
+        text = script.read_text()
+        assert "--cluster-profile" in text
+        assert "--readiness-receipt" in text
+        assert "load_cluster_profile" in text
+        assert "validate_scratch_root" in text
+        assert "scheduler_gpu_args" in text
+
+
+def test_profile_aware_eval_rejects_output_outside_cluster_namespace(tmp_path: Path) -> None:
+    """A profile-qualified evaluator cannot write into another cluster's result root."""
+    profile, receipt, _ = _write_cluster_contract(tmp_path)
+    env, run_dir, server_pid_file = _make_harness(tmp_path / "harness")
+    env.update(
+        {
+            "CLUSTER_PROFILE": str(profile),
+            "CLUSTER_READINESS_RECEIPT": str(receipt),
+            "MARS_SCRATCH_ROOT": str(tmp_path / "scratch"),
+        }
+    )
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "durable_root" in result.stderr
+    assert not server_pid_file.exists()
+    assert not run_dir.exists()
+
+
 @pytest.mark.parametrize(
     ("method", "block_size", "num_spec_tokens"),
     [("dflash", 8, 7), ("dflash", 16, 15), ("dspark", 8, 8), ("dspark", 16, 16)],
@@ -452,6 +599,18 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
     assert manifest["slurm_job_id"] == "12345"
     assert manifest["container"]["sha256"] == _IMAGE_SHA256
     assert manifest["dataset"]["revision"] == _DATASET_REVISION
+    fingerprint = json.loads((run_dir / "input-fingerprint.json").read_text())
+    assert fingerprint["schema_version"] == 1
+    assert len(fingerprint["sha256"]) == 64
+    assert fingerprint["inputs"]["dataset"]["revision"] == _DATASET_REVISION
+    assert fingerprint["inputs"]["image"]["sha256"] == _IMAGE_SHA256
+    assert fingerprint["inputs"]["runtime"]["sha256"] == _RUNTIME_SHA256
+    assert fingerprint["inputs"]["source"] == {
+        "modelopt_sha": _MODELOPT_SHA,
+        "speculators_sha": _SPECULATORS_SHA,
+    }
+    assert len(fingerprint["inputs"]["target_config_sha256"]) == 64
+    assert len(fingerprint["inputs"]["draft_config_sha256"]) == 64
     assert set(manifest["dataset"]["files"]) == set(_SUBSETS)
     assert manifest["versions"] == {
         "guidellm": "0.4.0",
@@ -567,6 +726,50 @@ def test_resume_skips_atomically_validated_completed_subsets(tmp_path: Path) -> 
     assert second_evaluations == first_evaluations
     assert "Reusing validated completed subset" in second.stdout
     assert (run_dir / "perf_results.csv").is_file()
+
+
+@pytest.mark.parametrize("mutated_input", ["target", "runtime"])
+def test_resume_rejects_immutable_input_fingerprint_change(
+    tmp_path: Path, mutated_input: str
+) -> None:
+    """A run ID cannot reuse subsets after any immutable staged input changes."""
+    env, _, _ = _make_harness(tmp_path)
+    evaluator_prefix = f"python3 {env['SPECULATORS_REPO']}/scripts/evaluate/evaluate.py "
+
+    first = _run(env, tmp_path)
+    first_evaluations = sum(
+        line.startswith(evaluator_prefix)
+        for line in (tmp_path / "invocations.log").read_text().splitlines()
+    )
+    if mutated_input == "target":
+        (Path(env["HF_MODEL_CKPT"]) / "config.json").write_text(
+            '{"model_type":"qwen3_moe","changed":true}\n'
+        )
+    else:
+        (Path(env["SPECULATORS_RUNTIME"]) / ".archive.sha256").write_text(f"{'d' * 64}\n")
+
+    second = _run(env, tmp_path)
+    second_evaluations = sum(
+        line.startswith(evaluator_prefix)
+        for line in (tmp_path / "invocations.log").read_text().splitlines()
+    )
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode != 0
+    assert "immutable input fingerprint mismatch" in second.stderr
+    assert second_evaluations == first_evaluations
+
+
+def test_sweep_mode_is_rejected_before_server_start(tmp_path: Path) -> None:
+    """The fixed-throughput wrapper must reject the incompatible upstream sweep path."""
+    env, run_dir, server_pid_file = _make_harness(tmp_path, eval_mode="sweep")
+
+    result = _run(env, tmp_path)
+
+    assert result.returncode != 0
+    assert "unsupported EVAL_MODE: sweep" in result.stderr
+    assert not server_pid_file.exists()
+    assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
 
 
 @pytest.mark.parametrize("max_concurrency", [0, 2, 64])
@@ -770,6 +973,7 @@ def test_invalid_acceptance_csv_fails_the_job(
 
     assert result.returncode != 0
     assert json.loads((run_dir / "manifest.json").read_text())["status"] == "failed"
+    assert not any((run_dir / "subsets").iterdir())
 
 
 def test_acceptance_csv_accepts_upstream_integral_float_counters(tmp_path: Path) -> None:

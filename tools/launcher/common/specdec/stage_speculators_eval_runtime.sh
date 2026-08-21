@@ -16,6 +16,51 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER_ROOT="${DRAFTER_LAUNCHER_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+
+validate_cluster_contract() {
+    [[ -n "${CLUSTER_PROFILE:-}" || -n "${CLUSTER_READINESS_RECEIPT:-}" ]] || return 0
+    [[ -n "${CLUSTER_PROFILE:-}" && -n "${CLUSTER_READINESS_RECEIPT:-}" ]] || {
+        echo "ERROR: CLUSTER_PROFILE and CLUSTER_READINESS_RECEIPT are required together" >&2
+        exit 2
+    }
+    PYTHONPATH="${LAUNCHER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 - \
+        "${CLUSTER_PROFILE}" "${CLUSTER_READINESS_RECEIPT}" \
+        "${MARS_SCRATCH_ROOT:-/raid/scratch}" "${SPECULATORS_RUNTIME_ARCHIVE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from common.specdec.cluster_profile import load_cluster_profile, validate_scratch_root
+
+profile = load_cluster_profile(Path(sys.argv[1]).resolve())
+receipt_path = Path(sys.argv[2]).resolve()
+receipt = json.loads(receipt_path.read_text())
+expected = {
+    "profile": profile.name,
+    "account": profile.account,
+    "partition": profile.partition,
+    "pyxis_available": True,
+    "gpu_count": profile.gpus_per_node,
+    "architecture": "aarch64",
+}
+if any(receipt.get(key) != value for key, value in expected.items()):
+    raise ValueError("cluster readiness receipt does not match profile")
+receipt_scratch = Path(receipt.get("scratch_root", ""))
+validate_scratch_root(profile, receipt_scratch)
+runtime_scratch = Path(sys.argv[3]).resolve(strict=False)
+validate_scratch_root(profile, runtime_scratch)
+if not runtime_scratch.is_relative_to(receipt_scratch.resolve(strict=False)):
+    raise ValueError("runtime scratch is outside the readiness scratch root")
+archive = Path(sys.argv[4]).resolve(strict=False)
+if not archive.is_relative_to(profile.durable_root.resolve(strict=False)):
+    raise ValueError("runtime archive is outside the profile durable_root")
+PY
+}
+
+validate_cluster_contract
+
 : "${SLURM_JOB_ID:?SLURM_JOB_ID is required}"
 : "${SPECULATORS_RUNTIME_ARCHIVE:?SPECULATORS_RUNTIME_ARCHIVE is required}"
 : "${SPECULATORS_RUNTIME_ARCHIVE_SHA256:?SPECULATORS_RUNTIME_ARCHIVE_SHA256 is required}"

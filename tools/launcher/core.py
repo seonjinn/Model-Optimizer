@@ -244,6 +244,9 @@ class GlobalVariables:
     eval_config: str = None
     dataset_manifest: str = None
     container_identity: str = None
+    max_concurrency: str = None
+    max_requests: str = None
+    eval_mode: str = None
 
 
 @dataclass

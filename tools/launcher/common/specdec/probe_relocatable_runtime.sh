@@ -6,6 +6,7 @@
 set -euo pipefail
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+LAUNCHER_ROOT="${DRAFTER_LAUNCHER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 MODE="outer"
 SOURCE_PATH=""
 RUNTIME_ARCHIVE=""
@@ -15,9 +16,11 @@ SCRATCH_ROOT="/raid/scratch/${USER}/modelopt-runtime-probe-${SLURM_JOB_ID:-local
 ACCOUNT="nemotron_n3_post"
 PARTITION="batch"
 PROBE_LOG=""
+CLUSTER_PROFILE=""
+READINESS_RECEIPT=""
 
 usage() {
-    echo "usage: $0 --source-path /home/... --runtime-archive /lustre/... --runtime-sha256 SHA256 --image /lustre/... [--scratch-root /raid/scratch/...] [--account ACCOUNT] [--partition PARTITION]" >&2
+    echo "usage: $0 --source-path /home/... --runtime-archive /lustre/... --runtime-sha256 SHA256 --image /lustre/... [--cluster-profile PATH --readiness-receipt PATH] [--scratch-root PATH] [--account ACCOUNT] [--partition PARTITION]" >&2
     exit 2
 }
 
@@ -32,11 +35,60 @@ while [[ $# -gt 0 ]]; do
         --account) ACCOUNT="$2"; shift 2 ;;
         --partition) PARTITION="$2"; shift 2 ;;
         --probe-log) PROBE_LOG="$2"; shift 2 ;;
+        --cluster-profile) CLUSTER_PROFILE="$2"; shift 2 ;;
+        --readiness-receipt) READINESS_RECEIPT="$2"; shift 2 ;;
         *) usage ;;
     esac
 done
 
-[[ "$SOURCE_PATH" == /home/* && "$RUNTIME_ARCHIVE" == /lustre/* && "$RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ && "$IMAGE_PATH" == /lustre/* && "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
+PROFILE_DURABLE_ROOT=""
+PROFILE_SCRATCH_BASE=""
+PROFILE_GPU_ARGS=(--gpus-per-node=4)
+PROFILE_EVAL_NODES=1
+PROFILE_EVAL_SEGMENT=1
+if [[ -n "$CLUSTER_PROFILE" || -n "$READINESS_RECEIPT" ]]; then
+    [[ -n "$CLUSTER_PROFILE" && -n "$READINESS_RECEIPT" ]] || usage
+    mapfile -t profile_values < <(PYTHONPATH="${LAUNCHER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 - \
+        "$CLUSTER_PROFILE" "$READINESS_RECEIPT" <<'PY'
+import json
+import sys
+from pathlib import Path
+from common.specdec.cluster_profile import load_cluster_profile, scheduler_gpu_args, validate_scratch_root
+profile = load_cluster_profile(Path(sys.argv[1]).resolve())
+receipt = json.loads(Path(sys.argv[2]).resolve().read_text())
+expected = {"profile": profile.name, "account": profile.account, "partition": profile.partition,
+            "pyxis_available": True, "gpu_count": profile.gpus_per_node, "architecture": "aarch64"}
+if any(receipt.get(key) != value for key, value in expected.items()):
+    raise ValueError("cluster readiness receipt does not match profile")
+scratch = Path(receipt.get("scratch_root", ""))
+validate_scratch_root(profile, scratch)
+print(profile.account)
+print(profile.partition)
+print(profile.durable_root)
+print(scratch)
+print(profile.evaluation_nodes)
+print(profile.evaluation_segment)
+for argument in scheduler_gpu_args(profile): print(argument)
+PY
+    )
+    (( ${#profile_values[@]} >= 6 )) || { echo "invalid cluster readiness contract" >&2; exit 2; }
+    ACCOUNT="${profile_values[0]}"
+    PARTITION="${profile_values[1]}"
+    PROFILE_DURABLE_ROOT="${profile_values[2]}"
+    PROFILE_SCRATCH_BASE="${profile_values[3]}"
+    SCRATCH_ROOT="${PROFILE_SCRATCH_BASE%/}/${USER}/modelopt-runtime-probe"
+    PROFILE_EVAL_NODES="${profile_values[4]}"
+    PROFILE_EVAL_SEGMENT="${profile_values[5]}"
+    PROFILE_GPU_ARGS=("${profile_values[@]:6}")
+fi
+
+[[ "$SOURCE_PATH" == /home/* && "$RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]] || usage
+if [[ -n "$PROFILE_DURABLE_ROOT" ]]; then
+    [[ "$(realpath -m -- "$RUNTIME_ARCHIVE")" == "$PROFILE_DURABLE_ROOT"/* ]] || usage
+    [[ "$(realpath -m -- "$IMAGE_PATH")" == "$PROFILE_DURABLE_ROOT"/* ]] || usage
+else
+    [[ "$RUNTIME_ARCHIVE" == /lustre/* && "$IMAGE_PATH" == /lustre/* && "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
+fi
 
 if [[ "$MODE" == "outer" ]]; then
     [[ "$SCRIPT_PATH" == /home/* ]] || { echo "probe script must be run from /home source" >&2; exit 2; }
@@ -46,12 +98,28 @@ if [[ "$MODE" == "outer" ]]; then
     RUNTIME_ARCHIVE_ROOT="$(dirname "$RUNTIME_ARCHIVE")"
     [[ "$PROBE_LOG" == /lustre/* ]] || usage
     mkdir -p "$(dirname "$PROBE_LOG")"
-    srun --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks=1 --gpus-per-node=4 --segment=1 --time=00:10:00 \
-        --job-name=modelopt-runtime-probe --output="$PROBE_LOG" --error="$PROBE_LOG" \
-        --no-container-mount-home \
-        --container-image="$IMAGE_PATH" \
-        --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},/raid/scratch:/raid/scratch" \
-        bash "$SCRIPT_PATH" --inside --source-path "$SOURCE_PATH" --runtime-archive "$RUNTIME_ARCHIVE" --runtime-sha256 "$RUNTIME_SHA256" --image "$IMAGE_PATH" --scratch-root "$SCRATCH_ROOT"
+    if [[ -n "$CLUSTER_PROFILE" ]]; then
+        args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes="$PROFILE_EVAL_NODES" --ntasks=1
+            "${PROFILE_GPU_ARGS[@]}" --segment="$PROFILE_EVAL_SEGMENT" --time=00:10:00
+            --job-name=modelopt-runtime-probe --output="$PROBE_LOG" --error="$PROBE_LOG"
+            "--export=ALL,DRAFTER_LAUNCHER_ROOT=$LAUNCHER_ROOT"
+            --no-container-mount-home --container-image="$IMAGE_PATH"
+            --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},${PROFILE_SCRATCH_BASE}:${PROFILE_SCRATCH_BASE}")
+        command=(bash "$SCRIPT_PATH" --inside --source-path "$SOURCE_PATH"
+            --runtime-archive "$RUNTIME_ARCHIVE" --runtime-sha256 "$RUNTIME_SHA256"
+            --image "$IMAGE_PATH" --scratch-root "$SCRATCH_ROOT"
+            --cluster-profile "$CLUSTER_PROFILE" --readiness-receipt "$READINESS_RECEIPT")
+        sbatch --test-only "${args[@]}" "${command[@]}"
+        submitted="$(sbatch --parsable "${args[@]}" "${command[@]}")"
+        echo "${submitted%%;*}"
+    else
+        srun --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks=1 --gpus-per-node=4 --segment=1 --time=00:10:00 \
+            --job-name=modelopt-runtime-probe --output="$PROBE_LOG" --error="$PROBE_LOG" \
+            --no-container-mount-home \
+            --container-image="$IMAGE_PATH" \
+            --container-mounts="${SOURCE_PATH}:${SOURCE_PATH},${RUNTIME_ARCHIVE_ROOT}:${RUNTIME_ARCHIVE_ROOT},/raid/scratch:/raid/scratch" \
+            bash "$SCRIPT_PATH" --inside --source-path "$SOURCE_PATH" --runtime-archive "$RUNTIME_ARCHIVE" --runtime-sha256 "$RUNTIME_SHA256" --image "$IMAGE_PATH" --scratch-root "$SCRATCH_ROOT"
+    fi
     echo "runtime probe log: $PROBE_LOG"
     exit 0
 fi
@@ -59,7 +127,11 @@ fi
 TRACE_LOG="$(dirname "$RUNTIME_ARCHIVE")/probes/runtime-probe-${SLURM_JOB_ID}.trace"
 exec >>"$TRACE_LOG" 2>&1
 set -x
-node_root="${SCRATCH_ROOT}/node-${SLURM_NODEID:-0}"
+if [[ -n "$CLUSTER_PROFILE" ]]; then
+    node_root="${SCRATCH_ROOT}/${SLURM_JOB_ID}/node-${SLURM_NODEID:-0}"
+else
+    node_root="${SCRATCH_ROOT}/node-${SLURM_NODEID:-0}"
+fi
 rm -rf "$node_root"
 mkdir -p "$node_root/runtime"
 cp -a "$SOURCE_PATH" "$node_root/source"

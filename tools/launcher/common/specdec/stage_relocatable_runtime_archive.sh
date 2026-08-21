@@ -7,13 +7,17 @@ set -euo pipefail
 
 SOURCE_RUNTIME=""
 OUTPUT_ARCHIVE=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAUNCHER_ROOT="${DRAFTER_LAUNCHER_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SCRATCH_ROOT="/raid/scratch/${USER}"
 MODE="submit"
 ACCOUNT="nemotron_n3_post"
 PARTITION="batch"
+CLUSTER_PROFILE=""
+READINESS_RECEIPT=""
 
 usage() {
-    echo "usage: $0 --source-runtime /lustre/... --output-archive /lustre/... [--scratch-root /raid/scratch/...] [--account ACCOUNT] [--partition PARTITION]" >&2
+    echo "usage: $0 --source-runtime /lustre/... --output-archive /lustre/... [--cluster-profile PATH --readiness-receipt PATH] [--scratch-root PATH] [--account ACCOUNT] [--partition PARTITION]" >&2
     exit 2
 }
 
@@ -24,12 +28,65 @@ while [[ $# -gt 0 ]]; do
         --scratch-root) SCRATCH_ROOT="$2"; shift 2 ;;
         --account) ACCOUNT="$2"; shift 2 ;;
         --partition) PARTITION="$2"; shift 2 ;;
+        --cluster-profile) CLUSTER_PROFILE="$2"; shift 2 ;;
+        --readiness-receipt) READINESS_RECEIPT="$2"; shift 2 ;;
         --run-stage) MODE="run"; shift ;;
         *) usage ;;
     esac
 done
 
-[[ "$SOURCE_RUNTIME" == /lustre/* && "$OUTPUT_ARCHIVE" == /lustre/*.tar.zst && "$SCRATCH_ROOT" == /raid/scratch/* && -n "$ACCOUNT" && -n "$PARTITION" ]] || usage
+PROFILE_DURABLE_ROOT=""
+PROFILE_GPU_ARGS=(--gpus-per-node=4)
+PROFILE_EVAL_NODES=1
+PROFILE_EVAL_SEGMENT=1
+if [[ -n "$CLUSTER_PROFILE" || -n "$READINESS_RECEIPT" ]]; then
+    [[ -n "$CLUSTER_PROFILE" && -n "$READINESS_RECEIPT" ]] || usage
+    mapfile -t profile_values < <(PYTHONPATH="${LAUNCHER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 - \
+        "$CLUSTER_PROFILE" "$READINESS_RECEIPT" <<'PY'
+import json
+import sys
+from pathlib import Path
+from common.specdec.cluster_profile import load_cluster_profile, scheduler_gpu_args, validate_scratch_root
+profile = load_cluster_profile(Path(sys.argv[1]).resolve())
+receipt = json.loads(Path(sys.argv[2]).resolve().read_text())
+expected = {"profile": profile.name, "account": profile.account, "partition": profile.partition,
+            "pyxis_available": True, "gpu_count": profile.gpus_per_node, "architecture": "aarch64"}
+if any(receipt.get(key) != value for key, value in expected.items()):
+    raise ValueError("cluster readiness receipt does not match profile")
+scratch = Path(receipt.get("scratch_root", ""))
+validate_scratch_root(profile, scratch)
+print(profile.account)
+print(profile.partition)
+print(profile.durable_root)
+print(scratch)
+print(profile.evaluation_nodes)
+print(profile.evaluation_segment)
+for argument in scheduler_gpu_args(profile): print(argument)
+PY
+    )
+    (( ${#profile_values[@]} >= 6 )) || { echo "invalid cluster readiness contract" >&2; exit 2; }
+    ACCOUNT="${profile_values[0]}"
+    PARTITION="${profile_values[1]}"
+    PROFILE_DURABLE_ROOT="${profile_values[2]}"
+    SCRATCH_ROOT="${profile_values[3]%/}/${USER}"
+    PROFILE_EVAL_NODES="${profile_values[4]}"
+    PROFILE_EVAL_SEGMENT="${profile_values[5]}"
+    PROFILE_GPU_ARGS=("${profile_values[@]:6}")
+fi
+
+[[ -n "$ACCOUNT" && -n "$PARTITION" && "$OUTPUT_ARCHIVE" == *.tar.zst ]] || usage
+if [[ -n "$PROFILE_DURABLE_ROOT" ]]; then
+    [[ "$(realpath -m -- "$SOURCE_RUNTIME")" == "$PROFILE_DURABLE_ROOT"/* ]] || usage
+    [[ "$(realpath -m -- "$OUTPUT_ARCHIVE")" == "$PROFILE_DURABLE_ROOT"/* ]] || usage
+    PYTHONPATH="${LAUNCHER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 - "$CLUSTER_PROFILE" "$SCRATCH_ROOT" <<'PY'
+import sys
+from pathlib import Path
+from common.specdec.cluster_profile import load_cluster_profile, validate_scratch_root
+validate_scratch_root(load_cluster_profile(Path(sys.argv[1]).resolve()), Path(sys.argv[2]))
+PY
+else
+    [[ "$SOURCE_RUNTIME" == /lustre/* && "$OUTPUT_ARCHIVE" == /lustre/*.tar.zst && "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
+fi
 
 if [[ "$MODE" == "submit" ]]; then
     [[ "${BASH_SOURCE[0]}" == /home/* ]] || { echo "staging script must run from /home source" >&2; exit 2; }
@@ -38,12 +95,20 @@ if [[ "$MODE" == "submit" ]]; then
         echo "runtime archive already verified: $OUTPUT_ARCHIVE"
         exit 0
     fi
-    args=(
-        --account="$ACCOUNT" --partition="$PARTITION" --nodes=1 --ntasks-per-node=1
-        --gpus-per-node=4 --segment=1 --time=00:30:00 --job-name=modelopt-runtime-archive
-        --output="${OUTPUT_ARCHIVE}.stage-%j.out"
-    )
+    if [[ -n "$CLUSTER_PROFILE" ]]; then
+        args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes="$PROFILE_EVAL_NODES"
+            --ntasks-per-node=1 "${PROFILE_GPU_ARGS[@]}" --segment="$PROFILE_EVAL_SEGMENT")
+    else
+        args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes=1
+            --ntasks-per-node=1 --gpus-per-node=4 --segment=1)
+    fi
+    args+=(--time=00:30:00 --job-name=modelopt-runtime-archive
+        --output="${OUTPUT_ARCHIVE}.stage-%j.out")
     command=("$0" --run-stage --source-runtime "$SOURCE_RUNTIME" --output-archive "$OUTPUT_ARCHIVE" --scratch-root "$SCRATCH_ROOT")
+    if [[ -n "$CLUSTER_PROFILE" ]]; then
+        args+=("--export=ALL,DRAFTER_LAUNCHER_ROOT=$LAUNCHER_ROOT")
+        command+=(--cluster-profile "$CLUSTER_PROFILE" --readiness-receipt "$READINESS_RECEIPT")
+    fi
     sbatch --test-only "${args[@]}" "${command[@]}"
     submitted="$(sbatch --parsable "${args[@]}" "${command[@]}")"
     echo "${submitted%%;*}"
