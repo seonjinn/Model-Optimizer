@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: oci-hsg
+partition: cpu_datamover
+cpus_per_task: 4
+gpus_per_node:
+walltime: "03:55:00"
