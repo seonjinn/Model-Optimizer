@@ -148,6 +148,7 @@ def test_probe_submits_once_after_test_only_when_sbatch_output_is_blank(
         "--account=coreai_dlalgo_llm --partition=36x2-a01r --nodes=1 "
         "--ntasks-per-node=1 --segment=1 --time=00:10:00 "
         "--job-name=drafter-profile-probe-ptyche "
+        f"--export=ALL,DRAFTER_LAUNCHER_ROOT={_LAUNCHER_DIR} "
         f"{_PROBE} --inside --profile {PROFILES / 'ptyche.yaml'} "
         "--output /lustre/fsw/coreai_dlalgo_llm/users/sna/"
         "modelopt-qwen3-drafter-training/readiness.json"
@@ -190,6 +191,9 @@ def test_probe_dry_run_stops_after_test_only(
     assert result.returncode == 0, result.stderr
     assert calls.read_text().splitlines()[0].startswith("--test-only ")
     assert len(calls.read_text().splitlines()) == 1
+    assert (
+        f"--export=ALL,DRAFTER_LAUNCHER_ROOT={_LAUNCHER_DIR}" in calls.read_text().splitlines()[0]
+    )
 
 
 def test_probe_passes_sacctmgr_conditions_as_separate_arguments(

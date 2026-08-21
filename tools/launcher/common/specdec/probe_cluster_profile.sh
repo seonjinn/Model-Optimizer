@@ -6,7 +6,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LAUNCHER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DEFAULT_LAUNCHER_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+LAUNCHER_ROOT="${DRAFTER_LAUNCHER_ROOT:-$DEFAULT_LAUNCHER_ROOT}"
+[[ "$LAUNCHER_ROOT" == /* ]] || { echo "launcher root must be absolute" >&2; exit 1; }
+[[ -f "$LAUNCHER_ROOT/common/specdec/cluster_profile.py" ]] || {
+    echo "launcher root does not contain cluster profile code: $LAUNCHER_ROOT" >&2
+    exit 1
+}
 MODE="outer"
 PROFILE=""
 OUTPUT=""
@@ -62,6 +68,7 @@ PARTITION="${profile_lines[4]}"
 SBATCH_ARGS=("${profile_lines[@]:5}")
 
 if [[ "$MODE" == "outer" ]]; then
+    SBATCH_ARGS+=("--export=ALL,DRAFTER_LAUNCHER_ROOT=$LAUNCHER_ROOT")
     sacctmgr --noheader --parsable2 show assoc where "user=$USER" "account=$ACCOUNT" format=Account,Partition \
         | awk -F'|' -v account="$ACCOUNT" -v partition="$PARTITION" '$1 == account && ($2 == partition || $2 == "") { found = 1 } END { exit !found }'
     scontrol show partition "$PARTITION" >/dev/null
