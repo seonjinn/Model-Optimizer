@@ -59,11 +59,12 @@ CLUSTER_READINESS_RECEIPT="${CLUSTER_READINESS_RECEIPT}" \
 MARS_SCRATCH_ROOT="${MARS_SCRATCH_ROOT}" \
 bash "${STAGER}" >/dev/null
 
-run_cell() {
-    local descriptor="$1" port="$2"
-    local method block_size spec_tokens concurrency max_requests draft label
-    IFS='|' read -r method block_size spec_tokens concurrency max_requests draft label \
+validate_cell() {
+    local descriptor="$1"
+    local method block_size spec_tokens concurrency max_requests draft label tp_size
+    IFS='|' read -r method block_size spec_tokens concurrency max_requests draft label tp_size \
         <<<"${descriptor}"
+    tp_size="${tp_size:-2}"
     validate_label "${label}"
     case "${method}:${block_size}:${spec_tokens}" in
         baseline:0:0|dflash:8:7|dflash:16:15|dspark:8:8|dspark:16:16) ;;
@@ -73,6 +74,10 @@ run_cell() {
         1|8|32|128) ;;
         *) echo "ERROR: invalid concurrency: ${concurrency}" >&2; return 2 ;;
     esac
+    case "${tp_size}" in
+        1|2|4) ;;
+        *) echo "ERROR: invalid tensor parallel size: ${tp_size}" >&2; return 2 ;;
+    esac
     if [[ "${concurrency}" == 128 && ${max_requests} -lt 512 ]]; then
         echo "ERROR: C128 requires at least 512 requests" >&2
         return 2
@@ -80,6 +85,15 @@ run_cell() {
     if [[ "${method}" != baseline ]]; then
         [[ -r "${draft}/config.json" && -r "${draft}/model.safetensors" ]]
     fi
+}
+
+run_cell() {
+    local descriptor="$1" port="$2"
+    local method block_size spec_tokens concurrency max_requests draft label tp_size
+    validate_cell "${descriptor}"
+    IFS='|' read -r method block_size spec_tokens concurrency max_requests draft label tp_size \
+        <<<"${descriptor}"
+    tp_size="${tp_size:-2}"
 
     local cell_root="${JOB_ROOT}/${label}"
     local output_root="${RESULT_ROOT}/${label}"
@@ -101,7 +115,7 @@ run_cell() {
         mounts+=",${draft}:${draft}"
     fi
 
-    srun --exclusive --nodes=1 --ntasks=1 --gpus=2 --cpus-per-task=72 --mem=450G \
+    exec srun --exclusive --nodes=1 --ntasks=1 --gpus="${tp_size}" --cpus-per-task=72 --mem=450G \
         --kill-on-bad-exit=1 \
         --container-image="${CONTAINER_IMAGE}" \
         --container-mounts="${mounts}" \
@@ -123,7 +137,7 @@ run_cell() {
         MAX_CONCURRENCY="${concurrency}" \
         MAX_REQUESTS="${max_requests}" \
         EVAL_MODE=throughput \
-        TP_SIZE=2 \
+        TP_SIZE="${tp_size}" \
         VLLM_PORT="${port}" \
         SERVE_READY_TIMEOUT=1800 \
         HF_HOME="${HF_HOME_DURABLE}" \
@@ -141,40 +155,76 @@ run_cell() {
         bash "${WRAPPER}"
 }
 
+cell_tp() {
+    local descriptor="$1"
+    local method block_size spec_tokens concurrency max_requests draft label tp_size
+    IFS='|' read -r method block_size spec_tokens concurrency max_requests draft label tp_size \
+        <<<"${descriptor}"
+    tp_size="${tp_size:-2}"
+    case "${tp_size}" in
+        1|2|4) printf '%s\n' "${tp_size}" ;;
+        *) echo "ERROR: invalid tensor parallel size: ${tp_size}" >&2; return 2 ;;
+    esac
+}
+
 CHILD_PIDS=()
 terminate_children() {
     local pid
     trap - EXIT INT TERM
-    for pid in "${CHILD_PIDS[@]}"; do
+    for pid in "${CHILD_PIDS[@]:-}"; do
+        [[ -n "${pid}" ]] || continue
         kill "${pid}" 2>/dev/null || true
     done
-    for pid in "${CHILD_PIDS[@]}"; do
+    for pid in "${CHILD_PIDS[@]:-}"; do
+        [[ -n "${pid}" ]] || continue
         wait "${pid}" 2>/dev/null || true
     done
     CHILD_PIDS=()
+}
+
+run_supervised_cell() {
+    local descriptor="$1" port="$2" log="$3" pid status
+    run_cell "${descriptor}" "${port}" >"${log}" 2>&1 &
+    pid=$!
+    CHILD_PIDS=("${pid}")
+    set +e
+    wait "${pid}"
+    status=$?
+    set -e
+    CHILD_PIDS=()
+    return "${status}"
 }
 trap terminate_children EXIT
 trap 'terminate_children; exit 130' INT
 trap 'terminate_children; exit 143' TERM
 
-run_cell "${CELL_A}" 8000 >"${RESULT_ROOT}/cell-a.log" 2>&1 &
-pid_a=$!
-run_cell "${CELL_B}" 8010 >"${RESULT_ROOT}/cell-b.log" 2>&1 &
-pid_b=$!
-CHILD_PIDS=("${pid_a}" "${pid_b}")
-active_pids=("${CHILD_PIDS[@]}")
-while ((${#active_pids[@]})); do
-    set +e
-    wait -n -p completed_pid "${active_pids[@]}"
-    status=$?
-    set -e
-    remaining_pids=()
-    for pid in "${active_pids[@]}"; do
-        [[ "${pid}" == "${completed_pid}" ]] || remaining_pids+=("${pid}")
+validate_cell "${CELL_A}"
+validate_cell "${CELL_B}"
+tp_a="$(cell_tp "${CELL_A}")"
+tp_b="$(cell_tp "${CELL_B}")"
+if ((tp_a + tp_b <= 4)); then
+    run_cell "${CELL_A}" 8000 >"${RESULT_ROOT}/cell-a.log" 2>&1 &
+    pid_a=$!
+    run_cell "${CELL_B}" 8010 >"${RESULT_ROOT}/cell-b.log" 2>&1 &
+    pid_b=$!
+    CHILD_PIDS=("${pid_a}" "${pid_b}")
+    active_pids=("${CHILD_PIDS[@]}")
+    while ((${#active_pids[@]})); do
+        set +e
+        wait -n -p completed_pid "${active_pids[@]}"
+        status=$?
+        set -e
+        remaining_pids=()
+        for pid in "${active_pids[@]}"; do
+            [[ "${pid}" == "${completed_pid}" ]] || remaining_pids+=("${pid}")
+        done
+        active_pids=("${remaining_pids[@]}")
+        CHILD_PIDS=("${active_pids[@]}")
+        [[ ${status} -eq 0 ]] || exit "${status}"
     done
-    active_pids=("${remaining_pids[@]}")
-    CHILD_PIDS=("${active_pids[@]}")
-    [[ ${status} -eq 0 ]] || exit "${status}"
-done
+else
+    run_supervised_cell "${CELL_A}" 8000 "${RESULT_ROOT}/cell-a.log"
+    run_supervised_cell "${CELL_B}" 8010 "${RESULT_ROOT}/cell-b.log"
+fi
 CHILD_PIDS=()
 trap - EXIT INT TERM

@@ -59,6 +59,9 @@ _SUBSETS = (
     "translation",
     "writing",
 )
+_BASH_MAJOR = int(
+    subprocess.check_output(["bash", "-c", 'printf "%s" "${BASH_VERSINFO[0]}"'], text=True)
+)
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -716,7 +719,7 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
         'JOB_ROOT="${MARS_SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
         'readonly JOB_RUNTIME="${JOB_ROOT}/speculators-runtime"',
         "EVAL_MODE=throughput",
-        "srun --exclusive --nodes=1 --ntasks=1 --gpus=2",
+        'srun --exclusive --nodes=1 --ntasks=1 --gpus="${tp_size}"',
         'run_cell "${CELL_A}" 8000',
         'run_cell "${CELL_B}" 8010',
         'SPECULATORS_RUNTIME_ARCHIVE_SHA256="${RUNTIME_ARCHIVE_SHA256}"',
@@ -742,6 +745,158 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
     assert "readonly SPECULATORS_RUNTIME=" not in runner
     assert "pip install" not in runner
     assert "git clone" not in runner
+
+
+def test_paired_evaluator_supports_tp_compatibility_cells_without_oversubscription() -> None:
+    """Cell descriptors select TP1/2/4 and TP4 pairs run sequentially on four GPUs."""
+    runner = _PAIR_RUNNER.read_text()
+
+    for required in (
+        "local method block_size spec_tokens concurrency max_requests draft label tp_size",
+        'tp_size="${tp_size:-2}"',
+        'case "${tp_size}" in',
+        "1|2|4)",
+        '--gpus="${tp_size}"',
+        'TP_SIZE="${tp_size}"',
+        'cell_tp "${CELL_A}"',
+        'cell_tp "${CELL_B}"',
+        "if ((tp_a + tp_b <= 4)); then",
+    ):
+        assert required in runner
+
+
+def _run_pair_harness(
+    tmp_path: Path,
+    cell_a: str,
+    cell_b: str,
+    *,
+    srun_sleep: float = 0.1,
+) -> tuple[subprocess.Popen[str], Path]:
+    fake_bin = tmp_path / "bin"
+    modelopt = tmp_path / "modelopt"
+    speculators = tmp_path / "speculators"
+    target = tmp_path / "target"
+    draft = tmp_path / "draft"
+    result_root = tmp_path / "results"
+    scratch = tmp_path / "scratch"
+    invocation_log = tmp_path / "srun.log"
+    for path in (fake_bin, modelopt / ".git", speculators / ".git", target, draft, scratch):
+        path.mkdir(parents=True, exist_ok=True)
+    (target / "config.json").write_text("{}\n")
+    (draft / "config.json").write_text("{}\n")
+    (draft / "model.safetensors").write_bytes(b"weights")
+    for name in ("image.sqsh", "image.identity.json", "datasets.json", "eval.yaml", "runtime.tar"):
+        (tmp_path / name).write_text("fixture\n")
+    stager = modelopt / "tools/launcher/common/specdec/stage_speculators_eval_runtime.sh"
+    wrapper = modelopt / "tools/launcher/common/specdec/run_speculators_eval.sh"
+    _write_executable(stager, "#!/bin/bash\nexit 0\n")
+    _write_executable(wrapper, "#!/bin/bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "git",
+        "#!/bin/bash\n"
+        "if [[ \"$*\" == *'rev-parse HEAD'* ]]; then printf '%s\\n' \"$PAIR_SHA\"; fi\n"
+        "exit 0\n",
+    )
+    _write_executable(
+        fake_bin / "srun",
+        "#!/bin/bash\n"
+        'printf \'start|%s\\n\' "$*" >> "$PAIR_SRUN_LOG"\n'
+        'sleep "$PAIR_SRUN_SLEEP" &\n'
+        "sleep_pid=$!\n"
+        'trap \'kill "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; '
+        'printf "term|%s\\n" "$*" >> "$PAIR_SRUN_LOG"; exit 143\' TERM\n'
+        'wait "$sleep_pid"\n'
+        'printf \'end|%s\\n\' "$*" >> "$PAIR_SRUN_LOG"\n',
+    )
+    sha = "a" * 40
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "CELL_A": cell_a.replace("{draft}", str(draft)),
+        "CELL_B": cell_b.replace("{draft}", str(draft)),
+        "CONTAINER_IDENTITY_PATH": str(tmp_path / "image.identity.json"),
+        "CONTAINER_IMAGE": str(tmp_path / "image.sqsh"),
+        "CLUSTER_PROFILE": str(tmp_path / "profile.yaml"),
+        "CLUSTER_READINESS_RECEIPT": str(tmp_path / "readiness.json"),
+        "DATASET_MANIFEST_PATH": str(tmp_path / "datasets.json"),
+        "EVAL_CONFIG_PATH": str(tmp_path / "eval.yaml"),
+        "EVAL_OUTPUT_ROOT": str(result_root),
+        "HF_HOME_DURABLE": str(tmp_path / "hf-home"),
+        "HF_MODEL_CKPT": str(target),
+        "MODELOPT_REPO": str(modelopt),
+        "MODELOPT_SHA": sha,
+        "PAIR_LABEL": "tp-harness",
+        "RUNTIME_ARCHIVE": str(tmp_path / "runtime.tar"),
+        "RUNTIME_ARCHIVE_SHA256": "b" * 64,
+        "SPECULATORS_REPO": str(speculators),
+        "SPECULATORS_SHA": sha,
+        "MARS_SCRATCH_ROOT": str(scratch),
+        "SLURM_JOB_ID": "12345",
+        "PAIR_SHA": sha,
+        "PAIR_SRUN_LOG": str(invocation_log),
+        "PAIR_SRUN_SLEEP": str(srun_sleep),
+    }
+    (tmp_path / "profile.yaml").write_text("fixture\n")
+    (tmp_path / "readiness.json").write_text("{}\n")
+    process = subprocess.Popen(
+        ["bash", str(_PAIR_RUNNER)],
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return process, invocation_log
+
+
+@pytest.mark.skipif(_BASH_MAJOR < 5, reason="runner uses Bash 5 wait -n -p supervision")
+def test_pair_runner_executes_legacy_tp2_cells_concurrently(tmp_path: Path) -> None:
+    """Seven-field descriptors remain TP2 and both cells start before either exits."""
+    process, log = _run_pair_harness(
+        tmp_path,
+        "baseline|0|0|8|10||ar",
+        "dflash|8|7|8|10|{draft}|df",
+    )
+    _, stderr = process.communicate(timeout=5)
+
+    assert process.returncode == 0, stderr
+    lines = log.read_text().splitlines()
+    assert [line.split("|", 1)[0] for line in lines[:2]] == ["start", "start"]
+    assert all("--gpus=2" in line and "TP_SIZE=2" in line for line in lines)
+
+
+def test_pair_runner_validates_both_cells_before_sequential_tp4(tmp_path: Path) -> None:
+    """A malformed second TP4 cell fails before the first cell reserves GPUs."""
+    process, log = _run_pair_harness(
+        tmp_path,
+        "baseline|0|0|8|10||ar|4",
+        "invalid|8|7|8|10|{draft}|bad|4",
+    )
+    _, stderr = process.communicate(timeout=5)
+
+    assert process.returncode != 0
+    assert "invalid cell descriptor" in stderr
+    assert not log.exists()
+
+
+def test_pair_runner_supervises_sequential_tp4_on_term(tmp_path: Path) -> None:
+    """TERM kills the active sequential TP4 step without waiting for it to finish."""
+    process, log = _run_pair_harness(
+        tmp_path,
+        "baseline|0|0|8|10||ar|4",
+        "dflash|8|7|8|10|{draft}|df|4",
+        srun_sleep=10,
+    )
+    deadline = time.monotonic() + 3
+    while not log.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert log.exists()
+
+    process.terminate()
+    _, stderr = process.communicate(timeout=3)
+
+    assert process.returncode == 143, stderr
+    assert any(line.startswith("term|") for line in log.read_text().splitlines())
 
 
 def test_resume_skips_atomically_validated_completed_subsets(tmp_path: Path) -> None:
