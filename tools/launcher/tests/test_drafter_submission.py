@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Contracts for the reusable OCI-HSG drafter workflow."""
 
@@ -1191,6 +1203,30 @@ def test_streaming_rendezvous_publishes_and_checks_every_replica() -> None:
         'wait_vllm_ready "$surl"',
     ):
         assert required in streaming
+
+
+def test_streaming_rendezvous_skips_link_local_ipv6(tmp_path: Path) -> None:
+    """Lyris rendezvous must publish the routable IPv4, not its first link-local address."""
+    streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
+    function = re.search(r"resolve_routable_ip\(\) \{.*?^\}", streaming, re.MULTILINE | re.DOTALL)
+    assert function is not None
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    getent = fake_bin / "getent"
+    getent.write_text(
+        "#!/usr/bin/env bash\nprintf 'fe80::d2f4:5ff:fe6a:6048 node\\n10.109.26.14 node\\n'\n"
+    )
+    getent.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", f'{function.group(0)}\nresolve_routable_ip ""'],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "SLURMD_NODENAME": "node"},
+        text=True,
+    )
+
+    assert result.stdout.strip() == "10.109.26.14"
 
 
 def test_requeued_runner_clears_exact_persistent_rendezvous_before_launch() -> None:

@@ -158,9 +158,18 @@ gpus_on_node() { nvidia-smi --query-gpu=count --format=csv,noheader,nounits | he
 #   $1 = optional override (SERVE_ADVERTISE_IP / TRAINER_ADVERTISE_IP)
 resolve_routable_ip() {
     local ip="$1"
-    [ -z "$ip" ] && ip=$(getent hosts "${SLURMD_NODENAME:-$(hostname)}" 2>/dev/null | awk '{print $1}' | head -1)
-    [ -z "$ip" ] && ip=$(hostname -I | tr ' ' '\n' | grep -vE '^(127\.|169\.254\.|fe80:|::1)' | head -1)
-    [ -z "$ip" ] && ip=$(hostname -I | awk '{print $1}')
+    if [ -n "$ip" ]; then
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && ! "$ip" =~ ^127\. && ! "$ip" =~ ^169\.254\. ]] || {
+            echo "ERROR: advertise address must be a routable IPv4: $ip" >&2
+            return 1
+        }
+    else
+        ip=$(getent hosts "${SLURMD_NODENAME:-$(hostname)}" 2>/dev/null \
+            | awk '$1 ~ /^[0-9]+\./ && $1 !~ /^127\./ && $1 !~ /^169\.254\./ {print $1; exit}')
+        [ -n "$ip" ] || ip=$(hostname -I | tr ' ' '\n' \
+            | awk '$1 ~ /^[0-9]+\./ && $1 !~ /^127\./ && $1 !~ /^169\.254\./ {print $1; exit}')
+        [ -n "$ip" ] || { echo "ERROR: no routable IPv4 address found." >&2; return 1; }
+    fi
     echo "$ip"
 }
 
