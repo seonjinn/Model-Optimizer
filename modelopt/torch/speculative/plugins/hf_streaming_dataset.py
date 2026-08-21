@@ -460,7 +460,7 @@ class EagleVllmStreamingDataset(StreamingDataset):
             _backends = nixl_backends_from_env()
             self._nixl = nixl_agent(f"hs-trainer-{pid}", nixl_agent_config(backends=_backends))
             self._nixl_pid = pid
-            self._remote_by_host: dict = {}
+            self._remote_by_host_port: dict = {}
             self._recv = None
             self._recv_reg = None  # NIXL registration handle for self._recv
             _wi = torch.utils.data.get_worker_info()
@@ -473,10 +473,11 @@ class EagleVllmStreamingDataset(StreamingDataset):
         return self._nixl
 
     def _remote(self, host, port):
-        if host not in self._remote_by_host:
+        key = (host, port)
+        if key not in self._remote_by_host_port:
             m = self._http_rdma.get(f"http://{host}:{port}/meta").json()["agent_metadata"]
-            self._remote_by_host[host] = self._nixl.add_remote_agent(base64.b64decode(m))
-        return self._remote_by_host[host]
+            self._remote_by_host_port[key] = self._nixl.add_remote_agent(base64.b64decode(m))
+        return self._remote_by_host_port[key]
 
     def _fetch(self, sample: dict) -> EagleFetchPayload | None:
         """Fetch one sample's hidden states from the server over NIXL RDMA.

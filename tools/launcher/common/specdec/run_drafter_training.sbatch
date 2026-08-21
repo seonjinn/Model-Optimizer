@@ -75,6 +75,14 @@ done
 [[ -f "$RUNTIME_ARCHIVE" ]] || { echo "runtime archive is missing" >&2; exit 2; }
 [[ "$(sha256sum "$RUNTIME_ARCHIVE" | cut -d' ' -f1)" == "$RUNTIME_ARCHIVE_SHA256" ]] || { echo "runtime archive SHA-256 mismatch" >&2; exit 2; }
 [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_STEPS must be positive" >&2; exit 2; }
+[[ "$SERVE_TP" =~ ^[1-9][0-9]*$ ]] || { echo "SERVE_TP must be positive" >&2; exit 2; }
+(( GPUS_PER_NODE % SERVE_TP == 0 )) || {
+    echo "SERVE_TP must divide all ${GPUS_PER_NODE} GPUs on each serve node" >&2; exit 2;
+}
+SERVE_REPLICAS_PER_NODE=$((GPUS_PER_NODE / SERVE_TP))
+(( SERVE_REPLICAS_PER_NODE * SERVE_TP == GPUS_PER_NODE )) || {
+    echo "serve replicas must occupy every allocated GPU" >&2; exit 2;
+}
 [[ $((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE)) -eq "$GLOBAL_BATCH_SIZE" ]] || { echo "manifest batch arithmetic must equal GBS 512" >&2; exit 2; }
 CONTROL_ROOT="${OUTPUT_ROOT}/control"
 STAGE_LOG_ROOT="${OUTPUT_ROOT}/logs/stage-${SLURM_JOB_ID}"
@@ -103,6 +111,7 @@ case "${METHOD}:${BLOCK_SIZE}" in
     *) echo "unsupported method/block size: ${METHOD}/${BLOCK_SIZE}" >&2; exit 2 ;;
 esac
 export SERVE_NODES NUM_SPEC_TOKENS
+export SERVE_REPLICAS_PER_NODE
 
 export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT SCRATCH_JOB_ROOT STAGE_LOG_ROOT
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
@@ -130,7 +139,7 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS RUN_NAME SAMPLE_SIZE
 
 # shellcheck disable=SC2016,SC2026 # The child shell expands its Slurm-node environment.
-srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="/raid/scratch:/raid/scratch,${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
+srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="/raid/scratch:/raid/scratch,${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     export MODELOPT_RUNTIME="$node_root/runtime"

@@ -522,6 +522,39 @@ def test_sidecar_port_taken_from_response(monkeypatch):
     assert seen_ports == {advertised_port}
 
 
+def test_remote_agent_cache_distinguishes_sidecars_on_the_same_host(monkeypatch):
+    """Replicas can share a hostname but always have distinct sidecar ports.
+
+    Register each replica independently instead of reusing the first replica's
+    NIXL remote-agent handle for every replica on that host.
+    """
+    seen_ports: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/meta"
+        seen_ports.append(request.url.port)
+        metadata = f"agent-{request.url.port}".encode()
+        return httpx.Response(200, json={"agent_metadata": base64.b64encode(metadata).decode()})
+
+    _mock_rdma(monkeypatch, handler)
+    ds = EagleVllmStreamingDataset(
+        entries=[{"conversation_id": "c-0", "messages": [{"role": "user", "content": "x"}]}],
+        tokenizer=_tokenizer_returning(8),
+        config=EagleVllmStreamingConfig(
+            server_urls="http://shared:8000",
+            model="mock-model",
+            max_seq_len=8,
+        ),
+    )
+    ds._rdma()
+
+    ds._remote("shared", 19001)
+    ds._remote("shared", 19002)
+    ds._remote("shared", 19001)
+
+    assert seen_ports == [19001, 19002]
+
+
 # ---------------------------------------------------------------------------
 # answer_only_loss template guard
 # ---------------------------------------------------------------------------

@@ -23,14 +23,15 @@
 # auto-chosen from the Slurm allocation (yaml `nodes:`) and $SERVE_NODES; nemo_run
 # runs this script once per node, branching on $SLURM_NODEID:
 #   nodes == 1  -> co-located: vllm serve on $SERVE_GPU, trainer on the rest.
-#   nodes >= 2  -> split: nodes 0..SERVE_NODES-1 each run an independent whole-node
-#                 vllm serve replica; nodes SERVE_NODES..NNODES-1 are multi-node-DDP
-#                 trainers. SERVE_NODES default 1. Rendezvous over shared
-#                 /scratchspace: each serve i publishes .serve_addr.i; head trainer
+#   nodes >= 2  -> split: nodes 0..SERVE_NODES-1 each run enough independent TP-sized
+#                 vllm serve replicas to occupy the node; nodes SERVE_NODES..NNODES-1
+#                 are multi-node-DDP trainers. SERVE_NODES default 1. Rendezvous over
+#                 shared /scratchspace: each serve node+replica publishes its address;
+#                 head trainer
 #                 (first trainer node = accelerate machine_rank 0) publishes its IP;
 #                 trainers collect every serve address.
 # Map-style dataset: DistributedSampler shards the corpus across trainer ranks, each
-# rank fetches only its shard round-robin across the SERVE_NODES replicas
+# rank fetches only its shard round-robin across all serve-node replicas
 # (data.streaming_server_url = comma-joined list).
 #
 # Env vars (required):
@@ -53,6 +54,8 @@
 #   SERVE_HOST          single-node: bind/connect host. default 127.0.0.1
 #   SERVE_GPU           single-node: CUDA_VISIBLE_DEVICES for vllm. default "0"
 #   SERVE_TP            tensor-parallel size. default 1 single-node / all serve-node GPUs
+#   SERVE_REPLICAS_PER_NODE  multi-node replicas per serve node. Each replica owns a
+#                         disjoint SERVE_TP-sized GPU slice. default 1
 #   TRAIN_GPUS          single-node: trainer CUDA_VISIBLE_DEVICES. default = all but SERVE_GPU
 #   SERVE_ADVERTISE_IP  multi-node: address node 1 dials. default node 0's routable IP
 
@@ -124,6 +127,8 @@ SERVE_PORT="${SERVE_PORT:-8765}"
 SERVED_MODEL_NAME="${SERVE_MODEL_NAME:-$HF_MODEL_CKPT}"
 SERVE_READY_TIMEOUT="${SERVE_READY_TIMEOUT:-900}"
 SERVE_NODES="${SERVE_NODES:-1}"
+SERVE_REPLICAS_PER_NODE="${SERVE_REPLICAS_PER_NODE:-1}"
+HS_SIDECAR_PORT="${HS_SIDECAR_PORT:-18999}"
 SERVE_LOG="${SERVE_LOG:-/scratchspace/vllm_serve.log}"   # serve nodes override with a per-node path
 # Namespace rendezvous/sentinel files per Slurm job (SLURM_JOB_ID: same across an
 # allocation's nodes, unique across allocations) so concurrent allocations on the
@@ -131,13 +136,19 @@ SERVE_LOG="${SERVE_LOG:-/scratchspace/vllm_serve.log}"   # serve nodes override 
 RUN_ID="${SLURM_JOB_ID:-local}"
 SERVE_ADDR_FILE="/scratchspace/.serve_addr.${RUN_ID}"
 DONE_FILE="/scratchspace/.training_done.${RUN_ID}"
-SERVE_PID=""
+SERVE_PIDS=()
+SERVE_LOGS=()
 
 cleanup() {
-    [ -n "$SERVE_PID" ] || return 0
-    echo "Cleaning up vllm serve (PID=$SERVE_PID)..."
-    kill "$SERVE_PID" 2>/dev/null || true
-    wait "$SERVE_PID" 2>/dev/null || true
+    ((${#SERVE_PIDS[@]} > 0)) || return 0
+    echo "Cleaning up ${#SERVE_PIDS[@]} vllm serve process(es)..."
+    local pid
+    for pid in "${SERVE_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${SERVE_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
 }
 
 gpus_on_node() { nvidia-smi --query-gpu=count --format=csv,noheader,nounits | head -n1; }
@@ -153,11 +164,12 @@ resolve_routable_ip() {
     echo "$ip"
 }
 
-# Start vllm serve in the background. Sets SERVE_PID.
+# Start one vllm serve replica in the background and append its PID/log to the supervisor arrays.
 #   $1 = bind host   $2 = tensor-parallel size   $3 = CUDA_VISIBLE_DEVICES ("" -> all)
+#   $4 = API port    $5 = hidden-state sidecar port   $6 = log path
 launch_vllm() {
-    local bind_host="$1" tp="$2" cvd="$3"
-    echo "Launching vllm serve on ${bind_host}:${SERVE_PORT} (TP=${tp}, CUDA_VISIBLE_DEVICES=${cvd:-all}, mem=${SERVE_GPU_MEM_UTIL}, log: $SERVE_LOG)..."
+    local bind_host="$1" tp="$2" cvd="$3" api_port="$4" sidecar_port="$5" serve_log="$6"
+    echo "Launching vllm serve on ${bind_host}:${api_port} (TP=${tp}, CUDA_VISIBLE_DEVICES=${cvd:-all}, mem=${SERVE_GPU_MEM_UTIL}, sidecar=${sidecar_port}, log: $serve_log)..."
     # Pin GPUs only for a non-empty set; empty CUDA_VISIBLE_DEVICES hides ALL, so unset = whole node.
     local -a gpu_env=()
     [ -n "$cvd" ] && gpu_env=(env "CUDA_VISIBLE_DEVICES=$cvd")
@@ -172,13 +184,14 @@ launch_vllm() {
     # Hidden states move serve -> trainer over NIXL RDMA (no disk round-trip): one
     # pre-registered pinned pool per serve, a tiny HTTP sidecar hands out per-request
     # transfer descriptors. Replicated across TP ranks, so only rank 0 owns the pool.
-    KVCFG="{\"kv_connector\":\"RdmaHiddenStatesConnector\",\"kv_connector_module_path\":\"modelopt.torch.speculative.plugins.rdma_hidden_states_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"sidecar_port\":\"${HS_SIDECAR_PORT:-18999}\",\"pool_slots\":\"${HS_POOL_SLOTS:-16}\",\"max_tokens\":\"${HS_MAX_TOKENS:-4096}\"}}"
+    local kvcfg
+    kvcfg="{\"kv_connector\":\"RdmaHiddenStatesConnector\",\"kv_connector_module_path\":\"modelopt.torch.speculative.plugins.rdma_hidden_states_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"sidecar_port\":\"${sidecar_port}\",\"pool_slots\":\"${HS_POOL_SLOTS:-16}\",\"max_tokens\":\"${HS_MAX_TOKENS:-4096}\"}}"
     # The container's /usr/local/bin/vllm has a fixed /usr/bin/python3 shebang,
     # which bypasses an activated MODELOPT_RUNTIME. Launch the CLI as a module so
     # its connector and dependencies come from the selected runtime instead.
     "${gpu_env[@]}" python -m vllm.entrypoints.cli.main serve "$HF_MODEL_CKPT" \
         --host "$bind_host" \
-        --port "$SERVE_PORT" \
+        --port "$api_port" \
         --served-model-name "$SERVED_MODEL_NAME" \
         --tensor-parallel-size "$tp" \
         --enforce-eager \
@@ -197,23 +210,34 @@ launch_vllm() {
                 }
             }
         }" \
-        --kv-transfer-config "$KVCFG" \
-        > "$SERVE_LOG" 2>&1 &
-    SERVE_PID=$!
+        --kv-transfer-config "$kvcfg" \
+        > "$serve_log" 2>&1 &
+    SERVE_PIDS+=("$!")
+    SERVE_LOGS+=("$serve_log")
 }
 
-# Poll until the server answers (or, if we own it, dies). $1 = base URL.
+# Poll until the server answers or its process dies.
+#   $1 = base URL   $2 = owned PID (optional)   $3 = log path (optional)
 wait_vllm_ready() {
-    local url="$1" tries=$(( SERVE_READY_TIMEOUT / 5 ))
+    local url="$1" pid="${2:-}" serve_log="${3:-$SERVE_LOG}" tries=$(( SERVE_READY_TIMEOUT / 5 ))
+    local replica owned_pid
     echo "Waiting for vllm serve at ${url} to become ready (up to ${SERVE_READY_TIMEOUT}s)..."
     for ((i = 0; i < tries; i++)); do
         if curl -fsS "${url}/v1/models" > /dev/null 2>&1; then echo "vllm serve ready."; return 0; fi
-        if [ -n "$SERVE_PID" ] && ! kill -0 "$SERVE_PID" 2>/dev/null; then
-            echo "vllm serve died early. Tail of $SERVE_LOG:"; tail -100 "$SERVE_LOG"; return 1
+        for replica in "${!SERVE_PIDS[@]}"; do
+            owned_pid="${SERVE_PIDS[$replica]}"
+            if ! kill -0 "$owned_pid" 2>/dev/null; then
+                echo "vllm serve replica ${replica} died early. Tail of ${SERVE_LOGS[$replica]}:"
+                tail -100 "${SERVE_LOGS[$replica]}"
+                return 1
+            fi
+        done
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            echo "vllm serve died early. Tail of $serve_log:"; tail -100 "$serve_log"; return 1
         fi
         sleep 5
     done
-    echo "Server not ready in ${SERVE_READY_TIMEOUT}s. Tail:"; tail -100 "$SERVE_LOG"; return 1
+    echo "Server not ready in ${SERVE_READY_TIMEOUT}s. Tail:"; tail -100 "$serve_log"; return 1
 }
 
 # Run the trainer then export the HF checkpoint.
@@ -294,27 +318,58 @@ PY
     fi
 
     trap cleanup INT TERM EXIT
-    launch_vllm "$SERVE_HOST" "$SERVE_TP" "$SERVE_GPU"
-    wait_vllm_ready "http://${SERVE_HOST}:${SERVE_PORT}" || exit 1
+    launch_vllm "$SERVE_HOST" "$SERVE_TP" "$SERVE_GPU" "$SERVE_PORT" "$HS_SIDECAR_PORT" "$SERVE_LOG"
+    wait_vllm_ready "http://${SERVE_HOST}:${SERVE_PORT}" "${SERVE_PIDS[0]}" "$SERVE_LOG" || exit 1
     run_trainer_and_export "http://${SERVE_HOST}:${SERVE_PORT}" "$TRAIN_GPUS" || exit 1
 
 elif [ "$NODEID" -lt "$SERVE_NODES" ]; then
     # ---------------------- multi-node: serve node(s) ----------------------
-    # Each runs a whole-node vllm serve replica and publishes ${SERVE_ADDR_FILE}.${NODEID}.
+    # Each runs enough TP-sized replicas to fill the node and publishes one atomic
+    # rendezvous file per node+replica.
     SERVE_GPU_MEM_UTIL="${SERVE_GPU_MEM_UTIL:-0.9}"     # dedicated node -> use most of it
     SERVE_TP="${SERVE_TP:-$(gpus_on_node)}"              # default: all GPUs on this node
-    SERVE_LOG="${SERVE_LOG_DIR:-/scratchspace}/vllm_serve.${NODEID}.log"  # per-node log (avoid collision)
-    rm -f "${SERVE_ADDR_FILE}.${NODEID}"                 # clear own stale address
+    node_gpus=$(gpus_on_node)
+    [[ "$SERVE_TP" =~ ^[1-9][0-9]*$ && "$SERVE_REPLICAS_PER_NODE" =~ ^[1-9][0-9]*$ ]] || {
+        echo "ERROR: SERVE_TP and SERVE_REPLICAS_PER_NODE must be positive integers." >&2; exit 1;
+    }
+    (( SERVE_REPLICAS_PER_NODE * SERVE_TP == node_gpus )) || {
+        echo "ERROR: ${SERVE_REPLICAS_PER_NODE} replicas x TP${SERVE_TP} does not occupy ${node_gpus} GPUs." >&2; exit 1;
+    }
+    for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++)); do
+        rm -f "${SERVE_ADDR_FILE}.${NODEID}.${replica}"
+    done
     [ "$NODEID" -eq 0 ] && rm -f "$DONE_FILE"            # node 0 clears the shared sentinel once
 
     trap cleanup INT TERM EXIT
-    launch_vllm "0.0.0.0" "$SERVE_TP" ""
-    wait_vllm_ready "http://127.0.0.1:${SERVE_PORT}" || exit 1
-
     serve_addr=$(resolve_routable_ip "${SERVE_ADVERTISE_IP:-}")
-    echo "$serve_addr" > "${SERVE_ADDR_FILE}.${NODEID}"
-    echo "Serve node ${NODEID}/${SERVE_NODES} published ${serve_addr}; holding up until training signals done..."
-    while [ ! -f "$DONE_FILE" ]; do sleep 10; done
+    for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++)); do
+        replica_start=$((replica * SERVE_TP))
+        replica_cvd=$(seq -s, "$replica_start" $((replica_start + SERVE_TP - 1)))
+        replica_api_port=$((SERVE_PORT + replica))
+        replica_sidecar_port=$((HS_SIDECAR_PORT + replica))
+        replica_log="${SERVE_LOG_DIR:-/scratchspace}/vllm_serve.${NODEID}.${replica}.log"
+        launch_vllm "0.0.0.0" "$SERVE_TP" "$replica_cvd" "$replica_api_port" "$replica_sidecar_port" "$replica_log"
+    done
+    for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++)); do
+        replica_api_port=$((SERVE_PORT + replica))
+        wait_vllm_ready "http://127.0.0.1:${replica_api_port}" "${SERVE_PIDS[$replica]}" "${SERVE_LOGS[$replica]}" || exit 1
+        addr_file="${SERVE_ADDR_FILE}.${NODEID}.${replica}"
+        addr_tmp="${addr_file}.tmp.$$"
+        echo "$serve_addr" > "$addr_tmp"
+        mv "$addr_tmp" "$addr_file"
+    done
+    echo "Serve node ${NODEID}/${SERVE_NODES} published ${SERVE_REPLICAS_PER_NODE} replica(s); holding up until training signals done..."
+    while [ ! -f "$DONE_FILE" ]; do
+        for replica in "${!SERVE_PIDS[@]}"; do
+            pid="${SERVE_PIDS[$replica]}"
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "ERROR: vllm serve replica ${replica} (PID=${pid}) died before training completed." >&2
+                tail -100 "${SERVE_LOGS[$replica]}" >&2 || true
+                exit 1
+            fi
+        done
+        sleep 10
+    done
     echo "Training-done sentinel seen; serve node ${NODEID} exiting (EXIT trap stops vllm)."
 
 else
@@ -332,18 +387,22 @@ else
     fi
 
     # Collect serve addresses into the comma-joined URL list the dataset round-robins across.
-    echo "Trainer node (rank ${TRAINER_RANK}/${NUM_TRAINER_NODES}) waiting for ${SERVE_NODES} serve address(es)..."
+    total_serve_replicas=$((SERVE_NODES * SERVE_REPLICAS_PER_NODE))
+    echo "Trainer node (rank ${TRAINER_RANK}/${NUM_TRAINER_NODES}) waiting for ${total_serve_replicas} serve address(es)..."
     URLS=""
     for ((s = 0; s < SERVE_NODES; s++)); do
-        af="${SERVE_ADDR_FILE}.${s}"
-        for ((i = 0; i < SERVE_READY_TIMEOUT; i++)); do
-            [ -f "$af" ] && break
-            sleep 1
+        for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++)); do
+            af="${SERVE_ADDR_FILE}.${s}.${replica}"
+            for ((i = 0; i < SERVE_READY_TIMEOUT; i++)); do
+                [ -f "$af" ] && break
+                sleep 1
+            done
+            [ -f "$af" ] || { echo "ERROR: serve node ${s} replica ${replica} never published its address." >&2; exit 1; }
+            replica_api_port=$((SERVE_PORT + replica))
+            surl="http://$(cat "$af"):${replica_api_port}"
+            wait_vllm_ready "$surl" || exit 1
+            URLS="${URLS:+$URLS,}$surl"
         done
-        [ -f "$af" ] || { echo "ERROR: serve node ${s} never published its address." >&2; exit 1; }
-        surl="http://$(cat "$af"):${SERVE_PORT}"
-        wait_vllm_ready "$surl" || exit 1
-        URLS="${URLS:+$URLS,}$surl"
     done
     echo "Trainer rank ${TRAINER_RANK} using serve URLs: ${URLS}"
 

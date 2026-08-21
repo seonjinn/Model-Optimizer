@@ -510,7 +510,7 @@ def test_streaming_serve_logs_stay_on_node_local_scratch() -> None:
     streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
 
     assert 'SERVE_LOG_DIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/logs"' in runner
-    assert "${SERVE_LOG_DIR:-/scratchspace}/vllm_serve.${NODEID}.log" in streaming
+    assert "${SERVE_LOG_DIR:-/scratchspace}/vllm_serve.${NODEID}.${replica}.log" in streaming
 
 
 def test_cumulative_runner_writes_a_checkpoint_for_every_resume_boundary() -> None:
@@ -539,6 +539,68 @@ def test_training_runner_preserves_proven_production_training_semantics() -> Non
     assert 'SERVED_MODEL_NAME="${SERVE_MODEL_NAME:-$HF_MODEL_CKPT}"' in streaming
     assert '--served-model-name "$SERVED_MODEL_NAME"' in streaming
     assert 'data.streaming_model_name="$SERVED_MODEL_NAME"' in streaming
+
+
+def test_training_runner_fills_every_serve_gpu_with_tp_replicas() -> None:
+    """Q30 TP2 uses two replicas per four-GPU serve node; Q235 TP4 stays at one."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        "GPUS_PER_NODE % SERVE_TP",
+        "SERVE_REPLICAS_PER_NODE=$((GPUS_PER_NODE / SERVE_TP))",
+        "SERVE_REPLICAS_PER_NODE * SERVE_TP == GPUS_PER_NODE",
+        "export SERVE_REPLICAS_PER_NODE",
+    ):
+        assert required in runner
+
+
+def test_streaming_serve_replicas_have_disjoint_devices_and_ports() -> None:
+    """Every local replica owns one TP-sized GPU slice and unique API/sidecar ports."""
+    streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
+
+    for required in (
+        "SERVE_REPLICAS_PER_NODE",
+        "replica * SERVE_TP",
+        "replica_api_port=$((SERVE_PORT + replica))",
+        "replica_sidecar_port=$((HS_SIDECAR_PORT + replica))",
+        'launch_vllm "0.0.0.0" "$SERVE_TP" "$replica_cvd"',
+        'vllm_serve.${NODEID}.${replica}.log',
+    ):
+        assert required in streaming
+
+
+def test_streaming_rendezvous_publishes_and_checks_every_replica() -> None:
+    """Trainers must not start until every per-node replica endpoint is healthy."""
+    streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
+
+    for required in (
+        '${SERVE_ADDR_FILE}.${NODEID}.${replica}',
+        'mv "$addr_tmp" "$addr_file"',
+        "for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++))",
+        '${SERVE_ADDR_FILE}.${s}.${replica}',
+        "wait_vllm_ready \"$surl\"",
+    ):
+        assert required in streaming
+
+
+def test_streaming_serve_supervisor_cleans_up_and_fails_on_child_death() -> None:
+    """A replica failure must fail the serve task and terminate all sibling replicas."""
+    streaming = (_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh").read_text()
+
+    assert "SERVE_PIDS=()" in streaming
+    assert 'for pid in "${SERVE_PIDS[@]}"' in streaming
+    assert 'if ! kill -0 "$pid"' in streaming
+    assert "ERROR: vllm serve replica" in streaming
+
+
+def test_training_step_terminates_all_node_tasks_when_a_replica_dies() -> None:
+    """A nonzero serve task must stop trainers before they use a partial endpoint set."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    execution_srun = next(
+        line for line in runner.splitlines() if "--container-image" in line and line.startswith("srun ")
+    )
+    assert "--kill-on-bad-exit=1" in execution_srun
 
 
 def test_runtime_probe_verifies_a_relocated_bundle_in_the_pinned_container() -> None:
