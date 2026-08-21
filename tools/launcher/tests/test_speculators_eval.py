@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 _LAUNCHER_DIR = Path(__file__).resolve().parents[1]
 _WRAPPER = _LAUNCHER_DIR / "common/specdec/run_speculators_eval.sh"
+_PAIR_RUNNER = _LAUNCHER_DIR / "common/specdec/run_speculators_eval_pair.sbatch"
 _RECIPE = _LAUNCHER_DIR / "examples/Qwen/Qwen3-30B-A3B/speculators_eval.yaml"
 _RUNTIME_STAGER = _LAUNCHER_DIR / "common/specdec/stage_speculators_eval_runtime.sh"
 _HF_STAGER = _LAUNCHER_DIR / "common/specdec/stage_hf_model.sh"
@@ -702,6 +703,40 @@ def test_baseline_throughput_omits_speculation_and_requires_only_performance(
     assert (run_dir / "perf_results.csv").is_file()
     assert not (run_dir / "acceptance.csv").exists()
     assert "--speculative-config" not in manifest["server_args"]
+
+
+def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
+    """Two TP2 cells share one four-GPU node and use the bounded throughput adapter."""
+    runner = _PAIR_RUNNER.read_text()
+
+    for required in (
+        "#SBATCH --nodes=1",
+        "#SBATCH --gpus-per-node=4",
+        "#SBATCH --segment=1",
+        'JOB_ROOT="${MARS_SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
+        "EVAL_MODE=throughput",
+        "srun --exclusive --nodes=1 --ntasks=1 --gpus=2",
+        'run_cell "${CELL_A}" 8000',
+        'run_cell "${CELL_B}" 8010',
+        'SPECULATORS_RUNTIME_ARCHIVE_SHA256="${RUNTIME_ARCHIVE_SHA256}"',
+        "CLUSTER_PROFILE CLUSTER_READINESS_RECEIPT",
+        'CLUSTER_PROFILE="${CLUSTER_PROFILE}"',
+        'CLUSTER_READINESS_RECEIPT="${CLUSTER_READINESS_RECEIPT}"',
+        '${CLUSTER_PROFILE}:${CLUSTER_PROFILE}',
+        '${CLUSTER_READINESS_RECEIPT}:${CLUSTER_READINESS_RECEIPT}',
+        'MARS_SCRATCH_ROOT="${MARS_SCRATCH_ROOT}"',
+        'validate_label "${PAIR_LABEL}"',
+        'validate_label "${label}"',
+        "wait -n -p completed_pid",
+        "terminate_children",
+        "trap terminate_children EXIT",
+        "trap 'terminate_children; exit 130' INT",
+        "trap 'terminate_children; exit 143' TERM",
+    ):
+        assert required in runner
+    assert "EVAL_MODE=sweep" not in runner
+    assert "pip install" not in runner
+    assert "git clone" not in runner
 
 
 def test_resume_skips_atomically_validated_completed_subsets(tmp_path: Path) -> None:
