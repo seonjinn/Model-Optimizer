@@ -544,6 +544,7 @@ def test_self_requeue_is_opt_in_and_configures_slurm_signal_delivery() -> None:
     submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
 
     assert "DEFAULT_REQUEUE_SAVE_STEPS=50" in submitter
+    assert "MAX_REQUEUES=50" in submitter
     assert 'elif [[ "$SELF_REQUEUE" -eq 1 ]]' in submitter
     assert 'save_steps="$DEFAULT_REQUEUE_SAVE_STEPS"' in submitter
     assert 'save_steps="$boundary"' in submitter
@@ -640,6 +641,19 @@ def test_streaming_rendezvous_publishes_and_checks_every_replica() -> None:
         "wait_vllm_ready \"$surl\"",
     ):
         assert required in streaming
+
+
+def test_requeued_runner_clears_exact_persistent_rendezvous_before_launch() -> None:
+    """Trainers cannot consume stale same-job-ID addresses after a new allocation starts."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        'rm -f "$CONTROL_ROOT/.training_done.${SLURM_JOB_ID}"',
+        'rm -f "$CONTROL_ROOT/.trainer_addr.${SLURM_JOB_ID}"',
+        'rm -f "$CONTROL_ROOT/.serve_addr.${SLURM_JOB_ID}.${serve_node}.${replica}"',
+    ):
+        assert required in runner
+    assert runner.index(".serve_addr.${SLURM_JOB_ID}") < runner.index("training_step=(srun")
 
 
 def test_streaming_serve_supervisor_cleans_up_and_fails_on_child_death() -> None:

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -39,6 +40,7 @@ def _write_fake_scontrol(tmp_path: Path) -> tuple[Path, Path]:
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         'printf "%s\\n" "$*" >>"$SCONTROL_CALLS"\n'
+        'if [[ "${SCONTROL_KILLS_CALLER:-0}" == 1 ]]; then kill -KILL "$PPID"; fi\n'
     )
     scontrol.chmod(0o755)
     return fake_bin, calls
@@ -53,6 +55,9 @@ def _start_lifecycle(
     max_requeues: int = 3,
     child_command: Optional[str] = None,
     terminate_grace_seconds: int = 1,
+    scontrol_kills_caller: bool = False,
+    milestone_steps: str = "4166,25391",
+    milestone_force_copy: bool = False,
 ) -> tuple[subprocess.Popen[str], Path, Path]:
     fake_bin, calls = _write_fake_scontrol(tmp_path)
     ready = tmp_path / "ready"
@@ -82,8 +87,11 @@ def _start_lifecycle(
         "SLURM_JOB_ID": "4242",
         "SLURM_RESTART_COUNT": str(restart_count),
         "SCONTROL_CALLS": str(calls),
+        "SCONTROL_KILLS_CALLER": "1" if scontrol_kills_caller else "0",
         "CHILD_READY": str(child_ready),
         "REQUEUE_TERMINATE_GRACE_SECONDS": str(terminate_grace_seconds),
+        "MILESTONE_STEPS": milestone_steps,
+        "MILESTONE_FORCE_COPY": "1" if milestone_force_copy else "0",
     }
     process = subprocess.Popen(
         [str(driver)],
@@ -127,6 +135,28 @@ def test_usr1_requeues_same_job_only_after_complete_checkpoint(tmp_path: Path) -
         "target_step": 70,
     }
     assert not (output_root / "control/training-complete-s70.json").exists()
+
+
+def test_requeue_receipt_survives_scheduler_terminating_batch_shell(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    checkpoint = _write_checkpoint(output_root, 20)
+    process, calls, receipt = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=70,
+        scontrol_kills_caller=True,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    process.send_signal(signal.SIGUSR1)
+    process.wait(timeout=10)
+
+    assert process.returncode != 0
+    assert calls.read_text().splitlines() == ["requeue 4242"]
+    record = json.loads(receipt.read_text())
+    assert record["checkpoint"] == str(checkpoint)
+    assert record["status"] == "requeue-requested"
 
 
 def test_usr1_reaps_a_terminated_step_without_waiting_full_grace(tmp_path: Path) -> None:
@@ -199,6 +229,44 @@ def test_usr1_fails_closed_at_restart_limit(tmp_path: Path) -> None:
     assert json.loads(receipt.read_text())["status"] == "failed-restart-limit"
 
 
+def test_restart_count_49_is_the_last_permitted_requeue(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    _write_checkpoint(output_root, 40)
+    process, calls, _ = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=70,
+        restart_count=49,
+        max_requeues=50,
+    )
+
+    process.send_signal(signal.SIGUSR1)
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert calls.read_text().splitlines() == ["requeue 4242"]
+
+
+def test_restart_count_50_refuses_another_requeue(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    _write_checkpoint(output_root, 40)
+    process, calls, _ = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=70,
+        restart_count=50,
+        max_requeues=50,
+    )
+
+    process.send_signal(signal.SIGUSR1)
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode != 0, (stdout, stderr)
+    assert not calls.exists()
+    receipt = output_root / "control/requeue/job-4242/attempt-50.json"
+    assert json.loads(receipt.read_text())["status"] == "failed-restart-limit"
+
+
 def test_normal_target_completion_marks_done_without_requeue(tmp_path: Path) -> None:
     output_root = tmp_path / "output"
     _write_checkpoint(output_root, 70)
@@ -251,6 +319,144 @@ def test_normal_non_divisible_target_accepts_valid_final_root(tmp_path: Path) ->
     marker = output_root / "control/training-complete-s70.json"
     assert json.loads(marker.read_text())["checkpoint"] == str(output_root)
     assert json.loads(marker.read_text())["global_step"] == 70
+
+
+def test_milestone_preserves_exact_export_and_nearest_resumable_checkpoint(
+    tmp_path: Path,
+) -> None:
+    output_root = tmp_path / "output"
+    checkpoint = _write_checkpoint(output_root, 4150)
+    future_checkpoint = _write_checkpoint(output_root, 5000)
+    (output_root / "model.safetensors").write_bytes(b"exact-final-model")
+    (output_root / "trainer_state.json").write_text(json.dumps({"global_step": 4166}))
+    export_path = output_root / "exported-checkpoint-4166"
+    export_path.mkdir()
+    (export_path / "model.safetensors").write_bytes(b"exact-export")
+    process, calls, _ = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=4166,
+        child_command="exit 0",
+    )
+
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert not calls.exists()
+    milestone = output_root / "milestones/step-004166"
+    exact_model = milestone / "exact-model"
+    resume = milestone / "resume-checkpoint-004150"
+    manifest = json.loads((milestone / "manifest.json").read_text())
+    assert exact_model.is_symlink()
+    assert exact_model.resolve() == export_path.resolve()
+    assert {key: manifest[key] for key in (
+        "exact_model_path",
+        "exact_model_step",
+        "resume_checkpoint_path",
+        "resume_checkpoint_step",
+    )} == {
+        "exact_model_path": "../../exported-checkpoint-4166",
+        "exact_model_step": 4166,
+        "resume_checkpoint_path": "resume-checkpoint-004150",
+        "resume_checkpoint_step": 4150,
+    }
+    assert manifest["exact_model_sha256"] == {
+        "model.safetensors": hashlib.sha256(b"exact-export").hexdigest()
+    }
+    assert manifest["resume_checkpoint_sha256"]["optimizer.pt"] == hashlib.sha256(
+        b"optimizer"
+    ).hexdigest()
+    assert set(manifest["resume_checkpoint_storage"].values()) == {"hardlink"}
+    assert (resume / "optimizer.pt").stat().st_ino == (checkpoint / "optimizer.pt").stat().st_ino
+    assert (resume / "optimizer.pt").stat().st_nlink >= 2
+
+    for path in sorted(checkpoint.rglob("*"), reverse=True):
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+    checkpoint.rmdir()
+    assert (resume / "optimizer.pt").read_bytes() == b"optimizer"
+    assert (exact_model / "model.safetensors").read_bytes() == b"exact-export"
+    assert future_checkpoint.is_dir()
+
+
+def test_non_milestone_completion_does_not_create_a_preservation_tree(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    _write_checkpoint(output_root, 14500)
+    (output_root / "model.safetensors").write_bytes(b"final-model")
+    (output_root / "trainer_state.json").write_text(json.dumps({"global_step": 14500}))
+    export_path = output_root / "exported-checkpoint-14500"
+    export_path.mkdir()
+    (export_path / "model.safetensors").write_bytes(b"export")
+    process, calls, _ = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=14500,
+        child_command="exit 0",
+    )
+
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert not calls.exists()
+    assert not (output_root / "milestones").exists()
+
+
+def test_final_target_is_also_a_permanent_milestone(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    _write_checkpoint(output_root, 25350)
+    (output_root / "model.safetensors").write_bytes(b"final-model")
+    (output_root / "trainer_state.json").write_text(json.dumps({"global_step": 25391}))
+    export_path = output_root / "exported-checkpoint-25391"
+    export_path.mkdir()
+    (export_path / "model.safetensors").write_bytes(b"final-export")
+    process, calls, _ = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=25391,
+        child_command="exit 0",
+    )
+
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert not calls.exists()
+    milestone = output_root / "milestones/step-025391"
+    manifest = json.loads((milestone / "manifest.json").read_text())
+    assert manifest["exact_model_step"] == 25391
+    assert manifest["resume_checkpoint_step"] == 25350
+    assert (milestone / "exact-model").resolve() == export_path.resolve()
+
+
+def test_milestone_copy_fallback_is_checksum_verified_and_recorded(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    checkpoint = _write_checkpoint(output_root, 4150)
+    (output_root / "model.safetensors").write_bytes(b"final-model")
+    (output_root / "trainer_state.json").write_text(json.dumps({"global_step": 4166}))
+    export_path = output_root / "exported-checkpoint-4166"
+    export_path.mkdir()
+    (export_path / "model.safetensors").write_bytes(b"export")
+    process, _, _ = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=4166,
+        child_command="exit 0",
+        milestone_force_copy=True,
+    )
+
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, (stdout, stderr)
+    milestone = output_root / "milestones/step-004166"
+    resume = milestone / "resume-checkpoint-004150"
+    manifest = json.loads((milestone / "manifest.json").read_text())
+    assert set(manifest["resume_checkpoint_storage"].values()) == {"copy"}
+    assert (resume / "optimizer.pt").stat().st_ino != (checkpoint / "optimizer.pt").stat().st_ino
+    assert (resume / "optimizer.pt").read_bytes() == (checkpoint / "optimizer.pt").read_bytes()
+    assert manifest["resume_checkpoint_sha256"]["optimizer.pt"] == hashlib.sha256(
+        b"optimizer"
+    ).hexdigest()
 
 
 def test_incomplete_newer_checkpoint_does_not_hide_latest_complete_one(tmp_path: Path) -> None:

@@ -182,6 +182,14 @@ if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     export WANDB_RESUME=allow
 fi
 
+rm -f "$CONTROL_ROOT/.training_done.${SLURM_JOB_ID}"
+rm -f "$CONTROL_ROOT/.trainer_addr.${SLURM_JOB_ID}"
+for ((serve_node = 0; serve_node < SERVE_NODES; serve_node++)); do
+    for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++)); do
+        rm -f "$CONTROL_ROOT/.serve_addr.${SLURM_JOB_ID}.${serve_node}.${replica}"
+    done
+done
+
 # shellcheck disable=SC2016,SC2026 # The child shell expands its Slurm-node environment.
 training_step=(srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="/raid/scratch:/raid/scratch,${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
     set -euo pipefail
