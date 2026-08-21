@@ -404,7 +404,7 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
         "SERVE_READY_TIMEOUT=1800",
         "HS_POOL_SLOTS=32",
         "SERVE_MAX_NUM_SEQS=16",
-        'training.save_steps="${MAX_STEPS}"',
+        'training.save_steps="${SAVE_STEPS}"',
         "training.save_total_limit=2",
         'cp -a "$SOURCE_PATH"',
         'cp -aL "$TARGET_PATH"',
@@ -463,6 +463,22 @@ def test_host_staging_preserves_one_bounded_diagnostic_log_per_node() -> None:
     assert "set -x" in runner
 
 
+def test_requeued_host_staging_reuses_only_a_completed_node_local_copy() -> None:
+    """Same-job-ID restart cannot nest or merge staged source/model/dataset trees."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        'stage_marker="$node_root/staging.complete"',
+        'stage_fingerprint="${SOURCE_SHA}|${RUNTIME_ARCHIVE_SHA256}|${TARGET_PATH}|${DATASET_PATH}|${stage_role}"',
+        'if [[ -f "$stage_marker" && "$(<"$stage_marker")" == "$stage_fingerprint" ]]',
+        '[[ "$node_root" == "/raid/scratch/${SLURM_JOB_ID}/node-${SLURM_NODEID}" ]]',
+        'rm -rf -- "$node_root"',
+        'printf "%s\\n" "$stage_fingerprint" >"$stage_marker_tmp"',
+        'mv "$stage_marker_tmp" "$stage_marker"',
+    ):
+        assert required in runner
+
+
 def test_missing_optional_target_sidecar_does_not_fail_host_staging() -> None:
     """Every role gets the complete target checkpoint without optional-sidecar branching."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
@@ -518,8 +534,51 @@ def test_cumulative_runner_writes_a_checkpoint_for_every_resume_boundary() -> No
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
     assert 'training.output_dir="${OUTPUT_ROOT}"' in runner
-    assert 'training.save_steps="${MAX_STEPS}"' in runner
+    assert 'SAVE_STEPS="${SAVE_STEPS:-$MAX_STEPS}"' in runner
+    assert 'training.save_steps="${SAVE_STEPS}"' in runner
     assert "training.save_total_limit=2" in runner
+
+
+def test_self_requeue_is_opt_in_and_configures_slurm_signal_delivery() -> None:
+    """Production waves change lifecycle only when explicitly requested."""
+    submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()
+
+    assert "DEFAULT_REQUEUE_SAVE_STEPS=50" in submitter
+    assert 'elif [[ "$SELF_REQUEUE" -eq 1 ]]' in submitter
+    assert 'save_steps="$DEFAULT_REQUEUE_SAVE_STEPS"' in submitter
+    assert 'save_steps="$boundary"' in submitter
+    for required in (
+        "--self-requeue",
+        "--save-steps",
+        "--max-requeues",
+        "--requeue-signal-lead",
+        "--requeue",
+        '"--signal=B:USR1@${REQUEUE_SIGNAL_LEAD}"',
+        "SELF_REQUEUE=${SELF_REQUEUE}",
+        "SAVE_STEPS=${save_steps}",
+        "MAX_REQUEUES=${MAX_REQUEUES}",
+        "WANDB_RUN_ID=${wandb_run_id}",
+    ):
+        assert required in submitter
+
+
+def test_self_requeue_runner_uses_checkpoint_gated_lifecycle() -> None:
+    """The runner resumes one W&B identity and requeues only through the tested helper."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        'SAVE_STEPS="${SAVE_STEPS:-$MAX_STEPS}"',
+        'training.save_steps="${SAVE_STEPS}"',
+        'export WANDB_RUN_ID="${WANDB_RUN_ID}"',
+        "export WANDB_RESUME=allow",
+        'source "$LAUNCHER_ROOT/common/specdec/drafter_requeue_lifecycle.sh"',
+        "drafter_requeue_init",
+        "drafter_run_requeueable_step",
+        "drafter_mark_training_complete",
+    ):
+        assert required in runner
+    assert runner.index("drafter_requeue_init") < runner.index("host staging complete")
+    assert runner.count("drafter_run_requeueable_step") == 2
 
 
 def test_training_runner_preserves_proven_production_training_semantics() -> None:
@@ -597,9 +656,7 @@ def test_training_step_terminates_all_node_tasks_when_a_replica_dies() -> None:
     """A nonzero serve task must stop trainers before they use a partial endpoint set."""
     runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
 
-    execution_srun = next(
-        line for line in runner.splitlines() if "--container-image" in line and line.startswith("srun ")
-    )
+    execution_srun = next(line for line in runner.splitlines() if "--container-image" in line)
     assert "--kill-on-bad-exit=1" in execution_srun
 
 

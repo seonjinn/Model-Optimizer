@@ -13,10 +13,15 @@ RECEIPT=""
 DEPENDENCY=""
 ONLY_STEP=""
 EXPERIMENT_INDEX=""
+SAVE_STEPS=""
+DEFAULT_REQUEUE_SAVE_STEPS=50
+SELF_REQUEUE=0
+MAX_REQUEUES=64
+REQUEUE_SIGNAL_LEAD=300
 DRY_RUN=0
 
 usage() {
-    echo "usage: $0 --manifest /home/.../manifest.json --receipt /lustre/.../receipt.jsonl [--dependency JOBID] [--max-steps N] [--dry-run] [-- dotlist args]" >&2
+    echo "usage: $0 --manifest /home/.../manifest.json --receipt /lustre/.../receipt.jsonl [--dependency JOBID] [--max-steps N] [--save-steps N] [--self-requeue] [--max-requeues N] [--requeue-signal-lead SECONDS] [--dry-run]" >&2
     exit 2
 }
 
@@ -26,6 +31,10 @@ while [[ $# -gt 0 ]]; do
         --receipt) RECEIPT="$2"; shift 2 ;;
         --dependency) DEPENDENCY="$2"; shift 2 ;;
         --max-steps) ONLY_STEP="$2"; shift 2 ;;
+        --save-steps) SAVE_STEPS="$2"; shift 2 ;;
+        --self-requeue) SELF_REQUEUE=1; shift ;;
+        --max-requeues) MAX_REQUEUES="$2"; shift 2 ;;
+        --requeue-signal-lead) REQUEUE_SIGNAL_LEAD="$2"; shift 2 ;;
         --experiment-index) EXPERIMENT_INDEX="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         --) echo "extra ModelOpt dotlist arguments are not accepted for pinned production manifests" >&2; exit 2 ;;
@@ -35,6 +44,9 @@ done
 [[ "$MANIFEST" == /home/* && "$RECEIPT" == /lustre/* && -f "$MANIFEST" ]] || usage
 [[ "$RUNNER" == /home/* ]] || { echo "runner must be in /home source" >&2; exit 2; }
 [[ -z "$ONLY_STEP" || "$ONLY_STEP" =~ ^[1-9][0-9]*$ ]] || usage
+[[ -z "$SAVE_STEPS" || "$SAVE_STEPS" =~ ^[1-9][0-9]*$ ]] || usage
+[[ "$MAX_REQUEUES" =~ ^[1-9][0-9]*$ ]] || usage
+[[ "$REQUEUE_SIGNAL_LEAD" =~ ^[1-9][0-9]*$ ]] || usage
 [[ -z "$EXPERIMENT_INDEX" || "$EXPERIMENT_INDEX" =~ ^[0-9]+$ ]] || usage
 render_waves() {
     PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST" "$ONLY_STEP" "$EXPERIMENT_INDEX" <<'PY'
@@ -92,9 +104,22 @@ PY
         printf '{"job_id":"%s","status":"already-known","tuple_identity":"%s","max_steps":%s}\n' "$existing" "$tuple_identity" "$boundary" >>"$RECEIPT"
         continue
     fi
-    exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,MANIFEST_PATH=${MANIFEST},EXPERIMENT_INDEX=${index},MAX_STEPS=${boundary},LAUNCHER_ROOT=${LAUNCHER_ROOT}"
+    if [[ -n "$SAVE_STEPS" ]]; then
+        save_steps="$SAVE_STEPS"
+    elif [[ "$SELF_REQUEUE" -eq 1 ]]; then
+        save_steps="$DEFAULT_REQUEUE_SAVE_STEPS"
+    else
+        save_steps="$boundary"
+    fi
+    exports="ALL,SCHEDULER_JOBS_SNAPSHOT=,MANIFEST_PATH=${MANIFEST},EXPERIMENT_INDEX=${index},MAX_STEPS=${boundary},SAVE_STEPS=${save_steps},SELF_REQUEUE=${SELF_REQUEUE},LAUNCHER_ROOT=${LAUNCHER_ROOT}"
+    requeue_args=()
+    if [[ "$SELF_REQUEUE" -eq 1 ]]; then
+        wandb_run_id="sd-${identity}-s${boundary}"
+        exports+=",MAX_REQUEUES=${MAX_REQUEUES},WANDB_RUN_ID=${wandb_run_id}"
+        requeue_args=(--requeue "--signal=B:USR1@${REQUEUE_SIGNAL_LEAD}")
+    fi
     mkdir -p "$output_root/logs"
-    args=(--account="$account" --partition="$partition" -N4 --ntasks-per-node=1 --gpus-per-node=4 --segment=4 --time=03:55:00 --job-name="$job_name" --comment="$tuple_identity" --export="$exports" --output="${output_root}/logs/slurm-%j.out" --error="${output_root}/logs/slurm-%j.err")
+    args=(--account="$account" --partition="$partition" -N4 --ntasks-per-node=1 --gpus-per-node=4 --segment=4 --time=03:55:00 --job-name="$job_name" --comment="$tuple_identity" --export="$exports" --output="${output_root}/logs/slurm-%j.out" --error="${output_root}/logs/slurm-%j.err" "${requeue_args[@]}")
     [[ -z "$DEPENDENCY" ]] || args+=(--dependency=afterok:"$DEPENDENCY")
     sbatch --test-only "${args[@]}" "$RUNNER"
     if [[ "$DRY_RUN" -eq 1 ]]; then

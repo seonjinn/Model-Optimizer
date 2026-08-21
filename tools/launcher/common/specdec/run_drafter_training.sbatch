@@ -15,6 +15,7 @@ readonly TRAINER_NODES=2
 readonly GPUS_PER_NODE=4
 readonly GLOBAL_BATCH_SIZE=512
 readonly SCRATCH_JOB_ROOT="/raid/scratch/${SLURM_JOB_ID}"
+readonly EXPECTED_RNG_STATES=$((TRAINER_NODES * GPUS_PER_NODE))
 
 for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
@@ -75,6 +76,13 @@ done
 [[ -f "$RUNTIME_ARCHIVE" ]] || { echo "runtime archive is missing" >&2; exit 2; }
 [[ "$(sha256sum "$RUNTIME_ARCHIVE" | cut -d' ' -f1)" == "$RUNTIME_ARCHIVE_SHA256" ]] || { echo "runtime archive SHA-256 mismatch" >&2; exit 2; }
 [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_STEPS must be positive" >&2; exit 2; }
+SAVE_STEPS="${SAVE_STEPS:-$MAX_STEPS}"
+[[ "$SAVE_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "SAVE_STEPS must be positive" >&2; exit 2; }
+[[ "${SELF_REQUEUE:-0}" =~ ^[01]$ ]] || { echo "SELF_REQUEUE must be 0 or 1" >&2; exit 2; }
+if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
+    [[ "${MAX_REQUEUES:-}" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_REQUEUES must be positive" >&2; exit 2; }
+    [[ -n "${WANDB_RUN_ID:-}" ]] || { echo "WANDB_RUN_ID is required for self-requeue" >&2; exit 2; }
+fi
 [[ "$SERVE_TP" =~ ^[1-9][0-9]*$ ]] || { echo "SERVE_TP must be positive" >&2; exit 2; }
 (( GPUS_PER_NODE % SERVE_TP == 0 )) || {
     echo "SERVE_TP must divide all ${GPUS_PER_NODE} GPUs on each serve node" >&2; exit 2;
@@ -86,6 +94,7 @@ SERVE_REPLICAS_PER_NODE=$((GPUS_PER_NODE / SERVE_TP))
 [[ $((PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE)) -eq "$GLOBAL_BATCH_SIZE" ]] || { echo "manifest batch arithmetic must equal GBS 512" >&2; exit 2; }
 CONTROL_ROOT="${OUTPUT_ROOT}/control"
 STAGE_LOG_ROOT="${OUTPUT_ROOT}/logs/stage-${SLURM_JOB_ID}"
+EXPORT_PATH="${OUTPUT_ROOT}/exported-checkpoint-${MAX_STEPS}"
 mkdir -p "$OUTPUT_ROOT" "$CONTROL_ROOT"
 mkdir -p "$STAGE_LOG_ROOT"
 
@@ -113,13 +122,36 @@ esac
 export SERVE_NODES NUM_SPEC_TOKENS
 export SERVE_REPLICAS_PER_NODE
 
-export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT SCRATCH_JOB_ROOT STAGE_LOG_ROOT
+export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES
+if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
+    # shellcheck source=tools/launcher/common/specdec/drafter_requeue_lifecycle.sh
+    source "$LAUNCHER_ROOT/common/specdec/drafter_requeue_lifecycle.sh"
+    drafter_requeue_init
+fi
 # shellcheck disable=SC2016 # The child shell expands node-local placement variables.
-srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
+staging_step=(srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
     set -euo pipefail
     exec >"${STAGE_LOG_ROOT}/node-${SLURM_NODEID}.log" 2>&1
     set -x
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
+    stage_marker="$node_root/staging.complete"
+    if (( SLURM_NODEID >= SERVE_NODES )); then
+        stage_role=trainer
+    else
+        stage_role=serve
+    fi
+    stage_fingerprint="${SOURCE_SHA}|${RUNTIME_ARCHIVE_SHA256}|${TARGET_PATH}|${DATASET_PATH}|${stage_role}"
+    if [[ -f "$stage_marker" && "$(<"$stage_marker")" == "$stage_fingerprint" ]]; then
+        echo "reusing completed host staging: node=${SLURM_NODEID}"
+        exit 0
+    fi
+    [[ "$node_root" == "/raid/scratch/${SLURM_JOB_ID}/node-${SLURM_NODEID}" ]] || {
+        echo "refusing to clean unexpected scratch path: $node_root" >&2
+        exit 2
+    }
+    if [[ -e "$node_root" ]]; then
+        rm -rf -- "$node_root"
+    fi
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
     cp -a "$SOURCE_PATH" "$node_root/source"
     tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
@@ -133,13 +165,25 @@ srun --nodes=4 --ntasks=4 --ntasks-per-node=1 bash -c '
     if (( SLURM_NODEID >= SERVE_NODES )); then
         cp -aL "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"
     fi
+    stage_marker_tmp="${stage_marker}.tmp.$$"
+    printf "%s\n" "$stage_fingerprint" >"$stage_marker_tmp"
+    mv "$stage_marker_tmp" "$stage_marker"
     echo "host staging complete: node=${SLURM_NODEID}"
-'
+')
+if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
+    drafter_run_requeueable_step "${staging_step[@]}"
+else
+    "${staging_step[@]}"
+fi
 
-export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS RUN_NAME SAMPLE_SIZE
+export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS SAVE_STEPS RUN_NAME SAMPLE_SIZE
+if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
+    export WANDB_RUN_ID="${WANDB_RUN_ID}"
+    export WANDB_RESUME=allow
+fi
 
 # shellcheck disable=SC2016,SC2026 # The child shell expands its Slurm-node environment.
-srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="/raid/scratch:/raid/scratch,${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
+training_step=(srun --nodes=4 --ntasks=4 --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="/raid/scratch:/raid/scratch,${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     export MODELOPT_RUNTIME="$node_root/runtime"
@@ -176,7 +220,7 @@ PY
     export SERVE_MODEL_NAME="modelopt-${RUN_NAME}"
     export SERVE_BLOCK_SIZE=32 SERVE_MAX_MODEL_LEN=8192 SERVE_READY_TIMEOUT=1800
     export HS_POOL_SLOTS=32 SERVE_MAX_NUM_SEQS=16
-    export EXPORT_PATH="${OUTPUT_ROOT}/exported-checkpoint-${MAX_STEPS}"
+    export EXPORT_PATH
     loss_args=(
         "dflash.dflash_loss_objective=${LOSS_OBJECTIVE}"
         "dflash.dflash_loss_decay_factor=${LOSS_VALUE}"
@@ -194,7 +238,7 @@ PY
         data.sample_size="${SAMPLE_SIZE}" \
         training.output_dir="${OUTPUT_ROOT}" \
         training.max_steps="${MAX_STEPS}" \
-        training.save_steps="${MAX_STEPS}" \
+        training.save_steps="${SAVE_STEPS}" \
         training.save_total_limit=2 \
         training.training_seq_len=4096 \
         training.answer_only_loss=false \
@@ -211,4 +255,11 @@ PY
         dflash.dflash_architecture_config.head_dim="${HEAD_DIM}" \
         dflash.dflash_architecture_config.intermediate_size="${INTERMEDIATE_SIZE}" \
         "${loss_args[@]}"
-'
+')
+
+if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
+    drafter_run_requeueable_step "${training_step[@]}"
+    drafter_mark_training_complete
+else
+    "${training_step[@]}"
+fi
