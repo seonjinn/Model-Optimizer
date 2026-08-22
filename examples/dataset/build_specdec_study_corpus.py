@@ -1,5 +1,17 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Build deterministic assistant-token-budgeted SpecDec study manifests."""
 
@@ -78,6 +90,12 @@ def _validate_candidates(
             "source_id",
             "source_revision",
             "license",
+            "source_manifest_sha256",
+            "source_file_path",
+            "source_file_sha256",
+            "full_token_count",
+            "response_source",
+            "tool_lane",
         } - row.keys()
         if missing:
             raise ValueError(f"candidate missing required fields: {sorted(missing)}")
@@ -93,6 +111,11 @@ def _validate_candidates(
             raise ValueError(f"prompt {prompt_id} has no source identity")
         if not isinstance(row["license"], str) or not row["license"].strip():
             raise ValueError(f"prompt {prompt_id} has no source license")
+        for digest_field in ("source_manifest_sha256", "source_file_sha256"):
+            if re.fullmatch(r"[0-9a-f]{64}", str(row[digest_field])) is None:
+                raise ValueError(f"prompt {prompt_id} has no verified {digest_field}")
+        if not isinstance(row["source_file_path"], str) or not row["source_file_path"]:
+            raise ValueError(f"prompt {prompt_id} has no verified source file path")
         revision = row["source_revision"]
         if (
             not isinstance(revision, str)
@@ -120,6 +143,19 @@ def _validate_candidates(
             raise ValueError(f"prompt {prompt_id} tokenizer identity mismatch")
         if row["context_bucket"] not in allowed_buckets:
             raise ValueError(f"prompt {prompt_id} has invalid context bucket")
+        if "full_token_count" in row:
+            full_token_count = int(row["full_token_count"])
+            derived_bucket = (
+                "le4k"
+                if full_token_count <= 4096
+                else "4k_16k"
+                if full_token_count <= 16384
+                else "16k_32k"
+                if full_token_count <= 32768
+                else None
+            )
+            if row["context_bucket"] != derived_bucket:
+                raise ValueError(f"prompt {prompt_id} has an invalid derived context bucket")
 
 
 def _trim_assistant_tokens(row: dict[str, Any], keep: int) -> dict[str, Any]:
@@ -258,15 +294,19 @@ def build_arm_manifest(
         raise ValueError(f"exposure_epochs exceeds maximum_epochs={maximum_epochs}")
     unique_tokens = sum(int(row["assistant_tokens"]) for row in selected)
     sources: dict[str, dict[str, Any]] = {}
+    source_files: set[tuple[str, str]] = set()
     for row in selected:
         source_id = str(row["source_id"])
         identity = {
             "revision": str(row["source_revision"]),
             "license": str(row["license"]),
+            "manifest_sha256": row.get("source_manifest_sha256"),
         }
         previous = sources.setdefault(source_id, identity)
         if previous != identity:
             raise ValueError(f"source identity changed within manifest: {source_id}")
+        if row.get("source_file_path") and row.get("source_file_sha256"):
+            source_files.add((str(row["source_file_path"]), str(row["source_file_sha256"])))
     category_totals: dict[str, int] = defaultdict(int)
     for row in selected:
         category_totals[f"{row['pool']}/{row['category']}"] += int(row["assistant_tokens"])
@@ -283,6 +323,7 @@ def build_arm_manifest(
         "category_assistant_tokens": dict(sorted(category_totals.items())),
         "context_assistant_tokens": token_totals_by(selected, "context_bucket"),
         "source_revisions": dict(sorted(sources.items())),
+        "source_files": [{"path": path, "sha256": digest} for path, digest in sorted(source_files)],
         "selected_prompt_ids_sha256": hashlib.sha256(
             "\n".join(str(row["prompt_id"]) for row in selected).encode()
         ).hexdigest(),
@@ -295,6 +336,8 @@ def materialize_parquet(
     *,
     rows_per_shard: int,
     tokenizer_sha256: str,
+    selection_manifest: dict[str, Any] | None = None,
+    selection_manifest_name: str = "SELECTION.json",
 ) -> dict[str, Any]:
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -311,13 +354,56 @@ def materialize_parquet(
         raise FileExistsError(f"partial directory already exists: {partial}")
     partial.mkdir()
     try:
+        schema = pa.schema(
+            [
+                pa.field("prompt_id", pa.string(), nullable=False),
+                pa.field("pool", pa.string(), nullable=False),
+                pa.field("category", pa.string(), nullable=False),
+                pa.field("context_bucket", pa.string(), nullable=False),
+                pa.field("assistant_tokens", pa.int64(), nullable=False),
+                pa.field("full_token_count", pa.int64()),
+                pa.field("full_assistant_tokens", pa.int64()),
+                pa.field("source_id", pa.string(), nullable=False),
+                pa.field("source_revision", pa.string(), nullable=False),
+                pa.field("license", pa.string(), nullable=False),
+                pa.field("source_manifest_sha256", pa.string()),
+                pa.field("source_file_path", pa.string()),
+                pa.field("source_file_sha256", pa.string()),
+                pa.field("source_row_index", pa.int64()),
+                pa.field("response_source", pa.string()),
+                pa.field("tool_lane", pa.string()),
+                pa.field("tokenizer_sha256", pa.string(), nullable=False),
+                pa.field("input_ids", pa.list_(pa.int64()), nullable=False),
+                pa.field("loss_mask", pa.list_(pa.int8()), nullable=False),
+                pa.field("messages", pa.large_string()),
+                pa.field("tools", pa.large_string()),
+            ]
+        )
+        normalized = []
+        for row in selected:
+            value = {field.name: row.get(field.name) for field in schema}
+            value["full_token_count"] = row.get("full_token_count", len(row["input_ids"]))
+            value["full_assistant_tokens"] = row.get(
+                "full_assistant_tokens", row["assistant_tokens"]
+            )
+            value["messages"] = (
+                json.dumps(row["messages"], ensure_ascii=False, sort_keys=True)
+                if row.get("messages") is not None
+                else None
+            )
+            value["tools"] = (
+                json.dumps(row["tools"], ensure_ascii=False, sort_keys=True)
+                if row.get("tools") is not None
+                else None
+            )
+            normalized.append(value)
         files = []
         shard_count = (len(selected) + rows_per_shard - 1) // rows_per_shard
         for shard_index, start in enumerate(range(0, len(selected), rows_per_shard)):
-            rows = selected[start : start + rows_per_shard]
+            rows = normalized[start : start + rows_per_shard]
             name = f"train-{shard_index:05d}-of-{shard_count:05d}.parquet"
             path = partial / name
-            pq.write_table(pa.Table.from_pylist(rows), path, compression="zstd")
+            pq.write_table(pa.Table.from_pylist(rows, schema=schema), path, compression="zstd")
             files.append({"path": name, "bytes": path.stat().st_size, "sha256": sha256_file(path)})
         manifest = {
             "schema_version": 1,
@@ -332,6 +418,19 @@ def materialize_parquet(
         (partial / "MANIFEST.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if selection_manifest is not None:
+            if Path(selection_manifest_name).name != selection_manifest_name:
+                raise ValueError("selection manifest name must be a basename")
+            published_selection = dict(selection_manifest)
+            published_selection["corpus_manifest_path"] = str(
+                (output_dir / "MANIFEST.json").resolve()
+            )
+            published_selection["corpus_manifest_sha256"] = sha256_file(partial / "MANIFEST.json")
+            published_selection["tokenizer_sha256"] = tokenizer_sha256
+            (partial / selection_manifest_name).write_text(
+                json.dumps(published_selection, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         os.rename(partial, output_dir)
     except BaseException:
         shutil.rmtree(partial, ignore_errors=True)
@@ -387,17 +486,18 @@ def main() -> int:
         target_assistant_tokens=args.target_assistant_tokens,
         exposure_epochs=args.exposure_epochs,
     )
+    if args.output_manifest.parent.resolve(strict=False) != args.output_corpus.resolve(
+        strict=False
+    ):
+        raise ValueError("output manifest must be published inside output corpus")
     materialize_parquet(
         selected,
         args.output_corpus,
         rows_per_shard=args.rows_per_shard,
         tokenizer_sha256=args.tokenizer_sha256,
+        selection_manifest=manifest,
+        selection_manifest_name=args.output_manifest.name,
     )
-    corpus_manifest_path = args.output_corpus / "MANIFEST.json"
-    manifest["corpus_manifest_path"] = str(corpus_manifest_path.resolve())
-    manifest["corpus_manifest_sha256"] = sha256_file(corpus_manifest_path)
-    manifest["tokenizer_sha256"] = args.tokenizer_sha256
-    _write_json_atomic(args.output_manifest, manifest)
     return 0
 
 

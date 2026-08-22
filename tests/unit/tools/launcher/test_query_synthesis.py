@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import importlib.util
@@ -271,3 +286,39 @@ def test_completed_shard_is_rehashed_before_resume(
             done,
             expected={"shard_id": 0},
         )
+
+
+def test_incomplete_shard_is_recovered_before_retry(
+    query_module: ModuleType, tmp_path: Path
+) -> None:
+    """A crash before the commit marker leaves no state that blocks a retry."""
+    output = tmp_path / "shard.jsonl"
+    metadata = output.with_suffix(".jsonl.metadata.json")
+    done = output.with_suffix(".jsonl.done")
+    output.write_text("partial\n")
+    metadata.write_text("{}\n")
+    stale = tmp_path / ".shard.jsonl.partial-123"
+    stale.write_text("partial\n")
+
+    assert (
+        query_module.recover_or_verify_shard(output, metadata, done, expected={"shard_id": 0})
+        is False
+    )
+
+    assert not output.exists()
+    assert not metadata.exists()
+    assert not done.exists()
+    assert not stale.exists()
+
+
+def test_done_marker_with_missing_payload_fails_closed(
+    query_module: ModuleType, tmp_path: Path
+) -> None:
+    """The durable commit marker is never silently downgraded to retryable state."""
+    output = tmp_path / "shard.jsonl"
+    metadata = output.with_suffix(".jsonl.metadata.json")
+    done = output.with_suffix(".jsonl.done")
+    done.write_text("done\n")
+
+    with pytest.raises(ValueError, match="incomplete synthesis shard state"):
+        query_module.recover_or_verify_shard(output, metadata, done, expected={"shard_id": 0})

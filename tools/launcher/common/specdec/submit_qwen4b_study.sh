@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 set -euo pipefail
 
@@ -53,6 +65,7 @@ from common.specdec.qwen4b_study_manifest import (
     readable_study_job_name,
     validate_canary_receipt,
     validate_milestone_receipt,
+    validate_readiness_receipt,
     validate_training_target,
 )
 
@@ -86,8 +99,13 @@ if assistant_token_target is not None:
         )
         validate_milestone_receipt(previous_milestone_path, experiment, previous_tokens)
 receipt = json.loads(receipt_path.read_text())
-if receipt.get("profile") not in (None, profile.name):
-    raise SystemExit("readiness receipt profile mismatch")
+validate_readiness_receipt(
+    receipt,
+    profile=profile.name,
+    account=profile.account,
+    partition=profile.partition,
+    scratch_root=Path(receipt.get("scratch_root", "")),
+)
 for value in (
     experiment.experiment_id,
     readable_study_job_name(experiment)

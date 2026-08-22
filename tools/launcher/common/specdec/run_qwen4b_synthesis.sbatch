@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -34,6 +47,7 @@ from pathlib import Path
 
 from common.specdec.build_qwen4b_synthesis_manifest import load_synthesis_manifest
 from common.specdec.cluster_profile import load_cluster_profile, validate_scratch_root
+from common.specdec.qwen4b_study_manifest import validate_readiness_receipt
 
 manifest = load_synthesis_manifest(Path(sys.argv[1]))[int(sys.argv[2])]
 profile = load_cluster_profile(Path(sys.argv[3]))
@@ -46,10 +60,13 @@ if manifest.settings.account != profile.account or manifest.settings.partition !
     raise SystemExit("manifest/profile scheduler mismatch")
 if profile.gpus_per_node != manifest.settings.replicas:
     raise SystemExit("manifest/profile GPU mismatch")
-if receipt.get("profile") != profile.name or Path(receipt["scratch_root"]) != scratch_root:
-    raise SystemExit("readiness receipt identity mismatch")
-if not receipt.get("pyxis") or receipt.get("architecture") != "aarch64" or receipt.get("gpu_count") != 4:
-    raise SystemExit("readiness hardware gate failed")
+validate_readiness_receipt(
+    receipt,
+    profile=profile.name,
+    account=profile.account,
+    partition=profile.partition,
+    scratch_root=scratch_root,
+)
 if manifest.response_source != "target-synth":
     raise SystemExit("trace-replay is a corpus input and must not allocate synthesis GPUs")
 

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import importlib.util
@@ -43,10 +58,16 @@ def _candidates(count_per_category: int = 1000) -> list[dict]:
                         "pool": pool,
                         "category": category,
                         "context_bucket": ["le4k", "4k_16k", "16k_32k"][index % 3],
+                        "full_token_count": [2, 5000, 20000][index % 3],
                         "assistant_tokens": 1,
                         "source_id": f"{pool}-{category}",
                         "source_revision": "a" * 40,
                         "license": "Apache-2.0",
+                        "source_manifest_sha256": "b" * 64,
+                        "source_file_path": f"{pool}-{category}.jsonl",
+                        "source_file_sha256": "c" * 64,
+                        "response_source": "target-synth",
+                        "tool_lane": "none",
                         "tokenizer_sha256": TOKENIZER_SHA256,
                         "input_ids": [10, 11],
                         "loss_mask": [0, 1],
@@ -147,13 +168,15 @@ def test_candidate_token_ids_must_match_the_pinned_target_tokenizer() -> None:
         module.select_arm(candidates, config=_config(), arm="B", target_assistant_tokens=10)
 
 
-def test_candidate_must_already_fit_the_training_sequence_length() -> None:
+def test_candidate_bucket_is_derived_from_full_length_before_training_truncation() -> None:
     module = _load_module()
     config = _config()
-    config["training_seq_len"] = 1
+    row = _candidates(10)[0]
+    row["full_token_count"] = 5000
+    row["context_bucket"] = "le4k"
 
-    with pytest.raises(ValueError, match="training sequence length"):
-        module.select_arm(_candidates(10), config=config, arm="B", target_assistant_tokens=10)
+    with pytest.raises(ValueError, match="derived context bucket"):
+        module.select_arm([row], config=config, arm="B", target_assistant_tokens=1)
 
 
 def test_selection_trims_final_loss_mask_to_exact_token_quota() -> None:
@@ -179,6 +202,12 @@ def test_selection_trims_final_loss_mask_to_exact_token_quota() -> None:
             "source_id": "source",
             "source_revision": "a" * 40,
             "license": "Apache-2.0",
+            "source_manifest_sha256": "b" * 64,
+            "source_file_path": "source.jsonl",
+            "source_file_sha256": "c" * 64,
+            "full_token_count": 8,
+            "response_source": "target-synth",
+            "tool_lane": "none",
             "tokenizer_sha256": TOKENIZER_SHA256,
             "input_ids": list(range(8)),
             "loss_mask": [0, 0, 1, 1, 1, 1, 1, 1],
@@ -253,6 +282,83 @@ def test_materialize_parquet_is_atomic_and_checksum_manifested(tmp_path: Path) -
     assert json.loads((output / "MANIFEST.json").read_text()) == manifest
 
 
+def test_materialize_parquet_uses_union_schema_for_tool_rows(tmp_path: Path) -> None:
+    """A non-tool first row cannot erase top-level tools from a later row or shard."""
+    module = _load_module()
+    selected = _candidates(10)[:2]
+    selected[0]["messages"] = [{"role": "user", "content": "plain"}]
+    selected[1]["messages"] = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
+    ]
+    selected[1]["tools"] = [
+        {
+            "type": "function",
+            "function": {"name": "shell", "description": "run", "parameters": {"type": "object"}},
+        }
+    ]
+    output = tmp_path / "corpus"
+
+    module.materialize_parquet(
+        selected, output, rows_per_shard=1, tokenizer_sha256=TOKENIZER_SHA256
+    )
+
+    import pyarrow.parquet as pq
+
+    tables = [pq.read_table(path) for path in sorted(output.glob("*.parquet"))]
+    assert all("tools" in table.column_names for table in tables)
+    assert json.loads(tables[1].to_pylist()[0]["tools"])[0]["function"]["name"] == "shell"
+
+
+def test_materialize_publishes_selection_with_corpus_in_one_rename(tmp_path: Path) -> None:
+    module = _load_module()
+    selected = _candidates(10)[:1]
+    output = tmp_path / "corpus"
+
+    module.materialize_parquet(
+        selected,
+        output,
+        rows_per_shard=1,
+        tokenizer_sha256=TOKENIZER_SHA256,
+        selection_manifest={"schema_version": 1, "arm": "B"},
+        selection_manifest_name="SELECTION.json",
+    )
+
+    selection = json.loads((output / "SELECTION.json").read_text())
+    assert selection["corpus_manifest_path"] == str(output / "MANIFEST.json")
+    assert selection["corpus_manifest_sha256"] == module.sha256_file(output / "MANIFEST.json")
+    assert not list(tmp_path.glob(".corpus.partial-*"))
+
+
+def test_manifest_binds_verified_input_file_identity() -> None:
+    module = _load_module()
+    selected = _candidates(10)[:1]
+    selected[0]["source_manifest_sha256"] = "1" * 64
+    selected[0]["source_file_sha256"] = "2" * 64
+    selected[0]["source_file_path"] = "ptv2/train-000.parquet"
+
+    manifest = module.build_arm_manifest(
+        selected,
+        config=_config(),
+        arm="B",
+        target_assistant_tokens=1,
+        exposure_epochs=1,
+    )
+
+    assert manifest["source_revisions"][selected[0]["source_id"]]["manifest_sha256"] == "1" * 64
+    assert manifest["source_files"] == [{"path": "ptv2/train-000.parquet", "sha256": "2" * 64}]
+
+
 def test_cli_materializes_selected_rows_as_pinned_parquet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -261,12 +367,18 @@ def test_cli_materializes_selected_rows_as_pinned_parquet(
     inventory.write_text("".join(json.dumps(row) + "\n" for row in _candidates(10)))
     config = tmp_path / "config.yaml"
     config.write_text(yaml.safe_dump(_config()))
-    output_manifest = tmp_path / "selection.json"
     output_corpus = tmp_path / "arm-b"
+    output_manifest = output_corpus / "SELECTION.json"
     observed: dict[str, object] = {}
 
     def fake_materialize(
-        selected: list[dict], output: Path, *, rows_per_shard: int, tokenizer_sha256: str
+        selected: list[dict],
+        output: Path,
+        *,
+        rows_per_shard: int,
+        tokenizer_sha256: str,
+        selection_manifest: dict,
+        selection_manifest_name: str,
     ) -> dict:
         observed.update(
             selected=selected,
@@ -276,6 +388,12 @@ def test_cli_materializes_selected_rows_as_pinned_parquet(
         )
         output.mkdir()
         (output / "MANIFEST.json").write_text('{"schema_version": 1}\n')
+        payload = selection_manifest | {
+            "corpus_manifest_path": str(output / "MANIFEST.json"),
+            "corpus_manifest_sha256": module.sha256_file(output / "MANIFEST.json"),
+            "tokenizer_sha256": tokenizer_sha256,
+        }
+        (output / selection_manifest_name).write_text(json.dumps(payload) + "\n")
         return {"schema_version": 1}
 
     monkeypatch.setattr(module, "materialize_parquet", fake_materialize)

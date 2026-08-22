@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Contracts for the Qwen3-4B speculative-decoding dataset study."""
 
@@ -70,6 +82,37 @@ def _manifest() -> Qwen4BSynthesisManifest:
             max_total_length=32768,
         ),
     )
+
+
+def test_readiness_receipt_requires_canonical_pyxis_available_field() -> None:
+    """Legacy pyxis aliases cannot satisfy the immutable readiness gate."""
+    from common.specdec.qwen4b_study_manifest import validate_readiness_receipt
+
+    expected = {
+        "profile": "oci-hsg",
+        "account": "nemotron_sw_post",
+        "partition": "batch",
+        "scratch_root": "/raid/scratch",
+        "pyxis_available": True,
+        "architecture": "aarch64",
+        "gpu_count": 4,
+    }
+
+    validate_readiness_receipt(
+        expected,
+        profile="oci-hsg",
+        account="nemotron_sw_post",
+        partition="batch",
+        scratch_root=Path("/raid/scratch"),
+    )
+    with pytest.raises(ValueError, match="readiness receipt"):
+        validate_readiness_receipt(
+            expected | {"pyxis_available": False, "pyxis": True},
+            profile="oci-hsg",
+            account="nemotron_sw_post",
+            partition="batch",
+            scratch_root=Path("/raid/scratch"),
+        )
 
 
 def test_synthesis_identity_separates_thinking_modes_and_response_sources() -> None:
@@ -645,8 +688,10 @@ def test_submitter_runs_test_only_before_real_submission_and_writes_receipt(
         json.dumps(
             {
                 "profile": "oci-hsg",
+                "account": "nemotron_sw_post",
+                "partition": "batch",
                 "scratch_root": "/raid/scratch",
-                "pyxis": True,
+                "pyxis_available": True,
                 "architecture": "aarch64",
                 "gpu_count": 4,
             }

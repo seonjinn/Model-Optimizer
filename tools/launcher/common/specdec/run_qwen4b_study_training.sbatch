@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -50,6 +63,7 @@ from common.specdec.qwen4b_study_manifest import (
     load_study_manifest,
     readable_study_job_name,
     validate_milestone_receipt,
+    validate_readiness_receipt,
     validate_training_target,
 )
 
@@ -64,10 +78,13 @@ if experiment.schedule.account != profile.account or experiment.schedule.partiti
     raise SystemExit("manifest/profile scheduler mismatch")
 if profile.training_nodes < 2 or profile.training_nodes % 2 or profile.gpus_per_node != 4:
     raise SystemExit("cluster profile cannot host the pinned two-node topology")
-if receipt.get("profile") != profile.name or Path(receipt["scratch_root"]) != scratch_root:
-    raise SystemExit("readiness receipt identity mismatch")
-if not receipt.get("pyxis") or receipt.get("architecture") != "aarch64" or receipt.get("gpu_count") != 4:
-    raise SystemExit("readiness hardware gate failed")
+validate_readiness_receipt(
+    receipt,
+    profile=profile.name,
+    account=profile.account,
+    partition=profile.partition,
+    scratch_root=scratch_root,
+)
 if experiment.schedule.account == "nemotron_n3_post":
     raise SystemExit("Qwen3-4B study training is forbidden on nemotron_n3_post")
 try:

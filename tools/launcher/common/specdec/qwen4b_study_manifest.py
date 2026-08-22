@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Typed Qwen3-4B speculative-decoding dataset-study experiments."""
 
@@ -22,12 +34,37 @@ __all__ = [
     "validate_canary_receipt",
     "validate_milestone_receipt",
     "validate_pmon_logs",
+    "validate_readiness_receipt",
     "validate_training_target",
     "write_study_manifest",
 ]
 
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_readiness_receipt(
+    receipt: dict,
+    *,
+    profile: str,
+    account: str,
+    partition: str,
+    scratch_root: Path,
+) -> None:
+    """Validate the canonical readiness contract shared by all launchers."""
+    expected = {
+        "profile": profile,
+        "account": account,
+        "partition": partition,
+        "scratch_root": str(scratch_root),
+        "pyxis_available": True,
+        "architecture": "aarch64",
+        "gpu_count": 4,
+    }
+    if not isinstance(receipt, dict) or any(
+        receipt.get(field) != value for field, value in expected.items()
+    ):
+        raise ValueError("cluster readiness receipt does not match the canonical contract")
 
 
 def _path_under(name: str, value: str, root: str) -> str:

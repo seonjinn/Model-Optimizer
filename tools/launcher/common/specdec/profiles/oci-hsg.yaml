@@ -1,12 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 name: oci-hsg
 modelopt_commit: e3febcbe1319f018eea81fa4d42e2e36cb54494e
 ssh_host: oci-hsg-cs-001-vscode-01
-account: nemotron_n3_post
+account: nemotron_sw_post
 partition: batch
-fallback_partition: null
+fallback_partition:
 durable_root: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec
 scratch_candidates:
   - /raid/scratch

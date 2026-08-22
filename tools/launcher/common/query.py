@@ -136,10 +136,57 @@ def verify_completed_shard(
         raise ValueError(f"completed shard identity mismatch: {output_path.name}")
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def recover_or_verify_shard(
+    output_path: Path,
+    metadata_path: Path,
+    done_path: Path,
+    *,
+    expected: dict[str, Any],
+) -> bool:
+    """Verify a committed shard or remove pre-commit crash residue for a retry."""
+    stale_partials = tuple(
+        partial
+        for final_path in (output_path, metadata_path, done_path)
+        for partial in output_path.parent.glob(f".{final_path.name}.partial-*")
+    )
+    if done_path.exists():
+        verify_completed_shard(
+            output_path,
+            metadata_path,
+            done_path,
+            expected=expected,
+        )
+        for partial in stale_partials:
+            partial.unlink(missing_ok=True)
+        return True
+    for path in (output_path, metadata_path, *stale_partials):
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+    return False
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as stream:
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
     partial = path.with_name(f".{path.name}.partial-{os.getpid()}")
-    partial.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    partial.write_text(content, encoding="utf-8")
+    _fsync_file(partial)
     os.replace(partial, path)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    _write_text_atomic(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def resolve_local_dataset(path: Path) -> tuple[str, list[str]]:
@@ -445,31 +492,33 @@ def main(argv: list[str] | None = None) -> int:
             file_path = Path(args.save) / f"shard_{shard_id}.jsonl"
         metadata_path = file_path.with_suffix(file_path.suffix + ".metadata.json")
         done_path = file_path.with_suffix(file_path.suffix + ".done")
-        if file_path.exists() or metadata_path.exists() or done_path.exists():
-            verify_completed_shard(
-                file_path,
-                metadata_path,
-                done_path,
-                expected={
-                    "shard_id": shard_id,
-                    "num_shards": args.num_shards,
-                    "thinking_mode": args.thinking_mode,
-                    "source_id": args.source_id or args.data,
-                    "target_revision": args.target_revision or args.model,
-                    "temperature": args.temperature,
-                    "max_tokens": args.max_tokens,
-                    "max_total_length": args.max_total_length,
-                },
-            )
+        expected = {
+            "shard_id": shard_id,
+            "num_shards": args.num_shards,
+            "thinking_mode": args.thinking_mode,
+            "source_id": args.source_id or args.data,
+            "target_revision": args.target_revision or args.model,
+            "temperature": args.temperature,
+            "max_tokens": args.max_tokens,
+            "max_total_length": args.max_total_length,
+        }
+        if recover_or_verify_shard(
+            file_path,
+            metadata_path,
+            done_path,
+            expected=expected,
+        ):
             continue
 
         shard = dataset.shard(num_shards=args.num_shards, index=shard_id)
         print(len(shard), file_path)
         num_proc = min(args.num_proc, len(shard))
         updated_shard = shard.map(synthesize, num_proc=num_proc)
-        updated_shard.to_json(str(file_path))
+        partial_output = file_path.with_name(f".{file_path.name}.partial-{os.getpid()}")
+        updated_shard.to_json(str(partial_output))
+        _fsync_file(partial_output)
         metadata = build_shard_metadata(
-            output_path=file_path,
+            output_path=partial_output,
             shard_id=shard_id,
             num_shards=args.num_shards,
             thinking_mode=args.thinking_mode,
@@ -479,8 +528,11 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             max_total_length=args.max_total_length,
         )
+        metadata["output_file"] = file_path.name
+        os.replace(partial_output, file_path)
         _write_json_atomic(metadata_path, metadata)
-        done_path.write_text("done\n", encoding="utf-8")
+        _write_text_atomic(done_path, "done\n")
+        _fsync_directory(file_path.parent)
         print(updated_shard[0])
 
         if early_termination:
