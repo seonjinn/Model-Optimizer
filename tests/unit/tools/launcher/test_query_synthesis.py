@@ -253,6 +253,42 @@ def test_synthesis_preserves_generated_turns_and_records_exact_api_tokens(
     assert result["_synthesis_assistant_tokens"] == 7
 
 
+def test_synthesis_preserves_prompt_identity_from_raw_json(
+    query_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeLLM:
+        last_completion_tokens = 3
+
+        @staticmethod
+        def generate(_messages: list[dict], verbose: bool = False) -> dict:
+            del verbose
+            return {"role": "assistant", "content": "answer"}
+
+    monkeypatch.setattr(query_module, "llm", FakeLLM(), raising=False)
+    monkeypatch.setattr(
+        query_module,
+        "args",
+        SimpleNamespace(
+            thinking_mode="off",
+            reject_tool_trajectories=True,
+            max_total_length=None,
+            max_tokens=None,
+            record_assistant_tokens=True,
+        ),
+        raising=False,
+    )
+    source = {
+        "prompt_id": "immutable-prompt",
+        "_canary_provenance": {"category": "math"},
+        "messages": [{"role": "user", "content": "solve"}],
+    }
+
+    result = query_module.synthesize({"raw_json": json.dumps(source)})
+
+    assert result["prompt_id"] == "immutable-prompt"
+    assert result["_canary_provenance"] == {"category": "math"}
+
+
 def test_completed_shard_is_rehashed_before_resume(
     query_module: ModuleType, tmp_path: Path
 ) -> None:

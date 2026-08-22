@@ -55,6 +55,16 @@ def resolve_thinking_mode(mode: str, row: dict[str, Any]) -> bool:
     raise ValueError(f"Unsupported thinking mode: {mode!r}")
 
 
+def decode_raw_json_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Decode the explicit union-schema wrapper used by staged prompt corpora."""
+    if set(row) != {"raw_json"}:
+        return row
+    decoded = json.loads(row["raw_json"])
+    if not isinstance(decoded, dict):
+        raise ValueError("raw_json dataset row must contain an object")
+    return decoded
+
+
 def prepare_generation_messages(
     row: dict[str, Any],
     mode: str,
@@ -63,11 +73,7 @@ def prepare_generation_messages(
     reject_tool_trajectories: bool = False,
 ) -> list[dict[str, Any]]:
     del shard_id
-    if set(row) == {"raw_json"}:
-        decoded = json.loads(row["raw_json"])
-        if not isinstance(decoded, dict):
-            raise ValueError("raw_json dataset row must contain an object")
-        row = decoded
+    row = decode_raw_json_row(row)
     messages = row.get("messages") or row.get("conversations")
     if messages is None:
         raise ValueError(
@@ -374,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def synthesize(data):
+    data = decode_raw_json_row(data)
     messages = prepare_generation_messages(
         data,
         args.thinking_mode,
@@ -448,6 +455,9 @@ def synthesize(data):
             raise ValueError(f"Unexpected message role {role!r} in conversation.")
 
     result = {"messages": output_messages}
+    for field in ("prompt_id", "_canary_provenance"):
+        if field in data:
+            result[field] = data[field]
     if args.record_assistant_tokens:
         result["_synthesis_assistant_tokens"] = assistant_tokens
     return result
