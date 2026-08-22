@@ -15,6 +15,7 @@ from common.specdec.build_qwen4b_prompt_canary import (
     _has_tool_trajectory,
     _prompt_identity,
     _prompt_view,
+    _tokenize_with_assistant_mask,
 )
 
 
@@ -58,6 +59,35 @@ def test_prompt_view_rejects_tool_trajectories() -> None:
 
     with pytest.raises(ValueError, match="tool trajectory"):
         _prompt_view(row)
+
+
+def test_trace_tokenization_preserves_tools_and_assistant_loss_mask() -> None:
+    """Tool-aware chat templating returns an aligned assistant-only loss mask."""
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages: list[dict], **kwargs: object) -> dict:
+            assert messages[-1]["role"] == "tool"
+            assert kwargs["tools"] == [{"type": "function", "function": {"name": "shell"}}]
+            assert kwargs["return_assistant_tokens_mask"] is True
+            return {"input_ids": [1, 2, 3, 4], "assistant_masks": [0, 0, 1, 0]}
+
+    row = {
+        "tools": [{"type": "function", "function": {"name": "shell"}}],
+        "messages": [
+            {"role": "user", "content": "run"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "shell"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+        ],
+    }
+
+    assert _tokenize_with_assistant_mask(FakeTokenizer(), row) == (
+        [1, 2, 3, 4],
+        [0, 0, 1, 0],
+    )
 
 
 @pytest.mark.parametrize(

@@ -102,16 +102,27 @@ def _bounded_candidates(path: Path, limit: int) -> list[dict[str, Any]]:
     return [entry[2] for entry in sorted(heap, key=lambda value: -value[0])]
 
 
-def _token_count(tokenizer: Any, row: dict[str, Any]) -> int:
+def _tokenize_with_assistant_mask(
+    tokenizer: Any, row: dict[str, Any]
+) -> tuple[list[int], list[int]]:
     encoded = tokenizer.apply_chat_template(
         _messages(row),
         tools=row.get("tools") or None,
         tokenize=True,
         add_generation_prompt=False,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
     )
-    if not isinstance(encoded, list):
-        raise ValueError("tokenizer did not return input IDs")
-    return len(encoded)
+    input_ids = encoded.get("input_ids")
+    loss_mask = encoded.get("assistant_masks", encoded.get("assistant_mask"))
+    if (
+        not isinstance(input_ids, list)
+        or not isinstance(loss_mask, list)
+        or len(input_ids) != len(loss_mask)
+        or any(value not in (0, 1) for value in loss_mask)
+    ):
+        raise ValueError("tokenizer did not return aligned IDs and assistant mask")
+    return input_ids, loss_mask
 
 
 def _select_rows(
@@ -121,10 +132,11 @@ def _select_rows(
     tokenizer: Any,
     quota: int,
     response_source: str,
-) -> tuple[list[dict[str, Any]], Counter[str], Counter[str]]:
+) -> tuple[list[dict[str, Any]], Counter[str], Counter[str], Counter[str]]:
     selected: list[dict[str, Any]] = []
     categories: Counter[str] = Counter()
     buckets: Counter[str] = Counter()
+    exclusions: Counter[str] = Counter()
     for record in records:
         candidates = _bounded_candidates(root / record["path"], max(quota * 8, 64))
         accepted = 0
@@ -136,9 +148,13 @@ def _select_rows(
                     if not _has_tool_trajectory(raw):
                         raise ValueError("trace-replay row has no tool trajectory")
                     row = dict(raw)
-                token_count = _token_count(tokenizer, row)
+                input_ids, loss_mask = _tokenize_with_assistant_mask(tokenizer, row)
+                token_count = len(input_ids)
                 bucket = _context_bucket(token_count)
-            except (KeyError, TypeError, ValueError):
+                if response_source == "trace-replay" and sum(loss_mask) < 1:
+                    raise ValueError("trace-replay row has no assistant loss tokens")
+            except (KeyError, TypeError, ValueError) as error:
+                exclusions[str(error)] += 1
                 continue
             prompt_id = _prompt_identity(row)
             row["prompt_id"] = prompt_id
@@ -151,7 +167,10 @@ def _select_rows(
                 "source_id": record["source_id"],
                 "source_revision": record["source_revision"],
                 "source_file_sha256": record["sha256"],
+                "full_assistant_tokens": sum(loss_mask),
             }
+            if response_source == "trace-replay":
+                row["_tokenized_trace"] = {"input_ids": input_ids, "loss_mask": loss_mask}
             selected.append(row)
             categories[record["category"]] += 1
             buckets[bucket] += 1
@@ -175,7 +194,7 @@ def _select_rows(
         raise ValueError(
             f"{response_source} category coverage mismatch: {dict(sorted(categories.items()))}"
         )
-    return selected, categories, buckets
+    return selected, categories, buckets, exclusions
 
 
 def _write_lane(
@@ -187,7 +206,8 @@ def _write_lane(
     tokenizer_sha256: str,
     categories: Counter[str],
     buckets: Counter[str],
-) -> None:
+    exclusions: Counter[str],
+) -> dict[str, Any]:
     destination.mkdir(parents=True, exist_ok=False)
     shard = destination / "canary.jsonl"
     with shard.open("w", encoding="utf-8") as output:
@@ -214,6 +234,16 @@ def _write_lane(
         "category_counts": dict(sorted(categories.items())),
         "context_bucket_counts": dict(sorted(buckets.items())),
         "context_bucket_basis": "exact target tokenizer over full selected conversation",
+        "excluded_candidate_counts_by_reason": dict(sorted(exclusions.items())),
+        "selected_full_context_tokens": sum(
+            row["_canary_provenance"]["full_context_tokens"] for row in rows
+        ),
+        "selected_assistant_tokens": sum(
+            row["_canary_provenance"]["full_assistant_tokens"] for row in rows
+        ),
+        "selected_prompt_ids_sha256": hashlib.sha256(
+            "\n".join(sorted(row["prompt_id"] for row in rows)).encode()
+        ).hexdigest(),
         "files": [
             {"path": shard.name, "bytes": shard.stat().st_size, "sha256": _sha256_file(shard)}
         ],
@@ -221,6 +251,7 @@ def _write_lane(
     temporary = destination / f".MANIFEST.json.tmp-{os.getpid()}"
     temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, destination / "MANIFEST.json")
+    return manifest
 
 
 def main() -> int:
@@ -263,8 +294,10 @@ def main() -> int:
         raise ValueError("output root or partial already exists")
     partial.mkdir(parents=True)
     try:
-        for lane, (rows, categories, buckets) in results.items():
-            _write_lane(
+        lane_manifests = {}
+        lane_prompt_ids = {}
+        for lane, (rows, categories, buckets, exclusions) in results.items():
+            lane_manifests[lane] = _write_lane(
                 partial / lane,
                 rows,
                 lane=lane,
@@ -272,7 +305,35 @@ def main() -> int:
                 tokenizer_sha256=args.tokenizer_sha256,
                 categories=categories,
                 buckets=buckets,
+                exclusions=exclusions,
             )
+            lane_prompt_ids[lane] = {row["prompt_id"] for row in rows}
+        overlap = lane_prompt_ids["target-synth"] & lane_prompt_ids["trace-replay"]
+        if overlap:
+            raise ValueError("selected prompt IDs appear in more than one response lane")
+        receipt = {
+            "schema_version": 1,
+            "source_manifest_sha256": args.source_manifest_sha256,
+            "tokenizer_sha256": args.tokenizer_sha256,
+            "selected_rows": {
+                lane: manifest["row_count"] for lane, manifest in lane_manifests.items()
+            },
+            "selected_full_context_tokens": {
+                lane: manifest["selected_full_context_tokens"]
+                for lane, manifest in lane_manifests.items()
+            },
+            "selected_assistant_tokens": {
+                lane: manifest["selected_assistant_tokens"]
+                for lane, manifest in lane_manifests.items()
+            },
+            "prompt_id_overlap_count": 0,
+            "lane_manifest_sha256": {
+                lane: _sha256_file(partial / lane / "MANIFEST.json") for lane in lane_manifests
+            },
+        }
+        (partial / "SELECTION_RECEIPT.json").write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         os.replace(partial, args.output_root)
     except BaseException:
         raise
