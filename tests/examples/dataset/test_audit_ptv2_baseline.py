@@ -133,3 +133,21 @@ def test_audit_still_fails_closed_on_histogram_mismatch(tmp_path: Path) -> None:
     )
     with pytest.raises(module.AuditError, match="histogram mismatch"):
         module.audit_baseline(root, expected)
+
+
+def test_audit_reproduces_authoritative_sorted_stream_take_boundary(tmp_path: Path) -> None:
+    module = _load()
+    root = tmp_path / "data"
+    root.mkdir()
+    _shard(root, "chat-0.parquet", ["c0", "c1"])
+    _shard(root, "math-0.parquet", ["m0", "unused"])
+    expected = module.BaselineExpectation(
+        "5c89e01dd720ae0f4058445ed49c5fb68a03c76e", 2, {"chat": 2, "math": 1}
+    )
+    audit = module.audit_baseline(root, expected)
+    assert audit.row_count == 3
+    assert audit.selection_policy == "hf-streaming-sorted-parquet-take"
+    assert audit.selection_boundary.file == "math-0.parquet"
+    assert audit.selection_boundary.rows_selected == 1
+    assert audit.selection_boundary.rows_available == 2
+    assert audit.selection_boundary.excluded_tail_rows == 1

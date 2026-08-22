@@ -37,6 +37,14 @@ class BaselineExpectation:
 
 
 @dataclass(frozen=True)
+class SelectionBoundary:
+    file: str
+    rows_selected: int
+    rows_available: int
+    excluded_tail_rows: int
+
+
+@dataclass(frozen=True)
 class BaselineAudit:
     source_revision: str
     row_count: int
@@ -44,6 +52,9 @@ class BaselineAudit:
     files: tuple[SourceFile, ...]
     prompt_uuids: tuple[str, ...]
     duplicate_uuid_multiplicity: dict[str, int]
+    physical_row_count: int
+    selection_policy: str
+    selection_boundary: SelectionBoundary
 
 
 EXPECTED_BASELINE = BaselineExpectation(
@@ -88,6 +99,10 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
     files: list[SourceFile] = []
     splits: Counter[str] = Counter()
     uuid_counts: Counter[str] = Counter()
+    selected_total = 0
+    physical_total = 0
+    target_total = sum(expected.split_rows.values())
+    boundary: SelectionBoundary | None = None
     for link in links:
         try:
             resolved = link.resolve(strict=True)
@@ -96,22 +111,38 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
         files.append(SourceFile(str(resolved), resolved.stat().st_size, _sha256_file(resolved)))
         split = re.sub(r"-\d+(?:-of-\d+)?\.parquet$", "", link.name)
         parquet = pq.ParquetFile(resolved)
-        splits[split] += parquet.metadata.num_rows
+        available_rows = parquet.metadata.num_rows
+        physical_total += available_rows
+        selected_rows = min(available_rows, max(target_total - selected_total, 0))
+        if selected_rows == 0:
+            continue
+        selected_total += selected_rows
+        splits[split] += selected_rows
+        boundary = SelectionBoundary(
+            link.name, selected_rows, available_rows, available_rows - selected_rows
+        )
         names = set(parquet.schema_arrow.names)
         if "messages" not in names and "conversations" not in names:
             raise AuditError(f"unsupported Parquet schema: {sorted(names)}")
         message_column = "messages" if "messages" in names else "conversations"
         columns = [message_column] + (["tools"] if "tools" in names else [])
+        remaining_rows = selected_rows
         for batch in parquet.iter_batches(columns=columns, batch_size=8192):
-            for row in batch.to_pylist():
+            rows = batch.to_pylist()[:remaining_rows]
+            for row in rows:
                 messages = _prompt_messages(_decode(row[message_column]))
                 tools = _decode(row.get("tools")) if row.get("tools") is not None else None
                 uuid = prompt_uuid(messages, tools)
                 uuid_counts[uuid] += 1
+            remaining_rows -= len(rows)
+            if remaining_rows == 0:
+                break
     actual = dict(sorted(splits.items()))
     wanted = {key: value for key, value in sorted(expected.split_rows.items()) if value}
     if actual != wanted:
         raise AuditError(f"histogram mismatch: {actual} != {wanted}")
+    if boundary is None or selected_total != target_total:
+        raise AuditError("sorted stream is shorter than sample_size")
     duplicates = {uuid: count for uuid, count in sorted(uuid_counts.items()) if count > 1}
     if len(uuid_counts) + sum(count - 1 for count in duplicates.values()) != sum(actual.values()):
         raise AuditError("UUID occurrence reconciliation mismatch")
@@ -122,6 +153,9 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
         tuple(files),
         tuple(sorted(uuid_counts)),
         duplicates,
+        physical_total,
+        "hf-streaming-sorted-parquet-take",
+        boundary,
     )
 
 
