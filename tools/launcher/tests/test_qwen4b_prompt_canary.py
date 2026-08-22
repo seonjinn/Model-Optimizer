@@ -29,7 +29,47 @@ def test_raw_json_union_row_is_decoded_without_losing_tools() -> None:
     }
 
     assert _decode_raw_row({"raw_json": json.dumps(payload)}) == payload
-    assert _has_tool_trajectory(payload)
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": "run it"}],
+        [
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+        ],
+        [
+            {"role": "user", "content": "run it"},
+            {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+            {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+        ],
+    ],
+)
+def test_tool_declarations_without_linked_call_results_are_not_replayable(
+    messages: list[dict],
+) -> None:
+    """Trace replay requires an ordered assistant call and matching tool result."""
+    row = {
+        "messages": messages,
+        "tools": [{"type": "function", "function": {"name": "shell"}}],
+    }
+
+    assert not _has_tool_trajectory(row)
+
+
+def test_linked_tool_call_and_result_are_replayable() -> None:
+    """A complete structured call/result exchange remains in the trace lane."""
+    row = {
+        "messages": [
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "shell"}}],
+    }
+
+    assert _has_tool_trajectory(row)
 
 
 def test_non_tool_prompt_view_removes_source_answers_but_keeps_turns() -> None:

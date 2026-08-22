@@ -43,6 +43,41 @@ def _messages(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _has_tool_trajectory(row: dict[str, Any]) -> bool:
+    tools = row.get("tools")
+    if (
+        not isinstance(tools, list)
+        or not tools
+        or any(not isinstance(tool, Mapping) for tool in tools)
+    ):
+        return False
+    call_positions: dict[str, int] = {}
+    result_ids: set[str] = set()
+    for position, message in enumerate(_messages(row)):
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            if message.get("role") != "assistant" or not isinstance(tool_calls, list):
+                return False
+            for call in tool_calls:
+                if not isinstance(call, Mapping):
+                    return False
+                call_id = call.get("id")
+                if not isinstance(call_id, str) or not call_id or call_id in call_positions:
+                    return False
+                call_positions[call_id] = position
+        if message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            if (
+                not isinstance(call_id, str)
+                or call_id not in call_positions
+                or call_id in result_ids
+                or call_positions[call_id] >= position
+            ):
+                return False
+            result_ids.add(call_id)
+    return bool(call_positions) and result_ids == set(call_positions)
+
+
+def _contains_tool_data(row: dict[str, Any]) -> bool:
     return bool(row.get("tools")) or any(
         message.get("role") == "tool" or bool(message.get("tool_calls"))
         for message in _messages(row)
@@ -50,7 +85,7 @@ def _has_tool_trajectory(row: dict[str, Any]) -> bool:
 
 
 def _prompt_view(row: dict[str, Any]) -> dict[str, Any]:
-    if _has_tool_trajectory(row):
+    if _contains_tool_data(row):
         raise ValueError("tool trajectory cannot enter target synthesis")
     messages = [
         message
