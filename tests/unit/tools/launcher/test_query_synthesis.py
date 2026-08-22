@@ -92,6 +92,18 @@ def test_prepare_generation_messages_never_depends_on_shard_id(
     assert shard_zero[0]["content"] == "Solve this"
 
 
+def test_prepare_generation_messages_reads_explicit_raw_json_parquet_row(
+    query_module: ModuleType,
+) -> None:
+    raw = {"messages": [{"role": "user", "content": "Pinned prompt"}]}
+
+    prepared = query_module.prepare_generation_messages(
+        {"raw_json": json.dumps(raw)}, "on", shard_id=0
+    )
+
+    assert prepared == raw["messages"]
+
+
 def test_thinking_off_adds_no_think_without_mutating_source(
     query_module: ModuleType,
 ) -> None:

@@ -63,6 +63,11 @@ def prepare_generation_messages(
     reject_tool_trajectories: bool = False,
 ) -> list[dict[str, Any]]:
     del shard_id
+    if set(row) == {"raw_json"}:
+        decoded = json.loads(row["raw_json"])
+        if not isinstance(decoded, dict):
+            raise ValueError("raw_json dataset row must contain an object")
+        row = decoded
     messages = row.get("messages") or row.get("conversations")
     if messages is None:
         raise ValueError(
