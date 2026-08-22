@@ -43,6 +43,7 @@ class BaselineAudit:
     split_rows: dict[str, int]
     files: tuple[SourceFile, ...]
     prompt_uuids: tuple[str, ...]
+    duplicate_uuid_multiplicity: dict[str, int]
 
 
 EXPECTED_BASELINE = BaselineExpectation(
@@ -86,7 +87,7 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
         raise AuditError(f"shard count mismatch: {len(links)} != {expected.shard_count}")
     files: list[SourceFile] = []
     splits: Counter[str] = Counter()
-    uuids: set[str] = set()
+    uuid_counts: Counter[str] = Counter()
     for link in links:
         try:
             resolved = link.resolve(strict=True)
@@ -106,15 +107,21 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
                 messages = _prompt_messages(_decode(row[message_column]))
                 tools = _decode(row.get("tools")) if row.get("tools") is not None else None
                 uuid = prompt_uuid(messages, tools)
-                if uuid in uuids:
-                    raise AuditError(f"duplicate UUID: {uuid}")
-                uuids.add(uuid)
+                uuid_counts[uuid] += 1
     actual = dict(sorted(splits.items()))
     wanted = {key: value for key, value in sorted(expected.split_rows.items()) if value}
     if actual != wanted:
         raise AuditError(f"histogram mismatch: {actual} != {wanted}")
+    duplicates = {uuid: count for uuid, count in sorted(uuid_counts.items()) if count > 1}
+    if len(uuid_counts) + sum(count - 1 for count in duplicates.values()) != sum(actual.values()):
+        raise AuditError("UUID occurrence reconciliation mismatch")
     return BaselineAudit(
-        expected.source_revision, sum(actual.values()), actual, tuple(files), tuple(sorted(uuids))
+        expected.source_revision,
+        sum(actual.values()),
+        actual,
+        tuple(files),
+        tuple(sorted(uuid_counts)),
+        duplicates,
     )
 
 

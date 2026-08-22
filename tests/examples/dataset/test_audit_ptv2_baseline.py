@@ -51,7 +51,7 @@ def test_audit_resolves_hashes_counts_and_unique_canonical_uuids(tmp_path: Path)
     assert len(audit.files) == 2
 
 
-def test_audit_fails_closed_on_histogram_or_duplicate_uuid(tmp_path: Path) -> None:
+def test_audit_preserves_duplicate_occurrences_and_unique_exclusion_set(tmp_path: Path) -> None:
     module = _load()
     root = tmp_path / "data"
     root.mkdir()
@@ -60,8 +60,15 @@ def test_audit_fails_closed_on_histogram_or_duplicate_uuid(tmp_path: Path) -> No
     expected = module.BaselineExpectation(
         "5c89e01dd720ae0f4058445ed49c5fb68a03c76e", 2, {"chat": 1, "math": 1}
     )
-    with pytest.raises(module.AuditError, match="duplicate UUID"):
-        module.audit_baseline(root, expected)
+    audit = module.audit_baseline(root, expected)
+    assert audit.row_count == 2
+    assert len(audit.prompt_uuids) == 1
+    assert audit.duplicate_uuid_multiplicity == {audit.prompt_uuids[0]: 2}
+    assert (
+        len(audit.prompt_uuids)
+        + sum(count - 1 for count in audit.duplicate_uuid_multiplicity.values())
+        == audit.row_count
+    )
 
 
 def test_audit_reads_top_level_nested_conversations_column(tmp_path: Path) -> None:
@@ -111,5 +118,18 @@ def test_audit_uuid_excludes_source_assistant_completion(tmp_path: Path) -> None
     expected = module.BaselineExpectation(
         "5c89e01dd720ae0f4058445ed49c5fb68a03c76e", 1, {"chat": 2}
     )
-    with pytest.raises(module.AuditError, match="duplicate UUID"):
+    audit = module.audit_baseline(root, expected)
+    assert len(audit.prompt_uuids) == 1
+    assert audit.duplicate_uuid_multiplicity == {audit.prompt_uuids[0]: 2}
+
+
+def test_audit_still_fails_closed_on_histogram_mismatch(tmp_path: Path) -> None:
+    module = _load()
+    root = tmp_path / "data"
+    root.mkdir()
+    _shard(root, "chat-0.parquet", ["one"])
+    expected = module.BaselineExpectation(
+        "5c89e01dd720ae0f4058445ed49c5fb68a03c76e", 1, {"chat": 2}
+    )
+    with pytest.raises(module.AuditError, match="histogram mismatch"):
         module.audit_baseline(root, expected)
