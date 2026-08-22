@@ -11,6 +11,7 @@ import heapq
 import json
 import os
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -126,7 +127,15 @@ def _tokenize_with_assistant_mask(
             tokenize=True,
             add_generation_prompt=generation_prompt,
         )
-        if not isinstance(encoded, list) or any(not isinstance(value, int) for value in encoded):
+        if isinstance(encoded, Mapping):
+            encoded = encoded.get("input_ids")
+        if hasattr(encoded, "tolist"):
+            encoded = encoded.tolist()
+        if isinstance(encoded, list) and len(encoded) == 1 and isinstance(encoded[0], list):
+            encoded = encoded[0]
+        if not isinstance(encoded, list) or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in encoded
+        ):
             raise ValueError("tokenizer did not return input IDs")
         return encoded
 

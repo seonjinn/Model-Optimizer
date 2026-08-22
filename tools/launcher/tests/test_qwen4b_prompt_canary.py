@@ -70,11 +70,11 @@ def test_trace_tokenization_preserves_tools_and_assistant_loss_mask() -> None:
             assert kwargs["tools"] == [{"type": "function", "function": {"name": "shell"}}]
             roles = [message["role"] for message in messages]
             if roles == ["user", "assistant", "tool"]:
-                return [1, 2, 3, 4, 5, 6]
+                return {"input_ids": [[1, 2, 3, 4, 5, 6]]}
             if roles == ["user"] and kwargs["add_generation_prompt"] is True:
-                return [1, 2]
+                return {"input_ids": [1, 2]}
             if roles == ["user", "assistant"]:
-                return [1, 2, 3, 4]
+                return {"input_ids": [1, 2, 3, 4]}
             raise AssertionError((roles, kwargs))
 
     row = {
