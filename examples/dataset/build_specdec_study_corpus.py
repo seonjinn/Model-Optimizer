@@ -281,6 +281,86 @@ def token_totals_by(rows: Iterable[dict[str, Any]], key: str) -> dict[str, int]:
     return dict(sorted(totals.items()))
 
 
+def select_ptv23_arm(
+    candidates: list[dict[str, Any]],
+    *,
+    config: dict[str, Any],
+    arm: str,
+    target_assistant_tokens: int,
+    prior_prompt_ids: set[str] | None = None,
+    held_out_prompt_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Select exact assistant-loss-token B/C/D domain and replay-lane quotas."""
+    if arm not in {"B", "C", "D"}:
+        raise ValueError(f"unknown arm {arm!r}")
+    exclusions = (prior_prompt_ids or set()) | (held_out_prompt_ids or set())
+    seen: set[str] = set()
+    eligible = []
+    for row in candidates:
+        prompt_id = str(row["prompt_id"])
+        if prompt_id in seen:
+            raise ValueError(f"duplicate prompt_id {prompt_id}")
+        seen.add(prompt_id)
+        if prompt_id in exclusions:
+            continue
+        if arm == "B":
+            if row["pool"] != "ptv2":
+                continue
+            if row.get("language") == "de":
+                continue
+            if row["category"] == "swe":
+                continue
+        eligible.append(row)
+
+    weights = config["b_domains" if arm == "B" else "cd_domains"]
+    domain_targets = _integer_targets(target_assistant_tokens, weights)
+    seed = int(config["seed"])
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+
+    for domain, target in domain_targets.items():
+        if domain == "swe":
+            lanes = config["c_swe_lanes" if arm == "C" else "d_swe_lanes"]
+            lane_targets = {
+                lane: int(target_assistant_tokens * float(weight)) for lane, weight in lanes.items()
+            }
+            if sum(lane_targets.values()) != target:
+                raise ValueError("SWE lane quotas do not reconcile with the top-level quota")
+        else:
+            lane_targets = {"target-synth": target}
+        for lane, lane_target in lane_targets.items():
+            available = [
+                row
+                for row in eligible
+                if row["category"] == domain and row.get("lane", "target-synth") == lane
+            ]
+            available.sort(
+                key=lambda row: hashlib.sha256(
+                    "\0".join(
+                        (
+                            arm,
+                            domain,
+                            str(row["context_bucket"]),
+                            str(row["source_id"]),
+                            str(row["prompt_id"]),
+                            str(seed),
+                        )
+                    ).encode()
+                ).hexdigest()
+            )
+            lane_selected: list[dict[str, Any]] = []
+            actual = _take_until_tokens(
+                available,
+                target_tokens=lane_target,
+                selected_ids=selected_ids,
+                selected=lane_selected,
+            )
+            if actual != lane_target:
+                raise ValueError(f"quota shortfall for {domain}/{lane}: {actual} < {lane_target}")
+            selected.extend(lane_selected)
+    return selected
+
+
 def build_arm_manifest(
     selected: list[dict[str, Any]],
     *,

@@ -1,0 +1,13 @@
+schema_version: 1
+seed: 20260822
+training_seq_len: 4096
+maximum_full_context: 32768
+tokenizer_sha256: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+context_buckets: [le4k, 4k_16k, 16k_32k]
+b_domains: {math: 0.25, code: 0.25, stem: 0.20, chat: 0.20, multilingual: 0.10}
+cd_domains: {swe: 0.35, math: 0.25, code: 0.15, stem: 0.15, chat: 0.05, multilingual: 0.05}
+c_swe_lanes: {agentless-swe: 0.35}
+d_swe_lanes: {agentless-swe: 0.15, interactive-swe-replay: 0.10, generic-tool-replay: 0.10}
+ptv2_languages:
+  allow: [en, ja, es, fr, it]
+  deny: [de]

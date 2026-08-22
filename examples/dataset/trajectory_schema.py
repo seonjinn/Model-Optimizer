@@ -11,13 +11,25 @@ from copy import deepcopy
 from typing import Any
 
 
-def _canonical_tool_call(call: dict[str, Any], source_id: str) -> dict[str, Any]:
+def _canonical_tool_call(
+    call: dict[str, Any], source_id: str, declared_functions: set[str]
+) -> dict[str, Any]:
     call_id = str(call.get("id") or call.get("tool_call_id") or "")
     if not call_id:
         raise ValueError(f"{source_id}: assistant tool call has no ID")
     function = call.get("function")
     if not isinstance(function, dict) or not function.get("name"):
         raise ValueError(f"{source_id}: tool call {call_id} has no function name")
+    name = str(function["name"])
+    if name not in declared_functions:
+        raise ValueError(f"{source_id}: undeclared function {name}")
+    arguments = function.get("arguments", "{}")
+    if not isinstance(arguments, str):
+        raise ValueError(f"{source_id}: malformed arguments for {call_id}")
+    try:
+        json.loads(arguments)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{source_id}: malformed arguments for {call_id}") from error
     return {
         "id": call_id,
         "type": str(call.get("type") or "function"),
@@ -31,6 +43,13 @@ def canonicalize_trajectory(example: dict[str, Any], *, source_id: str) -> dict[
         raise ValueError(f"{source_id}: trajectory has no messages")
 
     tools = deepcopy(example.get("tools") or [])
+    declared_functions = {
+        str(tool["function"]["name"])
+        for tool in tools
+        if isinstance(tool, dict)
+        and isinstance(tool.get("function"), dict)
+        and tool["function"].get("name")
+    }
     normalized: list[dict[str, Any]] = []
     pending: set[str] = set()
     seen_calls: set[str] = set()
@@ -62,7 +81,8 @@ def canonicalize_trajectory(example: dict[str, Any], *, source_id: str) -> dict[
             if "reasoning_content" in original:
                 message["reasoning_content"] = original.get("reasoning_content") or ""
             calls = [
-                _canonical_tool_call(call, source_id) for call in (original.get("tool_calls") or [])
+                _canonical_tool_call(call, source_id, declared_functions)
+                for call in (original.get("tool_calls") or [])
             ]
             for call in calls:
                 call_id = call["id"]

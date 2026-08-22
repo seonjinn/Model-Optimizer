@@ -119,6 +119,19 @@ def test_duplicate_tool_call_id_is_rejected() -> None:
         module.canonicalize_trajectory(row, source_id="swe-v1:train:11")
 
 
+def test_undeclared_function_and_malformed_arguments_are_rejected() -> None:
+    module = _load_module()
+    undeclared = _trajectory()
+    undeclared["messages"][2]["tool_calls"][0]["function"]["name"] = "python"
+    with pytest.raises(ValueError, match="undeclared function"):
+        module.canonicalize_trajectory(undeclared, source_id="trace:12")
+
+    malformed = _trajectory()
+    malformed["messages"][2]["tool_calls"][0]["function"]["arguments"] = "{"
+    with pytest.raises(ValueError, match="malformed arguments"):
+        module.canonicalize_trajectory(malformed, source_id="trace:13")
+
+
 def test_digest_is_independent_of_input_mapping_order() -> None:
     module = _load_module()
     row = _trajectory()
