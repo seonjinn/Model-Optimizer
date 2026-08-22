@@ -164,4 +164,5 @@ def test_subset_submitter_requests_the_profile_gpu_node_contract() -> None:
     ).read_text()
 
     assert "--gpus-per-node=4" in submitter
+    assert '--time="$WALLTIME"' in submitter
     assert "sbatch --test-only" in submitter

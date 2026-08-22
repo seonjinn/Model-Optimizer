@@ -71,6 +71,7 @@ if not output.is_relative_to(profile.durable_root):
     raise ValueError("output root must be under profile durable root")
 print(profile.account)
 print(profile.partition)
+print(profile.walltime)
 print(plan_path)
 print(plan["plan_sha256"])
 print(plan["container"]["path"])
@@ -79,16 +80,17 @@ print(readiness_path)
 print(Path(sys.argv[1]).resolve())
 PY
 )
-(( ${#identity[@]} == 8 )) || { echo "invalid staging identity" >&2; exit 2; }
+(( ${#identity[@]} == 9 )) || { echo "invalid staging identity" >&2; exit 2; }
 
 ACCOUNT="${identity[0]}"
 PARTITION="${identity[1]}"
-PLAN="${identity[2]}"
-PLAN_SHA256="${identity[3]}"
-IMAGE="${identity[4]}"
-IMAGE_SHA256="${identity[5]}"
-READINESS="${identity[6]}"
-PROFILE="${identity[7]}"
+WALLTIME="${identity[2]}"
+PLAN="${identity[3]}"
+PLAN_SHA256="${identity[4]}"
+IMAGE="${identity[5]}"
+IMAGE_SHA256="${identity[6]}"
+READINESS="${identity[7]}"
+PROFILE="${identity[8]}"
 REPO_ROOT="$(git -C "$LAUNCHER_ROOT" rev-parse --show-toplevel)"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 [[ -z "$(git -C "$REPO_ROOT" status --porcelain)" ]] || { echo "source checkout is dirty" >&2; exit 2; }
@@ -100,7 +102,7 @@ mkdir -p "$LOG_DIR"
 export_values="ALL,REPO_ROOT=$REPO_ROOT,SOURCE_COMMIT=$SOURCE_COMMIT,PROFILE=$PROFILE,PROFILE_SHA256=$PROFILE_SHA256,PLAN_PATH=$PLAN,PLAN_SHA256=$PLAN_SHA256,IMAGE=$IMAGE,IMAGE_SHA256=$IMAGE_SHA256,OUTPUT_ROOT=$OUTPUT_ROOT,READINESS_RECEIPT=$READINESS,READINESS_RECEIPT_SHA256=$READINESS_SHA256"
 args=(
     --account="$ACCOUNT" --partition="$PARTITION" --job-name=qwen4b-ptv3-stage
-    --nodes=1 --ntasks=1 --gpus-per-node=4 --cpus-per-task=16 --mem=128G --time=08:00:00
+    --nodes=1 --ntasks=1 --gpus-per-node=4 --cpus-per-task=16 --mem=128G --time="$WALLTIME"
     --output="$LOG_DIR/%x-%j.out" --error="$LOG_DIR/%x-%j.err"
     --export="$export_values"
 )
