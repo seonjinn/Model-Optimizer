@@ -114,5 +114,26 @@ def test_prompt_canary_runner_is_hash_bound_and_uses_compute() -> None:
     assert "#SBATCH --gpus-per-node=4" in runner
     assert "SOURCE_MANIFEST_SHA256" in runner
     assert "TOKENIZER_SHA256" in runner
+    assert "RUNTIME_ARCHIVE_SHA256" in runner
+    assert 'tar --extract --file="$RUNTIME_ARCHIVE"' in runner
+    assert 'export VIRTUAL_ENV="$JOB_ROOT/runtime"' in runner
     assert 'git -C "$SOURCE_PATH" rev-parse HEAD' in runner
     assert "srun --nodes=1" in runner
+
+
+def test_synthesis_canary_wrapper_binds_both_lanes_and_mode() -> None:
+    """Dependent synthesis binds prompts, traces, tokenizer, and explicit mode."""
+    wrapper = (
+        Path(__file__).resolve().parents[1] / "common/specdec/run_qwen4b_synthesis_canary.sbatch"
+    ).read_text()
+
+    assert 'THINKING_MODE" == on || "$THINKING_MODE" == off' in wrapper
+    assert "PROMPT_ROOT/target-synth/MANIFEST.json" in wrapper
+    assert "PROMPT_ROOT/trace-replay/MANIFEST.json" in wrapper
+    assert "verify_data_manifest(prompt_manifest" in wrapper
+    assert "verify_data_manifest(trace_manifest" in wrapper
+    assert "num_shards=8" in wrapper
+    assert (
+        'exec bash "$SOURCE_PATH/tools/launcher/common/specdec/run_qwen4b_synthesis.sbatch"'
+        in wrapper
+    )
