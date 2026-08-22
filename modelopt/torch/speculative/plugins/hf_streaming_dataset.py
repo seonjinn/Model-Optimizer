@@ -330,6 +330,41 @@ class StreamingDataset(Dataset):
         right-truncation to ``max_seq_len`` drops the entire supervised span
         (``answer_only_loss`` mode with the assistant turn at the tail).
         """
+        has_token_ids = "input_ids" in entry or "token_ids" in entry
+        has_loss_mask = "loss_mask" in entry
+        if has_token_ids or has_loss_mask:
+            token_ids = entry.get("input_ids", entry.get("token_ids"))
+            raw_mask = entry.get("loss_mask")
+            if (
+                not isinstance(token_ids, list)
+                or not token_ids
+                or not all(isinstance(token, int) and not isinstance(token, bool) for token in token_ids)
+                or not isinstance(raw_mask, list)
+                or len(raw_mask) != len(token_ids)
+                or any(value not in (0, 1) for value in raw_mask)
+            ):
+                raise ValueError(
+                    "pretokenized entry requires equal non-empty input_ids/token_ids and "
+                    "binary loss_mask lists"
+                )
+            if self.config.max_seq_len is not None:
+                token_ids = token_ids[: self.config.max_seq_len]
+                raw_mask = raw_mask[: self.config.max_seq_len]
+            loss_mask = torch.tensor(raw_mask, dtype=torch.long)
+            if int(loss_mask.sum()) == 0:
+                return None
+            cid = (
+                entry.get("primary_id")
+                or entry.get("conversation_id")
+                or entry.get("uuid")
+            )
+            if cid is None:
+                payload = json.dumps(
+                    [token_ids, raw_mask], ensure_ascii=False, separators=(",", ":")
+                )
+                cid = hashlib.sha256(payload.encode()).hexdigest()
+            return {"cid": str(cid), "token_ids": token_ids, "loss_mask": loss_mask}
+
         normalized = normalize_streaming_entry(entry)
         if normalized is None:
             return None

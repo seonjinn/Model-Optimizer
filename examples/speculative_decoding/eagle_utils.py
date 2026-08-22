@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import inspect
+import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,6 +31,10 @@ from scripts.ar_validate import validate_ar
 from transformers import Trainer, TrainerCallback
 
 import modelopt
+from modelopt.torch.speculative.assistant_token_budget import (
+    AssistantTokenBudgetController,
+    local_token_allowance,
+)
 from modelopt.torch.speculative.eagle.utils import (
     EagleOfflineDataCollator,
     OfflineSupervisedDataset,
@@ -181,6 +187,90 @@ class EagleTrainerWithAccLog(Trainer):
     ):
         super().__init__(*args, **kwargs)
         self.lora_lr_multiplier = lora_lr_multiplier
+        self.assistant_token_budget: AssistantTokenBudgetController | None = None
+        token_target = os.environ.get("MODELOPT_ASSISTANT_TOKEN_TARGET")
+        if token_target is not None:
+            fingerprint = os.environ.get("TRAINING_FINGERPRINT", "")
+            self.assistant_token_budget = AssistantTokenBudgetController(
+                target=int(token_target), training_fingerprint=fingerprint
+            )
+            self.add_callback(
+                _AssistantTokenBudgetCallback(self.assistant_token_budget, log_metrics=self.log)
+            )
+
+    def _apply_assistant_token_budget(self, inputs: dict) -> dict:
+        controller = self.assistant_token_budget
+        if controller is None or not self.model.training:
+            return inputs
+        loss_mask = inputs.get("loss_mask")
+        if not isinstance(loss_mask, torch.Tensor):
+            raise ValueError("exact assistant-token training requires a tensor loss_mask")
+        local_count = int(loss_mask.sum().item())
+        count_tensor = torch.tensor(
+            [local_count, controller.remaining], dtype=torch.long, device=loss_mask.device
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered = [
+                torch.zeros_like(count_tensor) for _ in range(torch.distributed.get_world_size())
+            ]
+            torch.distributed.all_gather(gathered, count_tensor)
+            counts = [int(value[0].item()) for value in gathered]
+            remaining_by_rank = [int(value[1].item()) for value in gathered]
+            if len(set(remaining_by_rank)) != 1:
+                raise RuntimeError("assistant-token counters diverged across trainer ranks")
+            rank = torch.distributed.get_rank()
+        else:
+            counts = [local_count]
+            rank = 0
+        allowance = local_token_allowance(counts, rank=rank, remaining=controller.remaining)
+        if allowance < local_count:
+            loss_mask = loss_mask.clone()
+            flat = loss_mask.reshape(-1)
+            active = torch.nonzero(flat, as_tuple=False).reshape(-1)
+            flat[active[allowance:]] = 0
+            inputs = dict(inputs)
+            inputs["loss_mask"] = loss_mask
+        controller.record_microbatch(min(sum(counts), controller.remaining))
+        return inputs
+
+    def train(self, *args, **kwargs):
+        """Restore and enforce exact assistant-token state around Trainer.train."""
+        controller = self.assistant_token_budget
+        resume = kwargs.get("resume_from_checkpoint")
+        if controller is not None and resume:
+            if not isinstance(resume, (str, os.PathLike)):
+                raise ValueError("exact assistant-token resume requires an explicit checkpoint")
+            checkpoint = Path(resume)
+            trainer_state = json.loads((checkpoint / "trainer_state.json").read_text())
+            controller.load_checkpoint(
+                checkpoint / "assistant-token-state.json",
+                expected_global_step=int(trainer_state["global_step"]),
+            )
+            if controller.reached_target:
+                raise RuntimeError(
+                    "assistant-token target is already complete; reuse its milestone receipt"
+                )
+        result = super().train(*args, **kwargs)
+        if controller is not None and not controller.reached_target:
+            raise RuntimeError(
+                f"training stopped at {controller.committed} assistant tokens before "
+                f"the exact target {controller.target}"
+            )
+        return result
+
+    def _save_checkpoint(self, *args, **kwargs):
+        """Bind committed assistant-token state to every resumable checkpoint."""
+        result = super()._save_checkpoint(*args, **kwargs)
+        controller = self.assistant_token_budget
+        if controller is not None and self.is_world_process_zero():
+            checkpoint = Path(self.args.output_dir) / f"checkpoint-{self.state.global_step}"
+            path = checkpoint / "assistant-token-state.json"
+            temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+            temporary.write_text(json.dumps(controller.state_dict(), sort_keys=True) + "\n")
+            os.replace(temporary, path)
+        if controller is not None:
+            self.accelerator.wait_for_everyone()
+        return result
 
     def create_optimizer(self):
         """Override to give LoRA parameters a higher learning rate."""
@@ -212,8 +302,15 @@ class EagleTrainerWithAccLog(Trainer):
             self.state.training_accs = []
         if not hasattr(self.state, "component_losses"):
             self.state.component_losses = {"eagle": [], "preservation": []}
+        positional = list(args)
+        if len(positional) >= 2:
+            positional[1] = self._apply_assistant_token_budget(positional[1])
+        elif "inputs" in kwargs:
+            kwargs["inputs"] = self._apply_assistant_token_budget(kwargs["inputs"])
+        else:
+            raise TypeError("compute_loss requires model and inputs")
         kwargs.pop("num_items_in_batch", None)
-        loss, outputs = super().compute_loss(return_outputs=True, *args, **kwargs)
+        loss, outputs = super().compute_loss(return_outputs=True, *positional, **kwargs)
         if hasattr(outputs, "train_acc") and any(outputs.train_acc):
             self.state.training_accs.append(outputs.train_acc)
         # Track per-component losses
@@ -225,6 +322,33 @@ class EagleTrainerWithAccLog(Trainer):
             if val is not None:
                 self.state.component_losses[key].append(val.item())
         return loss
+
+
+class _AssistantTokenBudgetCallback(TrainerCallback):
+    """Commit accumulation windows and stop/save exactly at the token target."""
+
+    def __init__(
+        self,
+        controller: AssistantTokenBudgetController,
+        log_metrics: Callable[[dict[str, float]], None] | None = None,
+    ) -> None:
+        self.controller = controller
+        self.log_metrics = log_metrics
+
+    def on_step_end(self, args, state, control, **kwargs):
+        del args, kwargs
+        self.controller.commit_step(int(state.global_step))
+        if self.log_metrics is not None:
+            self.log_metrics(
+                {
+                    "assistant_tokens": float(self.controller.committed),
+                    "assistant_token_target": float(self.controller.target),
+                }
+            )
+        if self.controller.reached_target:
+            control.should_save = True
+            control.should_training_stop = True
+        return control
 
 
 class LoRAWarmupCallback(TrainerCallback):

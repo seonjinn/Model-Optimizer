@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen3-4B Hybrid Drafter Dataset Study</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b0d10; --panel:#15191f; --line:#2c333d; --text:#edf2f7; --muted:#9ca8b7; --green:#76b900; --amber:#ffb547; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:15px/1.55 system-ui,sans-serif; background:var(--bg); color:var(--text); }
+    main { max-width:1120px; margin:auto; padding:48px 24px 72px; }
+    h1 { font-size:clamp(2rem,5vw,3.5rem); line-height:1.05; margin:.2em 0; }
+    h2 { margin-top:42px; }
+    .eyebrow { color:var(--green); text-transform:uppercase; letter-spacing:.12em; font-weight:700; }
+    .status { display:inline-block; padding:6px 10px; border:1px solid var(--amber); color:var(--amber); border-radius:999px; font-weight:700; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:16px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:20px; }
+    .mix { font-size:1.1rem; font-weight:700; }
+    table { width:100%; border-collapse:collapse; background:var(--panel); }
+    th,td { text-align:left; padding:12px; border-bottom:1px solid var(--line); vertical-align:top; }
+    th { color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.08em; }
+    code { color:#c8ef8f; }
+    .muted { color:var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">ModelOpt speculative decoding study</div>
+  <h1>Qwen3-4B hybrid-thinking data construction</h1>
+  <p class="status">PLANNED — no benchmark result yet</p>
+  <p>This page records the immutable study design before jobs run. It will be updated from corpus manifests, Slurm receipts, W&amp;B runs, and evaluator CSVs; planned cells are never displayed as measured results.</p>
+
+  <h2>Controlled comparison</h2>
+  <div class="grid">
+    <section class="card"><div class="eyebrow">Arm B</div><div class="mix">Balanced PTV2</div><p>100% balanced PTV2 target-synthesized with the exact Qwen3-4B target.</p></section>
+    <section class="card"><div class="eyebrow">Arm C</div><div class="mix">75% PTV2 / 25% PTV3</div><p>General post-training coverage plus a bounded SWE, agentic/tool, code, math, and reasoning continuation.</p></section>
+    <section class="card"><div class="eyebrow">Arm D</div><div class="mix">50% PTV2 / 50% PTV3</div><p>SWE-heavy alternative used to measure the trade-off against broad math and general acceptance.</p></section>
+  </div>
+
+  <h2>Fixed training contract</h2>
+  <table>
+    <tr><th>Target</th><td>Qwen/Qwen3-4B, exact revision pinned in each manifest</td></tr>
+    <tr><th>Response regime</th><td>Thinking ON for the primary B/C/D screen; Thinking OFF is a separate transfer check</td></tr>
+    <tr><th>Exposure</th><td>256M assistant tokens per arm, with realized unique tokens and overshoot recorded</td></tr>
+    <tr><th>Drafter</th><td>DFlash B8 first; DSpark B8 confirms whether the dataset ranking transfers across methods</td></tr>
+    <tr><th>Topology</th><td>2 GB200 nodes: 4×TP1 target replicas + 4 DDP trainer ranks; GBS128</td></tr>
+    <tr><th>Milestones</th><td>20-step canary, then 64M / 128M / 256M assistant-token study boundaries</td></tr>
+  </table>
+
+  <h2>Official workflow lineage</h2>
+  <p>The implementation follows NVIDIA ModelOpt's <code>examples/dataset</code> workflow: <code>make_nemotron_ptv2_dataset.py</code>, <code>make_nemotron_ptv3_dataset.py</code>, <code>nemotron_ptv3_datasets.yaml</code>, <code>conversation_utils.py</code>, and <code>query.py</code>. Extensions make thinking mode explicit, sample by assistant-token quota instead of lexical row prefixes, preserve tool schemas and call/result IDs, and separate target synthesis from trace replay.</p>
+
+  <h2>Decision gate</h2>
+  <p>Selection uses acceptance length/rate and end-to-end speed at concurrency 1/8/32, split by SPEED category, math/code, held-out SWE/tool traces, and context buckets ≤4K, 4–16K, and 16–32K. Correctness scores must remain target-equivalent because speculative decoding is lossless. Arm C/D must improve SWE acceptance without a material math or general-category regression.</p>
+  <p class="muted">Last design update: 2026-08-22. Jobs and results will be populated only after signed-source, asset, scheduler test-only, and 20-step canary gates pass.</p>
+</main>
+</body>
+</html>

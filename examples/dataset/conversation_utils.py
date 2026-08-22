@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from trajectory_schema import normalize_trajectory_for_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,14 @@ def normalize_messages(example: dict[str, Any], idx: int) -> dict[str, Any]:
     Prompt-only rows (no assistant turn) are returned with their messages intact;
     callers should filter them out for training use.
     """
+    has_structured_tools = bool(example.get("tools")) or any(
+        message.get("role") == "tool" or message.get("tool_calls")
+        for message in example["messages"]
+    )
+    if has_structured_tools:
+        source_id = str(example.get("conversation_id") or example.get("uuid") or f"row-{idx}")
+        return normalize_trajectory_for_dataset(example, source_id=source_id)
+
     normalized = []
     for m in example["messages"]:
         role = m.get("role")

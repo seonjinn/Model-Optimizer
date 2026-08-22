@@ -1,0 +1,37 @@
+schema_version: 1
+seed: 42
+training_seq_len: 4096
+context_buckets:
+  - le4k
+  - 4k_16k
+  - 16k_32k
+maximum_epochs: 2
+minimum_prompts_per_category: 2000
+minimum_prompts_per_populated_cell: 500
+arms:
+  B:
+    ptv2: 1.0
+    ptv3: 0.0
+  C:
+    ptv2: 0.75
+    ptv3: 0.25
+  D:
+    ptv2: 0.5
+    ptv3: 0.5
+pools:
+  ptv2:
+    categories:
+      math: 0.25
+      code: 0.25
+      stem: 0.20
+      chat_instruction: 0.20
+      multilingual: 0.10
+  ptv3:
+    categories:
+      swe: 0.20
+      agentic_tool: 0.25
+      code: 0.15
+      math: 0.20
+      science_reasoning: 0.10
+      chat_instruction: 0.05
+      multilingual: 0.05

@@ -87,6 +87,46 @@ def test_normalize_openperfectblend_entry_has_stable_id_and_roles():
     ]
 
 
+def test_pretokenized_entry_preserves_exact_loss_mask_without_retokenizing():
+    tokenizer = MagicMock()
+    ds = StreamingDataset(
+        [{"primary_id": "swe-7", "input_ids": [10, 11, 12, 13], "loss_mask": [0, 0, 1, 1]}],
+        tokenizer=tokenizer,
+        config=StreamingConfig(answer_only_loss=True, max_seq_len=3),
+    )
+
+    sample = ds._tokenize_entry(ds.entries[0])
+
+    assert sample is not None
+    assert sample["cid"] == "swe-7"
+    assert sample["token_ids"] == [10, 11, 12]
+    assert sample["loss_mask"].tolist() == [0, 0, 1]
+    tokenizer.apply_chat_template.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"input_ids": [1, 2], "loss_mask": [1]},
+        {"input_ids": [1, 2]},
+        {"loss_mask": [0, 1]},
+        {"input_ids": [1, 2], "loss_mask": [0, 2]},
+    ],
+)
+def test_invalid_pretokenized_entry_fails_loudly(entry):
+    ds = StreamingDataset([entry], tokenizer=MagicMock(), config=StreamingConfig())
+
+    with pytest.raises(ValueError, match="pretokenized"):
+        ds._tokenize_entry(entry)
+
+
+def test_pretokenized_entry_with_truncated_zero_supervision_is_skipped():
+    entry = {"input_ids": [1, 2, 3], "loss_mask": [0, 0, 1]}
+    ds = StreamingDataset([entry], tokenizer=MagicMock(), config=StreamingConfig(max_seq_len=2))
+
+    assert ds._tokenize_entry(entry) is None
+
+
 def test_empty_corpus_raises():
     with pytest.raises(ValueError, match="entries is empty"):
         StreamingDataset([], tokenizer=MagicMock(), config=StreamingConfig())

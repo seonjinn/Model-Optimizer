@@ -11,6 +11,7 @@ DRAFTER_REQUEUE_STEP_PID=""
 drafter_latest_complete_checkpoint() {
     python3 - "$1" "${2:-}" "${EXPECTED_RNG_STATES:-8}" "${3:-}" <<'PY'
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -19,6 +20,9 @@ output_root = Path(sys.argv[1])
 quarantine_root = Path(sys.argv[2]) if sys.argv[2] else None
 expected_rng_states = int(sys.argv[3])
 maximum_step = int(sys.argv[4]) if sys.argv[4] else None
+assistant_token_target = os.environ.get("MODELOPT_ASSISTANT_TOKEN_TARGET")
+assistant_token_target = int(assistant_token_target) if assistant_token_target else None
+training_fingerprint = os.environ.get("TRAINING_FINGERPRINT", "")
 weight_names = (
     "model.safetensors",
     "model.safetensors.index.json",
@@ -43,6 +47,21 @@ for directory_step, checkpoint in sorted(candidates, reverse=True):
         continue
     if global_step != directory_step:
         continue
+    if assistant_token_target is not None:
+        try:
+            token_state = json.loads(
+                (checkpoint / "assistant-token-state.json").read_text()
+            )
+            committed_tokens = int(token_state["committed_assistant_tokens"])
+        except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            token_state.get("schema_version") != 1
+            or token_state.get("training_fingerprint") != training_fingerprint
+            or int(token_state.get("global_step", -1)) != global_step
+            or not 0 <= committed_tokens <= assistant_token_target
+        ):
+            continue
     if not (checkpoint / "optimizer.pt").is_file() or (checkpoint / "optimizer.pt").stat().st_size == 0:
         continue
     if not (checkpoint / "scheduler.pt").is_file() or (checkpoint / "scheduler.pt").stat().st_size == 0:
@@ -69,12 +88,15 @@ PY
 drafter_completed_training_artifact() {
     python3 - "$OUTPUT_ROOT" "$EXPORT_PATH" "$MAX_STEPS" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
 output_root = Path(sys.argv[1])
 export_path = Path(sys.argv[2])
 target_step = int(sys.argv[3])
+assistant_token_target = os.environ.get("MODELOPT_ASSISTANT_TOKEN_TARGET")
+assistant_token_target = int(assistant_token_target) if assistant_token_target else None
 weight_names = (
     "model.safetensors",
     "model.safetensors.index.json",
@@ -86,8 +108,23 @@ try:
     global_step = int(state["global_step"])
 except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
-if global_step < target_step:
-    raise SystemExit(1)
+if assistant_token_target is None:
+    if global_step < target_step:
+        raise SystemExit(1)
+else:
+    if global_step > target_step:
+        raise SystemExit(1)
+    try:
+        token_state = json.loads(
+            (output_root / f"checkpoint-{global_step}" / "assistant-token-state.json").read_text()
+        )
+    except (FileNotFoundError, json.JSONDecodeError):
+        raise SystemExit(1)
+    if (
+        token_state.get("committed_assistant_tokens") != assistant_token_target
+        or token_state.get("global_step") != global_step
+    ):
+        raise SystemExit(1)
 for directory in (output_root, export_path):
     if not any((directory / name).is_file() and (directory / name).stat().st_size > 0 for name in weight_names):
         raise SystemExit(1)
@@ -121,15 +158,19 @@ export_path = Path(sys.argv[2])
 target_step = int(sys.argv[3])
 checkpoint = Path(sys.argv[4])
 checkpoint_step = int(sys.argv[5])
+assistant_token_target = os.environ.get("MODELOPT_ASSISTANT_TOKEN_TARGET")
+assistant_token_target = int(assistant_token_target) if assistant_token_target else None
 milestones_root = output_root / "milestones"
 milestone = milestones_root / f"step-{target_step:06d}"
 resume_name = f"resume-checkpoint-{checkpoint_step:06d}"
 manifest_base = {
     "exact_model_path": f"../../{export_path.name}",
-    "exact_model_step": target_step,
+    "exact_model_step": checkpoint_step if assistant_token_target is not None else target_step,
     "resume_checkpoint_path": resume_name,
     "resume_checkpoint_step": checkpoint_step,
 }
+if assistant_token_target is not None:
+    manifest_base["exact_assistant_tokens"] = assistant_token_target
 
 
 def sha256(path: Path) -> str:

@@ -56,6 +56,8 @@ def _start_lifecycle(
     scontrol_kills_caller: bool = False,
     milestone_steps: str = "4166,25391",
     milestone_force_copy: bool = False,
+    assistant_token_target: int | None = None,
+    training_fingerprint: str = "",
 ) -> tuple[subprocess.Popen[str], Path, Path]:
     fake_bin, calls = _write_fake_scontrol(tmp_path)
     ready = tmp_path / "ready"
@@ -91,6 +93,9 @@ def _start_lifecycle(
         "MILESTONE_STEPS": milestone_steps,
         "MILESTONE_FORCE_COPY": "1" if milestone_force_copy else "0",
     }
+    if assistant_token_target is not None:
+        env["MODELOPT_ASSISTANT_TOKEN_TARGET"] = str(assistant_token_target)
+        env["TRAINING_FINGERPRINT"] = training_fingerprint
     process = subprocess.Popen(
         [str(driver)],
         env=env,
@@ -293,6 +298,46 @@ def test_normal_target_completion_marks_done_without_requeue(tmp_path: Path) -> 
         "status": "completed",
         "target_step": 70,
     }
+
+
+def test_exact_token_completion_before_step_ceiling_preserves_counter_state(
+    tmp_path: Path,
+) -> None:
+    """Exact token completion may stop early and still preserves resumable state."""
+    output_root = tmp_path / "output"
+    checkpoint = _write_checkpoint(output_root, 40)
+    (checkpoint / "assistant-token-state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "training_fingerprint": "fingerprint",
+                "committed_assistant_tokens": 64,
+                "global_step": 40,
+            }
+        )
+    )
+    (output_root / "model.safetensors").write_bytes(b"final-model")
+    (output_root / "trainer_state.json").write_text(json.dumps({"global_step": 40}))
+    export_path = output_root / "exported-checkpoint-70"
+    export_path.mkdir()
+    (export_path / "model.safetensors").write_bytes(b"export")
+    process, calls, _ = _start_lifecycle(
+        tmp_path,
+        output_root,
+        target_step=70,
+        child_command="exit 0",
+        milestone_steps="70",
+        assistant_token_target=64,
+        training_fingerprint="fingerprint",
+    )
+
+    stdout, stderr = process.communicate(timeout=10)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert not calls.exists()
+    milestone = json.loads((output_root / "milestones/step-000070/manifest.json").read_text())
+    assert milestone["exact_assistant_tokens"] == 64
+    assert milestone["exact_model_step"] == 40
 
 
 def test_normal_non_divisible_target_accepts_valid_final_root(tmp_path: Path) -> None:
