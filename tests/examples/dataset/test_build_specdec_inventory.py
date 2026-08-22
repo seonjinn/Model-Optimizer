@@ -186,3 +186,32 @@ def test_tokenizer_digest_binds_exact_serialization_files(tmp_path: Path) -> Non
     assert module.tokenizer_snapshot_sha256(tmp_path) == first
     (tmp_path / "tokenizer.json").write_text('{"version":"2"}\n')
     assert module.tokenizer_snapshot_sha256(tmp_path) != first
+
+
+def test_inventory_reads_explicit_raw_json_parquet_shards(tmp_path: Path) -> None:
+    module = _load_module()
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "raw.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "raw_json": [
+                    json.dumps(
+                        {
+                            "prompt_id": "raw-1",
+                            "messages": [
+                                {"role": "user", "content": "q"},
+                                {"role": "assistant", "content": "a"},
+                            ],
+                        }
+                    )
+                ]
+            }
+        ),
+        path,
+        compression="zstd",
+    )
+
+    assert next(iter(module._iter_rows(path)))["prompt_id"] == "raw-1"

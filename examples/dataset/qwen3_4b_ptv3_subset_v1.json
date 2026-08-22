@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "name": "qwen3-4b-ptv3-subset-v1",
+  "container": {
+    "path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/vllm_openai_v0271_aarch64_20260813_2688476.sqsh",
+    "sha256": "e7be53f2754097c88f7c801da92f6d94794ec4d78d9df937fcd315a6994297f0"
+  },
+  "files": [
+    {
+      "source_id": "nvidia/Nemotron-SFT-SWE-v2",
+      "revision": "bd151f3f2d89c4804dda0083d912bd9f6a0a9fb7",
+      "license": "CC-BY-4.0; Apache-2.0; MIT; BSD-3-Clause; BSD-2-Clause",
+      "pool": "ptv3",
+      "category": "swe",
+      "response_source": "trace-replay",
+      "tool_lane": "recorded-trace",
+      "path": "data/agentless.jsonl",
+      "bytes": 6733030079,
+      "sha256": "38fac9845361fa754c7a79af90032f2d2bc4b5d3f1236411ab1c2a5750a12fe0"
+    },
+    {
+      "source_id": "nvidia/Nemotron-Agentic-v1",
+      "revision": "650d590978ca35c8f1ecea2faf136e5fac421b62",
+      "license": "CC-BY-4.0; Apache-2.0 (Glaive-derived records)",
+      "pool": "ptv3",
+      "category": "agentic_tool",
+      "response_source": "trace-replay",
+      "tool_lane": "recorded-trace",
+      "path": "data/interactive_agent.jsonl",
+      "bytes": 448570455,
+      "sha256": "dcfeda22372fa707c979cab29ddfe896b89a933f15ed4acbb4f16e7e3787d9dd"
+    },
+    {
+      "source_id": "nvidia/Nemotron-SFT-Competitive-Programming-v2",
+      "revision": "778afc98a9e027e10b3cd78020c120e93e142ef2",
+      "license": "CC-BY-4.0; ODC-By; MIT",
+      "pool": "ptv3",
+      "category": "code",
+      "response_source": "target-synth",
+      "tool_lane": "none",
+      "path": "data/exercism.jsonl",
+      "bytes": 690016972,
+      "sha256": "05172998eaa10bbeef03ccf9b03f6fb148e650b8e0cc0fbb6700b1a6321aeb87"
+    },
+    {
+      "source_id": "nvidia/Nemotron-Math-v2",
+      "revision": "8e793210e175b6406c752a870f585f62de98c0d3",
+      "license": "CC-BY-4.0; CC-BY-SA-4.0",
+      "pool": "ptv3",
+      "category": "math",
+      "response_source": "target-synth",
+      "tool_lane": "none",
+      "path": "data/low.parquet",
+      "bytes": 3119784927,
+      "sha256": "b06641733ac260a905e26a7f17ddeb0f3a39a106c5e3ff24694a0d96b1c666dc"
+    },
+    {
+      "source_id": "nvidia/Nemotron-Science-v1",
+      "revision": "82e1af468197076b4f0f392c239274eac032adc7",
+      "license": "CC-BY-4.0",
+      "pool": "ptv3",
+      "category": "science",
+      "response_source": "target-synth",
+      "tool_lane": "none",
+      "path": "data/RQA.jsonl",
+      "bytes": 816024116,
+      "sha256": "6f98940e85f7caded0142700d835fd9c625cda653ff402a5845dbb3162e1e00f"
+    },
+    {
+      "source_id": "nvidia/Nemotron-SFT-Instruction-Following-Chat-v2",
+      "revision": "1a9454ed054b8544503ab8d8c0a519d141a44c5b",
+      "license": "ODC-By",
+      "pool": "ptv3",
+      "category": "chat",
+      "response_source": "target-synth",
+      "tool_lane": "none",
+      "path": "data/reasoning_off.jsonl",
+      "bytes": 5955778329,
+      "sha256": "888aa1606f4e9ab5f8ac3fcb651654490739a02b841335d07048a9b4552aaf9d"
+    },
+    {
+      "source_id": "nvidia/Nemotron-SFT-Multilingual-v1",
+      "revision": "22c86505762a7c595abee309d720084351c9f4ba",
+      "license": "CC-BY-4.0; CC-BY-SA-4.0",
+      "pool": "ptv3",
+      "category": "multilingual",
+      "response_source": "target-synth",
+      "tool_lane": "none",
+      "path": "data/super-v3_stem_zh_translated_postedit_final.jsonl",
+      "bytes": 2857414655,
+      "sha256": "54d3cefa0025ec56ce141822309f5ba485dfca466453cf2d43b2229f06048fce"
+    }
+  ]
+}

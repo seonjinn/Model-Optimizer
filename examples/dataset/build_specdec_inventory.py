@@ -123,7 +123,8 @@ def _iter_rows(path: Path):
     if path.suffix == ".parquet":
         import pyarrow.parquet as pq
 
-        yield from pq.read_table(path).to_pylist()
+        for row in pq.read_table(path).to_pylist():
+            yield json.loads(row["raw_json"]) if set(row) == {"raw_json"} else row
         return
     with path.open(encoding="utf-8") as source:
         for line_number, line in enumerate(source, start=1):
