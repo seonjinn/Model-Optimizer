@@ -175,6 +175,8 @@ def _select_rows(
         else {"agentic_tool"}
     )
     for record in records:
+        if record["category"] not in expected_categories:
+            continue
         candidates = _bounded_candidates(root / record["path"], max(quota * 8, 64))
         accepted = 0
         for raw in candidates:
@@ -214,14 +216,10 @@ def _select_rows(
             accepted += 1
             if accepted == quota:
                 break
-        if record["category"] in expected_categories and accepted != quota:
+        if accepted != quota:
             raise ValueError(
                 f"{record['category']} yielded {accepted} valid {response_source} rows, "
                 f"need {quota}; exclusions={dict(sorted(exclusions.items()))}"
-            )
-        if record["category"] not in expected_categories and accepted:
-            raise ValueError(
-                f"{record['category']} unexpectedly entered {response_source}: {accepted} rows"
             )
     if not selected:
         raise ValueError(f"no rows selected for {response_source}")

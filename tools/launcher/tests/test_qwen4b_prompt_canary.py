@@ -16,6 +16,7 @@ from common.specdec.build_qwen4b_prompt_canary import (
     _prompt_identity,
     _prompt_view,
     _schema_mode,
+    _select_rows,
     _tokenize_with_assistant_mask,
 )
 
@@ -94,6 +95,70 @@ def test_trace_tokenization_preserves_tools_and_assistant_loss_mask() -> None:
         [1, 2, 3, 4, 5, 6],
         [0, 0, 1, 1, 0, 0],
     )
+
+
+def test_trace_selection_ignores_tool_rows_from_target_synthesis_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool-enabled math row cannot contaminate the interactive trace lane."""
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages: list[dict], **kwargs: object) -> list[int]:
+            roles = [message["role"] for message in messages]
+            if roles == ["user", "assistant", "tool"]:
+                return [1, 2, 3, 4, 5, 6]
+            if roles == ["user"] and kwargs["add_generation_prompt"] is True:
+                return [1, 2]
+            if roles == ["user", "assistant"]:
+                return [1, 2, 3, 4]
+            raise AssertionError((roles, kwargs))
+
+    trace = {
+        "tools": [{"type": "function", "function": {"name": "python"}}],
+        "messages": [
+            {"role": "user", "content": "calculate"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call-1", "function": {"name": "python"}}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "4"},
+        ],
+    }
+    records = [
+        {
+            "path": "math.parquet",
+            "category": "math",
+            "response_source": "target-synth",
+            "source_id": "math",
+            "source_revision": "r1",
+            "sha256": "math-sha",
+        },
+        {
+            "path": "agentic.parquet",
+            "category": "agentic_tool",
+            "response_source": "trace-replay",
+            "source_id": "agentic",
+            "source_revision": "r1",
+            "sha256": "agentic-sha",
+        },
+    ]
+    monkeypatch.setattr(
+        "common.specdec.build_qwen4b_prompt_canary._bounded_candidates",
+        lambda path, limit: [trace],
+    )
+
+    selected, categories, _, _ = _select_rows(
+        records,
+        root=tmp_path,
+        tokenizer=FakeTokenizer(),
+        quota=1,
+        response_source="trace-replay",
+    )
+
+    assert len(selected) == 1
+    assert categories == {"agentic_tool": 1}
+    assert selected[0]["_canary_provenance"]["source_id"] == "agentic"
 
 
 def test_parquet_schema_modes_are_explicit_and_fail_closed() -> None:
