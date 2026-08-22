@@ -160,6 +160,11 @@ def _select_rows(
     categories: Counter[str] = Counter()
     buckets: Counter[str] = Counter()
     exclusions: Counter[str] = Counter()
+    expected_categories = (
+        {"swe", "code", "math", "science", "chat", "multilingual"}
+        if response_source == "target-synth"
+        else {"agentic_tool"}
+    )
     for record in records:
         candidates = _bounded_candidates(root / record["path"], max(quota * 8, 64))
         accepted = 0
@@ -200,17 +205,17 @@ def _select_rows(
             accepted += 1
             if accepted == quota:
                 break
-        if accepted and accepted != quota:
+        if record["category"] in expected_categories and accepted != quota:
             raise ValueError(
-                f"{record['category']} yielded {accepted} valid {response_source} rows, need {quota}"
+                f"{record['category']} yielded {accepted} valid {response_source} rows, "
+                f"need {quota}; exclusions={dict(sorted(exclusions.items()))}"
+            )
+        if record["category"] not in expected_categories and accepted:
+            raise ValueError(
+                f"{record['category']} unexpectedly entered {response_source}: {accepted} rows"
             )
     if not selected:
         raise ValueError(f"no rows selected for {response_source}")
-    expected_categories = (
-        {"swe", "code", "math", "science", "chat", "multilingual"}
-        if response_source == "target-synth"
-        else {"agentic_tool"}
-    )
     if set(categories) != expected_categories or any(
         categories[category] != quota for category in expected_categories
     ):
