@@ -68,6 +68,15 @@ def _decode(value: object) -> object:
     return value
 
 
+def _prompt_messages(messages: object) -> list[dict[str, object]]:
+    if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
+        raise AuditError("messages must be a list of mappings")
+    prompt = [item for item in messages if item.get("role") in {"system", "developer", "user"}]
+    if not prompt:
+        raise AuditError("conversation has no prompt-bearing messages")
+    return prompt
+
+
 def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE) -> BaselineAudit:
     """Verify shard identity/histogram and reconstruct sorted canonical prompt UUIDs."""
     import pyarrow.parquet as pq
@@ -87,12 +96,14 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
         split = re.sub(r"-\d+(?:-of-\d+)?\.parquet$", "", link.name)
         parquet = pq.ParquetFile(resolved)
         splits[split] += parquet.metadata.num_rows
-        names = set(parquet.schema.names)
+        names = set(parquet.schema_arrow.names)
+        if "messages" not in names and "conversations" not in names:
+            raise AuditError(f"unsupported Parquet schema: {sorted(names)}")
         message_column = "messages" if "messages" in names else "conversations"
         columns = [message_column] + (["tools"] if "tools" in names else [])
         for batch in parquet.iter_batches(columns=columns, batch_size=8192):
             for row in batch.to_pylist():
-                messages = _decode(row[message_column])
+                messages = _prompt_messages(_decode(row[message_column]))
                 tools = _decode(row.get("tools")) if row.get("tools") is not None else None
                 uuid = prompt_uuid(messages, tools)
                 if uuid in uuids:
