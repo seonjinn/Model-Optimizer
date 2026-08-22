@@ -8,11 +8,15 @@
 
 set -euo pipefail
 
-for name in SOURCE_PATH SOURCE_SHA BASELINE_ROOT OUTPUT_PATH IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 SCRATCH_ROOT; do
+for name in SOURCE_PATH SOURCE_SHA BASELINE_ROOT BASELINE_SOURCE_ROOT OUTPUT_PATH IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 SCRATCH_ROOT; do
     [[ -n "${!name:-}" ]] || { echo "missing $name" >&2; exit 2; }
 done
 [[ "${SLURM_NNODES:-}" == 1 && "$BASELINE_ROOT" == /lustre/* && "$OUTPUT_PATH" == /lustre/* ]] || {
     echo "invalid audit topology or paths" >&2
+    exit 2
+}
+[[ "$BASELINE_SOURCE_ROOT" == /lustre/* && -d "$BASELINE_SOURCE_ROOT" ]] || {
+    echo "baseline source root is unavailable" >&2
     exit 2
 }
 [[ ! -e "$OUTPUT_PATH" ]] || { echo "immutable audit receipt already exists" >&2; exit 2; }
@@ -39,5 +43,5 @@ grep -IlZ "$old_venv" "$JOB_ROOT/runtime/bin"/* "$JOB_ROOT/runtime/pyvenv.cfg" 2
 
 srun --nodes=1 --ntasks=1 --gpus=4 --cpus-per-task=64 --mem=400G --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE_PATH" \
-    --container-mounts="$JOB_ROOT:$JOB_ROOT,$SOURCE_PATH:$SOURCE_PATH,$BASELINE_ROOT:$BASELINE_ROOT,$(dirname "$OUTPUT_PATH"):$(dirname "$OUTPUT_PATH")" \
+    --container-mounts="$JOB_ROOT:$JOB_ROOT,$SOURCE_PATH:$SOURCE_PATH,$BASELINE_ROOT:$BASELINE_ROOT,$BASELINE_SOURCE_ROOT:$BASELINE_SOURCE_ROOT,$(dirname "$OUTPUT_PATH"):$(dirname "$OUTPUT_PATH")" \
     bash -c 'export VIRTUAL_ENV="$JOB_ROOT/runtime"; export PATH="$VIRTUAL_ENV/bin:$PATH"; exec python3 "$SOURCE_PATH/examples/dataset/audit_ptv2_baseline.py" --root "$BASELINE_ROOT" --output "$OUTPUT_PATH"'
