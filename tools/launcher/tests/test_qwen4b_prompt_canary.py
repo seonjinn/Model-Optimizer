@@ -15,6 +15,7 @@ from common.specdec.build_qwen4b_prompt_canary import (
     _has_tool_trajectory,
     _prompt_identity,
     _prompt_view,
+    _schema_mode,
     _tokenize_with_assistant_mask,
 )
 
@@ -66,10 +67,15 @@ def test_trace_tokenization_preserves_tools_and_assistant_loss_mask() -> None:
 
     class FakeTokenizer:
         def apply_chat_template(self, messages: list[dict], **kwargs: object) -> dict:
-            assert messages[-1]["role"] == "tool"
             assert kwargs["tools"] == [{"type": "function", "function": {"name": "shell"}}]
-            assert kwargs["return_assistant_tokens_mask"] is True
-            return {"input_ids": [1, 2, 3, 4], "assistant_masks": [0, 0, 1, 0]}
+            roles = [message["role"] for message in messages]
+            if roles == ["user", "assistant", "tool"]:
+                return [1, 2, 3, 4, 5, 6]
+            if roles == ["user"] and kwargs["add_generation_prompt"] is True:
+                return [1, 2]
+            if roles == ["user", "assistant"]:
+                return [1, 2, 3, 4]
+            raise AssertionError((roles, kwargs))
 
     row = {
         "tools": [{"type": "function", "function": {"name": "shell"}}],
@@ -85,9 +91,17 @@ def test_trace_tokenization_preserves_tools_and_assistant_loss_mask() -> None:
     }
 
     assert _tokenize_with_assistant_mask(FakeTokenizer(), row) == (
-        [1, 2, 3, 4],
-        [0, 0, 1, 0],
+        [1, 2, 3, 4, 5, 6],
+        [0, 0, 1, 1, 0, 0],
     )
+
+
+def test_parquet_schema_modes_are_explicit_and_fail_closed() -> None:
+    """Raw wrappers and full native message schemas are distinct accepted inputs."""
+    assert _schema_mode(["raw_json"]) == "raw_json"
+    assert _schema_mode(["uuid", "messages", "tools", "metadata"]) == "native"
+    with pytest.raises(ValueError, match="messages"):
+        _schema_mode(["uuid", "problem"])
 
 
 @pytest.mark.parametrize(

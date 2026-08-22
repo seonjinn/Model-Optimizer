@@ -79,15 +79,26 @@ def _context_bucket(token_count: int) -> str:
     raise ValueError(f"conversation exceeds the 32K canary limit: {token_count}")
 
 
+def _schema_mode(names: list[str]) -> str:
+    if names == ["raw_json"]:
+        return "raw_json"
+    if "messages" in names:
+        return "native"
+    raise ValueError("staged Parquet schema must contain raw_json or explicit messages")
+
+
 def _iter_parquet_rows(path: Path):
     import pyarrow.parquet as pq
 
     parquet = pq.ParquetFile(path)
-    if parquet.schema_arrow.names != ["raw_json"]:
-        raise ValueError(f"staged shard lacks explicit raw_json union schema: {path.name}")
-    for batch in parquet.iter_batches(batch_size=4096, columns=["raw_json"]):
-        for value in batch.column(0).to_pylist():
-            yield _decode_raw_row({"raw_json": value})
+    mode = _schema_mode(parquet.schema_arrow.names)
+    columns = ["raw_json"] if mode == "raw_json" else parquet.schema_arrow.names
+    for batch in parquet.iter_batches(batch_size=4096, columns=columns):
+        if mode == "raw_json":
+            for value in batch.column(0).to_pylist():
+                yield _decode_raw_row({"raw_json": value})
+        else:
+            yield from batch.to_pylist()
 
 
 def _bounded_candidates(path: Path, limit: int) -> list[dict[str, Any]]:
@@ -105,23 +116,35 @@ def _bounded_candidates(path: Path, limit: int) -> list[dict[str, Any]]:
 def _tokenize_with_assistant_mask(
     tokenizer: Any, row: dict[str, Any]
 ) -> tuple[list[int], list[int]]:
-    encoded = tokenizer.apply_chat_template(
-        _messages(row),
-        tools=row.get("tools") or None,
-        tokenize=True,
-        add_generation_prompt=False,
-        return_dict=True,
-        return_assistant_tokens_mask=True,
-    )
-    input_ids = encoded.get("input_ids")
-    loss_mask = encoded.get("assistant_masks", encoded.get("assistant_mask"))
-    if (
-        not isinstance(input_ids, list)
-        or not isinstance(loss_mask, list)
-        or len(input_ids) != len(loss_mask)
-        or any(value not in (0, 1) for value in loss_mask)
-    ):
-        raise ValueError("tokenizer did not return aligned IDs and assistant mask")
+    messages = _messages(row)
+    tools = row.get("tools") or None
+
+    def render(prefix: list[dict[str, Any]], *, generation_prompt: bool) -> list[int]:
+        encoded = tokenizer.apply_chat_template(
+            prefix,
+            tools=tools,
+            tokenize=True,
+            add_generation_prompt=generation_prompt,
+        )
+        if not isinstance(encoded, list) or any(not isinstance(value, int) for value in encoded):
+            raise ValueError("tokenizer did not return input IDs")
+        return encoded
+
+    input_ids = render(messages, generation_prompt=False)
+    loss_mask = [0] * len(input_ids)
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        before = render(messages[:index], generation_prompt=True)
+        after = render(messages[: index + 1], generation_prompt=False)
+        if (
+            len(before) >= len(after)
+            or len(after) > len(input_ids)
+            or input_ids[: len(before)] != before
+            or input_ids[: len(after)] != after
+        ):
+            raise ValueError("assistant token span is not prefix aligned")
+        loss_mask[len(before) : len(after)] = [1] * (len(after) - len(before))
     return input_ids, loss_mask
 
 
