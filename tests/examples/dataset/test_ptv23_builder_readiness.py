@@ -205,6 +205,8 @@ def test_readiness_runner_binds_exact_inputs_and_uses_slurm() -> None:
     ).read_text()
 
     assert "#SBATCH --nodes=1" in runner
+    assert "#SBATCH --gpus-per-node=4" in runner
+    assert "srun --nodes=1 --ntasks=1 --gpus=4" in runner
     assert "AUDIT_RECEIPT_SHA256" in runner
     assert "PTV2_REVISION" in runner
     assert "PTV3_SOURCE_MANIFEST" in runner
