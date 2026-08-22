@@ -916,6 +916,26 @@ def test_training_runner_relocates_runtime_and_stages_only_role_inputs() -> None
     assert "EXTRA_MODELOPT_DOTLIST" not in runner
 
 
+def test_training_runner_mounts_wandb_netrc_without_exporting_the_secret() -> None:
+    """W&B auth enters the container through a private file, never Slurm argv."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    for required in (
+        'WANDB_NETRC_PATH="${WANDB_NETRC_PATH:-}"',
+        '[[ "$WANDB_NETRC_PATH" == /home/*/.netrc ]]',
+        '[[ ! -L "$WANDB_NETRC_PATH" && -f "$WANDB_NETRC_PATH" ]]',
+        '[[ "$(stat -c %u "$WANDB_NETRC_PATH")" == "$(id -u)" ]]',
+        'case "$(stat -c %a "$WANDB_NETRC_PATH")" in',
+        "${WANDB_NETRC_PATH}:/run/secrets/wandb.netrc:ro",
+        "WANDB_NETRC_CONTAINER_PATH=/run/secrets/wandb.netrc",
+        'netrc.netrc(sys.argv[1]).authenticators("api.wandb.ai")',
+        "export WANDB_API_KEY",
+    ):
+        assert required in runner
+    assert "WANDB_API_KEY=${WANDB_API_KEY}" not in runner
+    assert "--export=ALL,WANDB_API_KEY" not in runner
+
+
 def test_submitter_exports_the_home_launcher_root_to_the_spooled_runner() -> None:
     """A copied Slurm batch script must not derive imports from its spool directory."""
     submitter = (_LAUNCHER_DIR / "common/specdec/submit_drafter_training_wave.sh").read_text()

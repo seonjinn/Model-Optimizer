@@ -25,6 +25,28 @@ fi
 [[ "$SCRATCH_ROOT" == /* && "$SCRATCH_ROOT" != /lustre* && "$SCRATCH_ROOT" != /home* ]] || { echo "scratch root must be node-local" >&2; exit 2; }
 readonly SCRATCH_ROOT
 readonly SCRATCH_JOB_ROOT="${SCRATCH_ROOT%/}/${SLURM_JOB_ID}"
+WANDB_NETRC_PATH="${WANDB_NETRC_PATH:-}"
+WANDB_NETRC_CONTAINER_PATH=""
+if [[ -n "$WANDB_NETRC_PATH" ]]; then
+    [[ "$WANDB_NETRC_PATH" == /home/*/.netrc ]] || { echo "WANDB netrc must be under /home" >&2; exit 2; }
+    [[ "$WANDB_NETRC_PATH" =~ ^/home/[A-Za-z0-9._-]+/\.netrc$ ]] || { echo "WANDB netrc path is unsafe" >&2; exit 2; }
+    [[ ! -L "$WANDB_NETRC_PATH" && -f "$WANDB_NETRC_PATH" ]] || { echo "WANDB netrc must be a regular non-symlink file" >&2; exit 2; }
+    [[ "$(stat -c %u "$WANDB_NETRC_PATH")" == "$(id -u)" ]] || { echo "WANDB netrc must be owned by the submitting user" >&2; exit 2; }
+    case "$(stat -c %a "$WANDB_NETRC_PATH")" in
+        400|600) ;;
+        *) echo "WANDB netrc permissions must be 0400 or 0600" >&2; exit 2 ;;
+    esac
+    python3 - "$WANDB_NETRC_PATH" <<'PY'
+import netrc
+import sys
+
+credentials = netrc.netrc(sys.argv[1]).authenticators("api.wandb.ai")
+if credentials is None or not credentials[2]:
+    raise SystemExit("WANDB netrc has no api.wandb.ai credential")
+PY
+    WANDB_NETRC_CONTAINER_PATH=/run/secrets/wandb.netrc
+fi
+readonly WANDB_NETRC_PATH WANDB_NETRC_CONTAINER_PATH
 
 mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" "$CLUSTER_PROFILE_PATH" "${READINESS_RECEIPT:-}" "$CLUSTER_NAME" "$SCRATCH_ROOT" <<'PY'
 import json
@@ -266,7 +288,7 @@ else
 fi
 
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS SAVE_STEPS RUN_NAME SAMPLE_SIZE
-export SERVE_NODES CLUSTER_NAME
+export SERVE_NODES CLUSTER_NAME WANDB_NETRC_CONTAINER_PATH
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     export WANDB_RUN_ID="${WANDB_RUN_ID}"
     export WANDB_RESUME=allow
@@ -280,14 +302,31 @@ for ((serve_node = 0; serve_node < SERVE_NODES; serve_node++)); do
     done
 done
 
+CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace"
+if [[ -n "$WANDB_NETRC_PATH" ]]; then
+    CONTAINER_MOUNTS+=",${WANDB_NETRC_PATH}:/run/secrets/wandb.netrc:ro"
+fi
+
 # shellcheck disable=SC2016,SC2026 # The child shell expands its Slurm-node environment.
-training_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="${SCRATCH_ROOT}:${SCRATCH_ROOT},${OUTPUT_ROOT}:${OUTPUT_ROOT},${CONTROL_ROOT}:/scratchspace" bash -c '
+training_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntasks-per-node=1 --kill-on-bad-exit=1 --no-container-mount-home --container-image="$IMAGE_PATH" --container-mounts="$CONTAINER_MOUNTS" bash -c '
     set -euo pipefail
     node_root="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}"
     export MODELOPT_RUNTIME="$node_root/runtime"
     export VIRTUAL_ENV="$MODELOPT_RUNTIME"
     export PATH="$VIRTUAL_ENV/bin:$PATH"
     export PYTHONPATH="$node_root/source${PYTHONPATH:+:$PYTHONPATH}"
+    if [[ -n "$WANDB_NETRC_CONTAINER_PATH" ]]; then
+        export WANDB_API_KEY="$("$MODELOPT_RUNTIME/bin/python" - "$WANDB_NETRC_CONTAINER_PATH" <<'PY'
+import netrc
+import sys
+
+credentials = netrc.netrc(sys.argv[1]).authenticators("api.wandb.ai")
+if credentials is None or not credentials[2]:
+    raise SystemExit("mounted WANDB netrc has no api.wandb.ai credential")
+print(credentials[2])
+PY
+)"
+    fi
     "$MODELOPT_RUNTIME/bin/python" - "$node_root/source" <<'PY'
 import sys
 from pathlib import Path
