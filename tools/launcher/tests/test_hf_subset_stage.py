@@ -155,3 +155,13 @@ def test_qwen4b_ptv3_plan_is_selective_and_fully_content_pinned() -> None:
         "swe",
     }
     assert all(record["revision"] != "main" for record in plan["files"])
+
+
+def test_subset_submitter_requests_the_profile_gpu_node_contract() -> None:
+    """OCI batch submissions name the four GPUs required by its partition."""
+    submitter = (
+        REPOSITORY_ROOT / "tools/launcher/common/specdec/submit_hf_subset_stage.sh"
+    ).read_text()
+
+    assert "--gpus-per-node=4" in submitter
+    assert "sbatch --test-only" in submitter

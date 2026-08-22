@@ -100,7 +100,7 @@ mkdir -p "$LOG_DIR"
 export_values="ALL,REPO_ROOT=$REPO_ROOT,SOURCE_COMMIT=$SOURCE_COMMIT,PROFILE=$PROFILE,PROFILE_SHA256=$PROFILE_SHA256,PLAN_PATH=$PLAN,PLAN_SHA256=$PLAN_SHA256,IMAGE=$IMAGE,IMAGE_SHA256=$IMAGE_SHA256,OUTPUT_ROOT=$OUTPUT_ROOT,READINESS_RECEIPT=$READINESS,READINESS_RECEIPT_SHA256=$READINESS_SHA256"
 args=(
     --account="$ACCOUNT" --partition="$PARTITION" --job-name=qwen4b-ptv3-stage
-    --nodes=1 --ntasks=1 --cpus-per-task=16 --mem=128G --time=08:00:00
+    --nodes=1 --ntasks=1 --gpus-per-node=4 --cpus-per-task=16 --mem=128G --time=08:00:00
     --output="$LOG_DIR/%x-%j.out" --error="$LOG_DIR/%x-%j.err"
     --export="$export_values"
 )
