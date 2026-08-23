@@ -31,8 +31,20 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
-__all__ = ["main"]
+__all__ = [
+    "BundleError",
+    "FileRecord",
+    "atomic_install",
+    "create_manifest",
+    "load_manifest",
+    "main",
+    "verify_completion",
+    "verify_launcher",
+    "verify_tree",
+    "write_completion",
+]
 
 _MANIFEST_SCHEMA = "modelopt-specdec-manifest-v2"
 _COMPLETION_SCHEMA = "modelopt-specdec-completion-v1"
@@ -82,12 +94,14 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.output,
                 arguments.artifact_id,
                 arguments.manifest_sha256,
+                arguments.artifact_source_commit,
             )
         elif arguments.command == "verify-completion":
             verify_completion(
                 arguments.completion,
                 arguments.artifact_id,
                 arguments.manifest_sha256,
+                arguments.artifact_source_commit,
             )
         elif arguments.command == "install":
             print(atomic_install(arguments.manifest, arguments.partial, arguments.destination))
@@ -117,6 +131,8 @@ def create_manifest(
     if not source.is_dir():
         raise BundleError("upload source must be a directory")
 
+    publication = _publication_binding(source, artifact_source_commit)
+
     records: list[FileRecord] = []
     for directory, directory_names, file_names in os.walk(source, followlinks=False):
         directory_path = Path(directory)
@@ -142,6 +158,7 @@ def create_manifest(
         "artifact_source_commit": _commit(artifact_source_commit),
         "schema": _MANIFEST_SCHEMA,
         "total_bytes": sum(record.size for record in records),
+        **({"publication": publication} if publication is not None else {}),
     }
     data = _canonical_json(payload)
     _atomic_write(output, data)
@@ -165,13 +182,17 @@ def load_manifest(
         payload = json.loads(data)
     except json.JSONDecodeError as error:
         raise BundleError(f"invalid manifest JSON: {error}") from error
-    if not isinstance(payload, dict) or set(payload) != {
+    required_fields = {
         "file_count",
         "files",
         "artifact_source_commit",
         "schema",
         "total_bytes",
-    }:
+    }
+    if not isinstance(payload, dict) or set(payload) not in (
+        required_fields,
+        required_fields | {"publication"},
+    ):
         raise BundleError("invalid manifest fields")
     if payload["schema"] != _MANIFEST_SCHEMA or not isinstance(payload["files"], list):
         raise BundleError("invalid manifest schema")
@@ -190,6 +211,8 @@ def load_manifest(
         and source_commit != expected_artifact_source_commit
     ):
         raise BundleError("manifest artifact source commit mismatch")
+    if "publication" in payload:
+        _validate_publication_binding(payload["publication"], source_commit)
 
     records: list[FileRecord] = []
     for raw_record in payload["files"]:
@@ -244,10 +267,20 @@ def verify_tree(manifest: Path, root: Path) -> None:
             raise BundleError(f"SHA-256 mismatch for {record.path}")
 
 
-def write_completion(output: Path, artifact_id: str, manifest_sha256: str) -> None:
+def write_completion(
+    output: Path,
+    artifact_id: str,
+    manifest_sha256: str,
+    artifact_source_commit: str | None = None,
+) -> None:
     """Write the stable completion marker published after payload verification."""
     payload = {
         "artifact_id": artifact_id,
+        **(
+            {"artifact_source_commit": _commit(artifact_source_commit)}
+            if artifact_source_commit is not None
+            else {}
+        ),
         "complete": True,
         "manifest_sha256": manifest_sha256,
         "schema": _COMPLETION_SCHEMA,
@@ -255,7 +288,12 @@ def write_completion(output: Path, artifact_id: str, manifest_sha256: str) -> No
     _atomic_write(output, _canonical_json(payload))
 
 
-def verify_completion(path: Path, artifact_id: str, manifest_sha256: str) -> None:
+def verify_completion(
+    path: Path,
+    artifact_id: str,
+    manifest_sha256: str,
+    artifact_source_commit: str | None = None,
+) -> None:
     """Verify a remote completion marker against the requested content address."""
     try:
         data = path.read_bytes()
@@ -264,11 +302,22 @@ def verify_completion(path: Path, artifact_id: str, manifest_sha256: str) -> Non
         raise BundleError(f"invalid remote completion marker: {error}") from error
     expected = {
         "artifact_id": artifact_id,
+        **(
+            {"artifact_source_commit": _commit(artifact_source_commit)}
+            if artifact_source_commit is not None
+            else {}
+        ),
         "complete": True,
         "manifest_sha256": manifest_sha256,
         "schema": _COMPLETION_SCHEMA,
     }
     if payload != expected or data != _canonical_json(expected):
+        if (
+            artifact_source_commit is not None
+            and isinstance(payload, dict)
+            and payload.get("artifact_source_commit") != artifact_source_commit
+        ):
+            raise BundleError("remote completion marker artifact source commit mismatch")
         raise BundleError("remote completion marker does not match requested content")
 
 
@@ -360,6 +409,81 @@ def _validate_symlink(path: Path, durable_root: Path) -> None:
         raise BundleError(f"symlink target escapes durable root: {path}")
 
 
+def _publication_binding(source: Path, artifact_source_commit: str) -> dict[str, str] | None:
+    receipt_path = source / "PUBLICATION.json"
+    if not receipt_path.exists():
+        return None
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise BundleError("publication receipt is not a regular file")
+    data = receipt_path.read_bytes()
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError as error:
+        raise BundleError("publication receipt is not JSON") from error
+    if not isinstance(payload, dict) or data != _canonical_json(payload):
+        raise BundleError("publication receipt is not canonical JSON")
+    _validate_publication_binding(payload, artifact_source_commit)
+    corpus_manifest = source / "CORPUS_MANIFEST.json"
+    if (
+        corpus_manifest.is_symlink()
+        or not corpus_manifest.is_file()
+        or _sha256(corpus_manifest) != payload["corpus_manifest_sha256"]
+    ):
+        raise BundleError("publication corpus manifest identity mismatch")
+    return {
+        "artifact_id": payload["artifact_id"],
+        "corpus_manifest_sha256": payload["corpus_manifest_sha256"],
+        "selection_manifest_sha256": payload["selection_manifest_sha256"],
+    }
+
+
+def _validate_publication_binding(value: object, artifact_source_commit: str) -> None:
+    if not isinstance(value, dict):
+        raise BundleError("invalid publication binding")
+    expected_keys = {
+        "artifact_id",
+        "corpus_manifest_sha256",
+        "selection_manifest_sha256",
+    }
+    if set(value) == expected_keys:
+        binding = value
+    else:
+        receipt_keys = expected_keys | {
+            "artifact_source_commit",
+            "file_count",
+            "published_path",
+            "schema",
+            "total_bytes",
+        }
+        if set(value) != receipt_keys:
+            raise BundleError("invalid publication receipt fields")
+        if value["schema"] != "modelopt-specdec-publication-receipt-v1":
+            raise BundleError("invalid publication receipt schema")
+        if value["published_path"] != ".":
+            raise BundleError("publication receipt path is not transferable")
+        if value["artifact_source_commit"] != artifact_source_commit:
+            raise BundleError("publication artifact source commit mismatch")
+        binding = value
+    for field in expected_keys:
+        digest = binding.get(field)
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise BundleError(f"invalid publication {field}")
+    expected_artifact_id = hashlib.sha256(
+        _canonical_json(
+            {
+                "artifact_source_commit": artifact_source_commit,
+                "corpus_manifest_sha256": binding["corpus_manifest_sha256"],
+            }
+        )
+    ).hexdigest()
+    if binding["artifact_id"] != expected_artifact_id:
+        raise BundleError("publication artifact identity mismatch")
+
+
 def _file_record(raw_record: dict[str, Any]) -> FileRecord:
     path = raw_record["path"]
     digest = raw_record["sha256"]
@@ -404,12 +528,27 @@ def _canonical_json(payload: object) -> bytes:
 
 def _atomic_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    if os.path.lexists(path):
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+            raise BundleError(f"immutable output already exists with different bytes: {path}")
+        return
+    temporary = path.with_name(f".{path.name}.partial-{uuid4().hex}")
+    with temporary.open("xb") as output:
+        output.write(data)
+        output.flush()
+        os.fsync(output.fileno())
     try:
-        temporary.write_bytes(data)
-        os.replace(temporary, path)
+        _rename_no_replace(temporary, path)
+    except FileExistsError as error:
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+            raise BundleError(
+                f"immutable output collision; partial preserved at {temporary}"
+            ) from error
+    descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(descriptor)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -431,10 +570,12 @@ def _parser() -> argparse.ArgumentParser:
     write_completion_parser.add_argument("--output", type=Path, required=True)
     write_completion_parser.add_argument("--artifact-id", required=True)
     write_completion_parser.add_argument("--manifest-sha256", required=True)
+    write_completion_parser.add_argument("--artifact-source-commit")
     verify_completion_parser = commands.add_parser("verify-completion")
     verify_completion_parser.add_argument("--completion", type=Path, required=True)
     verify_completion_parser.add_argument("--artifact-id", required=True)
     verify_completion_parser.add_argument("--manifest-sha256", required=True)
+    verify_completion_parser.add_argument("--artifact-source-commit")
     install = commands.add_parser("install")
     install.add_argument("--manifest", type=Path, required=True)
     install.add_argument("--partial", type=Path, required=True)
