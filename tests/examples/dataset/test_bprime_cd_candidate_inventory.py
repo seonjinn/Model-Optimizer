@@ -21,6 +21,7 @@ import importlib.util
 import json
 import sys
 import tracemalloc
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -60,11 +61,12 @@ def _canonical_uuid(messages: list[dict], tools: list[dict] | None = None) -> st
 
 
 def _source(module, *, split: str, path: Path, lane: str = "target-synth"):
+    is_ptv2 = split == "math"
     return module.SourceIdentity(
-        repository_id="fixture/source",
+        repository_id=("nvidia/Nemotron-Post-Training-Dataset-v2" if is_ptv2 else "fixture/source"),
         configuration="default",
         split=split,
-        revision=("a" if split == "first" else "b") * 40,
+        revision=("5c89e01dd720ae0f4058445ed49c5fb68a03c76e" if is_ptv2 else "b" * 40),
         license_expression="Apache-2.0",
         approved_use=True,
         cell="math" if lane == "target-synth" else "swe-agentic-tool",
@@ -114,11 +116,8 @@ def _build(
         inventory,
         tokenizer=_Tokenizer(),
         tokenizer_sha256="f" * 64,
-        historical_prompt_ids=set(historical),
-        held_out_prompt_ids=set(held_out),
-        baseline_receipt_sha256="1" * 64,
-        held_out_receipt_sha256="2" * 64,
-        ptv2_revision="a" * 40,
+        baseline_exclusion=module.make_exclusion_receipt("baseline", historical),
+        held_out_exclusion=module.make_exclusion_receipt("held-out", held_out),
         storage_dir=storage_dir or inventory.staged_root / "candidate-storage",
     )
 
@@ -173,35 +172,66 @@ def test_inventory_binds_exclusion_receipts_and_pinned_ptv2_family(tmp_path: Pat
     admitted = [{"role": "user", "content": "admitted"}]
     path = _write_rows(
         tmp_path,
-        "first",
+        "math",
         [
             {"messages": excluded, "language": "en"},
             {"messages": admitted, "language": "en"},
         ],
     )
-    source = _source(module, split="first", path=path)
+    source = _source(module, split="math", path=path)
     historical = {_canonical_uuid(excluded)}
 
     candidates = module.build_candidate_inventory(
         _inventory(module, tmp_path, (source,)),
         tokenizer=_Tokenizer(),
         tokenizer_sha256="f" * 64,
-        historical_prompt_ids=historical,
-        held_out_prompt_ids=set(),
-        baseline_receipt_sha256="1" * 64,
-        held_out_receipt_sha256="2" * 64,
-        ptv2_revision="a" * 40,
+        baseline_exclusion=module.make_exclusion_receipt("baseline", historical),
+        held_out_exclusion=module.make_exclusion_receipt("held-out", set()),
         storage_dir=tmp_path / "candidate-storage",
     )
 
-    assert candidates.baseline_exclusion.receipt_sha256 == "1" * 64
+    assert candidates.baseline_exclusion.receipt_sha256 != "0" * 64
     assert candidates.baseline_exclusion.prompt_id_count == 1
     assert candidates.baseline_exclusion.excluded_candidate_count == 1
-    assert candidates.held_out_exclusion.receipt_sha256 == "2" * 64
+    assert candidates.held_out_exclusion.receipt_sha256 != "0" * 64
     assert candidates.held_out_exclusion.prompt_id_count == 0
     assert candidates.held_out_exclusion.excluded_candidate_count == 0
-    assert candidates.ptv2_revision == "a" * 40
+    assert candidates.ptv2_revision == "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
     assert candidates.rows[0].source_family == "ptv2"
+
+
+def test_inventory_rejects_receipt_content_mismatch_and_revision_spoof(tmp_path: Path) -> None:
+    module = _load_module()
+    path = _write_rows(
+        tmp_path,
+        "first",
+        [{"messages": [{"role": "user", "content": "x"}], "language": "en"}],
+    )
+    source = replace(
+        _source(module, split="first", path=path),
+        revision="5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
+    )
+    baseline = module.make_exclusion_receipt("baseline", {"1" * 64})
+    mismatched = replace(baseline, prompt_ids=("2" * 64,))
+
+    with pytest.raises(ValueError, match="receipt content"):
+        module.build_candidate_inventory(
+            _inventory(module, tmp_path, (source,)),
+            tokenizer=_Tokenizer(),
+            tokenizer_sha256="f" * 64,
+            baseline_exclusion=mismatched,
+            held_out_exclusion=module.make_exclusion_receipt("held-out", set()),
+        )
+
+    candidates = module.build_candidate_inventory(
+        _inventory(module, tmp_path, (source,)),
+        tokenizer=_Tokenizer(),
+        tokenizer_sha256="f" * 64,
+        baseline_exclusion=module.make_exclusion_receipt("baseline", set()),
+        held_out_exclusion=module.make_exclusion_receipt("held-out", set()),
+        storage_dir=tmp_path / "spoof-storage",
+    )
+    assert candidates.rows[0].source_family == "ptv3"
 
 
 def test_target_completion_is_stripped_before_uuid_and_full_context_bucket(

@@ -16,12 +16,12 @@
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import sys
 import tracemalloc
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -31,6 +31,8 @@ TEST_DIR = Path(__file__).parent
 
 sys.path[:0] = [str(MODULE_DIR), str(TEST_DIR)]
 try:
+    import select_bprime_cd_prompts as selection_module
+    from bprime_cd_policy import PromptCell
     from inspect_bprime_cd_prompts import inspect_prompt_manifest, main
     from select_bprime_cd_prompts import publish_prompt_view_bundle, select_prompt_views
     from specdec_corpus_contracts import canonical_json, sha256_bytes
@@ -116,7 +118,11 @@ def test_large_synthetic_selection_publication_and_inspection_are_bounded(tmp_pa
         )
         for index in range(10_000)
     )
-    streaming_inventory = replace(inventory, rows=itertools.chain(inventory.rows, noise))
+    streaming_inventory = replace(inventory, rows=(*inventory.rows, *noise))
+    streaming_inventory = replace(
+        streaming_inventory,
+        inventory_sha256=selection_module.candidate_inventory_sha256(streaming_inventory),
+    )
 
     tracemalloc.start()
     bundle = select_prompt_views(
@@ -165,6 +171,92 @@ def test_repaired_outer_digest_cannot_replace_the_externally_trusted_root(tmp_pa
             published.manifest_path,
             expected_root_sha256=published.root_sha256,
         )
+
+
+def test_repaired_semantic_proof_and_corrupt_unqueried_shard_are_rejected(tmp_path: Path) -> None:
+    published = _publish(tmp_path / "proof", rows_per_shard=10)
+    manifest = json.loads(published.manifest_path.read_bytes())
+    manifest["arms"]["B-prime"]["count_proof_sha256"] = "9" * 64
+    unsigned = dict(manifest)
+    del unsigned["root_sha256"]
+    repaired_root = sha256_bytes(canonical_json(unsigned))
+    manifest["root_sha256"] = repaired_root
+    published.manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+
+    with pytest.raises(ValueError, match=r"row-derived|count proof"):
+        inspect_prompt_manifest(
+            published.manifest_path,
+            expected_root_sha256=repaired_root,
+            arm="B-prime",
+            limit=1,
+        )
+
+    clean = _publish(tmp_path / "shard", rows_per_shard=10)
+    clean_manifest = json.loads(clean.manifest_path.read_bytes())
+    unqueried = clean.manifest_path.parent / clean_manifest["shards"][-1]["path"]
+    data = bytearray(unqueried.read_bytes())
+    data[-2] ^= 1
+    unqueried.write_bytes(data)
+    with pytest.raises(ValueError, match="shard digest"):
+        inspect_prompt_manifest(
+            clean.manifest_path,
+            expected_root_sha256=clean.root_sha256,
+            arm="B-prime",
+            limit=1,
+        )
+
+
+def test_publication_refuses_rename_race_without_replacing_destination(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bundle = select_prompt_views(
+        _inventory(),
+        _policy(),
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+    )
+    output = tmp_path / "race"
+
+    def race(source: Path, destination: Path) -> None:
+        del source
+        destination.mkdir()
+        (destination / "sentinel").write_text("winner", encoding="utf-8")
+        raise FileExistsError(destination)
+
+    monkeypatch.setattr(selection_module, "_rename_no_replace", race, raising=False)
+    with pytest.raises(FileExistsError):
+        publish_prompt_view_bundle(bundle, output)
+
+    assert (output / "sentinel").read_text(encoding="utf-8") == "winner"
+    assert not list(tmp_path.glob(".race.partial-*"))
+
+
+def test_inspector_accepts_exact_odd_d_lane_bucket_floor_proofs(tmp_path: Path) -> None:
+    policy = _policy()
+    d = policy.arms["D"]
+    cells = dict(d.cells)
+    cells["swe-agentic-tool"] = PromptCell(9)
+    odd_d = replace(
+        d,
+        prompt_count=289,
+        cells=MappingProxyType(cells),
+        lanes=MappingProxyType(dict.fromkeys(d.lanes, 3)),
+    )
+    bundle = select_prompt_views(
+        _inventory(),
+        replace(policy, arms=MappingProxyType({**policy.arms, "D": odd_d})),
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+    )
+    published = publish_prompt_view_bundle(bundle, tmp_path / "odd")
+
+    result = inspect_prompt_manifest(
+        published.manifest_path,
+        expected_root_sha256=published.root_sha256,
+        arm="D",
+        limit=1,
+    )
+    assert result["total_matches"] == 351
 
 
 def test_canonical_rows_preserve_content_and_cli_is_deterministic(

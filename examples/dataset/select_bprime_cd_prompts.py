@@ -30,8 +30,15 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
-from build_specdec_inventory import CandidateInventory, CandidatePrompt
+from build_specdec_inventory import (
+    APPROVED_PTV2_ALLOWLIST_SHA256,
+    APPROVED_PTV2_REVISION,
+    CandidateInventory,
+    CandidatePrompt,
+    candidate_inventory_sha256,
+)
 from specdec_corpus_contracts import canonical_json, sha256_bytes
+from stage_ptv23_sources import _fsync_directory, _rename_no_replace, _write_bytes_durable
 
 if TYPE_CHECKING:
     from bprime_cd_policy import PromptPolicy
@@ -109,6 +116,7 @@ class PromptView:
     lane_counts: Mapping[str, int]
     bucket_floors: Mapping[str, Mapping[str, int]]
     non_agentic_bucket_floors: Mapping[str, Mapping[str, int]]
+    lane_bucket_floors: Mapping[str, Mapping[str, int]]
     count_proof_sha256: str
 
     @property
@@ -158,6 +166,7 @@ class PromptViewBundle:
     baseline_receipt_sha256: str
     held_out_receipt_sha256: str
     ptv2_revision: str
+    ptv2_allowlist_sha256: str
     reserve_numerator: int
     reserve_denominator: int
     paired_cd_sha256: str
@@ -200,6 +209,7 @@ class _SelectionStorage:
         self._temporary = tempfile.TemporaryDirectory(prefix="specdec-selection-")
         self.path = Path(self._temporary.name) / "selection.sqlite3"
         self.closed = False
+        self._working_connection: sqlite3.Connection | None = None
 
     def connect(self) -> sqlite3.Connection:
         if self.closed:
@@ -208,8 +218,21 @@ class _SelectionStorage:
 
     def close(self) -> None:
         if not self.closed:
+            if self._working_connection is not None:
+                self._working_connection.close()
+                self._working_connection = None
             self.closed = True
             self._temporary.cleanup()
+
+    def open_working_connection(self) -> sqlite3.Connection:
+        """Open the single build connection owned by this storage lifetime."""
+        self._working_connection = self.connect()
+        return self._working_connection
+
+    def release_working_connection(self) -> None:
+        if self._working_connection is not None:
+            self._working_connection.close()
+            self._working_connection = None
 
 
 class DiskBackedSelectedRows(Sequence[SelectedPrompt]):
@@ -349,18 +372,46 @@ def select_prompt_views(
     baseline_receipt_sha256: str,
     held_out_receipt_sha256: str,
 ) -> PromptViewBundle:
+    """Select exact views and deterministically release storage on every failed exit."""
+    storage = _SelectionStorage()
+    try:
+        return _select_prompt_views_impl(
+            inventory,
+            policy,
+            baseline_receipt_sha256=baseline_receipt_sha256,
+            held_out_receipt_sha256=held_out_receipt_sha256,
+            storage=storage,
+        )
+    except BaseException:
+        storage.close()
+        raise
+
+
+def _select_prompt_views_impl(
+    inventory: CandidateInventory,
+    policy: PromptPolicy,
+    *,
+    baseline_receipt_sha256: str,
+    held_out_receipt_sha256: str,
+    storage: _SelectionStorage,
+) -> PromptViewBundle:
     """Select exact views using SQLite for external ordering and bounded resident memory."""
     _validate_digest(inventory.inventory_sha256, "source inventory")
+    if candidate_inventory_sha256(inventory) != inventory.inventory_sha256:
+        raise ValueError("source inventory streamed identity mismatch")
+    if (
+        inventory.ptv2_revision != APPROVED_PTV2_REVISION
+        or inventory.ptv2_allowlist_sha256 != APPROVED_PTV2_ALLOWLIST_SHA256
+    ):
+        raise ValueError("source inventory PTV2 allowlist identity mismatch")
     _validate_digest(policy.policy_sha256, "policy")
     _validate_exclusion_receipts(inventory, baseline_receipt_sha256, held_out_receipt_sha256)
-    storage = _SelectionStorage()
-    connection = storage.connect()
+    connection = storage.open_working_connection()
     _create_selection_schema(connection)
     try:
         _spool_candidates(connection, inventory.rows, policy)
     except BaseException:
-        connection.close()
-        storage.close()
+        storage.release_working_connection()
         raise
 
     b_floors: dict[str, dict[str, int]] = {}
@@ -416,6 +467,7 @@ def select_prompt_views(
     c_floors["swe-agentic-tool"] = floors
 
     d_agentic_floors: dict[str, int] = defaultdict(int)
+    d_lane_floors: dict[str, dict[str, int]] = {}
     for lane, quota in policy.arms["D"].lanes.items():
         floors = _select_sql_cell(
             connection,
@@ -431,12 +483,20 @@ def select_prompt_views(
         )
         for bucket, count in floors.items():
             d_agentic_floors[bucket] += count
+        d_lane_floors[lane] = floors
     d_floors["swe-agentic-tool"] = dict(d_agentic_floors)
     _assign_selection_indexes(connection)
     connection.commit()
-    b_view = _build_disk_view(storage, "B-prime", b_floors, policy, ())
-    c_view = _build_disk_view(storage, "C", c_floors, policy, _NON_AGENTIC_CELLS)
-    d_view = _build_disk_view(storage, "D", d_floors, policy, _NON_AGENTIC_CELLS)
+    b_view = _build_disk_view(storage, "B-prime", b_floors, policy, (), {})
+    c_view = _build_disk_view(
+        storage,
+        "C",
+        c_floors,
+        policy,
+        _NON_AGENTIC_CELLS,
+        {"agentless-swe": c_floors["swe-agentic-tool"]},
+    )
+    d_view = _build_disk_view(storage, "D", d_floors, policy, _NON_AGENTIC_CELLS, d_lane_floors)
     _validate_paired_sql(connection)
     paired_cd_sha256 = _stream_paired_digest(connection, c_view, d_view)
     metadata = {
@@ -447,11 +507,12 @@ def select_prompt_views(
         "baseline_receipt_sha256": baseline_receipt_sha256,
         "held_out_receipt_sha256": held_out_receipt_sha256,
         "ptv2_revision": inventory.ptv2_revision,
+        "ptv2_allowlist_sha256": inventory.ptv2_allowlist_sha256,
         "paired_cd_sha256": paired_cd_sha256,
         "arms": {v.arm: _compact_view_record(v) for v in (b_view, c_view, d_view)},
     }
     selection_sha256 = _stream_selection_digest(connection, metadata)
-    connection.close()
+    storage.release_working_connection()
     return PromptViewBundle(
         B_prime=b_view,
         C=c_view,
@@ -462,6 +523,7 @@ def select_prompt_views(
         baseline_receipt_sha256=baseline_receipt_sha256,
         held_out_receipt_sha256=held_out_receipt_sha256,
         ptv2_revision=inventory.ptv2_revision,
+        ptv2_allowlist_sha256=inventory.ptv2_allowlist_sha256,
         reserve_numerator=policy.reserve_numerator,
         reserve_denominator=policy.reserve_denominator,
         paired_cd_sha256=paired_cd_sha256,
@@ -708,6 +770,7 @@ def _build_disk_view(
     bucket_floors: Mapping[str, Mapping[str, int]],
     policy: PromptPolicy,
     non_agentic_cells: Sequence[str],
+    lane_bucket_floors: Mapping[str, Mapping[str, int]],
 ) -> PromptView:
     primary = DiskBackedSelectedRows(storage, arm, "primary")
     reserve = DiskBackedSelectedRows(storage, arm, "reserve")
@@ -722,6 +785,7 @@ def _build_disk_view(
     )
     floors = _freeze_floors(bucket_floors)
     non_agentic = _freeze_floors({name: bucket_floors[name] for name in non_agentic_cells})
+    lane_floors = _freeze_floors(lane_bucket_floors)
     proof = {
         "arm": arm,
         "primary_count": len(primary),
@@ -729,6 +793,7 @@ def _build_disk_view(
         "cell_counts": cell_counts,
         "lane_counts": lane_counts,
         "bucket_floors": _plain_floors(floors),
+        "lane_bucket_floors": _plain_floors(lane_floors),
         "acquisition_count": len(primary) + len(reserve),
     }
     return PromptView(
@@ -739,6 +804,7 @@ def _build_disk_view(
         MappingProxyType(lane_counts),
         floors,
         non_agentic,
+        lane_floors,
         sha256_bytes(canonical_json(proof)),
     )
 
@@ -751,6 +817,7 @@ def _compact_view_record(view: PromptView) -> dict[str, Any]:
         "lane_counts": dict(view.lane_counts),
         "bucket_floors": _plain_floors(view.bucket_floors),
         "non_agentic_bucket_floors": _plain_floors(view.non_agentic_bucket_floors),
+        "lane_bucket_floors": _plain_floors(view.lane_bucket_floors),
         "count_proof_sha256": view.count_proof_sha256,
     }
 
@@ -809,8 +876,6 @@ def publish_prompt_view_bundle(
     ):
         raise ValueError("rows_per_shard must be a positive integer")
     output_dir = Path(output_dir)
-    if output_dir.exists():
-        raise FileExistsError(f"published selection destination already exists: {output_dir}")
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     partial = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.partial-", dir=output_dir.parent))
     shards_dir = partial / "shards"
@@ -896,6 +961,8 @@ def publish_prompt_view_bundle(
         index.commit()
         index.execute("VACUUM")
         index.close()
+        with index_path.open("rb") as index_stream:
+            os.fsync(index_stream.fileno())
         index_sha256 = _file_sha256(index_path)
         manifest: dict[str, Any] = {
             "schema_version": 2,
@@ -908,6 +975,7 @@ def publish_prompt_view_bundle(
                 "baseline_receipt_sha256": bundle.baseline_receipt_sha256,
                 "held_out_receipt_sha256": bundle.held_out_receipt_sha256,
                 "ptv2_revision": bundle.ptv2_revision,
+                "ptv2_allowlist_sha256": bundle.ptv2_allowlist_sha256,
                 "reserve_numerator": bundle.reserve_numerator,
                 "reserve_denominator": bundle.reserve_denominator,
             },
@@ -922,8 +990,11 @@ def publish_prompt_view_bundle(
         }
         manifest["root_sha256"] = sha256_bytes(canonical_json(manifest))
         manifest_path = partial / "SELECTION_MANIFEST.json"
-        manifest_path.write_bytes(canonical_json(manifest) + b"\n")
-        os.replace(partial, output_dir)
+        _write_bytes_durable(manifest_path, canonical_json(manifest) + b"\n")
+        _fsync_directory(shards_dir)
+        _fsync_directory(partial)
+        _rename_no_replace(partial, output_dir)
+        _fsync_directory(output_dir.parent)
     except BaseException:
         if shard_file is not None and not shard_file.closed:
             shard_file.close()

@@ -43,11 +43,14 @@ from stage_ptv23_sources import SourceFile, SourceIdentity, SourceInventory
 from trajectory_schema import TrajectoryValidationError, validate_trajectory
 
 __all__ = [
+    "APPROVED_PTV2_ALLOWLIST_SHA256",
+    "APPROVED_PTV2_REVISION",
     "CandidateCell",
     "CandidateInventory",
     "CandidatePrompt",
     "DiskBackedCandidateRows",
     "ExclusionProof",
+    "ExclusionReceipt",
     "InventorySource",
     "SourceFile",
     "SourceIdentity",
@@ -56,7 +59,9 @@ __all__ = [
     "build_candidate_inventory",
     "build_inventory_rows",
     "candidate_inventory_bytes",
+    "candidate_inventory_sha256",
     "iter_candidate_inventory_bytes",
+    "make_exclusion_receipt",
     "sha256_file",
     "tokenizer_snapshot_sha256",
 ]
@@ -64,6 +69,28 @@ __all__ = [
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
+_PTV2_REVISION = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
+APPROVED_PTV2_REVISION = _PTV2_REVISION
+_APPROVED_PTV2_SOURCES = frozenset(
+    (
+        "nvidia/Nemotron-Post-Training-Dataset-v2",
+        "default",
+        split,
+        _PTV2_REVISION,
+    )
+    for split in (
+        "chat",
+        "code",
+        "math",
+        "stem",
+        "multilingual_ja",
+        "multilingual_it",
+        "multilingual_de",
+        "multilingual_es",
+        "multilingual_fr",
+    )
+)
+APPROVED_PTV2_ALLOWLIST_SHA256 = sha256_canonical_json(sorted(_APPROVED_PTV2_SOURCES))
 _LANGUAGE_ALIASES = {
     "english": "en",
     "french": "fr",
@@ -116,6 +143,65 @@ class ExclusionProof:
     prompt_ids_sha256: str
     prompt_id_count: int
     excluded_candidate_count: int
+
+
+@dataclass(frozen=True)
+class ExclusionReceipt:
+    """Typed, self-authenticating exclusion prompt-set receipt."""
+
+    kind: Literal["baseline", "held-out"]
+    prompt_ids: tuple[str, ...]
+    prompt_ids_sha256: str
+    prompt_id_count: int
+    receipt_sha256: str
+
+
+def make_exclusion_receipt(
+    kind: Literal["baseline", "held-out"], prompt_ids: Sequence[str]
+) -> ExclusionReceipt:
+    """Canonicalize an exact exclusion set into its typed content receipt."""
+    if kind not in {"baseline", "held-out"}:
+        raise ValueError("exclusion receipt kind must be baseline or held-out")
+    ordered = tuple(sorted(prompt_ids))
+    if len(set(ordered)) != len(ordered) or any(
+        _SHA256.fullmatch(value) is None for value in ordered
+    ):
+        raise ValueError("exclusion receipt prompt IDs must be unique lowercase SHA-256 values")
+    prompt_ids_sha256 = sha256_canonical_json(ordered)
+    payload = {
+        "schema_version": 1,
+        "kind": kind,
+        "prompt_ids": ordered,
+        "prompt_ids_sha256": prompt_ids_sha256,
+        "prompt_id_count": len(ordered),
+    }
+    return ExclusionReceipt(
+        kind,
+        ordered,
+        prompt_ids_sha256,
+        len(ordered),
+        sha256_canonical_json(payload),
+    )
+
+
+def _validate_exclusion_receipt(
+    receipt: ExclusionReceipt, expected_kind: Literal["baseline", "held-out"]
+) -> set[str]:
+    if not isinstance(receipt, ExclusionReceipt) or receipt.kind != expected_kind:
+        raise ValueError(f"{expected_kind} exclusion receipt has the wrong typed identity")
+    expected = make_exclusion_receipt(expected_kind, receipt.prompt_ids)
+    if receipt != expected or receipt.receipt_sha256 == "0" * 64:
+        raise ValueError(f"{expected_kind} exclusion receipt content reconciliation mismatch")
+    return set(receipt.prompt_ids)
+
+
+def _approved_ptv2_source(source: SourceIdentity) -> bool:
+    return (
+        source.repository_id,
+        source.configuration,
+        source.split,
+        source.revision,
+    ) in _APPROVED_PTV2_SOURCES
 
 
 @dataclass(frozen=True)
@@ -262,6 +348,7 @@ class CandidateInventory:
     baseline_exclusion: ExclusionProof
     held_out_exclusion: ExclusionProof
     ptv2_revision: str
+    ptv2_allowlist_sha256: str
 
     def close(self) -> None:
         """Release temporary row storage after all sequence consumers finish."""
@@ -286,6 +373,7 @@ class CandidateInventory:
             and self.baseline_exclusion == other.baseline_exclusion
             and self.held_out_exclusion == other.held_out_exclusion
             and self.ptv2_revision == other.ptv2_revision
+            and self.ptv2_allowlist_sha256 == other.ptv2_allowlist_sha256
         )
 
 
@@ -652,23 +740,27 @@ def _capacity_records(capacity: Mapping[CandidateCell, int]) -> list[dict[str, A
 
 
 def _identity_chunks(
-    rows: DiskBackedCandidateRows,
+    rows: Sequence[CandidatePrompt],
+    source_manifest_sha256: str,
+    tokenizer_sha256: str,
     capacity: Mapping[CandidateCell, int],
     quarantine_counts: Mapping[str, int],
     baseline_exclusion: ExclusionProof,
     held_out_exclusion: ExclusionProof,
     ptv2_revision: str,
+    ptv2_allowlist_sha256: str,
 ):
     yield (
         canonical_json(
             {
                 "type": "metadata",
                 "schema_version": 1,
-                "source_manifest_sha256": rows.source_manifest_sha256,
-                "tokenizer_sha256": rows.tokenizer_sha256,
+                "source_manifest_sha256": source_manifest_sha256,
+                "tokenizer_sha256": tokenizer_sha256,
                 "baseline_exclusion": asdict(baseline_exclusion),
                 "held_out_exclusion": asdict(held_out_exclusion),
                 "ptv2_revision": ptv2_revision,
+                "ptv2_allowlist_sha256": ptv2_allowlist_sha256,
             }
         )
         + b"\n"
@@ -684,27 +776,16 @@ def build_candidate_inventory(
     *,
     tokenizer: Any,
     tokenizer_sha256: str,
-    historical_prompt_ids: set[str],
-    held_out_prompt_ids: set[str],
-    baseline_receipt_sha256: str,
-    held_out_receipt_sha256: str,
-    ptv2_revision: str,
+    baseline_exclusion: ExclusionReceipt,
+    held_out_exclusion: ExclusionReceipt,
     training_seq_len: int = 4_096,
     storage_dir: Path | None = None,
 ) -> CandidateInventory:
     """Build canonical B-prime/C/D candidates from one verified staged inventory."""
-    if (
-        _SHA256.fullmatch(tokenizer_sha256) is None
-        or _SHA256.fullmatch(baseline_receipt_sha256) is None
-        or baseline_receipt_sha256 == "0" * 64
-        or _SHA256.fullmatch(held_out_receipt_sha256) is None
-        or held_out_receipt_sha256 == "0" * 64
-        or _REVISION.fullmatch(ptv2_revision) is None
-        or training_seq_len < 1
-    ):
-        raise ValueError(
-            "tokenizer, exclusion receipts, PTV2 revision, and sequence length must be pinned"
-        )
+    if _SHA256.fullmatch(tokenizer_sha256) is None or training_seq_len < 1:
+        raise ValueError("tokenizer and training sequence length must be pinned")
+    historical_prompt_ids = _validate_exclusion_receipt(baseline_exclusion, "baseline")
+    held_out_prompt_ids = _validate_exclusion_receipt(held_out_exclusion, "held-out")
     files = _verified_candidate_files(source_inventory)
     capacity: dict[CandidateCell, int] = {}
     quarantine_counts: dict[str, int] = {}
@@ -793,7 +874,7 @@ def build_candidate_inventory(
                     input_ids=input_ids,
                     tokenizer_sha256=tokenizer_sha256,
                     replay_valid=replay_valid,
-                    source_family="ptv2" if source.revision == ptv2_revision else "ptv3",
+                    source_family="ptv2" if _approved_ptv2_source(source) else "ptv3",
                 )
                 _insert_candidate(connection, candidate)
                 accepted_count += 1
@@ -819,16 +900,16 @@ def build_candidate_inventory(
         )
     )
     quarantine_counts = dict(sorted(quarantine_counts.items()))
-    baseline_exclusion = ExclusionProof(
-        baseline_receipt_sha256,
-        sha256_canonical_json(sorted(historical_prompt_ids)),
-        len(historical_prompt_ids),
+    baseline_proof = ExclusionProof(
+        baseline_exclusion.receipt_sha256,
+        baseline_exclusion.prompt_ids_sha256,
+        baseline_exclusion.prompt_id_count,
         quarantine_counts.get("historical_exclusion", 0),
     )
-    held_out_exclusion = ExclusionProof(
-        held_out_receipt_sha256,
-        sha256_canonical_json(sorted(held_out_prompt_ids)),
-        len(held_out_prompt_ids),
+    held_out_proof = ExclusionProof(
+        held_out_exclusion.receipt_sha256,
+        held_out_exclusion.prompt_ids_sha256,
+        held_out_exclusion.prompt_id_count,
         quarantine_counts.get("heldout_exclusion", 0),
     )
     rows = DiskBackedCandidateRows(
@@ -841,11 +922,14 @@ def build_candidate_inventory(
     digest = hashlib.sha256()
     for chunk in _identity_chunks(
         rows,
+        rows.source_manifest_sha256,
+        rows.tokenizer_sha256,
         capacity,
         quarantine_counts,
-        baseline_exclusion,
-        held_out_exclusion,
-        ptv2_revision,
+        baseline_proof,
+        held_out_proof,
+        _PTV2_REVISION,
+        APPROVED_PTV2_ALLOWLIST_SHA256,
     ):
         digest.update(chunk)
     return CandidateInventory(
@@ -853,29 +937,57 @@ def build_candidate_inventory(
         capacity=MappingProxyType(capacity),
         quarantine_counts=MappingProxyType(quarantine_counts),
         inventory_sha256=digest.hexdigest(),
-        baseline_exclusion=baseline_exclusion,
-        held_out_exclusion=held_out_exclusion,
-        ptv2_revision=ptv2_revision,
+        baseline_exclusion=baseline_proof,
+        held_out_exclusion=held_out_proof,
+        ptv2_revision=_PTV2_REVISION,
+        ptv2_allowlist_sha256=APPROVED_PTV2_ALLOWLIST_SHA256,
     )
 
 
 def iter_candidate_inventory_bytes(inventory: CandidateInventory):
     """Yield deterministic inventory bytes without materializing the inventory."""
-    if not isinstance(inventory.rows, DiskBackedCandidateRows):
-        raise TypeError("candidate inventory rows are not disk-backed")
+    if not inventory.rows:
+        raise ValueError("candidate inventory identity requires at least one row")
+    first = inventory.rows[0]
+    source_manifest_sha256 = (
+        inventory.rows.source_manifest_sha256
+        if isinstance(inventory.rows, DiskBackedCandidateRows)
+        else first.source_manifest_sha256
+    )
+    tokenizer_sha256 = (
+        inventory.rows.tokenizer_sha256
+        if isinstance(inventory.rows, DiskBackedCandidateRows)
+        else first.tokenizer_sha256
+    )
+    ordered_rows: Sequence[CandidatePrompt] = (
+        inventory.rows
+        if isinstance(inventory.rows, DiskBackedCandidateRows)
+        else tuple(sorted(inventory.rows, key=lambda row: row.prompt_uuid))
+    )
     yield from _identity_chunks(
-        inventory.rows,
+        ordered_rows,
+        source_manifest_sha256,
+        tokenizer_sha256,
         inventory.capacity,
         inventory.quarantine_counts,
         inventory.baseline_exclusion,
         inventory.held_out_exclusion,
         inventory.ptv2_revision,
+        inventory.ptv2_allowlist_sha256,
     )
 
 
 def candidate_inventory_bytes(inventory: CandidateInventory) -> bytes:
     """Materialize deterministic bytes for small tests; production callers should iterate."""
     return b"".join(iter_candidate_inventory_bytes(inventory))
+
+
+def candidate_inventory_sha256(inventory: CandidateInventory) -> str:
+    """Recompute the complete streamed inventory identity without materializing it."""
+    digest = hashlib.sha256()
+    for chunk in iter_candidate_inventory_bytes(inventory):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _tokenize(tokenizer: Any, row: dict[str, Any]) -> tuple[list[int], list[int]]:

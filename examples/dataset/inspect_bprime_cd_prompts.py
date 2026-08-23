@@ -21,10 +21,12 @@ import argparse
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from build_specdec_inventory import APPROVED_PTV2_ALLOWLIST_SHA256, APPROVED_PTV2_REVISION
 from specdec_corpus_contracts import canonical_json, sha256_bytes
 
 if TYPE_CHECKING:
@@ -68,6 +70,7 @@ def inspect_prompt_manifest(
     index_path = _confined(root, manifest["index"]["path"])
     if _file_sha256(index_path) != manifest["index"]["sha256"]:
         raise ValueError("selection index digest mismatch")
+    _verify_complete_artifact(root, index_path, manifest)
     filters = {
         "arm": arm,
         "domain": domain,
@@ -145,6 +148,7 @@ def _read_manifest(path: Path, expected_root: str) -> dict[str, Any]:
         "source_inventory_sha256",
         "baseline_receipt_sha256",
         "held_out_receipt_sha256",
+        "ptv2_allowlist_sha256",
     ):
         _validate_digest(identity.get(name), name)
         if name.endswith("receipt_sha256") and identity[name] == "0" * 64:
@@ -154,6 +158,11 @@ def _read_manifest(path: Path, expected_root: str) -> dict[str, Any]:
         or _REVISION.fullmatch(identity["ptv2_revision"]) is None
     ):
         raise ValueError("selection PTV2 revision is malformed")
+    if (
+        identity["ptv2_revision"] != APPROVED_PTV2_REVISION
+        or identity["ptv2_allowlist_sha256"] != APPROVED_PTV2_ALLOWLIST_SHA256
+    ):
+        raise ValueError("selection PTV2 allowlist identity is not approved")
     if isinstance(identity.get("seed"), bool) or not isinstance(identity.get("seed"), int):
         raise ValueError("selection seed is malformed")
     if not isinstance(payload["index"], dict):
@@ -183,9 +192,17 @@ def _validate_semantic_counts(manifest: dict[str, Any]) -> None:
         _validate_digest(proof.get("count_proof_sha256"), f"selection arm {arm} count proof")
         if proof["primary_count"] != sum(proof["cell_counts"].values()):
             raise ValueError(f"selection manifest arm {arm} cell count proof mismatch")
+        floor_groups = (
+            list(proof["bucket_floors"].values())
+            if arm == "B-prime"
+            else [
+                *proof["non_agentic_bucket_floors"].values(),
+                *proof["lane_bucket_floors"].values(),
+            ]
+        )
         expected_reserve = sum(
             (floor * numerator + denominator - 1) // denominator - floor
-            for buckets in proof["bucket_floors"].values()
+            for buckets in floor_groups
             for floor in buckets.values()
         )
         if proof["reserve_count"] != expected_reserve:
@@ -201,17 +218,230 @@ def _validate_semantic_counts(manifest: dict[str, Any]) -> None:
         _validate_digest(shard.get("sha256"), "selection shard")
 
 
+def _verify_complete_artifact(root: Path, index_path: Path, manifest: dict[str, Any]) -> None:
+    descriptors = {shard["path"]: shard for shard in manifest["shards"]}
+    for relative, descriptor in descriptors.items():
+        path = _confined(root, relative)
+        digest = sha256()
+        byte_count = 0
+        row_count = 0
+        try:
+            with path.open("rb") as handle:
+                for line in handle:
+                    digest.update(line)
+                    byte_count += len(line)
+                    row_count += 1
+        except OSError as error:
+            raise ValueError(f"selection shard is unreadable: {error}") from error
+        if (
+            digest.hexdigest() != descriptor["sha256"]
+            or byte_count != descriptor["byte_count"]
+            or row_count != descriptor["row_count"]
+        ):
+            raise ValueError(f"selection shard digest/count mismatch: {relative}")
+
+    uri = f"file:{index_path}?mode=ro&immutable=1"
+    connection = sqlite3.connect(uri, uri=True)
+    primary_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    lane_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    bucket_floors: dict[str, dict[str, dict[str, int]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(int))
+    )
+    lane_floors: dict[str, dict[str, dict[str, int]]] = defaultdict(
+        lambda: defaultdict(lambda: defaultdict(int))
+    )
+    status_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    rank_moments: dict[tuple[str, str, str, str], list[int]] = defaultdict(lambda: [0, 0, 0, -1])
+    global_expected = 0
+    current_relative: str | None = None
+    shard_handle: Any = None
+    try:
+        duplicate = connection.execute(
+            "SELECT 1 FROM rows GROUP BY arm,prompt_uuid HAVING count(*) != 1 LIMIT 1"
+        ).fetchone()
+        if duplicate is not None:
+            raise ValueError("selection row-derived UUID uniqueness proof mismatch")
+        records = connection.execute(
+            "SELECT global_index,arm,status,selection_index,shard_path,byte_offset,byte_length,"
+            "row_sha256 FROM rows ORDER BY global_index"
+        )
+        for record in records:
+            global_index, arm, status, selection_index, *location = record
+            if global_index != global_expected:
+                raise ValueError("selection index global ordering proof mismatch")
+            global_expected += 1
+            if selection_index != status_counts[arm][status]:
+                raise ValueError("selection index per-arm ordering proof mismatch")
+            status_counts[arm][status] += 1
+            relative = location[0]
+            if relative != current_relative:
+                if shard_handle is not None:
+                    shard_handle.close()
+                shard_handle = _confined(root, relative).open("rb")
+                current_relative = relative
+            row = _read_indexed_row(
+                root,
+                (arm, status, selection_index, *location),
+                manifest,
+                descriptors,
+                shard_handle,
+            )
+            cell = _semantic_cell(row)
+            group = (arm, cell, row["lane"], row["context_bucket"])
+            moment = rank_moments[group]
+            rank = row["candidate_rank"]
+            moment[0] += 1
+            moment[1] += rank
+            moment[2] += rank * rank
+            moment[3] = max(moment[3], rank)
+            if status == "primary":
+                primary_counts[arm][cell] += 1
+                bucket_floors[arm][cell][row["context_bucket"]] += 1
+                if row["domain"] == "swe-agentic-tool":
+                    lane_counts[arm][row["lane"]] += 1
+                    lane_floors[arm][row["lane"]][row["context_bucket"]] += 1
+    finally:
+        if shard_handle is not None:
+            shard_handle.close()
+        connection.close()
+    if global_expected != manifest["row_count"]:
+        raise ValueError("selection row-derived total count proof mismatch")
+    for moment in rank_moments.values():
+        count, total, squares, maximum = moment
+        if (
+            maximum != count - 1
+            or total != count * (count - 1) // 2
+            or squares != count * (count - 1) * (2 * count - 1) // 6
+        ):
+            raise ValueError("selection candidate-rank ordering proof mismatch")
+    for arm, proof in manifest["arms"].items():
+        derived_cells = dict(primary_counts[arm])
+        if derived_cells != proof["cell_counts"]:
+            raise ValueError(f"selection arm {arm} row-derived cell count proof mismatch")
+        derived_lanes = dict(lane_counts[arm])
+        if derived_lanes != proof["lane_counts"]:
+            raise ValueError(f"selection arm {arm} row-derived lane count proof mismatch")
+        derived_buckets = _plain_nested(bucket_floors[arm])
+        if derived_buckets != proof["bucket_floors"]:
+            raise ValueError(f"selection arm {arm} row-derived bucket floor proof mismatch")
+        derived_lane_floors = _plain_nested(lane_floors[arm])
+        if derived_lane_floors != proof["lane_bucket_floors"]:
+            raise ValueError(f"selection arm {arm} row-derived lane/bucket floor proof mismatch")
+        count_payload = {
+            "arm": arm,
+            "primary_count": status_counts[arm]["primary"],
+            "reserve_count": status_counts[arm]["reserve"],
+            "cell_counts": proof["cell_counts"],
+            "lane_counts": proof["lane_counts"],
+            "bucket_floors": proof["bucket_floors"],
+            "lane_bucket_floors": proof["lane_bucket_floors"],
+            "acquisition_count": status_counts[arm]["primary"] + status_counts[arm]["reserve"],
+        }
+        if sha256_bytes(canonical_json(count_payload)) != proof["count_proof_sha256"]:
+            raise ValueError(f"selection arm {arm} count proof SHA mismatch")
+    _verify_derived_digests(index_path, manifest)
+
+
+def _verify_derived_digests(index_path: Path, manifest: dict[str, Any]) -> None:
+    c = manifest["arms"]["C"]
+    d = manifest["arms"]["D"]
+    paired = sha256(
+        canonical_json(
+            {
+                "bucket_floors": c["non_agentic_bucket_floors"],
+                "C_count_proof_sha256": c["count_proof_sha256"],
+                "D_count_proof_sha256": d["count_proof_sha256"],
+            }
+        )
+    )
+    connection = sqlite3.connect(f"file:{index_path}?mode=ro&immutable=1", uri=True)
+    try:
+        mismatch = connection.execute(
+            "SELECT count(*) FROM ("
+            "SELECT status,prompt_uuid FROM rows WHERE arm='C' AND domain!='swe-agentic-tool' "
+            "EXCEPT SELECT status,prompt_uuid FROM rows WHERE arm='D' AND domain!='swe-agentic-tool'"
+            ")"
+        ).fetchone()[0]
+        if mismatch:
+            raise ValueError("selection paired C/D UUID set proof mismatch")
+        for row in connection.execute(
+            "SELECT status,prompt_uuid FROM rows WHERE arm='C' AND domain!='swe-agentic-tool' "
+            "ORDER BY status,prompt_uuid"
+        ):
+            paired.update(canonical_json(list(row)))
+            paired.update(b"\n")
+        if paired.hexdigest() != manifest["paired_cd_sha256"]:
+            raise ValueError("selection paired C/D UUID proof mismatch")
+        identity = manifest["identity"]
+        selection_metadata = {
+            "schema_version": 2,
+            "policy_sha256": identity["policy_sha256"],
+            "seed": identity["seed"],
+            "source_inventory_sha256": identity["source_inventory_sha256"],
+            "baseline_receipt_sha256": identity["baseline_receipt_sha256"],
+            "held_out_receipt_sha256": identity["held_out_receipt_sha256"],
+            "ptv2_revision": identity["ptv2_revision"],
+            "ptv2_allowlist_sha256": identity["ptv2_allowlist_sha256"],
+            "paired_cd_sha256": manifest["paired_cd_sha256"],
+            "arms": manifest["arms"],
+        }
+        selection = sha256(canonical_json(selection_metadata))
+        for row in connection.execute(
+            "SELECT arm,status,selection_index,prompt_uuid FROM rows "
+            "ORDER BY arm,status,selection_index"
+        ):
+            selection.update(canonical_json(list(row)))
+            selection.update(b"\n")
+        if selection.hexdigest() != manifest["selection_sha256"]:
+            raise ValueError("selection SHA row-derived identity mismatch")
+    finally:
+        connection.close()
+
+
+def _semantic_cell(row: dict[str, Any]) -> str:
+    if row["arm"] != "B-prime":
+        return str(row["domain"])
+    if row["domain"] == "stem-science":
+        return "stem"
+    return {
+        "ja": "japanese",
+        "es": "spanish",
+        "fr": "french",
+        "it": "italian",
+    }.get(row["language"], f"invalid:{row['language']}")
+
+
+def _plain_nested(value: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    return {
+        outer: {inner: counts[inner] for inner in sorted(counts, key=_bucket_sort_key)}
+        for outer, counts in sorted(value.items())
+    }
+
+
+def _bucket_sort_key(bucket: str) -> tuple[int, str]:
+    order = ("le4k", "4k_16k", "16k_32k")
+    return (order.index(bucket), bucket) if bucket in order else (len(order), bucket)
+
+
 def _read_indexed_row(
-    root: Path, index_row: Sequence[Any], manifest: dict[str, Any]
+    root: Path,
+    index_row: Sequence[Any],
+    manifest: dict[str, Any],
+    descriptors: dict[str, Any] | None = None,
+    shard_handle: Any = None,
 ) -> dict[str, Any]:
     arm, status, selection_index, relative, offset, length, row_sha = index_row
-    descriptors = {shard["path"]: shard for shard in manifest["shards"]}
+    descriptors = descriptors or {shard["path"]: shard for shard in manifest["shards"]}
     if relative not in descriptors:
         raise ValueError("selection index references an unauthenticated shard")
     shard = _confined(root, relative)
-    with shard.open("rb") as handle:
-        handle.seek(offset)
-        line = handle.read(length)
+    if shard_handle is None:
+        with shard.open("rb") as handle:
+            handle.seek(offset)
+            line = handle.read(length)
+    else:
+        shard_handle.seek(offset)
+        line = shard_handle.read(length)
     if sha256(line).hexdigest() != row_sha:
         raise ValueError("selected row digest mismatch")
     try:
