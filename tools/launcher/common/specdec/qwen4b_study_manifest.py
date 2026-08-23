@@ -29,6 +29,8 @@ __all__ = [
     "Qwen4BStudyExperiment",
     "Qwen4BStudyInputs",
     "Qwen4BStudySchedule",
+    "WandbStudyRun",
+    "build_wandb_study_run",
     "load_study_manifest",
     "readable_study_job_name",
     "validate_canary_receipt",
@@ -37,6 +39,7 @@ __all__ = [
     "validate_readiness_receipt",
     "validate_training_target",
     "write_study_manifest",
+    "write_wandb_run_receipt",
 ]
 
 _SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -287,6 +290,127 @@ def readable_study_job_name(experiment: Qwen4BStudyExperiment) -> str:
         f"q4b-{mode}-{experiment.arm.lower()}-{method}-b{experiment.block_size}"
         f"-n{experiment.nodes}-t{budget_millions}m"
     )
+
+
+@dataclass(frozen=True)
+class WandbStudyRun:
+    """Durable, receipt-bound W&B identity for one scientific exposure boundary."""
+
+    schema_version: int
+    project: str
+    group: str
+    job_type: str
+    run_name: str
+    run_id: str
+    mode: str
+    resume: str
+    wandb_dir: str
+    cache_dir: str
+    config_dir: str
+    artifact_dir: str
+    experiment_id: str
+    arm: str
+    thinking_mode: str
+    method: str
+    block_size: int
+    assistant_token_target: int | None
+    requested_steps: int
+    corpus_manifest_sha256: str
+    tokenizer_sha256: str
+    target_revision: str
+    source_sha: str
+
+    @property
+    def receipt(self) -> dict[str, object]:
+        """Return the canonical non-secret identity recorded beside checkpoints."""
+        return asdict(self)
+
+
+def build_wandb_study_run(
+    experiment: Qwen4BStudyExperiment,
+    requested_steps: int,
+    assistant_token_target: int | None,
+) -> WandbStudyRun:
+    """Resolve a stable W&B run without inheriting a parent training run."""
+    validate_training_target(experiment, requested_steps, assistant_token_target)
+    if assistant_token_target is None:
+        boundary = f"canary-s{requested_steps}"
+        name_boundary = f"canary-s{requested_steps}"
+    else:
+        boundary = f"assistant-tokens-{assistant_token_target}"
+        name_boundary = (
+            f"t{assistant_token_target // 1_000_000}m"
+            if assistant_token_target % 1_000_000 == 0
+            else f"t{assistant_token_target}"
+        )
+    identity = {
+        "schema_version": 1,
+        "experiment_id": experiment.experiment_id,
+        "boundary": boundary,
+    }
+    identity_sha256 = sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    run_id = f"q4b-{experiment.experiment_id}-{identity_sha256[:12]}"
+    durable_root = Path(experiment.inputs.output_root) / "wandb" / run_id
+    return WandbStudyRun(
+        schema_version=1,
+        project="sna-qwen3-4b-dataset-study",
+        group=(
+            f"q4b-{experiment.arm.lower()}-thinking-{experiment.thinking_mode}-"
+            f"{experiment.method}-b{experiment.block_size}"
+        ),
+        job_type="dataset-study-train",
+        run_name=f"{readable_study_job_name(experiment)}-{name_boundary}",
+        run_id=run_id,
+        mode="online",
+        resume="allow",
+        wandb_dir=str(durable_root / "runs"),
+        cache_dir=str(durable_root / "cache"),
+        config_dir=str(durable_root / "config"),
+        artifact_dir=str(durable_root / "artifacts"),
+        experiment_id=experiment.experiment_id,
+        arm=experiment.arm,
+        thinking_mode=experiment.thinking_mode,
+        method=experiment.method,
+        block_size=experiment.block_size,
+        assistant_token_target=assistant_token_target,
+        requested_steps=requested_steps,
+        corpus_manifest_sha256=experiment.inputs.corpus_manifest_sha256,
+        tokenizer_sha256=experiment.inputs.tokenizer_sha256,
+        target_revision=experiment.inputs.target_revision,
+        source_sha=experiment.inputs.source_sha,
+    )
+
+
+def write_wandb_run_receipt(path: Path, run: WandbStudyRun) -> None:
+    """Publish one immutable W&B identity, allowing byte-identical requeues."""
+    content = (json.dumps(run.receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() or path.is_symlink():
+        if not path.is_file() or path.is_symlink() or path.read_bytes() != content:
+            raise ValueError("W&B run receipt identity mismatch")
+        return
+    with tempfile.NamedTemporaryFile(
+        mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as output:
+        output.write(content)
+        output.flush()
+        os.fsync(output.fileno())
+        temporary = Path(output.name)
+    try:
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if not path.is_file() or path.is_symlink() or path.read_bytes() != content:
+                raise ValueError("W&B run receipt identity mismatch") from None
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def validate_canary_receipt(

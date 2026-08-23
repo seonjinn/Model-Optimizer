@@ -60,6 +60,7 @@ from common.specdec.build_qwen4b_synthesis_manifest import (
     verify_data_manifest,
 )
 from common.specdec.qwen4b_study_manifest import (
+    build_wandb_study_run,
     load_study_manifest,
     readable_study_job_name,
     validate_milestone_receipt,
@@ -111,6 +112,9 @@ assistant_token_target = (
     else None
 )
 validate_training_target(experiment, int(os.environ["MAX_STEPS"]), assistant_token_target)
+wandb_run = build_wandb_study_run(
+    experiment, int(os.environ["MAX_STEPS"]), assistant_token_target
+)
 if assistant_token_target is not None:
     milestone_index = experiment.schedule.assistant_token_milestones.index(
         assistant_token_target
@@ -164,11 +168,22 @@ for value in (
     experiment.num_key_value_heads,
     experiment.head_dim,
     experiment.intermediate_size,
+    wandb_run.project,
+    wandb_run.group,
+    wandb_run.job_type,
+    wandb_run.run_name,
+    wandb_run.run_id,
+    wandb_run.mode,
+    wandb_run.resume,
+    wandb_run.wandb_dir,
+    wandb_run.cache_dir,
+    wandb_run.config_dir,
+    wandb_run.artifact_dir,
 ):
     print(value)
 PY
 )
-(( ${#values[@]} == 32 )) || { echo "study manifest entry is unavailable" >&2; exit 2; }
+(( ${#values[@]} == 43 )) || { echo "study manifest entry is unavailable" >&2; exit 2; }
 EXPERIMENT_ID="${values[0]}"
 RUN_NAME="${values[1]}"
 ARM="${values[2]}"
@@ -204,6 +219,17 @@ NUM_ATTENTION_HEADS="${values[28]}"
 NUM_KEY_VALUE_HEADS="${values[29]}"
 HEAD_DIM="${values[30]}"
 INTERMEDIATE_SIZE="${values[31]}"
+WANDB_PROJECT="${values[32]}"
+WANDB_RUN_GROUP="${values[33]}"
+WANDB_JOB_TYPE="${values[34]}"
+WANDB_RUN_NAME="${values[35]}"
+WANDB_RUN_ID="${values[36]}"
+WANDB_MODE="${values[37]}"
+WANDB_RESUME="${values[38]}"
+WANDB_DIR="${values[39]}"
+WANDB_CACHE_DIR="${values[40]}"
+WANDB_CONFIG_DIR="${values[41]}"
+WANDB_ARTIFACT_DIR="${values[42]}"
 readonly EXPERIMENT_ID RUN_NAME ARM THINKING_MODE METHOD BLOCK_SIZE SOURCE_PATH SOURCE_SHA
 readonly IMAGE_PATH IMAGE_SHA256 RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH TARGET_REVISION TOKENIZER_SHA256
 readonly CORPUS_PATH CORPUS_MANIFEST_PATH CORPUS_MANIFEST_SHA256 STUDY_OUTPUT_ROOT OUTPUT_ROOT
@@ -212,6 +238,8 @@ readonly CORPUS_ROWS CANARY_STEPS ASSISTANT_TOKEN_MILESTONES EAGLE_CAPTURE_IDS
 readonly ASSISTANT_TOKEN_MILESTONE_STEP_CEILINGS
 readonly PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS
 readonly NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE
+readonly WANDB_PROJECT WANDB_RUN_GROUP WANDB_JOB_TYPE WANDB_RUN_NAME WANDB_RUN_ID
+readonly WANDB_MODE WANDB_RESUME WANDB_DIR WANDB_CACHE_DIR WANDB_CONFIG_DIR WANDB_ARTIFACT_DIR
 
 [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ && "$SAVE_STEPS" =~ ^[1-9][0-9]*$ ]] || {
     echo "MAX_STEPS and SAVE_STEPS must be positive" >&2
@@ -268,6 +296,23 @@ PY
 fi
 
 mkdir -p "$OUTPUT_ROOT/control" "$OUTPUT_ROOT/logs"
+PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    "$MANIFEST_PATH" "$EXPERIMENT_INDEX" "$MAX_STEPS" "${ASSISTANT_TOKEN_TARGET:-none}" \
+    "$OUTPUT_ROOT/control/wandb-run.json" <<'PY'
+import sys
+from pathlib import Path
+
+from common.specdec.qwen4b_study_manifest import (
+    build_wandb_study_run,
+    load_study_manifest,
+    write_wandb_run_receipt,
+)
+
+experiment = load_study_manifest(Path(sys.argv[1]))[int(sys.argv[2])]
+assistant_token_target = None if sys.argv[4] == "none" else int(sys.argv[4])
+run = build_wandb_study_run(experiment, int(sys.argv[3]), assistant_token_target)
+write_wandb_run_receipt(Path(sys.argv[5]), run)
+PY
 TARGET_TOKEN_BUDGET="${ASSISTANT_TOKEN_TARGET:-$ASSISTANT_TOKEN_BUDGET}"
 [[ "$TARGET_TOKEN_BUDGET" != none ]] || TARGET_TOKEN_BUDGET="$ASSISTANT_TOKEN_BUDGET"
 readonly TARGET_TOKEN_BUDGET
@@ -352,23 +397,18 @@ stage_step=(srun --nodes=2 --ntasks=2 --ntasks-per-node=1 bash -c '
 ')
 drafter_run_requeueable_step "${stage_step[@]}"
 
-WANDB_NETRC_PATH="${WANDB_NETRC_PATH:-}"
-CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},${OUTPUT_ROOT}:${OUTPUT_ROOT},${OUTPUT_ROOT}/control:/scratchspace"
-if [[ -n "$WANDB_NETRC_PATH" ]]; then
-    [[ "$WANDB_NETRC_PATH" =~ ^/home/[A-Za-z0-9._-]+/\.netrc$ && -f "$WANDB_NETRC_PATH" && ! -L "$WANDB_NETRC_PATH" ]] || {
-        echo "invalid W&B netrc" >&2; exit 2;
-    }
-    CONTAINER_MOUNTS+=",${WANDB_NETRC_PATH}:/run/secrets/wandb.netrc:ro"
-fi
+WANDB_NETRC_PATH="${WANDB_NETRC_PATH:-/home/${USER}/.netrc}"
+[[ "$WANDB_NETRC_PATH" =~ ^/home/[A-Za-z0-9._-]+/\.netrc$ && -f "$WANDB_NETRC_PATH" && ! -L "$WANDB_NETRC_PATH" ]] || {
+    echo "invalid W&B netrc" >&2; exit 2;
+}
+mkdir -p "$WANDB_DIR" "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR" "$WANDB_ARTIFACT_DIR"
+CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},${STUDY_OUTPUT_ROOT}:${STUDY_OUTPUT_ROOT},${OUTPUT_ROOT}/control:/scratchspace,${WANDB_NETRC_PATH}:/run/secrets/wandb.netrc:ro"
 export IMAGE_PATH CONTAINER_MOUNTS WANDB_NETRC_PATH RUN_NAME ARM THINKING_MODE METHOD BLOCK_SIZE
 export NUM_SPEC_TOKENS LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA EAGLE_CAPTURE_IDS
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE
 export SERVE_NODES TRAINER_NODES SERVE_REPLICAS_PER_NODE GLOBAL_BATCH_SIZE CORPUS_ROWS TARGET_REVISION
-DEFAULT_WANDB_RUN_ID="q4b-${EXPERIMENT_ID}-production"
-if [[ "$MAX_STEPS" == "$CANARY_STEPS" ]]; then
-    DEFAULT_WANDB_RUN_ID="q4b-${EXPERIMENT_ID}-canary"
-fi
-export WANDB_RUN_ID="$DEFAULT_WANDB_RUN_ID" WANDB_RESUME=allow
+export WANDB_PROJECT WANDB_RUN_GROUP WANDB_JOB_TYPE WANDB_RUN_NAME WANDB_RUN_ID WANDB_MODE WANDB_RESUME
+export WANDB_DIR WANDB_CACHE_DIR WANDB_CONFIG_DIR WANDB_ARTIFACT_DIR
 
 rm -f "$OUTPUT_ROOT/control/.training_done.${SLURM_JOB_ID}" "$OUTPUT_ROOT/control/.trainer_addr.${SLURM_JOB_ID}"
 for replica in 0 1 2 3; do rm -f "$OUTPUT_ROOT/control/.serve_addr.${SLURM_JOB_ID}.0.${replica}"; done
@@ -385,9 +425,7 @@ training_step=(srun --nodes=2 --ntasks=2 --ntasks-per-node=1 --exclusive --kill-
     export SERVE_LOG_DIR="$node_root/logs" SERVE_MODEL_NAME="qwen4b-${EXPERIMENT_ID}"
     export SERVE_TP=1 SERVE_BLOCK_SIZE=32 SERVE_MAX_MODEL_LEN=32768 SERVE_READY_TIMEOUT=1800
     export HS_POOL_SLOTS=32 SERVE_MAX_NUM_SEQS=16 EXPORT_PATH EAGLE_CAPTURE_IDS
-    export WANDB_PROJECT=sna-modelopt-specdec WANDB_RUN_GROUP="$RUN_NAME" WANDB_DIR="$node_root/wandb"
-    if [[ -n "$WANDB_NETRC_PATH" ]]; then
-        export WANDB_API_KEY="$(python - <<'PY'
+    export WANDB_API_KEY="$(python - <<'PY'
 import netrc
 credentials = netrc.netrc("/run/secrets/wandb.netrc").authenticators("api.wandb.ai")
 if credentials is None or not credentials[2]:
@@ -395,8 +433,7 @@ if credentials is None or not credentials[2]:
 print(credentials[2])
 PY
 )"
-    fi
-    mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TMPDIR" "$SERVE_LOG_DIR" "$WANDB_DIR"
+    mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$TMPDIR" "$SERVE_LOG_DIR"
     pmon="$OUTPUT_ROOT/logs/nvidia-smi-pmon-node-${SLURM_NODEID}-${SLURM_JOB_ID}.log"
     nvidia-smi pmon -d 10 -s um -o DT >"$pmon" 2>&1 &
     pmon_pid=$!
@@ -414,7 +451,7 @@ PY
         training.training_seq_len=4096 training.answer_only_loss=true training.seed=42 \
         training.per_device_train_batch_size="$PER_DEVICE_TRAIN_BATCH_SIZE" \
         training.gradient_accumulation_steps="$GRADIENT_ACCUMULATION_STEPS" \
-        training.report_to=wandb training.run_name="${RUN_NAME}-s${MAX_STEPS}" \
+        training.report_to=wandb training.run_name="$WANDB_RUN_NAME" \
         dflash.dflash_block_size="$BLOCK_SIZE" dflash.dflash_num_anchors=512 \
         dflash.dflash_mask_token_id=151669 \
         dflash.dflash_architecture_config.num_attention_heads="$NUM_ATTENTION_HEADS" \

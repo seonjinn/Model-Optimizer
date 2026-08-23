@@ -39,6 +39,7 @@ from common.specdec.qwen4b_study_manifest import (
     Qwen4BStudyInputs,
     Qwen4BStudySchedule,
     _directory_sha256,
+    build_wandb_study_run,
     load_study_manifest,
     readable_study_job_name,
     validate_canary_receipt,
@@ -46,6 +47,7 @@ from common.specdec.qwen4b_study_manifest import (
     validate_pmon_logs,
     validate_training_target,
     write_study_manifest,
+    write_wandb_run_receipt,
 )
 
 
@@ -514,6 +516,52 @@ def test_study_identity_and_job_name_expose_arm_mode_method_and_topology() -> No
     assert experiment.experiment_id != replace(experiment, thinking_mode="off").experiment_id
 
 
+def test_wandb_identity_is_durable_stable_and_separates_scientific_milestones(
+    tmp_path: Path,
+) -> None:
+    """A requeue keeps one W&B identity while another exposure gets a distinct run."""
+    experiment = _study_experiment()
+    run = build_wandb_study_run(experiment, 390, 64_000_000)
+
+    assert run.project == "sna-qwen3-4b-dataset-study"
+    assert run.group == "q4b-c-thinking-on-dflash-b8"
+    assert run.job_type == "dataset-study-train"
+    assert run.run_name == "q4b-thon-c-df-b8-n2-t256m-t64m"
+    assert run.run_id == build_wandb_study_run(experiment, 390, 64_000_000).run_id
+    assert run.run_id != build_wandb_study_run(experiment, 650, 128_000_000).run_id
+    assert run.mode == "online"
+    assert run.resume == "allow"
+    durable_root = Path(experiment.inputs.output_root) / "wandb" / run.run_id
+    assert run.wandb_dir == str(durable_root / "runs")
+    assert run.cache_dir == str(durable_root / "cache")
+    assert run.config_dir == str(durable_root / "config")
+    assert run.artifact_dir == str(durable_root / "artifacts")
+
+    receipt = tmp_path / "wandb-run.json"
+    write_wandb_run_receipt(receipt, run)
+    first = receipt.read_bytes()
+    write_wandb_run_receipt(receipt, run)
+    assert receipt.read_bytes() == first
+    payload = json.loads(first)
+    assert payload["experiment_id"] == experiment.experiment_id
+    assert payload["corpus_manifest_sha256"] == experiment.inputs.corpus_manifest_sha256
+    assert payload["tokenizer_sha256"] == experiment.inputs.tokenizer_sha256
+    assert payload["target_revision"] == experiment.inputs.target_revision
+    assert payload["source_sha"] == experiment.inputs.source_sha
+    assert payload["assistant_token_target"] == 64_000_000
+
+
+def test_wandb_receipt_refuses_identity_collision(tmp_path: Path) -> None:
+    """An existing durable receipt cannot be rebound to another dataset arm."""
+    run = build_wandb_study_run(_study_experiment(), 390, 64_000_000)
+    path = tmp_path / "wandb-run.json"
+    write_wandb_run_receipt(path, run)
+
+    other = build_wandb_study_run(replace(_study_experiment(), arm="D"), 390, 64_000_000)
+    with pytest.raises(ValueError, match="identity mismatch"):
+        write_wandb_run_receipt(path, other)
+
+
 def test_study_manifest_round_trip_is_canonical_and_identity_checked(tmp_path: Path) -> None:
     """Training jobs consume a canonical manifest whose identity cannot be edited."""
     path = tmp_path / "study.json"
@@ -645,10 +693,14 @@ def test_training_runner_encodes_full_gpu_requeue_and_assistant_loss_contract() 
     assert "MODELOPT_ASSISTANT_TOKEN_TARGET" in runner
     assert "assistant-token-milestone-${ASSISTANT_TOKEN_TARGET}.json" in runner
     assert 'OUTPUT_ROOT="$STUDY_OUTPUT_ROOT/canary"' in runner
-    assert 'DEFAULT_WANDB_RUN_ID="q4b-${EXPERIMENT_ID}-canary"' in runner
-    assert 'DEFAULT_WANDB_RUN_ID="q4b-${EXPERIMENT_ID}-production"' in runner
-    assert 'export WANDB_RUN_ID="$DEFAULT_WANDB_RUN_ID"' in runner
-    assert "${WANDB_RUN_ID:-$DEFAULT_WANDB_RUN_ID}" not in runner
+    assert "build_wandb_study_run" in runner
+    assert 'WANDB_NETRC_PATH="${WANDB_NETRC_PATH:-/home/${USER}/.netrc}"' in runner
+    assert '"$OUTPUT_ROOT/control/wandb-run.json"' in runner
+    assert "WANDB_CACHE_DIR" in runner
+    assert "WANDB_CONFIG_DIR" in runner
+    assert "WANDB_ARTIFACT_DIR" in runner
+    assert 'training.run_name="$WANDB_RUN_NAME"' in runner
+    assert "sna-modelopt-specdec" not in runner
     assert "MANIFEST_SHA256" in runner.split("for name in", 1)[1].split("; do", 1)[0]
     assert '"$MANIFEST_PATH:$MANIFEST_SHA256:study manifest"' in runner
     assert 'sha256sum "$path"' in runner
