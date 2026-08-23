@@ -837,6 +837,21 @@ def _load_identity(path: Path) -> GenerationIdentity:
     return GenerationIdentity(**json.loads(path.read_text(encoding="utf-8")))
 
 
+def _closed_wire_assistant_message(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("wire assistant message is not an object")
+    default_fields = {"reasoning_content", "reasoning", "tool_calls", "function_call"}
+    if set(value) - {"role", "content", *default_fields}:
+        raise ValueError("wire assistant message has unknown fields")
+    if value.get("role") != "assistant" or not isinstance(value.get("content"), str):
+        raise ValueError("wire assistant role/content is invalid")
+    for field in default_fields.intersection(value):
+        protocol_value = value[field]
+        if protocol_value is not None and protocol_value not in ("", [], {}):
+            raise ValueError(f"wire assistant {field} is nonempty")
+    return {"role": "assistant", "content": value["content"]}
+
+
 def _attempt_from_api(
     row: SelectedPrompt,
     identity: GenerationIdentity,
@@ -867,7 +882,7 @@ def _attempt_from_api(
             api_response = json.loads(response.read())
         choice = api_response["choices"][0]
         response_record = {
-            "message": choice["message"],
+            "message": _closed_wire_assistant_message(choice["message"]),
             "finish_reason": choice["finish_reason"],
             "completion_tokens": api_response["usage"]["completion_tokens"],
         }

@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[3]
 MODULE_DIR = ROOT / "examples/dataset"
 sys.path.insert(0, str(MODULE_DIR))
 try:
+    import promote_synthesis_reserve as promoter
     from promote_synthesis_reserve import (
         GenerationAttempt,
         GenerationIdentity,
@@ -145,6 +146,111 @@ def _attempt(
         response_json=response_json,
         response_sha256=sha256(response_json.encode()).hexdigest(),
     )
+
+
+class _WireResponse:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> _WireResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return _canonical(self._payload).encode()
+
+
+def test_vllm_empty_protocol_defaults_normalize_to_closed_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire_payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": None,
+                    "reasoning": "",
+                    "tool_calls": [],
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"completion_tokens": 4},
+    }
+    monkeypatch.setattr(
+        promoter.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _WireResponse(wire_payload),
+    )
+
+    attempt = promoter._attempt_from_api(
+        PRIMARY[0],
+        IDENTITY,
+        base_url="http://localhost:8000/v1",
+        model="qwen3-4b-study",
+        attempt_namespace="job-0",
+    )
+    response = {
+        "message": {"role": "assistant", "content": "answer"},
+        "finish_reason": "stop",
+        "completion_tokens": 4,
+    }
+
+    assert attempt.response_json == _canonical(response)
+    assert attempt.response_sha256 == sha256(_canonical(response).encode()).hexdigest()
+    corpus = promote_responses(
+        VIEW,
+        [attempt, _attempt(PRIMARY[1]), _attempt(PRIMARY[2])],
+        IDENTITY,
+    )
+    assert PRIMARY[0].prompt_uuid in corpus.promoted_ids
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reasoning_content", "hidden reasoning"),
+        ("reasoning", "hidden reasoning"),
+        ("tool_calls", [{"id": "call-1"}]),
+        ("function_call", {"name": "legacy", "arguments": "{}"}),
+    ],
+)
+def test_vllm_nonempty_protocol_fields_are_failed_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    wire_payload = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "answer", field: value},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"completion_tokens": 4},
+    }
+    monkeypatch.setattr(
+        promoter.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _WireResponse(wire_payload),
+    )
+
+    attempt = promoter._attempt_from_api(
+        PRIMARY[0],
+        IDENTITY,
+        base_url="http://localhost:8000/v1",
+        model="qwen3-4b-study",
+        attempt_namespace="job-0",
+    )
+
+    assert json.loads(attempt.response_json) == {
+        "message": {"role": "assistant", "content": ""},
+        "finish_reason": "error",
+        "completion_tokens": 0,
+    }
 
 
 def test_generation_identity_rejects_wrong_target_runtime_mode_and_request() -> None:

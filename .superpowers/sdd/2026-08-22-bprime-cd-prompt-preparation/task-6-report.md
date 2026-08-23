@@ -159,3 +159,36 @@ conftest bootstrap.
   remains.
 - Confirmed production iteration remains disk-backed through selection,
   attempt reconciliation, promotion, receipt generation, and Task 7 handoff.
+
+## Review fix round 2
+
+### Root cause and correction
+
+- The API boundary persisted the vLLM `choice.message` object verbatim, while
+  promotion intentionally accepts only the closed assistant schema
+  `{role, content}`. Real vLLM responses add empty protocol defaults such as
+  `reasoning_content: null`, `reasoning: ""`, and `tool_calls: []`, so otherwise
+  valid completions were classified as failed and could exhaust every cell.
+- The generator now closes the wire response before hashing or persistence.
+  Exact assistant role/content is retained; only known semantically empty
+  reasoning/tool/function defaults are removed. Unknown fields or nonempty
+  reasoning, tool-call, or legacy function-call values fail closed into the
+  canonical error-attempt envelope. Thus equivalent wire defaults produce the
+  same deterministic response identity without weakening promotion validation.
+
+### RED and GREEN evidence
+
+- `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tests/examples/dataset tests/examples/dataset/test_promote_synthesis_reserve.py -k 'vllm_empty_protocol_defaults_normalize or vllm_nonempty_protocol_fields' --basetemp=/tmp/task6-r2-red-all`
+  — RED: `5 failed, 18 deselected in 0.06s`; the successful wire response kept
+  the three empty defaults, and every nonempty protocol-field mutation remained
+  a nominal success.
+- The same focused command with `--basetemp=/tmp/task6-r2-green-focused` —
+  GREEN: `5 passed, 18 deselected in 0.03s`.
+- `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tests/examples/dataset tests/examples/dataset/test_promote_synthesis_reserve.py --basetemp=/tmp/task6-r2-core`
+  — `23 passed in 0.08s`.
+- `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/launcher .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tools/launcher/tests tools/launcher/tests/test_qwen4b_dataset_study.py --basetemp=/tmp/task6-r2-launcher`
+  — `31 passed in 1.82s`.
+- `bash -n tools/launcher/common/specdec/run_qwen4b_synthesis.sbatch` — passed.
+- `git diff --check` — passed.
+- Three-file pre-commit invocation — passed Ruff, Ruff format, repository mypy,
+  license validation, Bandit, and markdownlint.
