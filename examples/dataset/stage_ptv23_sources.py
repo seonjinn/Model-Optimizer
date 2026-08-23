@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import tempfile
@@ -52,6 +55,17 @@ _SOURCE_KEYS = frozenset(
     }
 )
 _FILE_KEYS = frozenset({"path", "bytes", "sha256"})
+_PTV3_SOURCE_KEYS = frozenset(
+    {
+        "repo_id",
+        "configuration",
+        "split",
+        "revision",
+        "license_expression",
+        "approved_use",
+        "files",
+    }
+)
 _RECEIPT_KEYS = frozenset(
     {"schema_version", "name", "source_manifest_sha256", "complete", "raw_counts", "files"}
 )
@@ -110,6 +124,7 @@ class SourceInventory:
     name: str
     sources: Sequence[SourceIdentity]
     manifest_sha256: str
+    canonical_manifest: bytes
     raw_counts: Mapping[str, int]
     staged_root: Path | None = None
 
@@ -120,6 +135,10 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_json(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _require_exact_keys(value: Mapping[str, Any], expected: frozenset[str], label: str) -> None:
@@ -233,89 +252,29 @@ def load_source_inventory(path: Path) -> SourceInventory:
                     f"duplicate logical file: {source.repository_id}@{source.revision}:{file.path}"
                 )
             logical_files.add(logical)
+    canonical_manifest = _canonical_json(root)
     return SourceInventory(
         schema_version=1,
         name=name,
         sources=sources,
-        manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        manifest_sha256=hashlib.sha256(canonical_manifest).hexdigest(),
+        canonical_manifest=canonical_manifest,
         raw_counts=MappingProxyType({}),
     )
 
 
 def _load_published_inventory(path: Path, receipt: Mapping[str, Any]) -> SourceInventory:
+    if path.is_symlink() or path.name != "SOURCE_INVENTORY.json":
+        raise SourceManifestError("staged inventory receipt path is invalid")
     if receipt["schema_version"] != 1 or receipt["complete"] is not True:
         raise SourceManifestError("staged inventory receipt is incomplete")
-    name = _nonempty_string(receipt["name"], "staged inventory name")
-    manifest_sha256 = receipt["source_manifest_sha256"]
-    if not isinstance(manifest_sha256, str) or _SHA256.fullmatch(manifest_sha256) is None:
-        raise SourceManifestError("staged inventory source manifest SHA-256 is invalid")
-    records = receipt["files"]
-    if not isinstance(records, list) or not records:
-        raise SourceManifestError("staged inventory must contain at least one file")
-    grouped: dict[tuple[str, str, str, str, str, bool, str, str], list[dict[str, Any]]] = {}
-    for index, value in enumerate(records):
-        label = f"staged inventory files[{index}]"
-        record = _mapping(value, label)
-        _require_exact_keys(record, _RECEIPT_FILE_KEYS, label)
-        fields = (
-            record["repository_id"],
-            record["configuration"],
-            record["split"],
-            record["revision"],
-            record["license_expression"],
-            record["approved_use"],
-            record["cell"],
-            record["lane"],
-        )
-        if (
-            not all(isinstance(field, str) for field in fields[:5])
-            or not isinstance(fields[5], bool)
-            or not all(isinstance(field, str) for field in fields[6:])
-        ):
-            raise SourceManifestError(f"{label} has invalid source identity fields")
-        key = (
-            fields[0],
-            fields[1],
-            fields[2],
-            fields[3],
-            fields[4],
-            fields[5],
-            fields[6],
-            fields[7],
-        )
-        grouped.setdefault(key, []).append(
-            {
-                "path": record["source_path"],
-                "bytes": record["bytes"],
-                "sha256": record["sha256"],
-            }
-        )
-    sources = tuple(
-        _parse_source(
-            {
-                "repository_id": key[0],
-                "configuration": key[1],
-                "split": key[2],
-                "revision": key[3],
-                "license_expression": key[4],
-                "approved_use": key[5],
-                "cell": key[6],
-                "lane": key[7],
-                "files": files,
-            },
-            index,
-        )
-        for index, (key, files) in enumerate(grouped.items())
-    )
     staged_root = path.parent.resolve(strict=True)
-    inventory = SourceInventory(
-        schema_version=1,
-        name=name,
-        sources=sources,
-        manifest_sha256=manifest_sha256,
-        raw_counts=MappingProxyType({}),
-        staged_root=staged_root,
-    )
+    preserved_plan = staged_root / "SOURCE_PLAN.json"
+    if preserved_plan.is_symlink() or not preserved_plan.is_file():
+        raise SourceManifestError("preserved source plan is missing or invalid")
+    inventory = load_source_inventory(preserved_plan)
+    if staged_root.name != inventory.manifest_sha256:
+        raise SourceManifestError("published source plan content address mismatch")
     return _verify_staged(inventory, staged_root)
 
 
@@ -326,15 +285,24 @@ def validate_ptv3_config_pins(path: Path) -> None:
     except (OSError, yaml.YAMLError) as error:
         raise SourceManifestError(f"unable to read PTV3 dataset config: {path}") from error
     root = _mapping(payload, "PTV3 dataset config")
+    if set(root) != {"datasets"}:
+        raise SourceManifestError("PTV3 dataset config has unknown or missing keys")
     datasets = root.get("datasets")
     if not isinstance(datasets, list) or not datasets:
         raise SourceManifestError("PTV3 dataset config has no datasets")
     for index, value in enumerate(datasets):
-        record = _mapping(value, f"datasets[{index}]")
-        repository_id = record.get("repo_id", f"datasets[{index}]")
+        label = f"datasets[{index}]"
+        record = _mapping(value, label)
+        repository_id = record.get("repo_id", label)
         revision = record.get("revision")
         if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
             raise SourceManifestError(f"unpinned dataset revision: {repository_id}")
+        _require_exact_keys(record, _PTV3_SOURCE_KEYS, label)
+        repository_id = _nonempty_string(record["repo_id"], f"{label}.repo_id")
+        if _REPOSITORY.fullmatch(repository_id) is None:
+            raise SourceManifestError(f"{label}.repo_id must be an owner/name identifier")
+        _nonempty_string(record["configuration"], f"{label}.configuration")
+        _nonempty_string(record["split"], f"{label}.split")
         if (
             not isinstance(record.get("license_expression"), str)
             or not record["license_expression"].strip()
@@ -344,6 +312,8 @@ def validate_ptv3_config_pins(path: Path) -> None:
             raise SourceManifestError(f"unapproved dataset use: {repository_id}")
         if not isinstance(record.get("files"), list) or not record["files"]:
             raise SourceManifestError(f"unpinned dataset files: {repository_id}")
+        for file_index, file in enumerate(record["files"]):
+            _parse_file(file, f"{label}.files[{file_index}]")
 
 
 def _local_candidates(root: Path, source: SourceIdentity, file: SourceFile) -> tuple[Path, ...]:
@@ -351,7 +321,6 @@ def _local_candidates(root: Path, source: SourceIdentity, file: SourceFile) -> t
     return (
         root / source.repository_id / source.revision / file.path,
         root / cache_name / "snapshots" / source.revision / file.path,
-        root / source.repository_id / file.path,
     )
 
 
@@ -424,12 +393,56 @@ def _write_json_durable(path: Path, payload: Mapping[str, Any]) -> None:
         os.fsync(stream.fileno())
 
 
+def _write_bytes_durable(path: Path, payload: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Atomically publish a sibling directory without replacing any destination."""
+    if source.parent.resolve() != destination.parent.resolve():
+        raise SourceManifestError("publication partial must be a sibling of its destination")
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    system = platform.system()
+    if system == "Linux":
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise SourceManifestError("atomic no-replace rename is unavailable") from error
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, destination_bytes, 1)
+    elif system == "Darwin":
+        rename = library.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, 0x00000004)
+    else:
+        raise SourceManifestError(f"atomic no-replace rename is unsupported on {system}")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    raise SourceManifestError(f"atomic no-replace rename failed: {os.strerror(error_number)}")
 
 
 def _receipt_payload(
@@ -445,18 +458,35 @@ def _receipt_payload(
     }
 
 
-def _verify_staged(inventory: SourceInventory, root: Path) -> SourceInventory:
+def _verify_staged(
+    inventory: SourceInventory, root: Path, *, enforce_content_address: bool = True
+) -> SourceInventory:
     if root.is_symlink() or not root.is_dir():
         raise SourceManifestError("stale staged inventory root")
+    if enforce_content_address and root.name != inventory.manifest_sha256:
+        raise SourceManifestError("published source plan content address mismatch")
+    preserved_plan = root / "SOURCE_PLAN.json"
+    if (
+        preserved_plan.is_symlink()
+        or not preserved_plan.is_file()
+        or preserved_plan.read_bytes() != inventory.canonical_manifest
+        or _sha256_file(preserved_plan) != inventory.manifest_sha256
+    ):
+        raise SourceManifestError("preserved source plan identity mismatch")
     receipt_path = root / "SOURCE_INVENTORY.json"
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise SourceManifestError("stale staged inventory receipt")
     try:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise SourceManifestError("stale staged inventory receipt") from error
-    files = receipt.get("files") if isinstance(receipt, dict) else None
-    raw_counts = receipt.get("raw_counts") if isinstance(receipt, dict) else None
+    if not isinstance(receipt, dict):
+        raise SourceManifestError("stale staged inventory receipt")
+    files = receipt.get("files")
+    raw_counts = receipt.get("raw_counts")
     if (
-        receipt.get("schema_version") != 1
+        set(receipt) != _RECEIPT_KEYS
+        or receipt.get("schema_version") != 1
         or receipt.get("name") != inventory.name
         or receipt.get("source_manifest_sha256") != inventory.manifest_sha256
         or receipt.get("complete") is not True
@@ -476,6 +506,7 @@ def _verify_staged(inventory: SourceInventory, root: Path) -> SourceInventory:
     for record in files:
         if not isinstance(record, dict):
             raise SourceManifestError("stale staged inventory file record")
+        _require_exact_keys(record, _RECEIPT_FILE_KEYS, "staged inventory file record")
         repository_id = record.get("repository_id")
         revision = record.get("revision")
         source_path = record.get("source_path")
@@ -492,7 +523,6 @@ def _verify_staged(inventory: SourceInventory, root: Path) -> SourceInventory:
             raise SourceManifestError("stale staged inventory file record")
         seen.add(key)
         source, descriptor = expected_record
-        raw_count = record.get("raw_count")
         if (
             record.get("configuration") != source.configuration
             or record.get("split") != source.split
@@ -502,11 +532,11 @@ def _verify_staged(inventory: SourceInventory, root: Path) -> SourceInventory:
             or record.get("lane") != source.lane
             or record.get("bytes") != descriptor.bytes
             or record.get("sha256") != descriptor.sha256
-            or isinstance(raw_count, bool)
-            or not isinstance(raw_count, int)
-            or raw_count < 1
         ):
-            raise SourceManifestError("stale staged inventory file record")
+            raise SourceManifestError("stale staged source identity")
+        raw_count = record.get("raw_count")
+        if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 1:
+            raise SourceManifestError("stale staged inventory raw counts")
         path = (root / relative).resolve(strict=False)
         if (
             not path.is_relative_to(root.resolve())
@@ -515,7 +545,10 @@ def _verify_staged(inventory: SourceInventory, root: Path) -> SourceInventory:
             or _sha256_file(path) != descriptor.sha256
         ):
             raise SourceManifestError(f"stale staged file: {relative}")
-        recorded_counts[source.cell] = recorded_counts.get(source.cell, 0) + raw_count
+        actual_raw_count = _raw_count(path)
+        if raw_count != actual_raw_count:
+            raise SourceManifestError("stale staged inventory raw counts")
+        recorded_counts[source.cell] = recorded_counts.get(source.cell, 0) + actual_raw_count
     if seen != set(expected):
         raise SourceManifestError("stale staged inventory file set")
     parsed_counts: dict[str, int] = {}
@@ -535,6 +568,7 @@ def _verify_staged(inventory: SourceInventory, root: Path) -> SourceInventory:
         name=inventory.name,
         sources=inventory.sources,
         manifest_sha256=inventory.manifest_sha256,
+        canonical_manifest=inventory.canonical_manifest,
         raw_counts=MappingProxyType(parsed_counts),
         staged_root=root,
     )
@@ -556,6 +590,8 @@ def stage_source_inventory(
         else None
     )
     output_root = durable_root / inventory.manifest_sha256
+    if output_root.is_symlink():
+        raise SourceManifestError("stale staged inventory root")
     if output_root.exists():
         return _verify_staged(inventory, output_root)
     durable_root.mkdir(parents=True, exist_ok=True)
@@ -607,19 +643,18 @@ def stage_source_inventory(
                         "raw_count": count,
                     }
                 )
+        _write_bytes_durable(scratch_partial / "SOURCE_PLAN.json", inventory.canonical_manifest)
         _write_json_durable(
             scratch_partial / "SOURCE_INVENTORY.json",
             _receipt_payload(inventory, records, raw_counts),
         )
         _fsync_directory(scratch_partial)
         shutil.copytree(scratch_partial, durable_partial, copy_function=shutil.copyfile)
-        _verify_staged(inventory, durable_partial)
+        _verify_staged(inventory, durable_partial, enforce_content_address=False)
         _fsync_directory(durable_partial)
         try:
-            os.rename(durable_partial, output_root)
-        except OSError:
-            if not output_root.exists():
-                raise
+            _rename_no_replace(durable_partial, output_root)
+        except FileExistsError:
             shutil.rmtree(durable_partial, ignore_errors=True)
         _fsync_directory(durable_root)
         return _verify_staged(inventory, output_root)

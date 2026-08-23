@@ -8,8 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +26,7 @@ SUBMITTER = ROOT / "tools/launcher/common/specdec/submit_ptv23_source_stage.sh"
 
 sys.path.insert(0, str(MODULE_DIR))
 try:
+    import stage_ptv23_sources as stage_module  # pyright: ignore[reportMissingImports]
     from stage_ptv23_sources import (  # pyright: ignore[reportMissingImports]
         SourceManifestError,
         load_source_inventory,
@@ -35,6 +39,12 @@ finally:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_manifest_sha256(path: Path) -> str:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    canonical = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return _sha256(canonical)
 
 
 def _write_manifest(
@@ -137,6 +147,10 @@ def test_staging_verifies_bytes_sha_counts_and_detects_stale_files(tmp_path: Pat
     assert staged.staged_root == durable_root / inventory.manifest_sha256
     receipt = staged.staged_root / "SOURCE_INVENTORY.json"
     assert receipt.is_file()
+    preserved_plan = staged.staged_root / "SOURCE_PLAN.json"
+    assert preserved_plan.is_file()
+    assert _sha256(preserved_plan.read_bytes()) == inventory.manifest_sha256
+    assert staged.staged_root.name == inventory.manifest_sha256
     reloaded = load_source_inventory(receipt)
     assert reloaded.sources == inventory.sources
     assert reloaded.raw_counts == {"math": 2}
@@ -189,6 +203,7 @@ def test_staging_rejects_tampered_raw_count_receipt(tmp_path: Path) -> None:
     receipt = staged.staged_root / "SOURCE_INVENTORY.json"
     payload = json.loads(receipt.read_text(encoding="utf-8"))
     payload["raw_counts"]["math"] += 1
+    payload["files"][0]["raw_count"] += 1
     receipt.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
     with pytest.raises(SourceManifestError, match="raw counts"):
@@ -200,10 +215,116 @@ def test_staging_rejects_tampered_raw_count_receipt(tmp_path: Path) -> None:
         )
 
 
+def test_published_inventory_rejects_self_consistent_metadata_tampering(tmp_path: Path) -> None:
+    """Receipt metadata must be checked against the independently preserved source plan."""
+    manifest, source_root = _write_manifest(tmp_path)
+    staged = stage_source_inventory(
+        load_source_inventory(manifest),
+        durable_root=tmp_path / "durable",
+        scratch_root=tmp_path / "scratch",
+        local_source_root=source_root,
+    )
+    assert staged.staged_root is not None
+    receipt = staged.staged_root / "SOURCE_INVENTORY.json"
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["files"][0]["license_expression"] = "MIT"
+    receipt.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(SourceManifestError, match="source identity"):
+        load_source_inventory(receipt)
+
+
+def test_published_inventory_rejects_rewritten_plan_and_receipt_hash(tmp_path: Path) -> None:
+    """Changing both mutable claims must still conflict with the final content address."""
+    manifest, source_root = _write_manifest(tmp_path)
+    staged = stage_source_inventory(
+        load_source_inventory(manifest),
+        durable_root=tmp_path / "durable",
+        scratch_root=tmp_path / "scratch",
+        local_source_root=source_root,
+    )
+    assert staged.staged_root is not None
+    preserved_plan = staged.staged_root / "SOURCE_PLAN.json"
+    plan = json.loads(preserved_plan.read_text(encoding="utf-8"))
+    plan["sources"][0]["license_expression"] = "MIT"
+    canonical = (json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    preserved_plan.write_bytes(canonical)
+    receipt = staged.staged_root / "SOURCE_INVENTORY.json"
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    payload["source_manifest_sha256"] = _sha256(canonical)
+    payload["files"][0]["license_expression"] = "MIT"
+    receipt.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(SourceManifestError, match="content address"):
+        load_source_inventory(receipt)
+
+
+def test_staging_refuses_unrevisioned_local_candidate(tmp_path: Path) -> None:
+    """A mutable repository/path cache layout must not satisfy a pinned descriptor."""
+    manifest, source_root = _write_manifest(tmp_path)
+    revisioned = source_root / "nvidia/Test" / ("a" * 40) / "data/train.jsonl"
+    unrevisioned = source_root / "nvidia/Test" / "data/train.jsonl"
+    unrevisioned.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(revisioned, unrevisioned)
+
+    with pytest.raises(SourceManifestError, match="local source file is absent"):
+        stage_source_inventory(
+            load_source_inventory(manifest),
+            durable_root=tmp_path / "durable",
+            scratch_root=tmp_path / "scratch",
+            local_source_root=source_root,
+        )
+
+
+def test_atomic_publication_never_replaces_concurrent_winner(tmp_path: Path) -> None:
+    """Exactly one simultaneous publisher may claim a previously absent namespace."""
+    destination = tmp_path / "published"
+    sources = [tmp_path / "partial-a", tmp_path / "partial-b"]
+    for index, source in enumerate(sources):
+        source.mkdir()
+        (source / "winner").write_text(str(index), encoding="utf-8")
+    barrier = threading.Barrier(2)
+
+    def publish(source: Path) -> str:
+        barrier.wait()
+        try:
+            stage_module._rename_no_replace(source, destination)
+        except FileExistsError:
+            return "collision"
+        return "installed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(publish, sources))
+
+    assert sorted(results) == ["collision", "installed"]
+    assert (destination / "winner").read_text(encoding="utf-8") in {"0", "1"}
+    loser = sources[results.index("collision")]
+    assert (loser / "winner").is_file()
+
+
 def test_unpinned_ptv3_yaml_is_refused() -> None:
     """The broad convenience YAML must never become an implicit production source plan."""
     with pytest.raises(SourceManifestError, match=r"unpinned.*revision"):
         validate_ptv3_config_pins(UNPINNED_PTV3_CONFIG)
+
+
+def test_ptv3_config_rejects_empty_file_descriptor(tmp_path: Path) -> None:
+    """A nominally pinned YAML candidate must still pin every physical file."""
+    config = tmp_path / "pinned-but-empty.yaml"
+    config.write_text(
+        "datasets:\n"
+        "  - repo_id: nvidia/Test\n"
+        "    configuration: default\n"
+        "    split: train\n"
+        f"    revision: {'a' * 40}\n"
+        "    license_expression: CC-BY-4.0\n"
+        "    approved_use: true\n"
+        "    files: [{}]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SourceManifestError, match="unknown or missing keys"):
+        validate_ptv3_config_pins(config)
 
 
 def test_checked_in_inventory_has_complete_requested_source_lanes() -> None:
@@ -310,4 +431,4 @@ def test_submitter_pulls_then_test_only_before_real_submission(tmp_path: Path) -
     submitted = lines[real_index]
     assert "--cpus-per-task=144" in submitted
     assert "--gpus" not in submitted and "--gres" not in submitted
-    assert hashlib.sha256(manifest.read_bytes()).hexdigest() in submitted
+    assert _canonical_manifest_sha256(manifest) in submitted

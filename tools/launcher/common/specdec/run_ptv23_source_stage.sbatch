@@ -42,7 +42,16 @@ done
     exit 2
 }
 [[ -f "$SOURCE_MANIFEST" ]] || { echo "source manifest is absent" >&2; exit 2; }
-[[ "$(sha256sum "$SOURCE_MANIFEST" | cut -d' ' -f1)" == "$SOURCE_MANIFEST_SHA256" ]] || {
+actual_manifest_sha256="$(PYTHONPATH="$REPO_ROOT/examples/dataset${PYTHONPATH:+:$PYTHONPATH}" python3 - "$SOURCE_MANIFEST" <<'PY'
+import sys
+from pathlib import Path
+
+from stage_ptv23_sources import load_source_inventory
+
+print(load_source_inventory(Path(sys.argv[1])).manifest_sha256)
+PY
+)"
+[[ "$actual_manifest_sha256" == "$SOURCE_MANIFEST_SHA256" ]] || {
     echo "source manifest SHA-256 mismatch" >&2
     exit 2
 }

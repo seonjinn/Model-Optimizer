@@ -68,15 +68,19 @@ DURABLE_ROOT="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys
 if [[ -n "$LOCAL_SOURCE_ROOT" ]]; then
     LOCAL_SOURCE_ROOT="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$LOCAL_SOURCE_ROOT")"
 fi
-PYTHONPATH="$REPO_ROOT/examples/dataset${PYTHONPATH:+:$PYTHONPATH}" python3 - "$SOURCE_MANIFEST" <<'PY'
+SOURCE_MANIFEST_SHA256="$(PYTHONPATH="$REPO_ROOT/examples/dataset${PYTHONPATH:+:$PYTHONPATH}" python3 - "$SOURCE_MANIFEST" <<'PY'
 import sys
 from pathlib import Path
 
 from stage_ptv23_sources import load_source_inventory
 
-load_source_inventory(Path(sys.argv[1]))
+print(load_source_inventory(Path(sys.argv[1])).manifest_sha256)
 PY
-SOURCE_MANIFEST_SHA256="$(sha256sum "$SOURCE_MANIFEST" | cut -d' ' -f1)"
+)"
+[[ "$SOURCE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "source manifest canonical SHA-256 is invalid" >&2
+    exit 2
+}
 LOG_DIR="$DURABLE_ROOT/logs/$SOURCE_MANIFEST_SHA256"
 mkdir -p "$LOG_DIR"
 
