@@ -26,13 +26,18 @@ import tempfile
 import weakref
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, overload
+from typing import Any, Literal, overload
 
 import yaml
-from specdec_corpus_contracts import CanonicalPrompt, canonical_json, sha256_bytes
+from specdec_corpus_contracts import (
+    CanonicalPrompt,
+    canonical_json,
+    sha256_bytes,
+    sha256_canonical_json,
+)
 from specdec_identity import UUIDCollisionError, canonicalize_prompt
 from stage_ptv23_sources import SourceFile, SourceIdentity, SourceInventory
 from trajectory_schema import TrajectoryValidationError, validate_trajectory
@@ -42,6 +47,7 @@ __all__ = [
     "CandidateInventory",
     "CandidatePrompt",
     "DiskBackedCandidateRows",
+    "ExclusionProof",
     "InventorySource",
     "SourceFile",
     "SourceIdentity",
@@ -103,6 +109,16 @@ class CandidateCell:
 
 
 @dataclass(frozen=True)
+class ExclusionProof:
+    """Receipt identity and exact prompt-set reconciliation used by an inventory."""
+
+    receipt_sha256: str
+    prompt_ids_sha256: str
+    prompt_id_count: int
+    excluded_candidate_count: int
+
+
+@dataclass(frozen=True)
 class CandidatePrompt(CanonicalPrompt):
     """A canonical prompt plus deterministic selection and tokenization metadata."""
 
@@ -114,6 +130,7 @@ class CandidatePrompt(CanonicalPrompt):
     input_ids: tuple[int, ...]
     tokenizer_sha256: str
     replay_valid: bool
+    source_family: Literal["ptv2", "ptv3"]
 
     @property
     def arm_domain(self) -> str:
@@ -137,6 +154,7 @@ _CANDIDATE_COLUMNS = (
     "input_ids",
     "tokenizer_sha256",
     "replay_valid",
+    "source_family",
 )
 
 
@@ -194,6 +212,7 @@ class DiskBackedCandidateRows(Sequence[CandidatePrompt]):
             input_ids=tuple(json.loads(values["input_ids"])),
             tokenizer_sha256=values["tokenizer_sha256"],
             replay_valid=bool(values["replay_valid"]),
+            source_family=values["source_family"],
         )
 
     def __iter__(self):
@@ -240,6 +259,9 @@ class CandidateInventory:
     capacity: Mapping[CandidateCell, int]
     quarantine_counts: Mapping[str, int]
     inventory_sha256: str
+    baseline_exclusion: ExclusionProof
+    held_out_exclusion: ExclusionProof
+    ptv2_revision: str
 
     def close(self) -> None:
         """Release temporary row storage after all sequence consumers finish."""
@@ -261,6 +283,9 @@ class CandidateInventory:
             self.inventory_sha256 == other.inventory_sha256
             and self.capacity == other.capacity
             and self.quarantine_counts == other.quarantine_counts
+            and self.baseline_exclusion == other.baseline_exclusion
+            and self.held_out_exclusion == other.held_out_exclusion
+            and self.ptv2_revision == other.ptv2_revision
         )
 
 
@@ -556,7 +581,8 @@ def _create_candidate_database(path: Path) -> sqlite3.Connection:
             source_file_path TEXT NOT NULL,
             input_ids TEXT NOT NULL,
             tokenizer_sha256 TEXT NOT NULL,
-            replay_valid INTEGER NOT NULL
+            replay_valid INTEGER NOT NULL,
+            source_family TEXT NOT NULL CHECK (source_family IN ('ptv2', 'ptv3'))
         ) WITHOUT ROWID
         """
     )
@@ -584,6 +610,7 @@ def _insert_candidate(connection: sqlite3.Connection, candidate: CandidatePrompt
             json.dumps(candidate.input_ids, separators=(",", ":")),
             candidate.tokenizer_sha256,
             int(candidate.replay_valid),
+            candidate.source_family,
         ),
     )
 
@@ -607,6 +634,7 @@ def _candidate_record(prompt: CandidatePrompt) -> dict[str, Any]:
         "input_ids": prompt.input_ids,
         "tokenizer_sha256": prompt.tokenizer_sha256,
         "replay_valid": prompt.replay_valid,
+        "source_family": prompt.source_family,
     }
 
 
@@ -627,6 +655,9 @@ def _identity_chunks(
     rows: DiskBackedCandidateRows,
     capacity: Mapping[CandidateCell, int],
     quarantine_counts: Mapping[str, int],
+    baseline_exclusion: ExclusionProof,
+    held_out_exclusion: ExclusionProof,
+    ptv2_revision: str,
 ):
     yield (
         canonical_json(
@@ -635,6 +666,9 @@ def _identity_chunks(
                 "schema_version": 1,
                 "source_manifest_sha256": rows.source_manifest_sha256,
                 "tokenizer_sha256": rows.tokenizer_sha256,
+                "baseline_exclusion": asdict(baseline_exclusion),
+                "held_out_exclusion": asdict(held_out_exclusion),
+                "ptv2_revision": ptv2_revision,
             }
         )
         + b"\n"
@@ -652,12 +686,25 @@ def build_candidate_inventory(
     tokenizer_sha256: str,
     historical_prompt_ids: set[str],
     held_out_prompt_ids: set[str],
+    baseline_receipt_sha256: str,
+    held_out_receipt_sha256: str,
+    ptv2_revision: str,
     training_seq_len: int = 4_096,
     storage_dir: Path | None = None,
 ) -> CandidateInventory:
     """Build canonical B-prime/C/D candidates from one verified staged inventory."""
-    if _SHA256.fullmatch(tokenizer_sha256) is None or training_seq_len < 1:
-        raise ValueError("tokenizer digest and training sequence length must be pinned")
+    if (
+        _SHA256.fullmatch(tokenizer_sha256) is None
+        or _SHA256.fullmatch(baseline_receipt_sha256) is None
+        or baseline_receipt_sha256 == "0" * 64
+        or _SHA256.fullmatch(held_out_receipt_sha256) is None
+        or held_out_receipt_sha256 == "0" * 64
+        or _REVISION.fullmatch(ptv2_revision) is None
+        or training_seq_len < 1
+    ):
+        raise ValueError(
+            "tokenizer, exclusion receipts, PTV2 revision, and sequence length must be pinned"
+        )
     files = _verified_candidate_files(source_inventory)
     capacity: dict[CandidateCell, int] = {}
     quarantine_counts: dict[str, int] = {}
@@ -746,6 +793,7 @@ def build_candidate_inventory(
                     input_ids=input_ids,
                     tokenizer_sha256=tokenizer_sha256,
                     replay_valid=replay_valid,
+                    source_family="ptv2" if source.revision == ptv2_revision else "ptv3",
                 )
                 _insert_candidate(connection, candidate)
                 accepted_count += 1
@@ -771,6 +819,18 @@ def build_candidate_inventory(
         )
     )
     quarantine_counts = dict(sorted(quarantine_counts.items()))
+    baseline_exclusion = ExclusionProof(
+        baseline_receipt_sha256,
+        sha256_canonical_json(sorted(historical_prompt_ids)),
+        len(historical_prompt_ids),
+        quarantine_counts.get("historical_exclusion", 0),
+    )
+    held_out_exclusion = ExclusionProof(
+        held_out_receipt_sha256,
+        sha256_canonical_json(sorted(held_out_prompt_ids)),
+        len(held_out_prompt_ids),
+        quarantine_counts.get("heldout_exclusion", 0),
+    )
     rows = DiskBackedCandidateRows(
         database_path,
         accepted_count,
@@ -779,13 +839,23 @@ def build_candidate_inventory(
         storage_root,
     )
     digest = hashlib.sha256()
-    for chunk in _identity_chunks(rows, capacity, quarantine_counts):
+    for chunk in _identity_chunks(
+        rows,
+        capacity,
+        quarantine_counts,
+        baseline_exclusion,
+        held_out_exclusion,
+        ptv2_revision,
+    ):
         digest.update(chunk)
     return CandidateInventory(
         rows=rows,
         capacity=MappingProxyType(capacity),
         quarantine_counts=MappingProxyType(quarantine_counts),
         inventory_sha256=digest.hexdigest(),
+        baseline_exclusion=baseline_exclusion,
+        held_out_exclusion=held_out_exclusion,
+        ptv2_revision=ptv2_revision,
     )
 
 
@@ -793,7 +863,14 @@ def iter_candidate_inventory_bytes(inventory: CandidateInventory):
     """Yield deterministic inventory bytes without materializing the inventory."""
     if not isinstance(inventory.rows, DiskBackedCandidateRows):
         raise TypeError("candidate inventory rows are not disk-backed")
-    yield from _identity_chunks(inventory.rows, inventory.capacity, inventory.quarantine_counts)
+    yield from _identity_chunks(
+        inventory.rows,
+        inventory.capacity,
+        inventory.quarantine_counts,
+        inventory.baseline_exclusion,
+        inventory.held_out_exclusion,
+        inventory.ptv2_revision,
+    )
 
 
 def candidate_inventory_bytes(inventory: CandidateInventory) -> bytes:

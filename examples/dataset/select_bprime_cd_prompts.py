@@ -18,32 +18,38 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import sqlite3
+import tempfile
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from hashlib import sha256
+from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 from build_specdec_inventory import CandidateInventory, CandidatePrompt
 from specdec_corpus_contracts import canonical_json, sha256_bytes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
-
     from bprime_cd_policy import PromptPolicy
 
 __all__ = [
+    "DiskBackedSelectedRows",
     "PromptSelectionBlocked",
     "PromptSelectionBlockedError",
     "PromptView",
     "PromptViewBundle",
+    "PublishedPromptViews",
     "SelectedPrompt",
     "SelectionBlockedError",
     "build_policy_count_proofs",
-    "prompt_view_manifest",
+    "publish_prompt_view_bundle",
     "select_prompt_views",
 ]
+
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _BUCKET_ORDER = ("le4k", "4k_16k", "16k_32k")
@@ -61,7 +67,6 @@ _NON_AGENTIC_CELLS = (
     "multilingual",
     "instruction-chat",
 )
-_DEFAULT_RECEIPT_SHA256 = "0" * 64
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,7 @@ class SelectedPrompt:
     language: str
     context_bucket: str
     source_id: str
+    source_family: Literal["ptv2", "ptv3"]
     source_revision: str
     source_file_sha256: str
     source_manifest_sha256: str
@@ -97,8 +103,8 @@ class PromptView:
     """One arm's exact ordered prompt list, reserves, and count proofs."""
 
     arm: str
-    primary_rows: tuple[SelectedPrompt, ...]
-    reserve_rows: tuple[SelectedPrompt, ...]
+    primary_rows: Sequence[SelectedPrompt]
+    reserve_rows: Sequence[SelectedPrompt]
     cell_counts: Mapping[str, int]
     lane_counts: Mapping[str, int]
     bucket_floors: Mapping[str, Mapping[str, int]]
@@ -106,24 +112,24 @@ class PromptView:
     count_proof_sha256: str
 
     @property
-    def primary_prompt_ids(self) -> tuple[str, ...]:
-        return tuple(row.prompt_uuid for row in self.primary_rows)
+    def primary_prompt_ids(self) -> Sequence[str]:
+        return _MappedSequence(self.primary_rows, "prompt_uuid")
 
     @property
-    def final_prompt_ids(self) -> tuple[str, ...]:
+    def final_prompt_ids(self) -> Sequence[str]:
         """Alias for the final ordered primary UUIDs."""
         return self.primary_prompt_ids
 
     @property
-    def final_ordered_uuids(self) -> tuple[str, ...]:
+    def final_ordered_uuids(self) -> Sequence[str]:
         return self.primary_prompt_ids
 
     @property
-    def reserve_prompt_ids(self) -> tuple[str, ...]:
-        return tuple(row.prompt_uuid for row in self.reserve_rows)
+    def reserve_prompt_ids(self) -> Sequence[str]:
+        return _MappedSequence(self.reserve_rows, "prompt_uuid")
 
     @property
-    def reserve_ordered_uuids(self) -> tuple[str, ...]:
+    def reserve_ordered_uuids(self) -> Sequence[str]:
         return self.reserve_prompt_ids
 
     @property
@@ -151,8 +157,12 @@ class PromptViewBundle:
     source_inventory_sha256: str
     baseline_receipt_sha256: str
     held_out_receipt_sha256: str
+    ptv2_revision: str
+    reserve_numerator: int
+    reserve_denominator: int
     paired_cd_sha256: str
     selection_sha256: str
+    _storage: _SelectionStorage
 
     @property
     def selection_digest(self) -> str:
@@ -163,6 +173,120 @@ class PromptViewBundle:
     def paired_cd_digest(self) -> str:
         """Return the paired C/D proof digest."""
         return self.paired_cd_sha256
+
+    def close(self) -> None:
+        """Release the temporary disk-backed selection database."""
+        self._storage.close()
+
+    def __enter__(self) -> PromptViewBundle:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+@dataclass(frozen=True)
+class PublishedPromptViews:
+    """Paths and trusted root identity of a sharded published selection."""
+
+    manifest_path: Path
+    index_path: Path
+    root_sha256: str
+    row_count: int
+
+
+class _SelectionStorage:
+    def __init__(self) -> None:
+        self._temporary = tempfile.TemporaryDirectory(prefix="specdec-selection-")
+        self.path = Path(self._temporary.name) / "selection.sqlite3"
+        self.closed = False
+
+    def connect(self) -> sqlite3.Connection:
+        if self.closed:
+            raise RuntimeError("selection storage is closed")
+        return sqlite3.connect(self.path)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self._temporary.cleanup()
+
+
+class DiskBackedSelectedRows(Sequence[SelectedPrompt]):
+    """A zero-resident sequence backed by the externally ordered SQLite result."""
+
+    resident_row_count = 0
+
+    def __init__(self, storage: _SelectionStorage, arm: str, status: str) -> None:
+        self._storage = storage
+        self._arm = arm
+        self._status = status
+
+    def __len__(self) -> int:
+        with self._storage.connect() as connection:
+            return int(
+                connection.execute(
+                    "SELECT count(*) FROM selected WHERE arm=? AND status=?",
+                    (self._arm, self._status),
+                ).fetchone()[0]
+            )
+
+    @overload
+    def __getitem__(self, index: int) -> SelectedPrompt: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[SelectedPrompt]: ...
+
+    def __getitem__(self, index: int | slice) -> SelectedPrompt | list[SelectedPrompt]:
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[position] for position in range(start, stop, step)]
+        if index < 0:
+            index += len(self)
+        if index < 0:
+            raise IndexError(index)
+        with self._storage.connect() as connection:
+            row = connection.execute(
+                "SELECT payload,arm,status,candidate_rank,rank,selection_index FROM selected "
+                "WHERE arm=? AND status=? AND selection_index=?",
+                (self._arm, self._status, index),
+            ).fetchone()
+        if row is None:
+            raise IndexError(index)
+        return _selected_from_db_row(row)
+
+    def __iter__(self) -> Iterator[SelectedPrompt]:
+        with self._storage.connect() as connection:
+            cursor = connection.execute(
+                "SELECT payload,arm,status,candidate_rank,rank,selection_index FROM selected "
+                "WHERE arm=? AND status=? ORDER BY selection_index",
+                (self._arm, self._status),
+            )
+            for row in cursor:
+                yield _selected_from_db_row(row)
+
+
+class _MappedSequence(Sequence[str]):
+    def __init__(self, rows: Sequence[SelectedPrompt], field: str) -> None:
+        self._rows = rows
+        self._field = field
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, index: int | slice) -> str | list[str]:
+        value = self._rows[index]
+        if isinstance(value, list):
+            return [str(getattr(row, self._field)) for row in value]
+        return str(getattr(value, self._field))
+
+    def __iter__(self) -> Iterator[str]:
+        return (str(getattr(row, self._field)) for row in self._rows)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Sequence):
+            return False
+        return len(self) == len(other) and all(left == right for left, right in zip(self, other))
 
 
 class PromptSelectionBlockedError(ValueError):
@@ -187,15 +311,16 @@ def build_policy_count_proofs(policy: PromptPolicy) -> dict[str, Any]:
     for arm_name, arm in policy.arms.items():
         cell_counts = {name: cell.prompt_count for name, cell in arm.cells.items()}
         lane_counts = dict(arm.lanes)
-        cell_acquisition_counts = {
+        cell_acquisition_lower_bounds = {
             name: _acquisition_count(count, policy) for name, count in cell_counts.items()
         }
         proof: dict[str, Any] = {
             "primary_count": arm.prompt_count,
-            "acquisition_count": sum(cell_acquisition_counts.values()),
-            "reserve_count": sum(cell_acquisition_counts.values()) - arm.prompt_count,
+            "acquisition_lower_bound_count": sum(cell_acquisition_lower_bounds.values()),
+            "reserve_lower_bound_count": sum(cell_acquisition_lower_bounds.values())
+            - arm.prompt_count,
             "cell_counts": cell_counts,
-            "cell_acquisition_counts": cell_acquisition_counts,
+            "cell_acquisition_lower_bound_counts": cell_acquisition_lower_bounds,
             "lane_counts": lane_counts,
             "lane_acquisition_counts": {
                 name: _acquisition_count(count, policy) for name, count in lane_counts.items()
@@ -208,7 +333,8 @@ def build_policy_count_proofs(policy: PromptPolicy) -> dict[str, Any]:
         "C": {name: proofs["C"]["cell_counts"][name] for name in _NON_AGENTIC_CELLS},
         "D": {name: proofs["D"]["cell_counts"][name] for name in _NON_AGENTIC_CELLS},
         "reserve": {
-            name: proofs["C"]["cell_acquisition_counts"][name] - proofs["C"]["cell_counts"][name]
+            name: proofs["C"]["cell_acquisition_lower_bound_counts"][name]
+            - proofs["C"]["cell_counts"][name]
             for name in _NON_AGENTIC_CELLS
         },
     }
@@ -220,126 +346,112 @@ def select_prompt_views(
     inventory: CandidateInventory,
     policy: PromptPolicy,
     *,
-    baseline_receipt_sha256: str = _DEFAULT_RECEIPT_SHA256,
-    held_out_receipt_sha256: str = _DEFAULT_RECEIPT_SHA256,
+    baseline_receipt_sha256: str,
+    held_out_receipt_sha256: str,
 ) -> PromptViewBundle:
-    """Select deterministic exact-count B-prime/C/D primary and reserve prompt views."""
+    """Select exact views using SQLite for external ordering and bounded resident memory."""
     _validate_digest(inventory.inventory_sha256, "source inventory")
     _validate_digest(policy.policy_sha256, "policy")
-    _validate_digest(baseline_receipt_sha256, "baseline receipt")
-    _validate_digest(held_out_receipt_sha256, "held-out receipt")
-    rows = _validate_and_index_rows(inventory.rows, policy)
+    _validate_exclusion_receipts(inventory, baseline_receipt_sha256, held_out_receipt_sha256)
+    storage = _SelectionStorage()
+    connection = storage.connect()
+    _create_selection_schema(connection)
+    try:
+        _spool_candidates(connection, inventory.rows, policy)
+    except BaseException:
+        connection.close()
+        storage.close()
+        raise
 
-    b_primary: dict[str, list[SelectedPrompt]] = {}
-    b_reserve: dict[str, list[SelectedPrompt]] = {}
     b_floors: dict[str, dict[str, int]] = {}
     for cell, (domain, lane, language) in _BPRIME_CELLS.items():
-        eligible = _eligible(rows, domain=domain, lane=lane, language=language)
-        primary, reserve, floors = _select_cell(
-            eligible,
+        floors = _select_sql_cell(
+            connection,
             quota=policy.count_for("B-prime", cell),
             arm="B-prime",
             cell=cell,
+            domain=domain,
+            lane=lane,
+            language=language,
+            source_family="ptv2",
+            source_revision=inventory.ptv2_revision,
             policy=policy,
             inventory_sha256=inventory.inventory_sha256,
             baseline_receipt_sha256=baseline_receipt_sha256,
             held_out_receipt_sha256=held_out_receipt_sha256,
         )
-        b_primary[cell], b_reserve[cell], b_floors[cell] = primary, reserve, floors
-    b_view = _build_view("B-prime", b_primary, b_reserve, b_floors, policy, non_agentic_cells=())
+        b_floors[cell] = floors
 
-    c_primary: dict[str, list[SelectedPrompt]] = {}
-    c_reserve: dict[str, list[SelectedPrompt]] = {}
     c_floors: dict[str, dict[str, int]] = {}
-    d_primary: dict[str, list[SelectedPrompt]] = {}
-    d_reserve: dict[str, list[SelectedPrompt]] = {}
     d_floors: dict[str, dict[str, int]] = {}
     for cell in _NON_AGENTIC_CELLS:
-        c_eligible = _eligible(rows, domain=cell, lane="target-synth")
-        d_eligible = _eligible(rows, domain=cell, lane="target-synth")
-        common_capacities = _common_bucket_capacities(c_eligible, d_eligible)
-        primary, reserve, floors = _select_cell(
-            c_eligible,
+        floors = _select_sql_cell(
+            connection,
             quota=policy.count_for("C", cell),
             arm="C",
             cell=cell,
+            domain=cell,
+            lane="target-synth",
             policy=policy,
             inventory_sha256=inventory.inventory_sha256,
             baseline_receipt_sha256=baseline_receipt_sha256,
             held_out_receipt_sha256=held_out_receipt_sha256,
-            capacity_vector=common_capacities,
         )
-        c_primary[cell], c_reserve[cell], c_floors[cell] = primary, reserve, floors
-        d_primary[cell] = [replace(row, arm="D") for row in primary]
-        d_reserve[cell] = [replace(row, arm="D") for row in reserve]
+        _clone_selected_cell(connection, source_arm="C", target_arm="D", domain=cell)
+        c_floors[cell] = floors
         d_floors[cell] = dict(floors)
 
-    c_agentic = _eligible(rows, domain="swe-agentic-tool", lane="agentless-swe")
-    primary, reserve, floors = _select_cell(
-        c_agentic,
+    floors = _select_sql_cell(
+        connection,
         quota=policy.count_for("C", "swe-agentic-tool"),
         arm="C",
         cell="swe-agentic-tool",
+        domain="swe-agentic-tool",
+        lane="agentless-swe",
         policy=policy,
         inventory_sha256=inventory.inventory_sha256,
         baseline_receipt_sha256=baseline_receipt_sha256,
         held_out_receipt_sha256=held_out_receipt_sha256,
     )
-    c_primary["swe-agentic-tool"] = primary
-    c_reserve["swe-agentic-tool"] = reserve
     c_floors["swe-agentic-tool"] = floors
 
-    d_agentic_primary: list[SelectedPrompt] = []
-    d_agentic_reserve: list[SelectedPrompt] = []
     d_agentic_floors: dict[str, int] = defaultdict(int)
     for lane, quota in policy.arms["D"].lanes.items():
-        eligible = _eligible(rows, domain="swe-agentic-tool", lane=lane)
-        primary, reserve, floors = _select_cell(
-            eligible,
+        floors = _select_sql_cell(
+            connection,
             quota=quota,
             arm="D",
             cell="swe-agentic-tool",
+            domain="swe-agentic-tool",
+            lane=lane,
             policy=policy,
             inventory_sha256=inventory.inventory_sha256,
             baseline_receipt_sha256=baseline_receipt_sha256,
             held_out_receipt_sha256=held_out_receipt_sha256,
         )
-        d_agentic_primary.extend(primary)
-        d_agentic_reserve.extend(reserve)
         for bucket, count in floors.items():
             d_agentic_floors[bucket] += count
-    d_primary["swe-agentic-tool"] = d_agentic_primary
-    d_reserve["swe-agentic-tool"] = d_agentic_reserve
     d_floors["swe-agentic-tool"] = dict(d_agentic_floors)
-
-    c_view = _build_view(
-        "C", c_primary, c_reserve, c_floors, policy, non_agentic_cells=_NON_AGENTIC_CELLS
-    )
-    d_view = _build_view(
-        "D", d_primary, d_reserve, d_floors, policy, non_agentic_cells=_NON_AGENTIC_CELLS
-    )
-    _validate_paired_views(c_view, d_view)
-    paired_cd_sha256 = _paired_cd_sha256(c_view, d_view)
-    identity = {
-        "schema_version": 1,
+    _assign_selection_indexes(connection)
+    connection.commit()
+    b_view = _build_disk_view(storage, "B-prime", b_floors, policy, ())
+    c_view = _build_disk_view(storage, "C", c_floors, policy, _NON_AGENTIC_CELLS)
+    d_view = _build_disk_view(storage, "D", d_floors, policy, _NON_AGENTIC_CELLS)
+    _validate_paired_sql(connection)
+    paired_cd_sha256 = _stream_paired_digest(connection, c_view, d_view)
+    metadata = {
+        "schema_version": 2,
         "policy_sha256": policy.policy_sha256,
         "seed": policy.seed,
         "source_inventory_sha256": inventory.inventory_sha256,
         "baseline_receipt_sha256": baseline_receipt_sha256,
         "held_out_receipt_sha256": held_out_receipt_sha256,
+        "ptv2_revision": inventory.ptv2_revision,
         "paired_cd_sha256": paired_cd_sha256,
-        "arms": {
-            view.arm: {
-                "primary_prompt_ids": view.primary_prompt_ids,
-                "reserve_prompt_ids": view.reserve_prompt_ids,
-                "cell_counts": dict(view.cell_counts),
-                "lane_counts": dict(view.lane_counts),
-                "bucket_floors": _plain_floors(view.bucket_floors),
-                "count_proof_sha256": view.count_proof_sha256,
-            }
-            for view in (b_view, c_view, d_view)
-        },
+        "arms": {v.arm: _compact_view_record(v) for v in (b_view, c_view, d_view)},
     }
+    selection_sha256 = _stream_selection_digest(connection, metadata)
+    connection.close()
     return PromptViewBundle(
         B_prime=b_view,
         C=c_view,
@@ -349,30 +461,511 @@ def select_prompt_views(
         source_inventory_sha256=inventory.inventory_sha256,
         baseline_receipt_sha256=baseline_receipt_sha256,
         held_out_receipt_sha256=held_out_receipt_sha256,
+        ptv2_revision=inventory.ptv2_revision,
+        reserve_numerator=policy.reserve_numerator,
+        reserve_denominator=policy.reserve_denominator,
         paired_cd_sha256=paired_cd_sha256,
-        selection_sha256=sha256_bytes(canonical_json(identity)),
+        selection_sha256=selection_sha256,
+        _storage=storage,
     )
 
 
-def prompt_view_manifest(bundle: PromptViewBundle) -> dict[str, Any]:
-    """Return a tamper-evident, canonical JSON selection artifact for inspection."""
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        "selection_sha256": bundle.selection_sha256,
-        "paired_cd_sha256": bundle.paired_cd_sha256,
-        "identity": {
-            "policy_sha256": bundle.policy_sha256,
-            "seed": bundle.seed,
-            "source_inventory_sha256": bundle.source_inventory_sha256,
-            "baseline_receipt_sha256": bundle.baseline_receipt_sha256,
-            "held_out_receipt_sha256": bundle.held_out_receipt_sha256,
+def _create_selection_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        PRAGMA journal_mode=OFF;
+        PRAGMA synchronous=OFF;
+        PRAGMA temp_store=FILE;
+        CREATE TABLE candidates(
+          prompt_uuid TEXT PRIMARY KEY, domain TEXT NOT NULL, lane TEXT NOT NULL,
+          language TEXT NOT NULL, bucket TEXT NOT NULL, source_family TEXT NOT NULL,
+          source_revision TEXT NOT NULL, rank TEXT NOT NULL, payload TEXT NOT NULL
+        );
+        CREATE INDEX candidates_cell ON candidates(
+          domain,lane,language,source_family,source_revision,bucket,rank,prompt_uuid
+        );
+        CREATE TABLE selected(
+          arm TEXT NOT NULL, status TEXT NOT NULL, cell TEXT NOT NULL,
+          prompt_uuid TEXT NOT NULL, domain TEXT NOT NULL, lane TEXT NOT NULL,
+          language TEXT NOT NULL, bucket TEXT NOT NULL, candidate_rank INTEGER NOT NULL,
+          rank TEXT NOT NULL, selection_index INTEGER NOT NULL DEFAULT -1, payload TEXT NOT NULL,
+          PRIMARY KEY(arm,status,prompt_uuid)
+        );
+        CREATE INDEX selected_order ON selected(arm,status,selection_index);
+        CREATE INDEX selected_filter ON selected(arm,domain,lane,language,prompt_uuid,status,selection_index);
+        """
+    )
+
+
+def _candidate_payload(candidate: CandidatePrompt) -> str:
+    return json.dumps(
+        {
+            "prompt_uuid": candidate.prompt_uuid,
+            "domain": candidate.domain,
+            "lane": candidate.lane,
+            "language": candidate.language,
+            "context_bucket": candidate.context_bucket,
+            "source_id": candidate.source_id,
+            "source_family": candidate.source_family,
+            "source_revision": candidate.source_revision,
+            "source_file_sha256": candidate.source_file_sha256,
+            "source_manifest_sha256": candidate.source_manifest_sha256,
+            "source_file_path": candidate.source_file_path,
+            "source_row_index": candidate.source_row_index,
+            "canonical_prompt_json": candidate.canonical_bytes.decode("utf-8"),
         },
-        "arms": {
-            view.arm: _view_manifest_record(view) for view in (bundle.B_prime, bundle.C, bundle.D)
-        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _spool_candidates(
+    connection: sqlite3.Connection, raw_rows: Iterable[Any], policy: PromptPolicy
+) -> None:
+    for row in raw_rows:
+        if not isinstance(row, CandidatePrompt):
+            raise TypeError("candidate inventory rows must be CandidatePrompt values")
+        _validate_digest(row.prompt_uuid, "prompt UUID")
+        if sha256(row.canonical_bytes).hexdigest() != row.prompt_uuid:
+            raise ValueError(f"candidate canonical prompt identity mismatch: {row.prompt_uuid}")
+        if not policy.is_language_allowed(row.language):
+            continue
+        try:
+            connection.execute(
+                "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    row.prompt_uuid,
+                    row.domain,
+                    row.lane,
+                    row.language,
+                    row.context_bucket,
+                    row.source_family,
+                    row.source_revision,
+                    _rank(row, policy),
+                    _candidate_payload(row),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(f"duplicate candidate prompt UUID: {row.prompt_uuid}") from error
+    connection.commit()
+
+
+def _candidate_where(
+    *,
+    domain: str,
+    lane: str,
+    language: str | None,
+    source_family: str | None,
+    source_revision: str | None,
+) -> tuple[str, list[str]]:
+    clauses = ["domain=?", "lane=?"]
+    values = [domain, lane]
+    for column, value in (
+        ("language", language),
+        ("source_family", source_family),
+        ("source_revision", source_revision),
+    ):
+        if value is not None:
+            clauses.append(f"{column}=?")
+            values.append(value)
+    return " AND ".join(clauses), values
+
+
+def _select_sql_cell(
+    connection: sqlite3.Connection,
+    *,
+    quota: int,
+    arm: str,
+    cell: str,
+    domain: str,
+    lane: str,
+    policy: PromptPolicy,
+    inventory_sha256: str,
+    baseline_receipt_sha256: str,
+    held_out_receipt_sha256: str,
+    language: str | None = None,
+    source_family: str | None = None,
+    source_revision: str | None = None,
+) -> dict[str, int]:
+    where, values = _candidate_where(
+        domain=domain,
+        lane=lane,
+        language=language,
+        source_family=source_family,
+        source_revision=source_revision,
+    )
+    capacities = {
+        str(bucket): int(count)
+        for bucket, count in connection.execute(
+            f"SELECT bucket,count(*) FROM candidates WHERE {where} GROUP BY bucket", values
+        )
     }
-    manifest["artifact_sha256"] = sha256_bytes(canonical_json(manifest))
-    return manifest
+    floors = _allocate_bucket_quotas(capacities, quota)
+    if not floors:
+        _raise_shortfall(
+            arm=arm,
+            cell=cell,
+            lane=lane,
+            bucket="none",
+            quota=quota,
+            required=_acquisition_count(quota, policy),
+            available=sum(capacities.values()),
+            policy=policy,
+            inventory_sha256=inventory_sha256,
+            baseline_receipt_sha256=baseline_receipt_sha256,
+            held_out_receipt_sha256=held_out_receipt_sha256,
+        )
+    for bucket, bucket_quota in floors.items():
+        required = _acquisition_count(bucket_quota, policy)
+        rows = connection.execute(
+            f"SELECT prompt_uuid,domain,lane,language,bucket,rank,payload FROM candidates "
+            f"WHERE {where} AND bucket=? ORDER BY rank,prompt_uuid LIMIT ?",
+            (*values, bucket, required),
+        )
+        selected = 0
+        reserve_count = required - bucket_quota
+        for candidate_rank, row in enumerate(rows):
+            status = "reserve" if candidate_rank < reserve_count else "primary"
+            connection.execute(
+                "INSERT INTO selected(arm,status,cell,prompt_uuid,domain,lane,language,bucket,"
+                "candidate_rank,rank,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    arm,
+                    status,
+                    cell,
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
+                    candidate_rank,
+                    row[5],
+                    row[6],
+                ),
+            )
+            selected += 1
+        if selected != required:
+            _raise_shortfall(
+                arm=arm,
+                cell=cell,
+                lane=lane,
+                bucket=bucket,
+                quota=bucket_quota,
+                required=required,
+                available=selected,
+                policy=policy,
+                inventory_sha256=inventory_sha256,
+                baseline_receipt_sha256=baseline_receipt_sha256,
+                held_out_receipt_sha256=held_out_receipt_sha256,
+            )
+    return floors
+
+
+def _clone_selected_cell(
+    connection: sqlite3.Connection, *, source_arm: str, target_arm: str, domain: str
+) -> None:
+    connection.execute(
+        "INSERT INTO selected(arm,status,cell,prompt_uuid,domain,lane,language,bucket,"
+        "candidate_rank,rank,payload) SELECT ?,status,cell,prompt_uuid,domain,lane,language,bucket,"
+        "candidate_rank,rank,payload FROM selected WHERE arm=? AND domain=?",
+        (target_arm, source_arm, domain),
+    )
+
+
+def _assign_selection_indexes(connection: sqlite3.Connection) -> None:
+    for arm in ("B-prime", "C", "D"):
+        for status in ("primary", "reserve"):
+            cursor = connection.execute(
+                "SELECT rowid FROM selected WHERE arm=? AND status=? "
+                "ORDER BY rank,prompt_uuid,domain,lane,bucket",
+                (arm, status),
+            )
+            for index, (rowid,) in enumerate(cursor):
+                connection.execute(
+                    "UPDATE selected SET selection_index=? WHERE rowid=?", (index, rowid)
+                )
+
+
+def _selected_from_db_row(row: Sequence[Any]) -> SelectedPrompt:
+    value = json.loads(row[0])
+    status = str(row[2])
+    if status not in {"primary", "reserve"}:
+        raise ValueError(f"invalid stored selection status: {status}")
+    return SelectedPrompt(
+        **value,
+        arm=str(row[1]),
+        status=cast("Literal['primary', 'reserve']", status),
+        candidate_rank=int(row[3]),
+        candidate_rank_sha256=str(row[4]),
+        selection_index=int(row[5]),
+    )
+
+
+def _build_disk_view(
+    storage: _SelectionStorage,
+    arm: str,
+    bucket_floors: Mapping[str, Mapping[str, int]],
+    policy: PromptPolicy,
+    non_agentic_cells: Sequence[str],
+) -> PromptView:
+    primary = DiskBackedSelectedRows(storage, arm, "primary")
+    reserve = DiskBackedSelectedRows(storage, arm, "reserve")
+    expected = policy.count_for(arm)
+    if len(primary) != expected:
+        raise AssertionError(f"{arm} exact-count proof failed: {len(primary)} != {expected}")
+    cell_counts = {name: policy.count_for(arm, name) for name in policy.arms[arm].cells}
+    lane_counts = (
+        {"agentless-swe": policy.count_for("C", "swe-agentic-tool")}
+        if arm == "C"
+        else dict(policy.arms[arm].lanes)
+    )
+    floors = _freeze_floors(bucket_floors)
+    non_agentic = _freeze_floors({name: bucket_floors[name] for name in non_agentic_cells})
+    proof = {
+        "arm": arm,
+        "primary_count": len(primary),
+        "reserve_count": len(reserve),
+        "cell_counts": cell_counts,
+        "lane_counts": lane_counts,
+        "bucket_floors": _plain_floors(floors),
+        "acquisition_count": len(primary) + len(reserve),
+    }
+    return PromptView(
+        arm,
+        primary,
+        reserve,
+        MappingProxyType(cell_counts),
+        MappingProxyType(lane_counts),
+        floors,
+        non_agentic,
+        sha256_bytes(canonical_json(proof)),
+    )
+
+
+def _compact_view_record(view: PromptView) -> dict[str, Any]:
+    return {
+        "primary_count": len(view.primary_rows),
+        "reserve_count": len(view.reserve_rows),
+        "cell_counts": dict(view.cell_counts),
+        "lane_counts": dict(view.lane_counts),
+        "bucket_floors": _plain_floors(view.bucket_floors),
+        "non_agentic_bucket_floors": _plain_floors(view.non_agentic_bucket_floors),
+        "count_proof_sha256": view.count_proof_sha256,
+    }
+
+
+def _validate_paired_sql(connection: sqlite3.Connection) -> None:
+    mismatch = connection.execute(
+        "SELECT count(*) FROM ("
+        "SELECT prompt_uuid,status FROM selected WHERE arm='C' AND domain!='swe-agentic-tool' "
+        "EXCEPT SELECT prompt_uuid,status FROM selected WHERE arm='D' AND domain!='swe-agentic-tool'"
+        ")"
+    ).fetchone()[0]
+    if mismatch:
+        raise AssertionError("C/D non-agentic prompt UUID sets are not paired")
+
+
+def _stream_paired_digest(
+    connection: sqlite3.Connection, c_view: PromptView, d_view: PromptView
+) -> str:
+    digest = sha256(
+        canonical_json(
+            {
+                "bucket_floors": _plain_floors(c_view.non_agentic_bucket_floors),
+                "C_count_proof_sha256": c_view.count_proof_sha256,
+                "D_count_proof_sha256": d_view.count_proof_sha256,
+            }
+        )
+    )
+    for row in connection.execute(
+        "SELECT status,prompt_uuid FROM selected WHERE arm='C' AND domain!='swe-agentic-tool' "
+        "ORDER BY status,prompt_uuid"
+    ):
+        digest.update(canonical_json(list(row)))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _stream_selection_digest(connection: sqlite3.Connection, metadata: Mapping[str, Any]) -> str:
+    digest = sha256(canonical_json(metadata))
+    for row in connection.execute(
+        "SELECT arm,status,selection_index,prompt_uuid FROM selected "
+        "ORDER BY arm,status,selection_index"
+    ):
+        digest.update(canonical_json(list(row)))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def publish_prompt_view_bundle(
+    bundle: PromptViewBundle, output_dir: Path, *, rows_per_shard: int = 10_000
+) -> PublishedPromptViews:
+    """Stream canonical rows to hashed JSONL shards plus a compact indexed root manifest."""
+    if (
+        isinstance(rows_per_shard, bool)
+        or not isinstance(rows_per_shard, int)
+        or rows_per_shard < 1
+    ):
+        raise ValueError("rows_per_shard must be a positive integer")
+    output_dir = Path(output_dir)
+    if output_dir.exists():
+        raise FileExistsError(f"published selection destination already exists: {output_dir}")
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    partial = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.partial-", dir=output_dir.parent))
+    shards_dir = partial / "shards"
+    shards_dir.mkdir()
+    index_path = partial / "selection-index.sqlite3"
+    index = sqlite3.connect(index_path)
+    index.executescript(
+        """
+        PRAGMA journal_mode=OFF;
+        PRAGMA synchronous=FULL;
+        CREATE TABLE rows(
+          global_index INTEGER PRIMARY KEY, arm TEXT NOT NULL, status TEXT NOT NULL,
+          selection_index INTEGER NOT NULL, domain TEXT NOT NULL, lane TEXT NOT NULL,
+          language TEXT NOT NULL, prompt_uuid TEXT NOT NULL, shard_path TEXT NOT NULL,
+          byte_offset INTEGER NOT NULL, byte_length INTEGER NOT NULL, row_sha256 TEXT NOT NULL
+        );
+        CREATE INDEX rows_filter ON rows(arm,domain,lane,language,prompt_uuid,status,selection_index);
+        """
+    )
+    shards: list[dict[str, Any]] = []
+    row_count = 0
+    shard_number = 0
+    shard_file: Any = None
+    shard_hasher = sha256()
+    shard_count = 0
+    shard_path = ""
+
+    def finish_shard() -> None:
+        nonlocal shard_file, shard_hasher, shard_count
+        if shard_file is None:
+            return
+        shard_file.flush()
+        os.fsync(shard_file.fileno())
+        byte_count = shard_file.tell()
+        shard_file.close()
+        shards.append(
+            {
+                "path": shard_path,
+                "row_count": shard_count,
+                "byte_count": byte_count,
+                "sha256": shard_hasher.hexdigest(),
+            }
+        )
+        shard_file = None
+
+    try:
+        for view in (bundle.B_prime, bundle.C, bundle.D):
+            for rows in (view.primary_rows, view.reserve_rows):
+                for selected in rows:
+                    if shard_file is None or shard_count == rows_per_shard:
+                        finish_shard()
+                        shard_number += 1
+                        shard_count = 0
+                        shard_hasher = sha256()
+                        shard_path = f"shards/rows-{shard_number:06d}.jsonl"
+                        shard_file = (partial / shard_path).open("wb")
+                    _validate_selected_rank(selected, bundle)
+                    record = _selected_manifest_record(selected)
+                    line = canonical_json(record) + b"\n"
+                    offset = shard_file.tell()
+                    shard_file.write(line)
+                    shard_hasher.update(line)
+                    index.execute(
+                        "INSERT INTO rows VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            row_count,
+                            selected.arm,
+                            selected.status,
+                            selected.selection_index,
+                            selected.domain,
+                            selected.lane,
+                            selected.language,
+                            selected.prompt_uuid,
+                            shard_path,
+                            offset,
+                            len(line),
+                            sha256(line).hexdigest(),
+                        ),
+                    )
+                    row_count += 1
+                    shard_count += 1
+        finish_shard()
+        index.commit()
+        index.execute("VACUUM")
+        index.close()
+        index_sha256 = _file_sha256(index_path)
+        manifest: dict[str, Any] = {
+            "schema_version": 2,
+            "selection_sha256": bundle.selection_sha256,
+            "paired_cd_sha256": bundle.paired_cd_sha256,
+            "identity": {
+                "policy_sha256": bundle.policy_sha256,
+                "seed": bundle.seed,
+                "source_inventory_sha256": bundle.source_inventory_sha256,
+                "baseline_receipt_sha256": bundle.baseline_receipt_sha256,
+                "held_out_receipt_sha256": bundle.held_out_receipt_sha256,
+                "ptv2_revision": bundle.ptv2_revision,
+                "reserve_numerator": bundle.reserve_numerator,
+                "reserve_denominator": bundle.reserve_denominator,
+            },
+            "arms": {
+                view.arm: _compact_view_record(view)
+                for view in (bundle.B_prime, bundle.C, bundle.D)
+            },
+            "row_count": row_count,
+            "rows_per_shard": rows_per_shard,
+            "shards": shards,
+            "index": {"path": "selection-index.sqlite3", "sha256": index_sha256},
+        }
+        manifest["root_sha256"] = sha256_bytes(canonical_json(manifest))
+        manifest_path = partial / "SELECTION_MANIFEST.json"
+        manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+        os.replace(partial, output_dir)
+    except BaseException:
+        if shard_file is not None and not shard_file.closed:
+            shard_file.close()
+        index.close()
+        import shutil
+
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
+    return PublishedPromptViews(
+        output_dir / "SELECTION_MANIFEST.json",
+        output_dir / "selection-index.sqlite3",
+        manifest["root_sha256"],
+        row_count,
+    )
+
+
+def _validate_selected_rank(row: SelectedPrompt, bundle: PromptViewBundle) -> None:
+    fields = (
+        bundle.policy_sha256,
+        str(bundle.seed),
+        row.domain,
+        row.lane,
+        row.language,
+        row.context_bucket,
+        row.source_id,
+        row.source_revision,
+        row.source_file_sha256,
+        row.source_manifest_sha256,
+        row.source_file_path,
+        str(row.source_row_index),
+        row.prompt_uuid,
+    )
+    if sha256("\0".join(fields).encode()).hexdigest() != row.candidate_rank_sha256:
+        raise ValueError("selected row candidate ranking proof mismatch")
+
+
+def _file_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _validate_digest(value: str, name: str) -> None:
@@ -380,59 +973,35 @@ def _validate_digest(value: str, name: str) -> None:
         raise ValueError(f"{name} digest must be an exact lowercase SHA-256")
 
 
-def _validate_and_index_rows(
-    raw_rows: Sequence[Any], policy: PromptPolicy
-) -> tuple[CandidatePrompt, ...]:
-    rows: list[CandidatePrompt] = []
-    seen: set[str] = set()
-    for row in raw_rows:
-        if not isinstance(row, CandidatePrompt):
-            raise TypeError("candidate inventory rows must be CandidatePrompt values")
-        _validate_digest(row.prompt_uuid, "prompt UUID")
-        if row.prompt_uuid in seen:
-            raise ValueError(f"duplicate candidate prompt UUID: {row.prompt_uuid}")
-        seen.add(row.prompt_uuid)
-        if not policy.is_language_allowed(row.language):
-            continue
-        if sha256(row.canonical_bytes).hexdigest() != row.prompt_uuid:
-            raise ValueError(f"candidate canonical prompt identity mismatch: {row.prompt_uuid}")
-        rows.append(row)
-    return tuple(rows)
-
-
-def _eligible(
-    rows: Sequence[CandidatePrompt],
-    *,
-    domain: str,
-    lane: str,
-    language: str | None = None,
-) -> tuple[CandidatePrompt, ...]:
-    return tuple(
-        row
-        for row in rows
-        if row.domain == domain
-        and row.lane == lane
-        and (language is None or row.language == language)
-    )
-
-
-def _common_bucket_capacities(
-    left: Sequence[CandidatePrompt], right: Sequence[CandidatePrompt]
-) -> dict[str, int]:
-    left_counts = _bucket_counts(left)
-    right_counts = _bucket_counts(right)
-    return {
-        bucket: min(left_counts.get(bucket, 0), right_counts.get(bucket, 0))
-        for bucket in sorted(set(left_counts) | set(right_counts), key=_bucket_key)
-        if min(left_counts.get(bucket, 0), right_counts.get(bucket, 0)) > 0
-    }
-
-
-def _bucket_counts(rows: Iterable[CandidatePrompt]) -> dict[str, int]:
-    counts: dict[str, int] = defaultdict(int)
-    for row in rows:
-        counts[row.context_bucket] += 1
-    return dict(counts)
+def _validate_exclusion_receipts(
+    inventory: CandidateInventory,
+    baseline_receipt_sha256: str,
+    held_out_receipt_sha256: str,
+) -> None:
+    for label, supplied, proof, quarantine_key in (
+        (
+            "baseline",
+            baseline_receipt_sha256,
+            inventory.baseline_exclusion,
+            "historical_exclusion",
+        ),
+        (
+            "held-out",
+            held_out_receipt_sha256,
+            inventory.held_out_exclusion,
+            "heldout_exclusion",
+        ),
+    ):
+        _validate_digest(supplied, f"{label} receipt")
+        if supplied == "0" * 64:
+            raise ValueError(f"{label} receipt digest must be nonzero")
+        if supplied != proof.receipt_sha256:
+            raise ValueError(f"{label} receipt does not match candidate inventory")
+        _validate_digest(proof.prompt_ids_sha256, f"{label} exclusion prompt IDs")
+        if proof.prompt_id_count < 0 or proof.excluded_candidate_count < 0:
+            raise ValueError(f"{label} exclusion reconciliation has invalid counts")
+        if proof.excluded_candidate_count != inventory.quarantine_counts.get(quarantine_key, 0):
+            raise ValueError(f"{label} exclusion reconciliation does not match quarantine")
 
 
 def _bucket_key(bucket: str) -> tuple[int, str]:
@@ -484,79 +1053,6 @@ def _rank(candidate: CandidatePrompt, policy: PromptPolicy) -> str:
     return sha256("\0".join(fields).encode()).hexdigest()
 
 
-def _select_cell(
-    candidates: Sequence[CandidatePrompt],
-    *,
-    quota: int,
-    arm: str,
-    cell: str,
-    policy: PromptPolicy,
-    inventory_sha256: str,
-    baseline_receipt_sha256: str,
-    held_out_receipt_sha256: str,
-    capacity_vector: Mapping[str, int] | None = None,
-) -> tuple[list[SelectedPrompt], list[SelectedPrompt], dict[str, int]]:
-    capacities = dict(capacity_vector or _bucket_counts(candidates))
-    bucket_quotas = _allocate_bucket_quotas(capacities, quota)
-    if not bucket_quotas:
-        _raise_shortfall(
-            arm=arm,
-            cell=cell,
-            lane=_single_lane(candidates),
-            bucket="none",
-            quota=quota,
-            required=_acquisition_count(quota, policy),
-            available=sum(capacities.values()),
-            policy=policy,
-            inventory_sha256=inventory_sha256,
-            baseline_receipt_sha256=baseline_receipt_sha256,
-            held_out_receipt_sha256=held_out_receipt_sha256,
-        )
-    by_bucket: dict[str, list[CandidatePrompt]] = defaultdict(list)
-    for candidate in candidates:
-        by_bucket[candidate.context_bucket].append(candidate)
-    primary: list[SelectedPrompt] = []
-    reserve: list[SelectedPrompt] = []
-    for bucket, bucket_quota in bucket_quotas.items():
-        ranked = sorted(by_bucket[bucket], key=lambda row: (_rank(row, policy), row.prompt_uuid))
-        required = _acquisition_count(bucket_quota, policy)
-        if len(ranked) < required:
-            _raise_shortfall(
-                arm=arm,
-                cell=cell,
-                lane=_single_lane(ranked or candidates),
-                bucket=bucket,
-                quota=bucket_quota,
-                required=required,
-                available=len(ranked),
-                policy=policy,
-                inventory_sha256=inventory_sha256,
-                baseline_receipt_sha256=baseline_receipt_sha256,
-                held_out_receipt_sha256=held_out_receipt_sha256,
-            )
-        reserve_count = required - bucket_quota
-        for candidate_rank, candidate in enumerate(ranked):
-            if candidate_rank >= required:
-                break
-            status: Literal["primary", "reserve"] = (
-                "reserve" if candidate_rank < reserve_count else "primary"
-            )
-            selected = _selected_prompt(
-                candidate,
-                arm=arm,
-                status=status,
-                candidate_rank=candidate_rank,
-                candidate_rank_sha256=_rank(candidate, policy),
-            )
-            (reserve if status == "reserve" else primary).append(selected)
-    return primary, reserve, bucket_quotas
-
-
-def _single_lane(candidates: Sequence[CandidatePrompt]) -> str:
-    lanes = sorted({candidate.lane for candidate in candidates})
-    return lanes[0] if len(lanes) == 1 else "mixed" if lanes else "unknown"
-
-
 def _raise_shortfall(
     *,
     arm: str,
@@ -593,103 +1089,6 @@ def _raise_shortfall(
     raise PromptSelectionBlockedError(receipt)
 
 
-def _selected_prompt(
-    candidate: CandidatePrompt,
-    *,
-    arm: str,
-    status: Literal["primary", "reserve"],
-    candidate_rank: int,
-    candidate_rank_sha256: str,
-) -> SelectedPrompt:
-    return SelectedPrompt(
-        prompt_uuid=candidate.prompt_uuid,
-        arm=arm,
-        domain=candidate.domain,
-        lane=candidate.lane,
-        language=candidate.language,
-        context_bucket=candidate.context_bucket,
-        source_id=candidate.source_id,
-        source_revision=candidate.source_revision,
-        source_file_sha256=candidate.source_file_sha256,
-        source_manifest_sha256=candidate.source_manifest_sha256,
-        source_file_path=candidate.source_file_path,
-        source_row_index=candidate.source_row_index,
-        candidate_rank=candidate_rank,
-        candidate_rank_sha256=candidate_rank_sha256,
-        selection_index=-1,
-        status=status,
-        canonical_prompt_json=candidate.canonical_bytes.decode("utf-8"),
-    )
-
-
-def _build_view(
-    arm: str,
-    primary_by_cell: Mapping[str, Sequence[SelectedPrompt]],
-    reserve_by_cell: Mapping[str, Sequence[SelectedPrompt]],
-    bucket_floors: Mapping[str, Mapping[str, int]],
-    policy: PromptPolicy,
-    *,
-    non_agentic_cells: Sequence[str],
-) -> PromptView:
-    primary = _index_selection(
-        sorted(
-            (row for rows in primary_by_cell.values() for row in rows),
-            key=_selected_order_key,
-        )
-    )
-    reserve = _index_selection(
-        sorted(
-            (row for rows in reserve_by_cell.values() for row in rows),
-            key=_selected_order_key,
-        )
-    )
-    expected_count = policy.count_for(arm)
-    if len(primary) != expected_count:
-        raise AssertionError(f"{arm} exact-count proof failed: {len(primary)} != {expected_count}")
-    all_ids = [row.prompt_uuid for row in (*primary, *reserve)]
-    if len(set(all_ids)) != len(all_ids):
-        raise ValueError(f"{arm} primary and reserve UUIDs are not globally unique")
-    cell_counts = {name: policy.count_for(arm, name) for name in policy.arms[arm].cells}
-    if arm == "C":
-        lane_counts = {"agentless-swe": policy.count_for("C", "swe-agentic-tool")}
-    else:
-        lane_counts = dict(policy.arms[arm].lanes)
-    frozen_floors = _freeze_floors(bucket_floors)
-    non_agentic = _freeze_floors({cell: bucket_floors[cell] for cell in non_agentic_cells})
-    proof_payload = {
-        "arm": arm,
-        "primary_count": len(primary),
-        "reserve_count": len(reserve),
-        "cell_counts": cell_counts,
-        "lane_counts": lane_counts,
-        "bucket_floors": _plain_floors(frozen_floors),
-    }
-    return PromptView(
-        arm=arm,
-        primary_rows=primary,
-        reserve_rows=reserve,
-        cell_counts=MappingProxyType(cell_counts),
-        lane_counts=MappingProxyType(lane_counts),
-        bucket_floors=frozen_floors,
-        non_agentic_bucket_floors=non_agentic,
-        count_proof_sha256=sha256_bytes(canonical_json(proof_payload)),
-    )
-
-
-def _selected_order_key(row: SelectedPrompt) -> tuple[str, str, str, str, str]:
-    return (
-        row.candidate_rank_sha256,
-        row.prompt_uuid,
-        row.domain,
-        row.lane,
-        row.context_bucket,
-    )
-
-
-def _index_selection(rows: Sequence[SelectedPrompt]) -> tuple[SelectedPrompt, ...]:
-    return tuple(replace(row, selection_index=index) for index, row in enumerate(rows))
-
-
 def _freeze_floors(
     floors: Mapping[str, Mapping[str, int]],
 ) -> Mapping[str, Mapping[str, int]]:
@@ -707,47 +1106,6 @@ def _plain_floors(floors: Mapping[str, Mapping[str, int]]) -> dict[str, dict[str
     return {cell: dict(values) for cell, values in floors.items()}
 
 
-def _validate_paired_views(c_view: PromptView, d_view: PromptView) -> None:
-    if c_view.non_agentic_prompt_ids != d_view.non_agentic_prompt_ids:
-        raise AssertionError("C/D non-agentic prompt UUID sets are not paired")
-    if _plain_floors(c_view.non_agentic_bucket_floors) != _plain_floors(
-        d_view.non_agentic_bucket_floors
-    ):
-        raise AssertionError("C/D non-agentic bucket floors are not paired")
-    c_reserve = {row.prompt_uuid for row in c_view.reserve_rows if row.domain != "swe-agentic-tool"}
-    d_reserve = {row.prompt_uuid for row in d_view.reserve_rows if row.domain != "swe-agentic-tool"}
-    if c_reserve != d_reserve:
-        raise AssertionError("C/D non-agentic reserve UUID sets are not paired")
-
-
-def _paired_cd_sha256(c_view: PromptView, d_view: PromptView) -> str:
-    payload = {
-        "non_agentic_primary_prompt_ids": sorted(c_view.non_agentic_prompt_ids),
-        "non_agentic_reserve_prompt_ids": sorted(
-            row.prompt_uuid for row in c_view.reserve_rows if row.domain != "swe-agentic-tool"
-        ),
-        "bucket_floors": _plain_floors(c_view.non_agentic_bucket_floors),
-        "C_count_proof_sha256": c_view.count_proof_sha256,
-        "D_count_proof_sha256": d_view.count_proof_sha256,
-    }
-    return sha256_bytes(canonical_json(payload))
-
-
-def _view_manifest_record(view: PromptView) -> dict[str, Any]:
-    return {
-        "primary_prompt_ids": list(view.primary_prompt_ids),
-        "reserve_prompt_ids": list(view.reserve_prompt_ids),
-        "cell_counts": dict(view.cell_counts),
-        "lane_counts": dict(view.lane_counts),
-        "bucket_floors": _plain_floors(view.bucket_floors),
-        "non_agentic_bucket_floors": _plain_floors(view.non_agentic_bucket_floors),
-        "count_proof_sha256": view.count_proof_sha256,
-        "rows": [
-            _selected_manifest_record(row) for row in (*view.primary_rows, *view.reserve_rows)
-        ],
-    }
-
-
 def _selected_manifest_record(row: SelectedPrompt) -> dict[str, Any]:
     return {
         "prompt_uuid": row.prompt_uuid,
@@ -757,6 +1115,7 @@ def _selected_manifest_record(row: SelectedPrompt) -> dict[str, Any]:
         "language": row.language,
         "context_bucket": row.context_bucket,
         "source_id": row.source_id,
+        "source_family": row.source_family,
         "source_revision": row.source_revision,
         "source_file_sha256": row.source_file_sha256,
         "source_manifest_sha256": row.source_manifest_sha256,

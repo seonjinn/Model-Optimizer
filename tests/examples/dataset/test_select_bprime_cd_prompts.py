@@ -31,14 +31,24 @@ MODULE_DIR = ROOT / "examples/dataset"
 sys.path.insert(0, str(MODULE_DIR))
 try:
     from bprime_cd_policy import ArmPolicy, PromptCell, PromptPolicy, load_prompt_policy
-    from build_specdec_inventory import CandidateCell, CandidateInventory, CandidatePrompt
+    from build_specdec_inventory import (
+        CandidateCell,
+        CandidateInventory,
+        CandidatePrompt,
+        ExclusionProof,
+    )
     from select_bprime_cd_prompts import (
+        DiskBackedSelectedRows,
         PromptSelectionBlocked,
         build_policy_count_proofs,
         select_prompt_views,
     )
 finally:
     sys.path.pop(0)
+
+BASELINE_RECEIPT_SHA256 = "1" * 64
+HELD_OUT_RECEIPT_SHA256 = "2" * 64
+PTV2_REVISION = "b" * 40
 
 
 def _policy() -> PromptPolicy:
@@ -96,14 +106,16 @@ def _candidate(
     lane: str,
     language: str,
     bucket: str,
+    source_family: str | None = None,
 ) -> CandidatePrompt:
     prompt = {"messages": [{"role": "user", "content": f"prompt-{ordinal}"}], "tools": []}
     canonical = json.dumps(prompt, sort_keys=True, separators=(",", ":")).encode()
+    family = source_family or ("ptv2" if domain in {"stem-science", "multilingual"} else "ptv3")
     return CandidatePrompt(
         prompt_uuid=hashlib.sha256(canonical).hexdigest(),
         canonical_bytes=canonical,
         source_id=f"fixture/{domain}/{lane}",
-        source_revision="b" * 40,
+        source_revision=PTV2_REVISION if family == "ptv2" else "9" * 40,
         source_file_sha256=hashlib.sha256(f"{domain}/{lane}".encode()).hexdigest(),
         source_row_index=ordinal,
         domain=domain,
@@ -116,6 +128,7 @@ def _candidate(
         input_ids=(1, 2),
         tokenizer_sha256="d" * 64,
         replay_valid=lane in {"interactive-swe-replay", "generic-tool-replay"},
+        source_family=family,
     )
 
 
@@ -157,6 +170,9 @@ def _inventory(*, reverse: bool = False, drop_last: bool = False) -> CandidateIn
         capacity=MappingProxyType(dict(capacity)),
         quarantine_counts=MappingProxyType({}),
         inventory_sha256=("e" if not drop_last else "f") * 64,
+        baseline_exclusion=ExclusionProof(BASELINE_RECEIPT_SHA256, "6" * 64, 1, 0),
+        held_out_exclusion=ExclusionProof(HELD_OUT_RECEIPT_SHA256, "7" * 64, 0, 0),
+        ptv2_revision=PTV2_REVISION,
     )
 
 
@@ -164,10 +180,63 @@ def _all_rows(view):
     return (*view.primary_rows, *view.reserve_rows)
 
 
+def _select(inventory: CandidateInventory, policy: PromptPolicy):
+    return select_prompt_views(
+        inventory,
+        policy,
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+    )
+
+
+def test_selection_requires_nonzero_inventory_bound_exclusion_receipts() -> None:
+    inventory = _inventory()
+    policy = _policy()
+
+    with pytest.raises(TypeError):
+        select_prompt_views(inventory, policy)
+    with pytest.raises(ValueError, match="nonzero"):
+        select_prompt_views(
+            inventory,
+            policy,
+            baseline_receipt_sha256="0" * 64,
+            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+        )
+    with pytest.raises(ValueError, match="does not match candidate inventory"):
+        select_prompt_views(
+            inventory,
+            policy,
+            baseline_receipt_sha256="8" * 64,
+            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+        )
+    inconsistent = replace(
+        inventory,
+        baseline_exclusion=replace(inventory.baseline_exclusion, excluded_candidate_count=1),
+    )
+    with pytest.raises(ValueError, match="exclusion reconciliation"):
+        _select(inconsistent, policy)
+
+
+def test_bprime_rejects_non_ptv2_or_unpinned_source_rows() -> None:
+    inventory = _inventory()
+    rows = tuple(
+        replace(row, source_family="ptv3", source_revision="9" * 40)
+        if row.domain in {"stem-science", "multilingual"}
+        else row
+        for row in inventory.rows
+    )
+
+    with pytest.raises(PromptSelectionBlocked) as caught:
+        _select(replace(inventory, rows=rows), _policy())
+
+    assert caught.value.receipt["arm"] == "B-prime"
+    assert caught.value.receipt["reason"] == "insufficient_candidates"
+
+
 def test_bprime_has_exact_language_counts_reserves_and_stable_unique_order() -> None:
     policy = _policy()
-    forward = select_prompt_views(_inventory(), policy)
-    reverse = select_prompt_views(_inventory(reverse=True), policy)
+    forward = _select(_inventory(), policy)
+    reverse = _select(_inventory(reverse=True), policy)
 
     assert forward.B_prime.cell_counts == {
         "stem": 40,
@@ -190,10 +259,12 @@ def test_bprime_has_exact_language_counts_reserves_and_stable_unique_order() -> 
     assert forward.B_prime.primary_prompt_ids == reverse.B_prime.primary_prompt_ids
     assert forward.B_prime.reserve_prompt_ids == reverse.B_prime.reserve_prompt_ids
     assert forward.selection_sha256 == reverse.selection_sha256
+    assert isinstance(forward.B_prime.primary_rows, DiskBackedSelectedRows)
+    assert forward.B_prime.primary_rows.resident_row_count == 0
 
 
 def test_cd_views_are_paired_outside_agentic_lanes() -> None:
-    bundle = select_prompt_views(_inventory(), _policy())
+    bundle = _select(_inventory(), _policy())
 
     assert len(bundle.C.primary_prompt_ids) == 400
     assert len(bundle.D.primary_prompt_ids) == 400
@@ -239,11 +310,31 @@ def test_cd_views_are_paired_outside_agentic_lanes() -> None:
 def test_selection_identity_binds_seed_receipts_source_and_quota() -> None:
     inventory = _inventory()
     policy = _policy()
-    original = select_prompt_views(inventory, policy)
-    changed_seed = select_prompt_views(inventory, replace(policy, seed=policy.seed + 1))
-    changed_heldout = select_prompt_views(inventory, policy, held_out_receipt_sha256="1" * 64)
-    changed_baseline = select_prompt_views(inventory, policy, baseline_receipt_sha256="2" * 64)
-    changed_source = select_prompt_views(replace(inventory, inventory_sha256="3" * 64), policy)
+    original = _select(inventory, policy)
+    changed_seed = _select(inventory, replace(policy, seed=policy.seed + 1))
+    changed_heldout_inventory = replace(
+        inventory,
+        inventory_sha256="3" * 64,
+        held_out_exclusion=replace(inventory.held_out_exclusion, receipt_sha256="4" * 64),
+    )
+    changed_heldout = select_prompt_views(
+        changed_heldout_inventory,
+        policy,
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256="4" * 64,
+    )
+    changed_baseline_inventory = replace(
+        inventory,
+        inventory_sha256="5" * 64,
+        baseline_exclusion=replace(inventory.baseline_exclusion, receipt_sha256="6" * 64),
+    )
+    changed_baseline = select_prompt_views(
+        changed_baseline_inventory,
+        policy,
+        baseline_receipt_sha256="6" * 64,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+    )
+    changed_source = _select(replace(inventory, inventory_sha256="8" * 64), policy)
     b_arm = policy.arms["B-prime"]
     cells = dict(b_arm.cells)
     cells["stem"] = PromptCell(39)
@@ -251,6 +342,8 @@ def test_selection_identity_binds_seed_receipts_source_and_quota() -> None:
     changed_quota = select_prompt_views(
         inventory,
         replace(policy, arms=MappingProxyType({**policy.arms, "B-prime": changed_b})),
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
     )
 
     digests = {
@@ -266,7 +359,7 @@ def test_selection_identity_binds_seed_receipts_source_and_quota() -> None:
 
 def test_one_row_shortfall_is_fatal_and_emits_a_blocker_receipt() -> None:
     with pytest.raises(PromptSelectionBlocked) as caught:
-        select_prompt_views(_inventory(drop_last=True), _policy())
+        _select(_inventory(drop_last=True), _policy())
 
     assert caught.value.receipt["status"] == "blocked"
     assert caught.value.receipt["reason"] == "insufficient_candidates"
@@ -282,9 +375,43 @@ def test_canonical_large_count_proof_uses_exact_policy_arithmetic_only() -> None
 
     assert proof["B-prime"]["primary_count"] == 700_000
     assert proof["C"]["primary_count"] == proof["D"]["primary_count"] == 2_000_000
-    assert proof["B-prime"]["acquisition_count"] == 840_000
-    assert proof["C"]["acquisition_count"] == proof["D"]["acquisition_count"] == 2_400_000
+    assert proof["B-prime"]["acquisition_lower_bound_count"] == 840_000
+    assert (
+        proof["C"]["acquisition_lower_bound_count"]
+        == proof["D"]["acquisition_lower_bound_count"]
+        == 2_400_000
+    )
     assert sum(proof["B-prime"]["cell_counts"].values()) == 700_000
     assert sum(proof["D"]["lane_counts"].values()) == 600_000
     assert proof["C"]["non_agentic_count"] == proof["D"]["non_agentic_count"]
     assert proof["paired_cd_sha256"]
+
+
+def test_count_proof_labels_cell_ceils_as_lower_bounds_for_odd_bucket_splits() -> None:
+    policy = _policy()
+    b = policy.arms["B-prime"]
+    cells = dict(b.cells)
+    cells["stem"] = PromptCell(2)
+    odd = replace(
+        policy,
+        arms=MappingProxyType(
+            {**policy.arms, "B-prime": replace(b, prompt_count=102, cells=MappingProxyType(cells))}
+        ),
+    )
+
+    proof = build_policy_count_proofs(odd)["B-prime"]
+
+    assert "acquisition_count" not in proof
+    assert proof["cell_acquisition_lower_bound_counts"]["stem"] == 3
+
+    cells["stem"] = PromptCell(3)
+    odd = replace(
+        policy,
+        arms=MappingProxyType(
+            {**policy.arms, "B-prime": replace(b, prompt_count=103, cells=MappingProxyType(cells))}
+        ),
+    )
+    selected = _select(_inventory(), odd)
+
+    assert selected.B_prime.bucket_floors["stem"] == {"le4k": 2, "4k_16k": 1}
+    assert len([row for row in selected.B_prime.reserve_rows if row.domain == "stem-science"]) == 2

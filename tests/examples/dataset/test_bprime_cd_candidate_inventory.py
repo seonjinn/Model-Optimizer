@@ -1,5 +1,17 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -104,6 +116,9 @@ def _build(
         tokenizer_sha256="f" * 64,
         historical_prompt_ids=set(historical),
         held_out_prompt_ids=set(held_out),
+        baseline_receipt_sha256="1" * 64,
+        held_out_receipt_sha256="2" * 64,
+        ptv2_revision="a" * 40,
         storage_dir=storage_dir or inventory.staged_root / "candidate-storage",
     )
 
@@ -150,6 +165,43 @@ def test_exclusions_and_cross_source_duplicates_precede_capacity(tmp_path: Path)
         "heldout_exclusion": 1,
         "historical_exclusion": 1,
     }
+
+
+def test_inventory_binds_exclusion_receipts_and_pinned_ptv2_family(tmp_path: Path) -> None:
+    module = _load_module()
+    excluded = [{"role": "user", "content": "historical"}]
+    admitted = [{"role": "user", "content": "admitted"}]
+    path = _write_rows(
+        tmp_path,
+        "first",
+        [
+            {"messages": excluded, "language": "en"},
+            {"messages": admitted, "language": "en"},
+        ],
+    )
+    source = _source(module, split="first", path=path)
+    historical = {_canonical_uuid(excluded)}
+
+    candidates = module.build_candidate_inventory(
+        _inventory(module, tmp_path, (source,)),
+        tokenizer=_Tokenizer(),
+        tokenizer_sha256="f" * 64,
+        historical_prompt_ids=historical,
+        held_out_prompt_ids=set(),
+        baseline_receipt_sha256="1" * 64,
+        held_out_receipt_sha256="2" * 64,
+        ptv2_revision="a" * 40,
+        storage_dir=tmp_path / "candidate-storage",
+    )
+
+    assert candidates.baseline_exclusion.receipt_sha256 == "1" * 64
+    assert candidates.baseline_exclusion.prompt_id_count == 1
+    assert candidates.baseline_exclusion.excluded_candidate_count == 1
+    assert candidates.held_out_exclusion.receipt_sha256 == "2" * 64
+    assert candidates.held_out_exclusion.prompt_id_count == 0
+    assert candidates.held_out_exclusion.excluded_candidate_count == 0
+    assert candidates.ptv2_revision == "a" * 40
+    assert candidates.rows[0].source_family == "ptv2"
 
 
 def test_target_completion_is_stripped_before_uuid_and_full_context_bucket(

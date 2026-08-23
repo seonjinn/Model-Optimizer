@@ -287,6 +287,9 @@ def test_candidate_inventory_verifies_every_source_before_parsing_rows(tmp_path:
             tokenizer_sha256="f" * 64,
             historical_prompt_ids=set(),
             held_out_prompt_ids=set(),
+            baseline_receipt_sha256="1" * 64,
+            held_out_receipt_sha256="2" * 64,
+            ptv2_revision="a" * 40,
         )
 
 
