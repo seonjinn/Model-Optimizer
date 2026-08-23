@@ -75,6 +75,24 @@ class _Record:
     record_sha256: str
 
 
+@dataclass(frozen=True)
+class _GenerationIdentity:
+    target_revision: str
+    tokenizer_sha256: str
+    chat_template_sha256: str
+    runtime_sha256: str
+    container_sha256: str
+    source_selection_sha256: str
+    thinking_mode: str
+    temperature: float
+    max_tokens: int
+    max_total_length: int
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(_canonical(asdict(self))).hexdigest()
+
+
 class _Tokenizer:
     chat_template = CHAT_TEMPLATE
 
@@ -100,6 +118,8 @@ def _record(
     mask: list[int],
     paired_sha256: str = PAIRED_SHA256,
     selection_sha256: str = "5" * 64,
+    generation_identity_sha256: str = "6" * 64,
+    context_bucket: str = "le4k",
 ) -> _Record:
     canonical = json.dumps(
         {"messages": [{"role": "assistant", "content": json.dumps({"ids": ids, "mask": mask})}]},
@@ -112,13 +132,13 @@ def _record(
         "domain": domain,
         "lane": lane,
         "language": "en",
-        "context_bucket": "le4k",
+        "context_bucket": context_bucket,
         "canonical_record_json": canonical,
         "request_sha256": "3" * 64,
         "response_sha256": "4" * 64,
         "selection_sha256": selection_sha256,
         "paired_cd_sha256": paired_sha256,
-        "generation_identity_sha256": "6" * 64,
+        "generation_identity_sha256": generation_identity_sha256,
         "attempt_or_replay_validation_sha256": "7" * 64,
     }
     return _Record(
@@ -159,7 +179,7 @@ def _digest_lines(seed: object, rows: list[list[object]]) -> str:
 
 
 def _write_selection_artifact(root: Path) -> tuple[Path, str, str, str]:
-    root.mkdir()
+    root.mkdir(parents=True)
     index_path = root / "selection-index.sqlite3"
     connection = sqlite3.connect(index_path)
     connection.execute(
@@ -242,8 +262,14 @@ def _write_selection_artifact(root: Path) -> tuple[Path, str, str, str]:
     )
 
 
-def _write_response_artifact(root: Path, corpus: SimpleNamespace, record: _Record) -> None:
-    root.mkdir()
+def _write_response_artifact(
+    root: Path,
+    corpus: SimpleNamespace,
+    record: _Record,
+    *,
+    artifact_paired_sha256: str | None = None,
+) -> str:
+    root.mkdir(parents=True)
     payload = _canonical(asdict(record)).decode()
     response_path = root / "responses.jsonl"
     response_path.write_bytes(payload.encode() + b"\n")
@@ -266,7 +292,7 @@ def _write_response_artifact(root: Path, corpus: SimpleNamespace, record: _Recor
         "arm": corpus.arm,
         "generation_identity_sha256": corpus.generation_identity_sha256,
         "selection_sha256": record.selection_sha256,
-        "paired_cd_sha256": record.paired_cd_sha256,
+        "paired_cd_sha256": artifact_paired_sha256 or record.paired_cd_sha256,
         "cell_counts": {"math": 1},
         "promoted_record_stream_sha256": stream_sha256,
         "attempt_history_stream_sha256": history_sha256,
@@ -280,7 +306,7 @@ def _write_response_artifact(root: Path, corpus: SimpleNamespace, record: _Recor
         "generation_identity_sha256": corpus.generation_identity_sha256,
         "source_selection_sha256": corpus.source_selection_sha256,
         "selection_sha256": record.selection_sha256,
-        "paired_cd_sha256": record.paired_cd_sha256,
+        "paired_cd_sha256": artifact_paired_sha256 or record.paired_cd_sha256,
         "promoted_count": 1,
         "cell_counts": {"math": 1},
         "unused_reserve_count": 0,
@@ -297,6 +323,35 @@ def _write_response_artifact(root: Path, corpus: SimpleNamespace, record: _Recor
         ],
     }
     (root / "PROMOTION.json").write_bytes(_canonical(receipt) + b"\n")
+    promotion_path = root / "PROMOTION.json"
+    files = [
+        {
+            "path": f"corpus/{path.name}",
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in (response_path, index_path, promotion_path)
+    ]
+    identity = corpus.generation_identity
+    completion = {
+        "schema_version": 1,
+        "generation_identity_sha256": corpus.generation_identity_sha256,
+        "target_revision": identity.target_revision,
+        "tokenizer_sha256": identity.tokenizer_sha256,
+        "chat_template_sha256": identity.chat_template_sha256,
+        "runtime_sha256": identity.runtime_sha256,
+        "container_sha256": identity.container_sha256,
+        "source_selection_sha256": identity.source_selection_sha256,
+        "thinking_mode": identity.thinking_mode,
+        "promotion_status": "passed",
+        "corpus_sha256": corpus.corpus_sha256,
+        "promotion_receipt_sha256": hashlib.sha256(promotion_path.read_bytes()).hexdigest(),
+        "file_count": len(files),
+        "files": files,
+    }
+    completion_path = root.parent / "completion.json"
+    completion_path.write_bytes(_canonical(completion) + b"\n")
+    return hashlib.sha256(completion_path.read_bytes()).hexdigest()
 
 
 def test_exact_boundary_masks_only_late_assistant_positions(tmp_path: Path) -> None:
@@ -726,26 +781,42 @@ def test_production_view_authenticates_task5_task6_and_tokenizer_artifacts(
         snapshot.update(b"\0")
         snapshot.update(bytes.fromhex(hashlib.sha256(path.read_bytes()).hexdigest()))
     tokenizer_digest = snapshot.hexdigest()
+    identity = _GenerationIdentity(
+        target_revision="1" * 40,
+        tokenizer_sha256=tokenizer_digest,
+        chat_template_sha256=template_file_sha256,
+        runtime_sha256="2" * 64,
+        container_sha256="3" * 64,
+        source_selection_sha256=manifest_sha256,
+        thinking_mode="off",
+        temperature=0.0,
+        max_tokens=128,
+        max_total_length=4_096,
+    )
     record = _record(
         "shared",
+        arm="B",
         ids=[10, 11],
         mask=[0, 1],
         selection_sha256=selection_sha256,
         paired_sha256=paired_sha256,
+        generation_identity_sha256=identity.sha256,
     )
     corpus = SimpleNamespace(
-        arm="C",
+        arm="B",
         records=[record],
         corpus_sha256="0" * 64,
         source_selection_sha256=manifest_sha256,
-        generation_identity_sha256="6" * 64,
-        generation_identity=SimpleNamespace(
-            tokenizer_sha256=tokenizer_digest,
-            chat_template_sha256=template_file_sha256,
-        ),
+        generation_identity_sha256=identity.sha256,
+        generation_identity=identity,
     )
-    response_root = tmp_path / "response"
-    _write_response_artifact(response_root, corpus, record)
+    response_root = tmp_path / "response/corpus"
+    completion_sha256 = _write_response_artifact(
+        response_root,
+        corpus,
+        record,
+        artifact_paired_sha256=paired_sha256,
+    )
 
     view = module._build_exposure_views(
         corpus,
@@ -757,6 +828,7 @@ def test_production_view_authenticates_task5_task6_and_tokenizer_artifacts(
         chat_template_sha256=template_file_sha256,
         production=True,
         response_artifact_root=response_root,
+        expected_task6_completion_sha256=completion_sha256,
         selection_manifest_path=manifest_path,
         tokenizer_root=tokenizer_root,
         _allow_partial_production_suite=True,
@@ -764,7 +836,119 @@ def test_production_view_authenticates_task5_task6_and_tokenizer_artifacts(
 
     assert view.purpose == "production-comparison"
     assert view.selection_sha256 == selection_sha256
-    assert view.paired_selection_bucket_sha256 == paired_sha256
+    assert view.paired_selection_bucket_sha256 == "0" * 64
+    assert view.task5_paired_selection_bucket_sha256 == paired_sha256
+    assert view.task6_completion_sha256 == completion_sha256
     assert view.source_policy_sha256 == "c" * 64
     assert view.assistant_tokens == sum(_rows(view)[0]["loss_mask"])
     assert view.assistant_tokens != 1
+
+
+def test_production_recomputes_complete_generation_identity() -> None:
+    module = _load_module()
+    identity = _GenerationIdentity(
+        target_revision="1" * 40,
+        tokenizer_sha256="2" * 64,
+        chat_template_sha256="3" * 64,
+        runtime_sha256="4" * 64,
+        container_sha256="5" * 64,
+        source_selection_sha256="6" * 64,
+        thinking_mode="off",
+        temperature=0.25,
+        max_tokens=1_024,
+        max_total_length=4_096,
+    )
+    corpus = SimpleNamespace(
+        generation_identity=identity,
+        generation_identity_sha256="0" * 64,
+        source_selection_sha256=identity.source_selection_sha256,
+    )
+
+    with pytest.raises(module.ExposureViewError, match="generation identity digest"):
+        module._authenticate_generation_identity(corpus)
+
+
+def test_task6_completion_requires_an_external_expected_digest(tmp_path: Path) -> None:
+    module = _load_module()
+    published_root = tmp_path / "published"
+    corpus_root = published_root / "corpus"
+    corpus_root.mkdir(parents=True)
+    (published_root / "completion.json").write_text("{}\n")
+
+    with pytest.raises(module.ExposureViewError, match="completion identity mismatch"):
+        module._authenticate_task6_completion(corpus_root, expected_sha256="0" * 64)
+
+
+@pytest.mark.parametrize(
+    ("d_prompt_uuid", "d_context_bucket"),
+    [("reserve-replacement", "le4k"), ("shared", "gt4k")],
+)
+def test_final_paired_rows_reject_reserve_or_bucket_drift_without_materializing(
+    tmp_path: Path,
+    d_prompt_uuid: str,
+    d_context_bucket: str,
+) -> None:
+    module = _load_module()
+
+    def write_index(path: Path, prompt_uuid: str, context_bucket: str) -> None:
+        payload = _canonical(
+            {
+                "prompt_uuid": prompt_uuid,
+                "domain": "math",
+                "context_bucket": context_bucket,
+            }
+        ).decode()
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE promoted(ordinal INTEGER,prompt_uuid TEXT,cell TEXT,"
+            "assistant_tokens INTEGER,payload TEXT)"
+        )
+        connection.execute("INSERT INTO promoted VALUES(0,?,'math',1,?)", (prompt_uuid, payload))
+        connection.commit()
+        connection.close()
+
+    c_index = tmp_path / "c.sqlite3"
+    d_index = tmp_path / "d.sqlite3"
+    write_index(c_index, "shared", "le4k")
+    write_index(d_index, d_prompt_uuid, d_context_bucket)
+
+    with pytest.raises(module.ExposureViewError, match="final C/D promoted rows"):
+        module._authenticate_final_paired_rows(c_index, d_index)
+
+
+def test_final_paired_rows_return_a_deterministic_stream_digest(tmp_path: Path) -> None:
+    module = _load_module()
+
+    def write_index(path: Path) -> None:
+        connection = sqlite3.connect(path)
+        connection.execute(
+            "CREATE TABLE promoted(ordinal INTEGER,prompt_uuid TEXT,cell TEXT,"
+            "assistant_tokens INTEGER,payload TEXT)"
+        )
+        for ordinal, prompt_uuid in enumerate(("second", "first")):
+            payload = _canonical(
+                {
+                    "prompt_uuid": prompt_uuid,
+                    "domain": "math",
+                    "context_bucket": "le4k",
+                }
+            ).decode()
+            connection.execute(
+                "INSERT INTO promoted VALUES(?,?,'math',1,?)",
+                (ordinal, prompt_uuid, payload),
+            )
+        connection.commit()
+        connection.close()
+
+    c_index = tmp_path / "c.sqlite3"
+    d_index = tmp_path / "d.sqlite3"
+    write_index(c_index)
+    write_index(d_index)
+
+    expected = hashlib.sha256(
+        _canonical({"schema_version": 1, "scope": "final-promoted-non-agentic-cd"})
+    )
+    for prompt_uuid in ("first", "second"):
+        expected.update(_canonical([prompt_uuid, "le4k"]) + b"\n")
+
+    assert module._authenticate_final_paired_rows(c_index, d_index) == expected.hexdigest()

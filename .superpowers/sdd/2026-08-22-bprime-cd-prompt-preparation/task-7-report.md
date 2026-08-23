@@ -17,12 +17,15 @@ Implemented disk-backed, authenticated assistant-token exposure staging:
 - Resume reauthenticates staged databases, JSONL bytes, semantic rows, ordering,
   cumulative counts, and identity digests before returning an existing view.
 - Production construction authenticates Task 5 manifests, indexes, shards,
-  selection and paired C/D bucket digests; Task 6 promotion files, indexes,
-  record streams, cell counts, histograms, histories, and corpus root; and the
-  tokenizer snapshot files and chat template.
-- Paired C/D construction proves identical selected UUIDs and bucket assignments
-  before generating fixed 256M/1B, common-exposure, and one-pass views. Its
-  receipt binds both arms' independent full-corpus token totals.
+  selection and paired C/D bucket digests; externally pinned Task 6 completion
+  identities, promotion files, indexes, record streams, cell counts,
+  histograms, histories, and corpus roots; and the tokenizer snapshot files and
+  chat template.
+- Paired C/D construction streams the authenticated final promotion indexes and
+  proves identical non-agentic UUIDs and context buckets after reserve
+  replacement, before generating fixed 256M/1B, common-exposure, and one-pass
+  views. Its receipt binds both arms' completion identities, independent
+  full-corpus token totals, and the final paired-row digest.
 - Production policy permits only exact 256M and 1B fixed views plus a true
   one-pass view. The 64M value is exposed only as a runtime-screen milestone,
   and a common exposure can only be requested through the paired builder.
@@ -38,8 +41,9 @@ Implemented disk-backed, authenticated assistant-token exposure staging:
   tokenizer identity, resume semantic tampering, agentless lane handling, and
   public one-pass/common-label bypasses.
 - Final isolated GREEN command:
-  `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tests/examples/dataset tests/examples/dataset/test_build_assistant_token_views.py tests/examples/dataset/test_build_specdec_study_corpus.py --basetemp=/tmp/task7-final-green-all`
-  — `36 passed in 2.62s`.
+  `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tests/examples/dataset tests/examples/dataset/test_build_assistant_token_views.py tests/examples/dataset/test_build_specdec_study_corpus.py --basetemp=/tmp/task7-r1-full2`
+  — correction-round final rerun: `41 passed in 121.67s`; collection and
+  execution were unusually slow under concurrent host CPU contention.
 
 ## Verification
 
@@ -61,10 +65,45 @@ Implemented disk-backed, authenticated assistant-token exposure staging:
 - Confirmed the production tokenizer is reloaded local-only after authenticating
   the snapshot; fake or mutable caller objects cannot determine production
   counts.
-- Three independent review rounds identified and drove fixes for sequence/tool
-  cut safety, transitive artifact authentication, closed production policy,
-  tokenizer snapshot binding, semantic resume checks, lane classification,
-  and duplicate retokenization/performance concerns.
+- Independent review identified and drove fixes for sequence/tool cut safety,
+  transitive artifact authentication, closed production policy, tokenizer
+  snapshot binding, semantic resume checks, lane classification, duplicate
+  retokenization/performance concerns, and the correction round below.
+
+## Review fix round 1
+
+### Root causes and corrections
+
+- B's promoted records carry the study-global Task 5 paired digest, while the
+  original tokenized staging logic intentionally populated its record-scoped
+  paired field only for C/D. Production incorrectly compared those differently
+  scoped fields. Receipts now retain a zero record-scoped pair for B and bind the
+  separately named authenticated Task 5 paired proof for every arm.
+- Production previously trusted the claimed generation-identity digest after
+  checking only tokenizer/template members. It now requires the exact Task 6
+  dataclass schema, recomputes the canonical `asdict` digest across target,
+  tokenizer, template, runtime, container, source selection, thinking mode,
+  temperature, and generation limits, and reconciles it with the corpus claim.
+- A self-consistent `PROMOTION.json` tree had no external trust root. Every
+  production arm now requires the caller's expected Task 6 `completion.json`
+  SHA-256, authenticates that published file and its declared files, reconciles
+  the promotion receipt and full generation identity, and carries the trusted
+  completion SHA through staging, view, and paired receipts.
+- Task 5 proved the selected C/D candidates, but reserve replacement could make
+  the final promoted corpora differ. The paired builder now merge-streams both
+  authenticated SQLite indexes in UUID order, filters only the agentic-only
+  domain, requires exact `(prompt_uuid, context_bucket)` equality, and binds the
+  resulting final-row digest without materializing the corpus.
+
+### RED and GREEN evidence
+
+- Focused RED: `5 failed, 15 deselected`; B production rejected the new trusted
+  completion API, and the generation, completion, and final-pair authenticators
+  were absent.
+- Focused GREEN: `6 passed, 15 deselected`, including separate reserve-ID and
+  context-bucket drift mutations plus a deterministic final stream digest.
+- Full isolated Task 7 suite: initial correction run `41 passed in 3.65s`;
+  final post-review rerun `41 passed in 121.67s` under host contention.
 
 ## Concern
 

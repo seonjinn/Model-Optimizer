@@ -22,7 +22,7 @@ import os
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -88,6 +88,9 @@ class ExposureView:
     loss_masks_sha256: str
     cumulative_tokens_sha256: str
     paired_selection_bucket_sha256: str
+    task5_paired_selection_bucket_sha256: str
+    task6_completion_sha256: str
+    final_paired_response_sha256: str
     resume_fingerprint: str
     receipt_path: str
     receipt_sha256: str
@@ -103,6 +106,9 @@ class PairedExposureViews:
     C_full_prompt_assistant_tokens: int
     D_full_prompt_assistant_tokens: int
     paired_selection_bucket_sha256: str
+    final_paired_response_sha256: str
+    C_task6_completion_sha256: str
+    D_task6_completion_sha256: str
     source_policy_sha256: str
     exposure_policy_sha256: str
     receipt_path: str
@@ -125,6 +131,9 @@ class _TokenizedCorpus:
     record_count: int
     total_assistant_tokens: int
     paired_selection_bucket_sha256: str
+    task5_paired_selection_bucket_sha256: str
+    task6_completion_sha256: str
+    final_paired_response_sha256: str
     database_path: str
     database_bytes: int
     database_sha256: str
@@ -134,8 +143,19 @@ class _TokenizedCorpus:
 @dataclass(frozen=True)
 class _ProductionProof:
     selection_sha256: str
-    paired_sha256: str
+    task5_paired_sha256: str
+    record_paired_sha256: str
     source_policy_sha256: str
+    task6_completion_sha256: str
+    final_paired_response_sha256: str
+
+
+@dataclass(frozen=True)
+class _AuthenticatedResponse:
+    selection_sha256: str
+    paired_sha256: str
+    index_path: Path
+    completion_sha256: str
 
 
 def _require_digest(name: str, value: str) -> None:
@@ -176,6 +196,9 @@ def _identity_payload(
     purpose: str,
     policy_sha256: str,
     source_policy_sha256: str,
+    task5_paired_sha256: str,
+    task6_completion_sha256: str,
+    final_paired_response_sha256: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -190,6 +213,9 @@ def _identity_payload(
         "purpose": purpose,
         "policy_sha256": policy_sha256,
         "source_policy_sha256": source_policy_sha256,
+        "task5_paired_selection_bucket_sha256": task5_paired_sha256,
+        "task6_completion_sha256": task6_completion_sha256,
+        "final_paired_response_sha256": final_paired_response_sha256,
     }
 
 
@@ -393,6 +419,9 @@ def _stage_tokenized_corpus(
     purpose: str,
     policy_sha256: str,
     source_policy_sha256: str,
+    task5_paired_sha256: str,
+    task6_completion_sha256: str,
+    final_paired_response_sha256: str,
     resume_fingerprint: str,
     reconcile_resume: bool,
 ) -> _TokenizedCorpus:
@@ -408,6 +437,9 @@ def _stage_tokenized_corpus(
             purpose,
             policy_sha256,
             source_policy_sha256,
+            task5_paired_sha256,
+            task6_completion_sha256,
+            final_paired_response_sha256,
         )
         actual_identity = (
             resumed.arm,
@@ -419,6 +451,9 @@ def _stage_tokenized_corpus(
             resumed.purpose,
             resumed.policy_sha256,
             resumed.source_policy_sha256,
+            resumed.task5_paired_selection_bucket_sha256,
+            resumed.task6_completion_sha256,
+            resumed.final_paired_response_sha256,
         )
         if actual_identity != expected_identity:
             raise ExposureViewError("tokenized staging identity reconciliation failed")
@@ -521,6 +556,9 @@ def _stage_tokenized_corpus(
         record_count=record_count,
         total_assistant_tokens=total_tokens,
         paired_selection_bucket_sha256=paired_digest or "0" * 64,
+        task5_paired_selection_bucket_sha256=task5_paired_sha256,
+        task6_completion_sha256=task6_completion_sha256,
+        final_paired_response_sha256=final_paired_response_sha256,
         database_path=str(database_path),
         database_bytes=database_bytes,
         database_sha256=database_sha256,
@@ -656,6 +694,9 @@ def _reconcile_view(view: ExposureView, tokenized: _TokenizedCorpus) -> None:
         view.source_policy_sha256,
         view.seed,
         view.paired_selection_bucket_sha256,
+        view.task5_paired_selection_bucket_sha256,
+        view.task6_completion_sha256,
+        view.final_paired_response_sha256,
         view.resume_fingerprint,
     ) != (
         1,
@@ -670,6 +711,9 @@ def _reconcile_view(view: ExposureView, tokenized: _TokenizedCorpus) -> None:
         tokenized.source_policy_sha256,
         tokenized.seed,
         tokenized.paired_selection_bucket_sha256,
+        tokenized.task5_paired_selection_bucket_sha256,
+        tokenized.task6_completion_sha256,
+        tokenized.final_paired_response_sha256,
         tokenized.resume_fingerprint,
     ):
         raise ExposureViewError("exposure receipt identity reconciliation failed")
@@ -970,6 +1014,9 @@ def _build_view(
         "loss_masks_sha256": loss_masks_digest.hexdigest(),
         "cumulative_tokens_sha256": cumulative_digest.hexdigest(),
         "paired_selection_bucket_sha256": tokenized.paired_selection_bucket_sha256,
+        "task5_paired_selection_bucket_sha256": tokenized.task5_paired_selection_bucket_sha256,
+        "task6_completion_sha256": tokenized.task6_completion_sha256,
+        "final_paired_response_sha256": tokenized.final_paired_response_sha256,
         "resume_fingerprint": tokenized.resume_fingerprint,
         "receipt_path": str(receipt_path),
     }
@@ -1102,8 +1149,83 @@ def _authenticate_selection_manifest(
     return selection_sha256, paired_sha256, source_policy_sha256
 
 
-def _authenticate_response_corpus(corpus: Any, root: Path) -> tuple[str, str]:
+def _authenticate_generation_identity(corpus: Any) -> dict[str, Any]:
+    try:
+        payload = asdict(corpus.generation_identity)
+    except TypeError as error:
+        raise ExposureViewError("generation identity must be a frozen Task 6 record") from error
+    required = {
+        "target_revision",
+        "tokenizer_sha256",
+        "chat_template_sha256",
+        "runtime_sha256",
+        "container_sha256",
+        "source_selection_sha256",
+        "thinking_mode",
+        "temperature",
+        "max_tokens",
+        "max_total_length",
+    }
+    if set(payload) != required:
+        raise ExposureViewError("generation identity schema mismatch")
+    actual = sha256(canonical_json(payload)).hexdigest()
+    if actual != corpus.generation_identity_sha256:
+        raise ExposureViewError("generation identity digest mismatch")
+    if payload["source_selection_sha256"] != corpus.source_selection_sha256:
+        raise ExposureViewError("generation identity source selection mismatch")
+    return payload
+
+
+def _authenticate_task6_completion(root: Path, *, expected_sha256: str) -> dict[str, Any]:
+    _require_digest("expected Task 6 completion", expected_sha256)
+    completion_path = root.parent / "completion.json"
+    if (
+        completion_path.is_symlink()
+        or not completion_path.is_file()
+        or _sha256_file(completion_path) != expected_sha256
+    ):
+        raise ExposureViewError("Task 6 completion identity mismatch")
+    try:
+        completion = json.loads(completion_path.read_bytes())
+    except json.JSONDecodeError as error:
+        raise ExposureViewError("Task 6 completion is not JSON") from error
+    if not isinstance(completion, dict):
+        raise ExposureViewError("Task 6 completion is malformed")
+    return completion
+
+
+def _authenticate_response_corpus(
+    corpus: Any,
+    root: Path,
+    *,
+    expected_completion_sha256: str,
+) -> _AuthenticatedResponse:
+    completion = _authenticate_task6_completion(root, expected_sha256=expected_completion_sha256)
     receipt = _canonical_document(root / "PROMOTION.json", "Task 6 promotion receipt")
+    promotion_sha256 = _sha256_file(root / "PROMOTION.json")
+    identity = _authenticate_generation_identity(corpus)
+    completion_expected = {
+        "generation_identity_sha256": corpus.generation_identity_sha256,
+        "target_revision": identity["target_revision"],
+        "tokenizer_sha256": identity["tokenizer_sha256"],
+        "chat_template_sha256": identity["chat_template_sha256"],
+        "runtime_sha256": identity["runtime_sha256"],
+        "container_sha256": identity["container_sha256"],
+        "source_selection_sha256": identity["source_selection_sha256"],
+        "thinking_mode": identity["thinking_mode"],
+        "promotion_status": "passed",
+        "corpus_sha256": corpus.corpus_sha256,
+        "promotion_receipt_sha256": promotion_sha256,
+    }
+    if any(completion.get(key) != value for key, value in completion_expected.items()):
+        raise ExposureViewError("Task 6 completion reconciliation failed")
+    completion_files = completion.get("files")
+    if not isinstance(completion_files, list) or completion.get("file_count") != len(
+        completion_files
+    ):
+        raise ExposureViewError("Task 6 completion file manifest is malformed")
+    for descriptor in completion_files:
+        _declared_file(root.parent, descriptor, "Task 6 published file")
     for name, expected in (
         ("corpus_sha256", corpus.corpus_sha256),
         ("generation_identity_sha256", corpus.generation_identity_sha256),
@@ -1195,7 +1317,41 @@ def _authenticate_response_corpus(corpus: Any, root: Path) -> tuple[str, str]:
     paired_sha256 = str(receipt.get("paired_cd_sha256"))
     _require_digest("Task 6 selection", selection_sha256)
     _require_digest("Task 6 paired C/D", paired_sha256)
-    return selection_sha256, paired_sha256
+    return _AuthenticatedResponse(
+        selection_sha256=selection_sha256,
+        paired_sha256=paired_sha256,
+        index_path=index_path,
+        completion_sha256=expected_completion_sha256,
+    )
+
+
+def _authenticate_final_paired_rows(c_index: Path, d_index: Path) -> str:
+    def rows(connection: sqlite3.Connection) -> Iterator[tuple[str, str]]:
+        for (payload,) in connection.execute("SELECT payload FROM promoted ORDER BY prompt_uuid"):
+            record = json.loads(payload)
+            if record.get("domain") != "swe-agentic-tool":
+                yield str(record.get("prompt_uuid")), str(record.get("context_bucket"))
+
+    c_connection = sqlite3.connect(f"file:{c_index}?mode=ro", uri=True)
+    d_connection = sqlite3.connect(f"file:{d_index}?mode=ro", uri=True)
+    try:
+        c_rows = iter(rows(c_connection))
+        d_rows = iter(rows(d_connection))
+        digest = sha256(
+            canonical_json({"schema_version": 1, "scope": "final-promoted-non-agentic-cd"})
+        )
+        while True:
+            c_row = next(c_rows, None)
+            d_row = next(d_rows, None)
+            if c_row is None and d_row is None:
+                break
+            if c_row is None or d_row is None or c_row != d_row:
+                raise ExposureViewError("final C/D promoted rows differ by UUID or context bucket")
+            _digest_item(digest, list(c_row))
+        return digest.hexdigest()
+    finally:
+        c_connection.close()
+        d_connection.close()
 
 
 def _authenticate_tokenizer_root(
@@ -1263,6 +1419,7 @@ def _build_exposure_views(
     production: bool = False,
     policy_sha256: str | None = None,
     response_artifact_root: Path | None = None,
+    expected_task6_completion_sha256: str | None = None,
     selection_manifest_path: Path | None = None,
     tokenizer_root: Path | None = None,
     _production_proof: _ProductionProof | None = None,
@@ -1315,11 +1472,16 @@ def _build_exposure_views(
             raise ExposureViewError("production exposure policy digest mismatch")
     resolved_policy_sha256 = policy_sha256 or (_EXPOSURE_POLICY_SHA256 if production else "0" * 64)
     resolved_source_policy_sha256 = "0" * 64
+    task5_paired_sha256 = "0" * 64
+    task6_completion_sha256 = "0" * 64
+    final_paired_response_sha256 = "0" * 64
     proof = _production_proof
     if production:
+        _authenticate_generation_identity(corpus)
         if proof is None:
             if (
                 response_artifact_root is None
+                or expected_task6_completion_sha256 is None
                 or selection_manifest_path is None
                 or tokenizer_root is None
             ):
@@ -1330,18 +1492,34 @@ def _build_exposure_views(
                 selection_manifest_path,
                 expected_manifest_sha256=corpus.source_selection_sha256,
             )
-            response_selection, response_pair = _authenticate_response_corpus(
-                corpus, response_artifact_root
+            response = _authenticate_response_corpus(
+                corpus,
+                response_artifact_root,
+                expected_completion_sha256=expected_task6_completion_sha256,
             )
-            if (response_selection, response_pair) != (selection_sha256, paired_sha256):
+            if (response.selection_sha256, response.paired_sha256) != (
+                selection_sha256,
+                paired_sha256,
+            ):
                 raise ExposureViewError("Task 5/Task 6 selection or paired proof mismatch")
             tokenizer = _authenticate_tokenizer_root(
                 tokenizer_root,
                 tokenizer_sha256=tokenizer_sha256,
                 chat_template_sha256=chat_template_sha256,
             )
-            proof = _ProductionProof(selection_sha256, paired_sha256, source_policy)
+            record_paired_sha256 = paired_sha256 if corpus.arm in {"C", "D"} else "0" * 64
+            proof = _ProductionProof(
+                selection_sha256,
+                paired_sha256,
+                record_paired_sha256,
+                source_policy,
+                response.completion_sha256,
+                "0" * 64,
+            )
         resolved_source_policy_sha256 = proof.source_policy_sha256
+        task5_paired_sha256 = proof.task5_paired_sha256
+        task6_completion_sha256 = proof.task6_completion_sha256
+        final_paired_response_sha256 = proof.final_paired_response_sha256
     _require_digest("policy", resolved_policy_sha256)
     _require_digest("source policy", resolved_source_policy_sha256)
     identity = corpus.generation_identity
@@ -1367,6 +1545,9 @@ def _build_exposure_views(
             purpose=purpose,
             policy_sha256=resolved_policy_sha256,
             source_policy_sha256=resolved_source_policy_sha256,
+            task5_paired_sha256=task5_paired_sha256,
+            task6_completion_sha256=task6_completion_sha256,
+            final_paired_response_sha256=final_paired_response_sha256,
         ),
     )
     tokenized = _stage_tokenized_corpus(
@@ -1380,6 +1561,9 @@ def _build_exposure_views(
         purpose=purpose,
         policy_sha256=resolved_policy_sha256,
         source_policy_sha256=resolved_source_policy_sha256,
+        task5_paired_sha256=task5_paired_sha256,
+        task6_completion_sha256=task6_completion_sha256,
+        final_paired_response_sha256=final_paired_response_sha256,
         resume_fingerprint=resume_fingerprint,
         reconcile_resume=_reconcile_resume,
     )
@@ -1388,7 +1572,10 @@ def _build_exposure_views(
             raise ExposureViewError("production proof construction failed")
         if (
             tokenized.selection_sha256 != proof.selection_sha256
-            or tokenized.paired_selection_bucket_sha256 != proof.paired_sha256
+            or tokenized.paired_selection_bucket_sha256 != proof.record_paired_sha256
+            or tokenized.task5_paired_selection_bucket_sha256 != proof.task5_paired_sha256
+            or tokenized.task6_completion_sha256 != proof.task6_completion_sha256
+            or tokenized.final_paired_response_sha256 != proof.final_paired_response_sha256
         ):
             raise ExposureViewError(
                 "authenticated production proof does not match tokenized records"
@@ -1414,6 +1601,7 @@ def build_exposure_views(
     training_sequence_length: int = 4_096,
     production: bool = False,
     response_artifact_root: Path | None = None,
+    expected_task6_completion_sha256: str | None = None,
     selection_manifest_path: Path | None = None,
     tokenizer_root: Path | None = None,
 ) -> Mapping[str, ExposureView]:
@@ -1429,6 +1617,7 @@ def build_exposure_views(
         training_sequence_length=training_sequence_length,
         production=production,
         response_artifact_root=response_artifact_root,
+        expected_task6_completion_sha256=expected_task6_completion_sha256,
         selection_manifest_path=selection_manifest_path,
         tokenizer_root=tokenizer_root,
     )
@@ -1443,6 +1632,9 @@ def _write_paired_receipt(
     paired_digest: str,
     source_policy_sha256: str,
     exposure_policy_sha256: str,
+    final_paired_response_sha256: str,
+    c_task6_completion_sha256: str,
+    d_task6_completion_sha256: str,
 ) -> tuple[str, str]:
     receipt_path = root / "PAIRED_EXPOSURE.json"
     payload = {
@@ -1453,6 +1645,9 @@ def _write_paired_receipt(
         "paired_selection_bucket_sha256": paired_digest,
         "source_policy_sha256": source_policy_sha256,
         "exposure_policy_sha256": exposure_policy_sha256,
+        "final_paired_response_sha256": final_paired_response_sha256,
+        "C_task6_completion_sha256": c_task6_completion_sha256,
+        "D_task6_completion_sha256": d_task6_completion_sha256,
         "C_view_receipts": {name: view.receipt_sha256 for name, view in views_c.items()},
         "D_view_receipts": {name: view.receipt_sha256 for name, view in views_d.items()},
     }
@@ -1480,6 +1675,7 @@ def build_paired_exposure_views(
     training_sequence_length: int = 4_096,
     production: bool = True,
     response_artifact_roots: Mapping[str, Path] | None = None,
+    expected_task6_completion_sha256s: Mapping[str, str] | None = None,
     selection_manifest_path: Path | None = None,
     tokenizer_root: Path | None = None,
 ) -> PairedExposureViews:
@@ -1506,6 +1702,8 @@ def build_paired_exposure_views(
         if (
             response_artifact_roots is None
             or set(response_artifact_roots) != {"C", "D"}
+            or expected_task6_completion_sha256s is None
+            or set(expected_task6_completion_sha256s) != {"C", "D"}
             or selection_manifest_path is None
             or tokenizer_root is None
         ):
@@ -1518,19 +1716,53 @@ def build_paired_exposure_views(
             selection_manifest_path,
             expected_manifest_sha256=corpus_c.source_selection_sha256,
         )
-        c_selection, c_pair = _authenticate_response_corpus(corpus_c, response_artifact_roots["C"])
-        d_selection, d_pair = _authenticate_response_corpus(corpus_d, response_artifact_roots["D"])
-        if (c_selection, d_selection) != (selection_sha256, selection_sha256) or (
-            c_pair,
-            d_pair,
+        c_response = _authenticate_response_corpus(
+            corpus_c,
+            response_artifact_roots["C"],
+            expected_completion_sha256=expected_task6_completion_sha256s["C"],
+        )
+        d_response = _authenticate_response_corpus(
+            corpus_d,
+            response_artifact_roots["D"],
+            expected_completion_sha256=expected_task6_completion_sha256s["D"],
+        )
+        if (c_response.selection_sha256, d_response.selection_sha256) != (
+            selection_sha256,
+            selection_sha256,
+        ) or (
+            c_response.paired_sha256,
+            d_response.paired_sha256,
         ) != (paired_sha256, paired_sha256):
             raise ExposureViewError("Task 5/Task 6 selection or paired proof mismatch")
+        final_paired_response_sha256 = _authenticate_final_paired_rows(
+            c_response.index_path,
+            d_response.index_path,
+        )
         tokenizer = _authenticate_tokenizer_root(
             tokenizer_root,
             tokenizer_sha256=tokenizer_sha256,
             chat_template_sha256=chat_template_sha256,
         )
-        production_proof = _ProductionProof(selection_sha256, paired_sha256, source_policy_sha256)
+        c_production_proof = _ProductionProof(
+            selection_sha256,
+            paired_sha256,
+            paired_sha256,
+            source_policy_sha256,
+            c_response.completion_sha256,
+            final_paired_response_sha256,
+        )
+        d_production_proof = _ProductionProof(
+            selection_sha256,
+            paired_sha256,
+            paired_sha256,
+            source_policy_sha256,
+            d_response.completion_sha256,
+            final_paired_response_sha256,
+        )
+    else:
+        c_production_proof = production_proof
+        d_production_proof = production_proof
+        final_paired_response_sha256 = "0" * 64
     output_root.mkdir(parents=True, exist_ok=True)
     one_pass = {"one-pass": None}
     initial_c = _build_exposure_views(
@@ -1544,7 +1776,7 @@ def build_paired_exposure_views(
         training_sequence_length=training_sequence_length,
         production=production,
         policy_sha256=policy_sha256,
-        _production_proof=production_proof,
+        _production_proof=c_production_proof,
         _allow_partial_production_suite=True,
     )
     initial_d = _build_exposure_views(
@@ -1558,7 +1790,7 @@ def build_paired_exposure_views(
         training_sequence_length=training_sequence_length,
         production=production,
         policy_sha256=policy_sha256,
-        _production_proof=production_proof,
+        _production_proof=d_production_proof,
         _allow_partial_production_suite=True,
     )
     paired_digest = initial_c["one-pass"].paired_selection_bucket_sha256
@@ -1585,7 +1817,7 @@ def build_paired_exposure_views(
         training_sequence_length=training_sequence_length,
         production=production,
         policy_sha256=policy_sha256,
-        _production_proof=production_proof,
+        _production_proof=c_production_proof,
         _reconcile_resume=False,
         _allow_common_production=True,
     )
@@ -1600,7 +1832,7 @@ def build_paired_exposure_views(
         training_sequence_length=training_sequence_length,
         production=production,
         policy_sha256=policy_sha256,
-        _production_proof=production_proof,
+        _production_proof=d_production_proof,
         _reconcile_resume=False,
         _allow_common_production=True,
     )
@@ -1612,6 +1844,9 @@ def build_paired_exposure_views(
         paired_digest=paired_digest,
         source_policy_sha256=source_policy_sha256,
         exposure_policy_sha256=policy_sha256,
+        final_paired_response_sha256=final_paired_response_sha256,
+        c_task6_completion_sha256=views_c["one-pass"].task6_completion_sha256,
+        d_task6_completion_sha256=views_d["one-pass"].task6_completion_sha256,
     )
     return PairedExposureViews(
         C=views_c,
@@ -1620,6 +1855,9 @@ def build_paired_exposure_views(
         C_full_prompt_assistant_tokens=views_c["one-pass"].full_prompt_assistant_tokens,
         D_full_prompt_assistant_tokens=views_d["one-pass"].full_prompt_assistant_tokens,
         paired_selection_bucket_sha256=paired_digest,
+        final_paired_response_sha256=final_paired_response_sha256,
+        C_task6_completion_sha256=views_c["one-pass"].task6_completion_sha256,
+        D_task6_completion_sha256=views_d["one-pass"].task6_completion_sha256,
         source_policy_sha256=source_policy_sha256,
         exposure_policy_sha256=policy_sha256,
         receipt_path=receipt_path,
