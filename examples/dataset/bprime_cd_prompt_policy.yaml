@@ -1,0 +1,44 @@
+schema_version: 1
+seed: 20260822
+reserve:
+  numerator: 6
+  denominator: 5
+exposure_tokens: [256000000, 1000000000]
+sequence_length: 4096
+full_context_maximum: 32768
+languages:
+  allowed: [en, ja]
+  denied: [de]
+arms:
+  B-prime:
+    prompt_count: 700000
+    cells:
+      math: 200000
+      code: 125000
+      stem: 125000
+      chat: 125000
+      multilingual: 125000
+    lanes: {}
+  C:
+    prompt_count: 2000000
+    cells:
+      math: 600000
+      code: 400000
+      stem: 200000
+      chat: 400000
+      multilingual: 300000
+      swe: 100000
+    lanes: {}
+  D:
+    prompt_count: 2000000
+    cells:
+      math: 600000
+      code: 400000
+      stem: 200000
+      chat: 400000
+      multilingual: 300000
+      swe: 100000
+    lanes:
+      agentless-swe: 200000
+      interactive-swe-replay: 200000
+      generic-tool-replay: 200000
