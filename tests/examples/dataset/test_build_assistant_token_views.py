@@ -171,6 +171,38 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
+def test_ptv2_scientific_milestone_cannot_extend_past_the_2m_occurrence_pass() -> None:
+    """A 256M receipt is invalid until both authenticated one-pass totals reach it."""
+    module = _load_module()
+    prefix = module.PTV2OnePassCorpus(
+        strategy="A-prefix",
+        occurrence_count=2_000_000,
+        trainer_epochs=1,
+        assistant_tokens=200_000_000,
+        tokenizer_sha256="1" * 64,
+        chat_template_sha256="2" * 64,
+        assistant_loss_target_sha256="3" * 64,
+        training_config_sha256="4" * 64,
+        source_response_root_sha256="5" * 64,
+        ordered_occurrences_sha256="6" * 64,
+    )
+    balanced = module.PTV2OnePassCorpus(
+        strategy="B-balanced",
+        occurrence_count=2_000_000,
+        trainer_epochs=1,
+        assistant_tokens=240_000_000,
+        tokenizer_sha256="1" * 64,
+        chat_template_sha256="2" * 64,
+        assistant_loss_target_sha256="3" * 64,
+        training_config_sha256="4" * 64,
+        source_response_root_sha256="7" * 64,
+        ordered_occurrences_sha256="8" * 64,
+    )
+
+    with pytest.raises(module.ExposureViewError, match="one-pass does not reach 256M"):
+        module.build_ptv2_study_exposures(prefix, balanced, scientific_tokens=256_000_000)
+
+
 def _digest_lines(seed: object, rows: list[list[object]]) -> str:
     digest = hashlib.sha256(_canonical(seed))
     for row in rows:

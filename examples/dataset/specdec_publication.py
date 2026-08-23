@@ -404,6 +404,34 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
         if not isinstance(shards, list) or not shards or not isinstance(index, dict):
             raise PublicationError("selection manifest declared files are malformed")
         return [*shards, index]
+    if role == "selection" and payload.get("schema_version") == 3:
+        root_sha256 = payload.get("root_sha256")
+        root_record = {key: value for key, value in payload.items() if key != "root_sha256"}
+        if root_sha256 != _sha256_bytes(_identity_json(root_record)):
+            raise PublicationError("PTV2 selection receipt root SHA-256 mismatch")
+        required = {
+            "selection_sha256",
+            "policy_sha256",
+            "source_inventory_sha256",
+            "baseline_receipt_sha256",
+            "held_out_receipt_sha256",
+            "policy",
+            "index",
+            "shards",
+        }
+        if not required.issubset(payload):
+            raise PublicationError("PTV2 selection receipt schema is incomplete")
+        policy = payload["policy"]
+        index = payload["index"]
+        shards = payload["shards"]
+        if (
+            not isinstance(policy, dict)
+            or not isinstance(index, dict)
+            or not isinstance(shards, list)
+            or not shards
+        ):
+            raise PublicationError("PTV2 selection receipt declared files are malformed")
+        return [*shards, index, policy]
     if role == "tokenized" and payload.get("schema_version") == 1:
         required = {
             "database_path",

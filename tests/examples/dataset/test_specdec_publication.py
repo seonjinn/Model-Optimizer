@@ -91,6 +91,44 @@ def _bundle(root: Path, *, count: int = 5) -> publication.CorpusBundle:
     )
 
 
+def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards(
+    tmp_path: Path,
+) -> None:
+    """A PTV2 selection adapter must carry every disk-backed selection input into publication."""
+    policy = tmp_path / "policy.yaml"
+    index = tmp_path / "ptv2-study-index.sqlite3"
+    shard = tmp_path / "a-prefix.jsonl"
+    policy.write_bytes(b"policy\n")
+    index.write_bytes(b"sqlite\n")
+    shard.write_bytes(b"occurrence\n")
+
+    def descriptor(path: Path) -> dict[str, Any]:
+        return {
+            "path": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    payload = {
+        "schema_version": 3,
+        "selection_sha256": "1" * 64,
+        "policy_sha256": "2" * 64,
+        "source_inventory_sha256": "3" * 64,
+        "baseline_receipt_sha256": "4" * 64,
+        "held_out_receipt_sha256": "5" * 64,
+        "policy": descriptor(policy),
+        "index": descriptor(index),
+        "shards": [descriptor(shard)],
+    }
+    payload["root_sha256"] = hashlib.sha256(publication._identity_json(payload)).hexdigest()
+
+    assert publication._role_file_descriptors("selection", payload) == [
+        descriptor(shard),
+        descriptor(index),
+        descriptor(policy),
+    ]
+
+
 @pytest.mark.parametrize(
     "phase",
     [

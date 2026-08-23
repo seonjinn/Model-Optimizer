@@ -1,0 +1,17 @@
+schema_version: 1
+seed: 20260822
+ptv2_revision: 5c89e01dd720ae0f4058445ed49c5fb68a03c76e
+prefix: {selection: source-order, occurrences: 2000000, preserve_duplicates: true}
+balanced:
+  selection: seeded-within-cell
+  occurrences: {math: 500000, code: 400000, stem: 500000, chat: 400000, multilingual: 200000}
+  capacity_shortfall: deterministic-within-cell-cycle
+multilingual: {de: 40000, ja: 40000, es: 40000, fr: 40000, it: 40000}
+assistant_responses: source-native
+trainer_epochs: 1
+global_batch_size: 512
+occurrence_milestones: [500000, 1000000, 1300000, 2000000]
+runtime_screen_tokens: 64000000
+scientific_exposures: [one-pass]
+conditional_scientific_tokens: 256000000
+sequence_length: 4096

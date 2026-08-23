@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from specdec_corpus_contracts import canonical_json
 from trajectory_schema import TrajectoryValidationError, validate_trajectory
@@ -35,9 +35,12 @@ from trajectory_schema import TrajectoryValidationError, validate_trajectory
 __all__ = [
     "ExposureView",
     "ExposureViewError",
+    "PTV2OnePassCorpus",
+    "PTV2StudyExposureViews",
     "PairedExposureViews",
     "build_exposure_views",
     "build_paired_exposure_views",
+    "build_ptv2_study_exposures",
 ]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -113,6 +116,90 @@ class PairedExposureViews:
     exposure_policy_sha256: str
     receipt_path: str
     receipt_sha256: str
+
+
+@dataclass(frozen=True)
+class PTV2OnePassCorpus:
+    """Authenticated token totals for one exact 2M-occurrence PTV2 arm."""
+
+    strategy: Literal["A-prefix", "B-balanced"]
+    occurrence_count: int
+    trainer_epochs: int
+    assistant_tokens: int
+    tokenizer_sha256: str
+    chat_template_sha256: str
+    assistant_loss_target_sha256: str
+    training_config_sha256: str
+    source_response_root_sha256: str
+    ordered_occurrences_sha256: str
+
+
+@dataclass(frozen=True)
+class PTV2StudyExposureViews:
+    """One-pass and reachable paired scientific receipt boundaries for A/B."""
+
+    runtime_screen_tokens: int
+    scientific_tokens: int
+    prefix_u2m: int
+    balanced_u2m: int
+    paired_scientific_reached: bool
+
+
+def build_ptv2_study_exposures(
+    prefix: PTV2OnePassCorpus,
+    balanced: PTV2OnePassCorpus,
+    *,
+    scientific_tokens: int = 256_000_000,
+    runtime_screen_tokens: int = 64_000_000,
+) -> PTV2StudyExposureViews:
+    """Authorize paired PTV2 exposure receipts only within the exact one-pass totals."""
+    if scientific_tokens != 256_000_000:
+        raise ExposureViewError("PTV2 scientific tokens must be exactly 256M")
+    if runtime_screen_tokens != 64_000_000:
+        raise ExposureViewError("PTV2 runtime screen must be exactly 64M")
+    _validate_ptv2_one_pass(prefix, "A-prefix")
+    _validate_ptv2_one_pass(balanced, "B-balanced")
+    identity_fields = (
+        "tokenizer_sha256",
+        "chat_template_sha256",
+        "assistant_loss_target_sha256",
+        "training_config_sha256",
+    )
+    if any(getattr(prefix, field) != getattr(balanced, field) for field in identity_fields):
+        raise ExposureViewError(
+            "A/B tokenizer, template, target mask, and training config must match"
+        )
+    if min(prefix.assistant_tokens, balanced.assistant_tokens) < runtime_screen_tokens:
+        raise ExposureViewError("one-pass does not reach 64M runtime screen")
+    if min(prefix.assistant_tokens, balanced.assistant_tokens) < scientific_tokens:
+        raise ExposureViewError("one-pass does not reach 256M")
+    return PTV2StudyExposureViews(
+        runtime_screen_tokens,
+        scientific_tokens,
+        prefix.assistant_tokens,
+        balanced.assistant_tokens,
+        True,
+    )
+
+
+def _validate_ptv2_one_pass(corpus: PTV2OnePassCorpus, strategy: str) -> None:
+    if not isinstance(corpus, PTV2OnePassCorpus) or corpus.strategy != strategy:
+        raise ExposureViewError(f"PTV2 one-pass receipt must be {strategy}")
+    if corpus.occurrence_count != 2_000_000:
+        raise ExposureViewError("PTV2 one-pass receipt must bind exactly 2M occurrences")
+    if corpus.trainer_epochs != 1:
+        raise ExposureViewError("PTV2 one-pass receipt must bind exactly one trainer epoch")
+    if isinstance(corpus.assistant_tokens, bool) or corpus.assistant_tokens < 1:
+        raise ExposureViewError("PTV2 one-pass assistant tokens must be positive")
+    for field in (
+        "tokenizer_sha256",
+        "chat_template_sha256",
+        "assistant_loss_target_sha256",
+        "training_config_sha256",
+        "source_response_root_sha256",
+        "ordered_occurrences_sha256",
+    ):
+        _require_digest(field, getattr(corpus, field))
 
 
 @dataclass(frozen=True)
