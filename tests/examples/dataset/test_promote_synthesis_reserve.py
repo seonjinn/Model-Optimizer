@@ -213,12 +213,19 @@ def test_vllm_empty_protocol_defaults_normalize_to_closed_success(
     ("field", "value"),
     [
         ("reasoning_content", "hidden reasoning"),
+        ("reasoning_content", []),
         ("reasoning", "hidden reasoning"),
+        ("reasoning", []),
         ("tool_calls", [{"id": "call-1"}]),
+        ("tool_calls", ""),
+        ("tool_calls", {}),
         ("function_call", {"name": "legacy", "arguments": "{}"}),
+        ("function_call", []),
+        ("function_call", {}),
+        ("function_call", ""),
     ],
 )
-def test_vllm_nonempty_protocol_fields_are_failed_attempts(
+def test_vllm_invalid_protocol_fields_are_failed_attempts(
     monkeypatch: pytest.MonkeyPatch,
     field: str,
     value: object,

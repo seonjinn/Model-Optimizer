@@ -845,10 +845,13 @@ def _closed_wire_assistant_message(value: Any) -> dict[str, str]:
         raise ValueError("wire assistant message has unknown fields")
     if value.get("role") != "assistant" or not isinstance(value.get("content"), str):
         raise ValueError("wire assistant role/content is invalid")
-    for field in default_fields.intersection(value):
-        protocol_value = value[field]
-        if protocol_value is not None and protocol_value not in ("", [], {}):
-            raise ValueError(f"wire assistant {field} is nonempty")
+    for field in {"reasoning_content", "reasoning"}.intersection(value):
+        if value[field] is not None and value[field] != "":
+            raise ValueError(f"wire assistant {field} is invalid")
+    if "tool_calls" in value and value["tool_calls"] is not None and value["tool_calls"] != []:
+        raise ValueError("wire assistant tool_calls is invalid")
+    if "function_call" in value and value["function_call"] is not None:
+        raise ValueError("wire assistant function_call is invalid")
     return {"role": "assistant", "content": value["content"]}
 
 

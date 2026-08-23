@@ -192,3 +192,34 @@ conftest bootstrap.
 - `git diff --check` — passed.
 - Three-file pre-commit invocation — passed Ruff, Ruff format, repository mypy,
   license validation, Bandit, and markdownlint.
+
+## Review fix round 3
+
+### Root cause and correction
+
+- Round 2 used one generic JSON-emptiness predicate for every optional wire
+  field. That erased malformed cross-type values such as `reasoning: []`,
+  `tool_calls: ""`, and `function_call: {}` before the closed-schema validator
+  could reject them.
+- Wire defaults now have field-specific contracts: `reasoning` and
+  `reasoning_content` accept only null or the empty string, `tool_calls` accepts
+  only null or the empty list, and `function_call` accepts only null. All other
+  values become the deterministic canonical failed-attempt envelope; valid
+  defaults still normalize to identical role/content response bytes and hash.
+
+### RED and GREEN evidence
+
+- `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tests/examples/dataset tests/examples/dataset/test_promote_synthesis_reserve.py -k 'vllm_invalid_protocol_fields' --basetemp=/tmp/task6-r3-red`
+  — RED: `7 failed, 4 passed, 19 deselected in 0.08s`; every newly added
+  cross-type mutation was incorrectly normalized as a success.
+- The focused wire suite with
+  `-k 'vllm_invalid_protocol_fields or vllm_empty_protocol_defaults_normalize' --basetemp=/tmp/task6-r3-green`
+  — GREEN: `12 passed, 18 deselected in 0.05s`.
+- `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tests/examples/dataset tests/examples/dataset/test_promote_synthesis_reserve.py --basetemp=/tmp/task6-r3-core`
+  — `30 passed in 0.09s`.
+- `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/launcher .venv/bin/python -m pytest -q -o addopts='' --disable-warnings --confcutdir=tools/launcher/tests tools/launcher/tests/test_qwen4b_dataset_study.py --basetemp=/tmp/task6-r3-launcher`
+  — `31 passed in 1.97s`.
+- `bash -n tools/launcher/common/specdec/run_qwen4b_synthesis.sbatch` — passed.
+- `git diff --check` — passed.
+- Three-file pre-commit invocation — passed Ruff, Ruff format, repository mypy,
+  license validation, Bandit, and markdownlint.
