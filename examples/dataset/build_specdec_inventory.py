@@ -60,6 +60,7 @@ __all__ = [
     "build_inventory_rows",
     "candidate_inventory_bytes",
     "candidate_inventory_sha256",
+    "is_approved_ptv2_source",
     "iter_candidate_inventory_bytes",
     "make_exclusion_receipt",
     "sha256_file",
@@ -195,13 +196,22 @@ def _validate_exclusion_receipt(
     return set(receipt.prompt_ids)
 
 
-def _approved_ptv2_source(source: SourceIdentity) -> bool:
+def is_approved_ptv2_source(
+    repository_id: str, configuration: str, split: str, revision: str
+) -> bool:
+    """Return whether a structured identity is in the immutable PTV2 allowlist."""
     return (
-        source.repository_id,
-        source.configuration,
-        source.split,
-        source.revision,
+        repository_id,
+        configuration,
+        split,
+        revision,
     ) in _APPROVED_PTV2_SOURCES
+
+
+def _approved_ptv2_source(source: SourceIdentity) -> bool:
+    return is_approved_ptv2_source(
+        source.repository_id, source.configuration, source.split, source.revision
+    )
 
 
 @dataclass(frozen=True)
@@ -217,6 +227,9 @@ class CandidatePrompt(CanonicalPrompt):
     tokenizer_sha256: str
     replay_valid: bool
     source_family: Literal["ptv2", "ptv3"]
+    source_repository_id: str
+    source_configuration: str
+    source_split: str
 
     @property
     def arm_domain(self) -> str:
@@ -241,6 +254,9 @@ _CANDIDATE_COLUMNS = (
     "tokenizer_sha256",
     "replay_valid",
     "source_family",
+    "source_repository_id",
+    "source_configuration",
+    "source_split",
 )
 
 
@@ -299,6 +315,9 @@ class DiskBackedCandidateRows(Sequence[CandidatePrompt]):
             tokenizer_sha256=values["tokenizer_sha256"],
             replay_valid=bool(values["replay_valid"]),
             source_family=values["source_family"],
+            source_repository_id=values["source_repository_id"],
+            source_configuration=values["source_configuration"],
+            source_split=values["source_split"],
         )
 
     def __iter__(self):
@@ -670,7 +689,10 @@ def _create_candidate_database(path: Path) -> sqlite3.Connection:
             input_ids TEXT NOT NULL,
             tokenizer_sha256 TEXT NOT NULL,
             replay_valid INTEGER NOT NULL,
-            source_family TEXT NOT NULL CHECK (source_family IN ('ptv2', 'ptv3'))
+            source_family TEXT NOT NULL CHECK (source_family IN ('ptv2', 'ptv3')),
+            source_repository_id TEXT NOT NULL,
+            source_configuration TEXT NOT NULL,
+            source_split TEXT NOT NULL
         ) WITHOUT ROWID
         """
     )
@@ -699,6 +721,9 @@ def _insert_candidate(connection: sqlite3.Connection, candidate: CandidatePrompt
             candidate.tokenizer_sha256,
             int(candidate.replay_valid),
             candidate.source_family,
+            candidate.source_repository_id,
+            candidate.source_configuration,
+            candidate.source_split,
         ),
     )
 
@@ -723,6 +748,9 @@ def _candidate_record(prompt: CandidatePrompt) -> dict[str, Any]:
         "tokenizer_sha256": prompt.tokenizer_sha256,
         "replay_valid": prompt.replay_valid,
         "source_family": prompt.source_family,
+        "source_repository_id": prompt.source_repository_id,
+        "source_configuration": prompt.source_configuration,
+        "source_split": prompt.source_split,
     }
 
 
@@ -875,6 +903,9 @@ def build_candidate_inventory(
                     tokenizer_sha256=tokenizer_sha256,
                     replay_valid=replay_valid,
                     source_family="ptv2" if _approved_ptv2_source(source) else "ptv3",
+                    source_repository_id=source.repository_id,
+                    source_configuration=source.configuration,
+                    source_split=source.split,
                 )
                 _insert_candidate(connection, candidate)
                 accepted_count += 1

@@ -114,6 +114,7 @@ def _candidate(
     prompt = {"messages": [{"role": "user", "content": f"prompt-{ordinal}"}], "tools": []}
     canonical = json.dumps(prompt, sort_keys=True, separators=(",", ":")).encode()
     family = source_family or ("ptv2" if domain in {"stem-science", "multilingual"} else "ptv3")
+    ptv2_split = "stem" if domain == "stem-science" else f"multilingual_{language}"
     return CandidatePrompt(
         prompt_uuid=hashlib.sha256(canonical).hexdigest(),
         canonical_bytes=canonical,
@@ -132,6 +133,11 @@ def _candidate(
         tokenizer_sha256="d" * 64,
         replay_valid=lane in {"interactive-swe-replay", "generic-tool-replay"},
         source_family=family,
+        source_repository_id=(
+            "nvidia/Nemotron-Post-Training-Dataset-v2" if family == "ptv2" else "fixture/source"
+        ),
+        source_configuration="default",
+        source_split=ptv2_split if family == "ptv2" else lane,
     )
 
 
@@ -253,6 +259,21 @@ def test_selection_independently_recomputes_streamed_inventory_identity() -> Non
 
     with pytest.raises(ValueError, match="streamed identity mismatch"):
         _select(replace(inventory, rows=tampered_rows), _policy())
+
+
+def test_rehashed_unapproved_structured_bprime_source_is_rejected() -> None:
+    inventory = _inventory()
+    tampered_rows = tuple(
+        replace(row, source_repository_id="attacker/revision-spoof")
+        if row.source_family == "ptv2"
+        else row
+        for row in inventory.rows
+    )
+
+    with pytest.raises(PromptSelectionBlocked) as caught:
+        _select(_rehash(replace(inventory, rows=tampered_rows)), _policy())
+
+    assert caught.value.receipt["arm"] == "B-prime"
 
 
 def test_bprime_has_exact_language_counts_reserves_and_stable_unique_order() -> None:

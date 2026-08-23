@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 from collections import defaultdict
@@ -36,6 +37,7 @@ from build_specdec_inventory import (
     CandidateInventory,
     CandidatePrompt,
     candidate_inventory_sha256,
+    is_approved_ptv2_source,
 )
 from specdec_corpus_contracts import canonical_json, sha256_bytes
 from stage_ptv23_sources import _fsync_directory, _rename_no_replace, _write_bytes_durable
@@ -45,6 +47,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DiskBackedSelectedRows",
+    "PromptPublicationDurabilityError",
     "PromptSelectionBlocked",
     "PromptSelectionBlockedError",
     "PromptView",
@@ -88,6 +91,9 @@ class SelectedPrompt:
     context_bucket: str
     source_id: str
     source_family: Literal["ptv2", "ptv3"]
+    source_repository_id: str
+    source_configuration: str
+    source_split: str
     source_revision: str
     source_file_sha256: str
     source_manifest_sha256: str
@@ -202,6 +208,15 @@ class PublishedPromptViews:
     index_path: Path
     root_sha256: str
     row_count: int
+
+
+class PromptPublicationDurabilityError(RuntimeError):
+    """A published path could not be proven durable or safely removed."""
+
+    def __init__(self, destination: Path) -> None:
+        self.destination = destination
+        self.state = "durability_unconfirmed_recovery_required"
+        super().__init__(f"publication durability is unconfirmed; inspect or remove {destination}")
 
 
 class _SelectionStorage:
@@ -426,6 +441,7 @@ def _select_prompt_views_impl(
             language=language,
             source_family="ptv2",
             source_revision=inventory.ptv2_revision,
+            approved_ptv2=True,
             policy=policy,
             inventory_sha256=inventory.inventory_sha256,
             baseline_receipt_sha256=baseline_receipt_sha256,
@@ -541,10 +557,11 @@ def _create_selection_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE candidates(
           prompt_uuid TEXT PRIMARY KEY, domain TEXT NOT NULL, lane TEXT NOT NULL,
           language TEXT NOT NULL, bucket TEXT NOT NULL, source_family TEXT NOT NULL,
-          source_revision TEXT NOT NULL, rank TEXT NOT NULL, payload TEXT NOT NULL
+          source_revision TEXT NOT NULL, approved_ptv2 INTEGER NOT NULL,
+          rank TEXT NOT NULL, payload TEXT NOT NULL
         );
         CREATE INDEX candidates_cell ON candidates(
-          domain,lane,language,source_family,source_revision,bucket,rank,prompt_uuid
+          domain,lane,language,source_family,source_revision,approved_ptv2,bucket,rank,prompt_uuid
         );
         CREATE TABLE selected(
           arm TEXT NOT NULL, status TEXT NOT NULL, cell TEXT NOT NULL,
@@ -569,6 +586,9 @@ def _candidate_payload(candidate: CandidatePrompt) -> str:
             "context_bucket": candidate.context_bucket,
             "source_id": candidate.source_id,
             "source_family": candidate.source_family,
+            "source_repository_id": candidate.source_repository_id,
+            "source_configuration": candidate.source_configuration,
+            "source_split": candidate.source_split,
             "source_revision": candidate.source_revision,
             "source_file_sha256": candidate.source_file_sha256,
             "source_manifest_sha256": candidate.source_manifest_sha256,
@@ -595,7 +615,7 @@ def _spool_candidates(
             continue
         try:
             connection.execute(
-                "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     row.prompt_uuid,
                     row.domain,
@@ -604,6 +624,14 @@ def _spool_candidates(
                     row.context_bucket,
                     row.source_family,
                     row.source_revision,
+                    int(
+                        is_approved_ptv2_source(
+                            row.source_repository_id,
+                            row.source_configuration,
+                            row.source_split,
+                            row.source_revision,
+                        )
+                    ),
                     _rank(row, policy),
                     _candidate_payload(row),
                 ),
@@ -620,6 +648,7 @@ def _candidate_where(
     language: str | None,
     source_family: str | None,
     source_revision: str | None,
+    approved_ptv2: bool | None,
 ) -> tuple[str, list[str]]:
     clauses = ["domain=?", "lane=?"]
     values = [domain, lane]
@@ -627,6 +656,7 @@ def _candidate_where(
         ("language", language),
         ("source_family", source_family),
         ("source_revision", source_revision),
+        ("approved_ptv2", None if approved_ptv2 is None else str(int(approved_ptv2))),
     ):
         if value is not None:
             clauses.append(f"{column}=?")
@@ -649,6 +679,7 @@ def _select_sql_cell(
     language: str | None = None,
     source_family: str | None = None,
     source_revision: str | None = None,
+    approved_ptv2: bool | None = None,
 ) -> dict[str, int]:
     where, values = _candidate_where(
         domain=domain,
@@ -656,6 +687,7 @@ def _select_sql_cell(
         language=language,
         source_family=source_family,
         source_revision=source_revision,
+        approved_ptv2=approved_ptv2,
     )
     capacities = {
         str(bucket): int(count)
@@ -879,22 +911,8 @@ def publish_prompt_view_bundle(
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     partial = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.partial-", dir=output_dir.parent))
     shards_dir = partial / "shards"
-    shards_dir.mkdir()
     index_path = partial / "selection-index.sqlite3"
-    index = sqlite3.connect(index_path)
-    index.executescript(
-        """
-        PRAGMA journal_mode=OFF;
-        PRAGMA synchronous=FULL;
-        CREATE TABLE rows(
-          global_index INTEGER PRIMARY KEY, arm TEXT NOT NULL, status TEXT NOT NULL,
-          selection_index INTEGER NOT NULL, domain TEXT NOT NULL, lane TEXT NOT NULL,
-          language TEXT NOT NULL, prompt_uuid TEXT NOT NULL, shard_path TEXT NOT NULL,
-          byte_offset INTEGER NOT NULL, byte_length INTEGER NOT NULL, row_sha256 TEXT NOT NULL
-        );
-        CREATE INDEX rows_filter ON rows(arm,domain,lane,language,prompt_uuid,status,selection_index);
-        """
-    )
+    index: sqlite3.Connection | None = None
     shards: list[dict[str, Any]] = []
     row_count = 0
     shard_number = 0
@@ -922,6 +940,30 @@ def publish_prompt_view_bundle(
         shard_file = None
 
     try:
+        shards_dir.mkdir()
+        index = sqlite3.connect(index_path)
+        index.executescript(
+            """
+            PRAGMA journal_mode=OFF;
+            PRAGMA synchronous=FULL;
+            CREATE TABLE rows(
+              global_index INTEGER PRIMARY KEY, arm TEXT NOT NULL, status TEXT NOT NULL,
+              selection_index INTEGER NOT NULL, domain TEXT NOT NULL, lane TEXT NOT NULL,
+              language TEXT NOT NULL, prompt_uuid TEXT NOT NULL, context_bucket TEXT NOT NULL,
+              source_family TEXT NOT NULL, source_repository_id TEXT NOT NULL,
+              source_configuration TEXT NOT NULL, source_split TEXT NOT NULL,
+              source_id TEXT NOT NULL, source_revision TEXT NOT NULL,
+              source_file_sha256 TEXT NOT NULL, source_manifest_sha256 TEXT NOT NULL,
+              source_file_path TEXT NOT NULL, source_row_index INTEGER NOT NULL,
+              candidate_rank INTEGER NOT NULL, candidate_rank_sha256 TEXT NOT NULL,
+              shard_path TEXT NOT NULL, byte_offset INTEGER NOT NULL,
+              byte_length INTEGER NOT NULL, row_sha256 TEXT NOT NULL
+            );
+            CREATE INDEX rows_filter ON rows(
+              arm,domain,lane,language,prompt_uuid,status,selection_index
+            );
+            """
+        )
         for view in (bundle.B_prime, bundle.C, bundle.D):
             for rows in (view.primary_rows, view.reserve_rows):
                 for selected in rows:
@@ -938,22 +980,36 @@ def publish_prompt_view_bundle(
                     offset = shard_file.tell()
                     shard_file.write(line)
                     shard_hasher.update(line)
+                    index_values = (
+                        row_count,
+                        selected.arm,
+                        selected.status,
+                        selected.selection_index,
+                        selected.domain,
+                        selected.lane,
+                        selected.language,
+                        selected.prompt_uuid,
+                        selected.context_bucket,
+                        selected.source_family,
+                        selected.source_repository_id,
+                        selected.source_configuration,
+                        selected.source_split,
+                        selected.source_id,
+                        selected.source_revision,
+                        selected.source_file_sha256,
+                        selected.source_manifest_sha256,
+                        selected.source_file_path,
+                        selected.source_row_index,
+                        selected.candidate_rank,
+                        selected.candidate_rank_sha256,
+                        shard_path,
+                        offset,
+                        len(line),
+                        sha256(line).hexdigest(),
+                    )
                     index.execute(
-                        "INSERT INTO rows VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            row_count,
-                            selected.arm,
-                            selected.status,
-                            selected.selection_index,
-                            selected.domain,
-                            selected.lane,
-                            selected.language,
-                            selected.prompt_uuid,
-                            shard_path,
-                            offset,
-                            len(line),
-                            sha256(line).hexdigest(),
-                        ),
+                        f"INSERT INTO rows VALUES({','.join('?' for _ in index_values)})",
+                        index_values,
                     )
                     row_count += 1
                     shard_count += 1
@@ -993,14 +1049,29 @@ def publish_prompt_view_bundle(
         _write_bytes_durable(manifest_path, canonical_json(manifest) + b"\n")
         _fsync_directory(shards_dir)
         _fsync_directory(partial)
+        partial_identity = partial.stat()
         _rename_no_replace(partial, output_dir)
-        _fsync_directory(output_dir.parent)
+        try:
+            _fsync_directory(output_dir.parent)
+        except BaseException as fsync_error:
+            try:
+                published_identity = output_dir.stat(follow_symlinks=False)
+                if (
+                    published_identity.st_dev != partial_identity.st_dev
+                    or published_identity.st_ino != partial_identity.st_ino
+                ):
+                    raise PromptPublicationDurabilityError(output_dir)
+                shutil.rmtree(output_dir)
+            except PromptPublicationDurabilityError:
+                raise
+            except BaseException as cleanup_error:
+                raise PromptPublicationDurabilityError(output_dir) from cleanup_error
+            raise fsync_error
     except BaseException:
         if shard_file is not None and not shard_file.closed:
             shard_file.close()
-        index.close()
-        import shutil
-
+        if index is not None:
+            index.close()
         shutil.rmtree(partial, ignore_errors=True)
         raise
     return PublishedPromptViews(
@@ -1187,6 +1258,9 @@ def _selected_manifest_record(row: SelectedPrompt) -> dict[str, Any]:
         "context_bucket": row.context_bucket,
         "source_id": row.source_id,
         "source_family": row.source_family,
+        "source_repository_id": row.source_repository_id,
+        "source_configuration": row.source_configuration,
+        "source_split": row.source_split,
         "source_revision": row.source_revision,
         "source_file_sha256": row.source_file_sha256,
         "source_manifest_sha256": row.source_manifest_sha256,

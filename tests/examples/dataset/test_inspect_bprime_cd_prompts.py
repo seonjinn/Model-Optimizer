@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import sys
 import tracemalloc
 from dataclasses import replace
@@ -191,6 +192,41 @@ def test_repaired_semantic_proof_and_corrupt_unqueried_shard_are_rejected(tmp_pa
             limit=1,
         )
 
+
+def test_repaired_index_semantics_and_bogus_nonagentic_floors_are_rejected(
+    tmp_path: Path,
+) -> None:
+    indexed = _publish(tmp_path / "indexed")
+    connection = sqlite3.connect(indexed.index_path)
+    connection.execute("UPDATE rows SET domain='tampered-domain' WHERE global_index=0")
+    connection.commit()
+    connection.execute("VACUUM")
+    connection.close()
+    manifest = json.loads(indexed.manifest_path.read_bytes())
+    manifest["index"]["sha256"] = hashlib.sha256(indexed.index_path.read_bytes()).hexdigest()
+    unsigned = dict(manifest)
+    del unsigned["root_sha256"]
+    repaired_root = sha256_bytes(canonical_json(unsigned))
+    manifest["root_sha256"] = repaired_root
+    indexed.manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+    with pytest.raises(ValueError, match="index row metadata"):
+        inspect_prompt_manifest(indexed.manifest_path, expected_root_sha256=repaired_root)
+
+    floors = _publish(tmp_path / "floors")
+    manifest = json.loads(floors.manifest_path.read_bytes())
+    for arm in ("C", "D"):
+        manifest["arms"][arm]["non_agentic_bucket_floors"]["math"] = {
+            "le4k": 45,
+            "4k_16k": 35,
+        }
+    unsigned = dict(manifest)
+    del unsigned["root_sha256"]
+    repaired_root = sha256_bytes(canonical_json(unsigned))
+    manifest["root_sha256"] = repaired_root
+    floors.manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+    with pytest.raises(ValueError, match="row-derived non-agentic"):
+        inspect_prompt_manifest(floors.manifest_path, expected_root_sha256=repaired_root)
+
     clean = _publish(tmp_path / "shard", rows_per_shard=10)
     clean_manifest = json.loads(clean.manifest_path.read_bytes())
     unqueried = clean.manifest_path.parent / clean_manifest["shards"][-1]["path"]
@@ -229,6 +265,41 @@ def test_publication_refuses_rename_race_without_replacing_destination(
 
     assert (output / "sentinel").read_text(encoding="utf-8") == "winner"
     assert not list(tmp_path.glob(".race.partial-*"))
+
+
+def test_publication_cleans_early_setup_failure_and_postrename_fsync_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bundle = select_prompt_views(
+        _inventory(),
+        _policy(),
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+    )
+    original_connect = selection_module.sqlite3.connect
+    monkeypatch.setattr(
+        selection_module.sqlite3,
+        "connect",
+        lambda *args, **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("setup")),
+    )
+    with pytest.raises(sqlite3.OperationalError, match="setup"):
+        publish_prompt_view_bundle(bundle, tmp_path / "setup")
+    assert not list(tmp_path.glob(".setup.partial-*"))
+    monkeypatch.setattr(selection_module.sqlite3, "connect", original_connect)
+
+    output = tmp_path / "fsync"
+    original_fsync = selection_module._fsync_directory
+
+    def fail_parent(path: Path) -> None:
+        if path == output.parent and output.exists():
+            raise OSError("parent fsync failed")
+        original_fsync(path)
+
+    monkeypatch.setattr(selection_module, "_fsync_directory", fail_parent)
+    with pytest.raises(OSError, match="parent fsync failed"):
+        publish_prompt_view_bundle(bundle, output)
+    assert not output.exists()
+    assert not list(tmp_path.glob(".fsync.partial-*"))
 
 
 def test_inspector_accepts_exact_odd_d_lane_bucket_floor_proofs(tmp_path: Path) -> None:

@@ -26,7 +26,11 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from build_specdec_inventory import APPROVED_PTV2_ALLOWLIST_SHA256, APPROVED_PTV2_REVISION
+from build_specdec_inventory import (
+    APPROVED_PTV2_ALLOWLIST_SHA256,
+    APPROVED_PTV2_REVISION,
+    is_approved_ptv2_source,
+)
 from specdec_corpus_contracts import canonical_json, sha256_bytes
 
 if TYPE_CHECKING:
@@ -38,6 +42,36 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _ARMS = ("B-prime", "C", "D")
 _MAX_LIMIT = 1_000
+_NON_AGENTIC_CELLS = (
+    "math",
+    "code",
+    "stem-science",
+    "multilingual",
+    "instruction-chat",
+)
+_INDEX_SEMANTIC_FIELDS = (
+    "arm",
+    "status",
+    "selection_index",
+    "prompt_uuid",
+    "domain",
+    "lane",
+    "language",
+    "context_bucket",
+    "source_family",
+    "source_repository_id",
+    "source_configuration",
+    "source_split",
+    "source_id",
+    "source_revision",
+    "source_file_sha256",
+    "source_manifest_sha256",
+    "source_file_path",
+    "source_row_index",
+    "candidate_rank",
+    "candidate_rank_sha256",
+)
+_INDEX_COLUMNS = ",".join(_INDEX_SEMANTIC_FIELDS)
 
 
 def inspect_prompt_manifest(
@@ -90,7 +124,7 @@ def inspect_prompt_manifest(
         connection = sqlite3.connect(uri, uri=True)
         total = int(connection.execute(f"SELECT count(*) FROM rows{where}", values).fetchone()[0])
         records = connection.execute(
-            "SELECT arm,status,selection_index,shard_path,byte_offset,byte_length,row_sha256 "
+            f"SELECT {_INDEX_COLUMNS},shard_path,byte_offset,byte_length,row_sha256 "
             f"FROM rows{where} ORDER BY global_index LIMIT ? OFFSET ?",
             (*values, limit, offset),
         )
@@ -262,18 +296,28 @@ def _verify_complete_artifact(root: Path, index_path: Path, manifest: dict[str, 
         if duplicate is not None:
             raise ValueError("selection row-derived UUID uniqueness proof mismatch")
         records = connection.execute(
-            "SELECT global_index,arm,status,selection_index,shard_path,byte_offset,byte_length,"
+            f"SELECT global_index,{_INDEX_COLUMNS},shard_path,byte_offset,byte_length,"
             "row_sha256 FROM rows ORDER BY global_index"
         )
         for record in records:
-            global_index, arm, status, selection_index, *location = record
+            global_index, *indexed = record
+            semantic = dict(
+                zip(
+                    _INDEX_SEMANTIC_FIELDS,
+                    indexed[: len(_INDEX_SEMANTIC_FIELDS)],
+                    strict=True,
+                )
+            )
+            arm = semantic["arm"]
+            status = semantic["status"]
+            selection_index = semantic["selection_index"]
             if global_index != global_expected:
                 raise ValueError("selection index global ordering proof mismatch")
             global_expected += 1
             if selection_index != status_counts[arm][status]:
                 raise ValueError("selection index per-arm ordering proof mismatch")
             status_counts[arm][status] += 1
-            relative = location[0]
+            relative = indexed[len(_INDEX_SEMANTIC_FIELDS)]
             if relative != current_relative:
                 if shard_handle is not None:
                     shard_handle.close()
@@ -281,7 +325,7 @@ def _verify_complete_artifact(root: Path, index_path: Path, manifest: dict[str, 
                 current_relative = relative
             row = _read_indexed_row(
                 root,
-                (arm, status, selection_index, *location),
+                indexed,
                 manifest,
                 descriptors,
                 shard_handle,
@@ -324,6 +368,13 @@ def _verify_complete_artifact(root: Path, index_path: Path, manifest: dict[str, 
         derived_buckets = _plain_nested(bucket_floors[arm])
         if derived_buckets != proof["bucket_floors"]:
             raise ValueError(f"selection arm {arm} row-derived bucket floor proof mismatch")
+        derived_non_agentic = {
+            cell: derived_buckets[cell] for cell in _NON_AGENTIC_CELLS if cell in derived_buckets
+        }
+        if derived_non_agentic != proof["non_agentic_bucket_floors"]:
+            raise ValueError(
+                f"selection arm {arm} row-derived non-agentic bucket floor proof mismatch"
+            )
         derived_lane_floors = _plain_nested(lane_floors[arm])
         if derived_lane_floors != proof["lane_bucket_floors"]:
             raise ValueError(f"selection arm {arm} row-derived lane/bucket floor proof mismatch")
@@ -430,7 +481,9 @@ def _read_indexed_row(
     descriptors: dict[str, Any] | None = None,
     shard_handle: Any = None,
 ) -> dict[str, Any]:
-    arm, status, selection_index, relative, offset, length, row_sha = index_row
+    semantic_values = index_row[: len(_INDEX_SEMANTIC_FIELDS)]
+    relative, offset, length, row_sha = index_row[len(_INDEX_SEMANTIC_FIELDS) :]
+    indexed_semantics = dict(zip(_INDEX_SEMANTIC_FIELDS, semantic_values, strict=True))
     descriptors = descriptors or {shard["path"]: shard for shard in manifest["shards"]}
     if relative not in descriptors:
         raise ValueError("selection index references an unauthenticated shard")
@@ -448,12 +501,9 @@ def _read_indexed_row(
         row = json.loads(line)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("selected row is malformed") from error
-    if (
-        row.get("arm") != arm
-        or row.get("status") != status
-        or row.get("selection_index") != selection_index
-    ):
-        raise ValueError("selection index row metadata mismatch")
+    for field, indexed_value in indexed_semantics.items():
+        if row.get(field) != indexed_value:
+            raise ValueError(f"selection index row metadata mismatch: {field}")
     canonical = row.get("canonical_prompt")
     if not isinstance(canonical, dict) or sha256(canonical_json(canonical)).hexdigest() != row.get(
         "prompt_uuid"
@@ -479,6 +529,12 @@ def _read_indexed_row(
     if row["arm"] == "B-prime" and (
         row.get("source_family") != "ptv2"
         or row["source_revision"] != manifest["identity"]["ptv2_revision"]
+        or not is_approved_ptv2_source(
+            row["source_repository_id"],
+            row["source_configuration"],
+            row["source_split"],
+            row["source_revision"],
+        )
     ):
         raise ValueError("selected B-prime row is not from the pinned PTV2 source")
     return row
