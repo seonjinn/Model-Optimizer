@@ -246,7 +246,7 @@ def test_repaired_index_semantics_and_bogus_nonagentic_floors_are_rejected(
         )
 
 
-def test_publication_refuses_rename_race_without_replacing_destination(
+def test_prerename_path_replacement_preserves_every_namespace_for_recovery(
     tmp_path: Path, monkeypatch
 ) -> None:
     bundle = select_prompt_views(
@@ -256,36 +256,171 @@ def test_publication_refuses_rename_race_without_replacing_destination(
         held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
     )
     output = tmp_path / "race"
+    displaced = tmp_path / "publisher-partial-before-replacement"
+    partial: Path | None = None
 
     def race(source: Path, destination: Path) -> None:
-        del source
+        nonlocal partial
+        partial = source
+        source.rename(displaced)
+        source.mkdir()
+        (source / "sentinel").write_text("concurrent partial owner", encoding="utf-8")
         destination.mkdir()
         (destination / "sentinel").write_text("winner", encoding="utf-8")
         raise FileExistsError(destination)
 
     monkeypatch.setattr(selection_module, "_rename_no_replace", race, raising=False)
-    with pytest.raises(FileExistsError):
+    with pytest.raises(FileExistsError) as caught:
         publish_prompt_view_bundle(bundle, output)
 
+    assert partial is not None
+    recovery = selection_module.prompt_publication_recovery_state(caught.value)
+    displaced_identity = displaced.stat(follow_symlinks=False)
+    partial_identity = partial.stat(follow_symlinks=False)
+    destination_identity = output.stat(follow_symlinks=False)
+    assert recovery.phase.value == "rename"
+    assert recovery.partial_path == partial
+    assert recovery.destination_path == output
+    assert recovery.expected_artifact_identity is not None
+    assert recovery.expected_artifact_identity.device == displaced_identity.st_dev
+    assert recovery.expected_artifact_identity.inode == displaced_identity.st_ino
+    assert recovery.expected_artifact_identity.root_sha256 is not None
+    assert recovery.partial_observation.status == "present"
+    assert recovery.partial_observation.device == partial_identity.st_dev
+    assert recovery.partial_observation.inode == partial_identity.st_ino
+    assert recovery.destination_observation.status == "present"
+    assert recovery.destination_observation.device == destination_identity.st_dev
+    assert recovery.destination_observation.inode == destination_identity.st_ino
+    assert (partial / "sentinel").read_text(encoding="utf-8") == "concurrent partial owner"
     assert (output / "sentinel").read_text(encoding="utf-8") == "winner"
-    assert not list(tmp_path.glob(".race.partial-*"))
+    assert list(displaced.iterdir())
 
 
-def test_publication_cleans_early_setup_failure(tmp_path: Path, monkeypatch) -> None:
+def test_ordinary_setup_failure_preserves_replaced_partial_with_recovery_state(
+    tmp_path: Path, monkeypatch
+) -> None:
     bundle = select_prompt_views(
         _inventory(),
         _policy(),
         baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
         held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
     )
-    monkeypatch.setattr(
-        selection_module.sqlite3,
-        "connect",
-        lambda *args, **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("setup")),
+    output = tmp_path / "setup"
+    displaced = tmp_path / "publisher-setup-partial"
+    partial: Path | None = None
+
+    def replace_then_fail(index_path: Path, *args, **kwargs):
+        del args, kwargs
+        nonlocal partial
+        partial = Path(index_path).parent
+        partial.rename(displaced)
+        partial.mkdir()
+        (partial / "sentinel").write_text("concurrent setup owner", encoding="utf-8")
+        raise sqlite3.OperationalError("setup")
+
+    monkeypatch.setattr(selection_module.sqlite3, "connect", replace_then_fail)
+    with pytest.raises(sqlite3.OperationalError, match="setup") as caught:
+        publish_prompt_view_bundle(bundle, output)
+
+    assert partial is not None
+    recovery = selection_module.prompt_publication_recovery_state(caught.value)
+    displaced_identity = displaced.stat(follow_symlinks=False)
+    partial_identity = partial.stat(follow_symlinks=False)
+    assert recovery.phase.value == "partial_setup"
+    assert recovery.partial_path == partial
+    assert recovery.destination_path == output
+    assert recovery.expected_artifact_identity is not None
+    assert recovery.expected_artifact_identity.device == displaced_identity.st_dev
+    assert recovery.expected_artifact_identity.inode == displaced_identity.st_ino
+    assert recovery.expected_artifact_identity.root_sha256 is None
+    assert recovery.partial_observation.status == "present"
+    assert recovery.partial_observation.device == partial_identity.st_dev
+    assert recovery.partial_observation.inode == partial_identity.st_ino
+    assert recovery.destination_observation.status == "absent"
+    assert (partial / "sentinel").read_text(encoding="utf-8") == "concurrent setup owner"
+    assert list(displaced.iterdir())
+
+
+def test_successful_but_raising_rename_preserves_ambiguous_paths_for_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bundle = select_prompt_views(
+        _inventory(),
+        _policy(),
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
     )
-    with pytest.raises(sqlite3.OperationalError, match="setup"):
-        publish_prompt_view_bundle(bundle, tmp_path / "setup")
-    assert not list(tmp_path.glob(".setup.partial-*"))
+    output = tmp_path / "ambiguous"
+    original_rename = selection_module._rename_no_replace
+    partial: Path | None = None
+
+    def rename_then_raise(source: Path, destination: Path) -> None:
+        nonlocal partial
+        original_rename(source, destination)
+        partial = source
+        partial.mkdir()
+        (partial / "sentinel").write_text("concurrent post-rename owner", encoding="utf-8")
+        raise OSError("rename helper raised after success")
+
+    monkeypatch.setattr(selection_module, "_rename_no_replace", rename_then_raise)
+    with pytest.raises(OSError, match="rename helper raised after success") as caught:
+        publish_prompt_view_bundle(bundle, output)
+
+    assert partial is not None
+    recovery = selection_module.prompt_publication_recovery_state(caught.value)
+    published_identity = output.stat(follow_symlinks=False)
+    partial_identity = partial.stat(follow_symlinks=False)
+    assert recovery.phase.value == "rename"
+    assert recovery.expected_artifact_identity is not None
+    assert recovery.expected_artifact_identity.device == published_identity.st_dev
+    assert recovery.expected_artifact_identity.inode == published_identity.st_ino
+    assert recovery.destination_observation.status == "present"
+    assert recovery.destination_observation.inode == published_identity.st_ino
+    assert recovery.partial_observation.status == "present"
+    assert recovery.partial_observation.inode == partial_identity.st_ino
+    assert (partial / "sentinel").read_text(encoding="utf-8") == ("concurrent post-rename owner")
+    assert (output / "SELECTION_MANIFEST.json").is_file()
+
+
+def test_async_keyboard_interrupt_preserves_ambiguous_rename_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bundle = select_prompt_views(
+        _inventory(),
+        _policy(),
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+    )
+    output = tmp_path / "interrupt"
+    original_rename = selection_module._rename_no_replace
+    partial: Path | None = None
+
+    def rename_then_interrupt(source: Path, destination: Path) -> None:
+        nonlocal partial
+        original_rename(source, destination)
+        partial = source
+        partial.mkdir()
+        (partial / "sentinel").write_text("concurrent interrupt owner", encoding="utf-8")
+        raise KeyboardInterrupt("injected after rename")
+
+    monkeypatch.setattr(selection_module, "_rename_no_replace", rename_then_interrupt)
+    with pytest.raises(KeyboardInterrupt, match="injected after rename") as caught:
+        publish_prompt_view_bundle(bundle, output)
+
+    assert partial is not None
+    recovery = selection_module.prompt_publication_recovery_state(caught.value)
+    published_identity = output.stat(follow_symlinks=False)
+    partial_identity = partial.stat(follow_symlinks=False)
+    assert type(caught.value) is KeyboardInterrupt
+    assert recovery.phase.value == "rename"
+    assert recovery.expected_artifact_identity is not None
+    assert recovery.expected_artifact_identity.inode == published_identity.st_ino
+    assert recovery.destination_observation.status == "present"
+    assert recovery.destination_observation.inode == published_identity.st_ino
+    assert recovery.partial_observation.status == "present"
+    assert recovery.partial_observation.inode == partial_identity.st_ino
+    assert (partial / "sentinel").read_text(encoding="utf-8") == "concurrent interrupt owner"
+    assert (output / "SELECTION_MANIFEST.json").is_file()
 
 
 def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
@@ -302,7 +437,6 @@ def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
     displaced = tmp_path / "published-before-swap"
     original_fsync = selection_module._fsync_directory
     original_rename = selection_module._rename_no_replace
-    original_stat = Path.stat
     former_partial: Path | None = None
 
     def rename_then_recreate_partial(source: Path, destination: Path) -> None:
@@ -316,32 +450,24 @@ def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
 
     def fail_parent(path: Path) -> None:
         if path == output.parent:
-            raise OSError("parent fsync failed")
-        original_fsync(path)
-
-    swapped = False
-
-    def swap_after_identity_check(path: Path, *args, **kwargs):
-        nonlocal swapped
-        identity = original_stat(path, *args, **kwargs)
-        if path == output and not swapped:
-            swapped = True
             output.rename(displaced)
             output.mkdir()
             (output / "sentinel").write_text("concurrent winner", encoding="utf-8")
-        return identity
+            raise OSError("parent fsync failed")
+        original_fsync(path)
 
     monkeypatch.setattr(selection_module, "_fsync_directory", fail_parent)
     monkeypatch.setattr(selection_module, "_rename_no_replace", rename_then_recreate_partial)
-    monkeypatch.setattr(Path, "stat", swap_after_identity_check)
     with pytest.raises(PromptPublicationDurabilityError) as caught:
         publish_prompt_view_bundle(bundle, output)
 
     recovery = caught.value
+    recovery_state = selection_module.prompt_publication_recovery_state(recovery)
     assert former_partial is not None
-    displaced_identity = original_stat(displaced, follow_symlinks=False)
+    displaced_identity = displaced.stat(follow_symlinks=False)
+    partial_identity = former_partial.stat(follow_symlinks=False)
+    destination_identity = output.stat(follow_symlinks=False)
     displaced_manifest = json.loads((displaced / "SELECTION_MANIFEST.json").read_bytes())
-    assert swapped
     assert (output / "sentinel").read_text(encoding="utf-8") == "concurrent winner"
     assert (former_partial / "sentinel").read_text(encoding="utf-8") == (
         "concurrent former-partial owner"
@@ -357,30 +483,42 @@ def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
     assert recovery.expected_device == displaced_identity.st_dev
     assert recovery.expected_inode == displaced_identity.st_ino
     assert recovery.expected_root_sha256 == displaced_manifest["root_sha256"]
-    assert recovery.receipt == {
-        "state": "durability_unconfirmed_recovery_required",
-        "recovery_required": True,
-        "destination": str(output),
-        "expected_identity": {
-            "device": displaced_identity.st_dev,
-            "inode": displaced_identity.st_ino,
-        },
-        "expected_root_sha256": displaced_manifest["root_sha256"],
-        "verification_instructions": recovery.verification_instructions,
-    }
+    assert recovery_state.phase.value == "parent_fsync"
+    assert recovery_state.partial_path == former_partial
+    assert recovery_state.destination_path == output
+    assert recovery_state.expected_artifact_identity is not None
+    assert recovery_state.expected_artifact_identity.device == displaced_identity.st_dev
+    assert recovery_state.expected_artifact_identity.inode == displaced_identity.st_ino
+    assert (
+        recovery_state.expected_artifact_identity.root_sha256 == displaced_manifest["root_sha256"]
+    )
+    assert recovery_state.partial_observation.status == "present"
+    assert recovery_state.partial_observation.inode == partial_identity.st_ino
+    assert recovery_state.destination_observation.status == "present"
+    assert recovery_state.destination_observation.inode == destination_identity.st_ino
+    assert recovery.receipt == recovery_state.receipt
+    assert recovery.receipt["phase"] == "parent_fsync"
+    assert recovery.receipt["partial_path"] == str(former_partial)
+    assert recovery.receipt["destination_path"] == str(output)
     assert "independently" in recovery.verification_instructions.lower()
     assert "without following symlinks" in recovery.verification_instructions
     assert set(tmp_path.glob(".fsync.partial-*")) == {former_partial}
 
     monkeypatch.setattr(selection_module, "_fsync_directory", original_fsync)
-    monkeypatch.setattr(Path, "stat", original_stat)
-    with pytest.raises(FileExistsError):
+    before_retry = set(tmp_path.glob(".fsync.partial-*"))
+    with pytest.raises(FileExistsError) as retry_caught:
         publish_prompt_view_bundle(bundle, output)
+    retry_recovery = selection_module.prompt_publication_recovery_state(retry_caught.value)
+    after_retry = set(tmp_path.glob(".fsync.partial-*"))
+    assert retry_recovery.phase.value == "rename"
+    assert retry_recovery.destination_observation.status == "present"
+    assert retry_recovery.destination_observation.inode == destination_identity.st_ino
+    assert before_retry < after_retry
     assert (output / "sentinel").read_text(encoding="utf-8") == "concurrent winner"
     assert (former_partial / "sentinel").read_text(encoding="utf-8") == (
         "concurrent former-partial owner"
     )
-    assert set(tmp_path.glob(".fsync.partial-*")) == {former_partial}
+    assert former_partial in after_retry
 
 
 def test_inspector_accepts_exact_odd_d_lane_bucket_floor_proofs(tmp_path: Path) -> None:

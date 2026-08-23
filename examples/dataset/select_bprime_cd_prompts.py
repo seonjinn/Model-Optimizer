@@ -20,12 +20,13 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import sqlite3
 import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
@@ -47,7 +48,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DiskBackedSelectedRows",
+    "PromptPublicationArtifactIdentity",
     "PromptPublicationDurabilityError",
+    "PromptPublicationInodeSnapshot",
+    "PromptPublicationPhase",
+    "PromptPublicationRecoveryState",
     "PromptSelectionBlocked",
     "PromptSelectionBlockedError",
     "PromptView",
@@ -56,6 +61,7 @@ __all__ = [
     "SelectedPrompt",
     "SelectionBlockedError",
     "build_policy_count_proofs",
+    "prompt_publication_recovery_state",
     "publish_prompt_view_bundle",
     "select_prompt_views",
 ]
@@ -210,45 +216,152 @@ class PublishedPromptViews:
     row_count: int
 
 
+class PromptPublicationPhase(str, Enum):
+    """The last publication operation attempted before recovery became required."""
+
+    PARTIAL_SETUP = "partial_setup"
+    SHARD_WRITE = "shard_write"
+    INDEX_FINALIZE = "index_finalize"
+    MANIFEST_WRITE = "manifest_write"
+    STAGING_FSYNC = "staging_fsync"
+    RENAME = "rename"
+    PARENT_FSYNC = "parent_fsync"
+
+
+@dataclass(frozen=True)
+class PromptPublicationArtifactIdentity:
+    """The inode created for an artifact and its authenticated root when available."""
+
+    device: int
+    inode: int
+    root_sha256: str | None
+
+    @property
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "device": self.device,
+            "inode": self.inode,
+            "root_sha256": self.root_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class PromptPublicationInodeSnapshot:
+    """One no-follow, point-in-time pathname observation."""
+
+    path: Path
+    status: Literal["present", "absent", "unavailable"]
+    device: int | None
+    inode: int | None
+    mode: int | None
+    error: str | None
+
+    @property
+    def identity(self) -> tuple[int, int] | None:
+        if self.device is None or self.inode is None:
+            return None
+        return self.device, self.inode
+
+    @property
+    def receipt(self) -> dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "status": self.status,
+            "device": self.device,
+            "inode": self.inode,
+            "mode": self.mode,
+            "error": self.error,
+        }
+
+
+@dataclass(frozen=True)
+class PromptPublicationRecoveryState:
+    """Typed evidence retained after any failure following partial creation."""
+
+    phase: PromptPublicationPhase
+    partial_path: Path
+    destination_path: Path
+    expected_artifact_identity: PromptPublicationArtifactIdentity | None
+    partial_observation: PromptPublicationInodeSnapshot
+    destination_observation: PromptPublicationInodeSnapshot
+    recovery_required: Literal[True] = True
+
+    @property
+    def state(self) -> Literal["publication_recovery_required"]:
+        return "publication_recovery_required"
+
+    @property
+    def verification_instructions(self) -> str:
+        expected = self.expected_artifact_identity
+        if expected is None:
+            expected_text = "No expected artifact inode was available."
+        elif expected.root_sha256 is None:
+            expected_text = (
+                f"The created partial used device {expected.device}, inode {expected.inode}; "
+                "its authenticated root was not complete."
+            )
+        else:
+            expected_text = (
+                f"The created artifact used device {expected.device}, inode {expected.inode}, "
+                f"and root SHA-256 {expected.root_sha256}."
+            )
+        return (
+            f"Preserve {self.partial_path} and {self.destination_path}. Independently acquire "
+            f"exclusive control of {self.destination_path.parent}, then inspect both paths without "
+            f"following symlinks. {expected_text} Treat the recorded inode observations as "
+            "point-in-time evidence, authenticate any manifest before reconciliation, and do not "
+            "delete either pathname from this recovery state. Publication retries fail while the "
+            "destination exists."
+        )
+
+    @property
+    def receipt(self) -> dict[str, Any]:
+        expected = self.expected_artifact_identity
+        return {
+            "state": self.state,
+            "recovery_required": self.recovery_required,
+            "phase": self.phase.value,
+            "partial_path": str(self.partial_path),
+            "destination_path": str(self.destination_path),
+            "expected_artifact_identity": None if expected is None else expected.receipt,
+            "observations": {
+                "partial": self.partial_observation.receipt,
+                "destination": self.destination_observation.receipt,
+            },
+            "verification_instructions": self.verification_instructions,
+        }
+
+
 class PromptPublicationDurabilityError(RuntimeError):
     """A published path requires independent durability recovery."""
 
-    def __init__(
-        self,
-        destination: Path,
-        *,
-        expected_identity: tuple[int, int],
-        expected_root_sha256: str,
-        observed_identity: tuple[int, int] | None,
-    ) -> None:
-        self.destination = destination
+    def __init__(self, recovery_state: PromptPublicationRecoveryState) -> None:
+        expected = recovery_state.expected_artifact_identity
+        if expected is None or expected.root_sha256 is None:
+            raise ValueError("durability recovery requires a complete expected artifact identity")
+        self.recovery_state = recovery_state
+        self.destination = recovery_state.destination_path
         self.state = "durability_unconfirmed_recovery_required"
-        self.recovery_required = True
-        self.expected_device, self.expected_inode = expected_identity
-        self.expected_identity = expected_identity
-        self.expected_root_sha256 = expected_root_sha256
-        self.observed_identity = observed_identity
-        self.verification_instructions = (
-            f"Independently acquire exclusive control of {destination.parent}, then inspect "
-            f"{destination} without following symlinks and require device {self.expected_device}, "
-            f"inode {self.expected_inode}. Authenticate SELECTION_MANIFEST.json against root "
-            f"SHA-256 {expected_root_sha256}, durably reconcile the namespace, and only then retry; "
-            "publication retries fail while the destination exists."
-        )
-        self.receipt = {
-            "state": self.state,
-            "recovery_required": self.recovery_required,
-            "destination": str(destination),
-            "expected_identity": {
-                "device": self.expected_device,
-                "inode": self.expected_inode,
-            },
-            "expected_root_sha256": expected_root_sha256,
-            "verification_instructions": self.verification_instructions,
-        }
+        self.recovery_required = recovery_state.recovery_required
+        self.expected_device = expected.device
+        self.expected_inode = expected.inode
+        self.expected_identity = (expected.device, expected.inode)
+        self.expected_root_sha256 = expected.root_sha256
+        self.observed_identity = recovery_state.destination_observation.identity
+        self.verification_instructions = recovery_state.verification_instructions
+        self.receipt = recovery_state.receipt
         super().__init__(
-            f"publication durability is unconfirmed for {destination}; independent recovery is required"
+            f"publication durability is unconfirmed for {self.destination}; "
+            "independent recovery is required"
         )
+
+
+def prompt_publication_recovery_state(error: BaseException) -> PromptPublicationRecoveryState:
+    """Return typed recovery evidence carried by a publication exception."""
+    recovery_state = getattr(error, "recovery_state", None)
+    if not isinstance(recovery_state, PromptPublicationRecoveryState):
+        raise ValueError("exception does not carry prompt publication recovery state")
+    return recovery_state
 
 
 class _SelectionStorage:
@@ -929,6 +1042,30 @@ def _stream_selection_digest(connection: sqlite3.Connection, metadata: Mapping[s
     return digest.hexdigest()
 
 
+def _observe_publication_inode(path: Path) -> PromptPublicationInodeSnapshot:
+    try:
+        observation = os.lstat(path)
+    except FileNotFoundError:
+        return PromptPublicationInodeSnapshot(path, "absent", None, None, None, None)
+    except OSError as error:
+        return PromptPublicationInodeSnapshot(
+            path,
+            "unavailable",
+            None,
+            None,
+            None,
+            f"{type(error).__name__}: {error}",
+        )
+    return PromptPublicationInodeSnapshot(
+        path,
+        "present",
+        observation.st_dev,
+        observation.st_ino,
+        observation.st_mode,
+        None,
+    )
+
+
 def publish_prompt_view_bundle(
     bundle: PromptViewBundle, output_dir: Path, *, rows_per_shard: int = 10_000
 ) -> PublishedPromptViews:
@@ -941,9 +1078,7 @@ def publish_prompt_view_bundle(
         raise ValueError("rows_per_shard must be a positive integer")
     output_dir = Path(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    partial = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.partial-", dir=output_dir.parent))
-    shards_dir = partial / "shards"
-    index_path = partial / "selection-index.sqlite3"
+    partial: Path | None = None
     index: sqlite3.Connection | None = None
     shards: list[dict[str, Any]] = []
     row_count = 0
@@ -952,7 +1087,9 @@ def publish_prompt_view_bundle(
     shard_hasher = sha256()
     shard_count = 0
     shard_path = ""
-    rename_completed: bool = False
+    phase = PromptPublicationPhase.PARTIAL_SETUP
+    expected_artifact_identity: PromptPublicationArtifactIdentity | None = None
+    root_sha256: str | None = None
 
     def finish_shard() -> None:
         nonlocal shard_file, shard_hasher, shard_count
@@ -973,6 +1110,17 @@ def publish_prompt_view_bundle(
         shard_file = None
 
     try:
+        partial = Path(
+            tempfile.mkdtemp(prefix=f".{output_dir.name}.partial-", dir=output_dir.parent)
+        )
+        created_identity = os.lstat(partial)
+        expected_artifact_identity = PromptPublicationArtifactIdentity(
+            created_identity.st_dev,
+            created_identity.st_ino,
+            None,
+        )
+        shards_dir = partial / "shards"
+        index_path = partial / "selection-index.sqlite3"
         shards_dir.mkdir()
         index = sqlite3.connect(index_path)
         index.executescript(
@@ -997,6 +1145,7 @@ def publish_prompt_view_bundle(
             );
             """
         )
+        phase = PromptPublicationPhase.SHARD_WRITE
         for view in (bundle.B_prime, bundle.C, bundle.D):
             for rows in (view.primary_rows, view.reserve_rows):
                 for selected in rows:
@@ -1046,13 +1195,16 @@ def publish_prompt_view_bundle(
                     )
                     row_count += 1
                     shard_count += 1
+        phase = PromptPublicationPhase.INDEX_FINALIZE
         finish_shard()
         index.commit()
         index.execute("VACUUM")
         index.close()
+        index = None
         with index_path.open("rb") as index_stream:
             os.fsync(index_stream.fileno())
         index_sha256 = _file_sha256(index_path)
+        phase = PromptPublicationPhase.MANIFEST_WRITE
         manifest: dict[str, Any] = {
             "schema_version": 2,
             "selection_sha256": bundle.selection_sha256,
@@ -1077,40 +1229,61 @@ def publish_prompt_view_bundle(
             "shards": shards,
             "index": {"path": "selection-index.sqlite3", "sha256": index_sha256},
         }
-        manifest["root_sha256"] = sha256_bytes(canonical_json(manifest))
+        root_sha256 = sha256_bytes(canonical_json(manifest))
+        manifest["root_sha256"] = root_sha256
+        expected_artifact_identity = PromptPublicationArtifactIdentity(
+            expected_artifact_identity.device,
+            expected_artifact_identity.inode,
+            root_sha256,
+        )
         manifest_path = partial / "SELECTION_MANIFEST.json"
         _write_bytes_durable(manifest_path, canonical_json(manifest) + b"\n")
+        phase = PromptPublicationPhase.STAGING_FSYNC
         _fsync_directory(shards_dir)
         _fsync_directory(partial)
-        partial_identity = partial.stat(follow_symlinks=False)
+        phase = PromptPublicationPhase.RENAME
+        current_partial = _observe_publication_inode(partial)
+        if current_partial.identity != (
+            expected_artifact_identity.device,
+            expected_artifact_identity.inode,
+        ):
+            raise RuntimeError("publication partial inode changed before rename")
         _rename_no_replace(partial, output_dir)
-        rename_completed = True
-        try:
-            _fsync_directory(output_dir.parent)
-        except BaseException as fsync_error:
-            try:
-                published_identity = output_dir.stat(follow_symlinks=False)
-                observed_identity = (published_identity.st_dev, published_identity.st_ino)
-            except OSError:
-                observed_identity = None
-            raise PromptPublicationDurabilityError(
-                output_dir,
-                expected_identity=(partial_identity.st_dev, partial_identity.st_ino),
-                expected_root_sha256=manifest["root_sha256"],
-                observed_identity=observed_identity,
-            ) from fsync_error
-    except BaseException:
+        installed_artifact = _observe_publication_inode(output_dir)
+        if installed_artifact.identity != (
+            expected_artifact_identity.device,
+            expected_artifact_identity.inode,
+        ):
+            raise RuntimeError("published destination inode does not match created artifact")
+        phase = PromptPublicationPhase.PARENT_FSYNC
+        _fsync_directory(output_dir.parent)
+    except BaseException as error:
         if shard_file is not None and not shard_file.closed:
-            shard_file.close()
+            with suppress(BaseException):
+                shard_file.close()
         if index is not None:
-            index.close()
-        if not rename_completed:
-            shutil.rmtree(partial, ignore_errors=True)
+            with suppress(BaseException):
+                index.close()
+        if partial is None:
+            raise
+        recovery_state = PromptPublicationRecoveryState(
+            phase=phase,
+            partial_path=partial,
+            destination_path=output_dir,
+            expected_artifact_identity=expected_artifact_identity,
+            partial_observation=_observe_publication_inode(partial),
+            destination_observation=_observe_publication_inode(output_dir),
+        )
+        if phase is PromptPublicationPhase.PARENT_FSYNC and isinstance(error, Exception):
+            raise PromptPublicationDurabilityError(recovery_state) from error
+        setattr(error, "recovery_state", recovery_state)
         raise
+    if root_sha256 is None:
+        raise AssertionError("successful publication lacks an authenticated root")
     return PublishedPromptViews(
         output_dir / "SELECTION_MANIFEST.json",
         output_dir / "selection-index.sqlite3",
-        manifest["root_sha256"],
+        root_sha256,
         row_count,
     )
 
