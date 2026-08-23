@@ -211,12 +211,44 @@ class PublishedPromptViews:
 
 
 class PromptPublicationDurabilityError(RuntimeError):
-    """A published path could not be proven durable or safely removed."""
+    """A published path requires independent durability recovery."""
 
-    def __init__(self, destination: Path) -> None:
+    def __init__(
+        self,
+        destination: Path,
+        *,
+        expected_identity: tuple[int, int],
+        expected_root_sha256: str,
+        observed_identity: tuple[int, int] | None,
+    ) -> None:
         self.destination = destination
         self.state = "durability_unconfirmed_recovery_required"
-        super().__init__(f"publication durability is unconfirmed; inspect or remove {destination}")
+        self.recovery_required = True
+        self.expected_device, self.expected_inode = expected_identity
+        self.expected_identity = expected_identity
+        self.expected_root_sha256 = expected_root_sha256
+        self.observed_identity = observed_identity
+        self.verification_instructions = (
+            f"Independently acquire exclusive control of {destination.parent}, then inspect "
+            f"{destination} without following symlinks and require device {self.expected_device}, "
+            f"inode {self.expected_inode}. Authenticate SELECTION_MANIFEST.json against root "
+            f"SHA-256 {expected_root_sha256}, durably reconcile the namespace, and only then retry; "
+            "publication retries fail while the destination exists."
+        )
+        self.receipt = {
+            "state": self.state,
+            "recovery_required": self.recovery_required,
+            "destination": str(destination),
+            "expected_identity": {
+                "device": self.expected_device,
+                "inode": self.expected_inode,
+            },
+            "expected_root_sha256": expected_root_sha256,
+            "verification_instructions": self.verification_instructions,
+        }
+        super().__init__(
+            f"publication durability is unconfirmed for {destination}; independent recovery is required"
+        )
 
 
 class _SelectionStorage:
@@ -1049,24 +1081,22 @@ def publish_prompt_view_bundle(
         _write_bytes_durable(manifest_path, canonical_json(manifest) + b"\n")
         _fsync_directory(shards_dir)
         _fsync_directory(partial)
-        partial_identity = partial.stat()
+        partial_identity = partial.stat(follow_symlinks=False)
         _rename_no_replace(partial, output_dir)
         try:
             _fsync_directory(output_dir.parent)
         except BaseException as fsync_error:
             try:
                 published_identity = output_dir.stat(follow_symlinks=False)
-                if (
-                    published_identity.st_dev != partial_identity.st_dev
-                    or published_identity.st_ino != partial_identity.st_ino
-                ):
-                    raise PromptPublicationDurabilityError(output_dir)
-                shutil.rmtree(output_dir)
-            except PromptPublicationDurabilityError:
-                raise
-            except BaseException as cleanup_error:
-                raise PromptPublicationDurabilityError(output_dir) from cleanup_error
-            raise fsync_error
+                observed_identity = (published_identity.st_dev, published_identity.st_ino)
+            except OSError:
+                observed_identity = None
+            raise PromptPublicationDurabilityError(
+                output_dir,
+                expected_identity=(partial_identity.st_dev, partial_identity.st_ino),
+                expected_root_sha256=manifest["root_sha256"],
+                observed_identity=observed_identity,
+            ) from fsync_error
     except BaseException:
         if shard_file is not None and not shard_file.closed:
             shard_file.close()

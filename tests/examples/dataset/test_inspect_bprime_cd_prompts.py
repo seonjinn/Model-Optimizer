@@ -35,7 +35,11 @@ try:
     import select_bprime_cd_prompts as selection_module
     from bprime_cd_policy import PromptCell
     from inspect_bprime_cd_prompts import inspect_prompt_manifest, main
-    from select_bprime_cd_prompts import publish_prompt_view_bundle, select_prompt_views
+    from select_bprime_cd_prompts import (
+        PromptPublicationDurabilityError,
+        publish_prompt_view_bundle,
+        select_prompt_views,
+    )
     from specdec_corpus_contracts import canonical_json, sha256_bytes
     from test_select_bprime_cd_prompts import (
         BASELINE_RECEIPT_SHA256,
@@ -267,16 +271,13 @@ def test_publication_refuses_rename_race_without_replacing_destination(
     assert not list(tmp_path.glob(".race.partial-*"))
 
 
-def test_publication_cleans_early_setup_failure_and_postrename_fsync_failure(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_publication_cleans_early_setup_failure(tmp_path: Path, monkeypatch) -> None:
     bundle = select_prompt_views(
         _inventory(),
         _policy(),
         baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
         held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
     )
-    original_connect = selection_module.sqlite3.connect
     monkeypatch.setattr(
         selection_module.sqlite3,
         "connect",
@@ -285,20 +286,81 @@ def test_publication_cleans_early_setup_failure_and_postrename_fsync_failure(
     with pytest.raises(sqlite3.OperationalError, match="setup"):
         publish_prompt_view_bundle(bundle, tmp_path / "setup")
     assert not list(tmp_path.glob(".setup.partial-*"))
-    monkeypatch.setattr(selection_module.sqlite3, "connect", original_connect)
+
+
+def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    bundle = select_prompt_views(
+        _inventory(),
+        _policy(),
+        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+    )
 
     output = tmp_path / "fsync"
+    displaced = tmp_path / "published-before-swap"
     original_fsync = selection_module._fsync_directory
+    original_stat = Path.stat
 
     def fail_parent(path: Path) -> None:
-        if path == output.parent and output.exists():
+        if path == output.parent:
             raise OSError("parent fsync failed")
         original_fsync(path)
 
+    swapped = False
+
+    def swap_after_identity_check(path: Path, *args, **kwargs):
+        nonlocal swapped
+        identity = original_stat(path, *args, **kwargs)
+        if path == output and not swapped:
+            swapped = True
+            output.rename(displaced)
+            output.mkdir()
+            (output / "sentinel").write_text("concurrent winner", encoding="utf-8")
+        return identity
+
     monkeypatch.setattr(selection_module, "_fsync_directory", fail_parent)
-    with pytest.raises(OSError, match="parent fsync failed"):
+    monkeypatch.setattr(Path, "stat", swap_after_identity_check)
+    with pytest.raises(PromptPublicationDurabilityError) as caught:
         publish_prompt_view_bundle(bundle, output)
-    assert not output.exists()
+
+    recovery = caught.value
+    displaced_identity = original_stat(displaced, follow_symlinks=False)
+    displaced_manifest = json.loads((displaced / "SELECTION_MANIFEST.json").read_bytes())
+    assert swapped
+    assert (output / "sentinel").read_text(encoding="utf-8") == "concurrent winner"
+    assert recovery.__cause__ is not None
+    assert str(recovery.__cause__) == "parent fsync failed"
+    assert recovery.recovery_required is True
+    assert recovery.destination == output
+    assert recovery.expected_identity == (
+        displaced_identity.st_dev,
+        displaced_identity.st_ino,
+    )
+    assert recovery.expected_device == displaced_identity.st_dev
+    assert recovery.expected_inode == displaced_identity.st_ino
+    assert recovery.expected_root_sha256 == displaced_manifest["root_sha256"]
+    assert recovery.receipt == {
+        "state": "durability_unconfirmed_recovery_required",
+        "recovery_required": True,
+        "destination": str(output),
+        "expected_identity": {
+            "device": displaced_identity.st_dev,
+            "inode": displaced_identity.st_ino,
+        },
+        "expected_root_sha256": displaced_manifest["root_sha256"],
+        "verification_instructions": recovery.verification_instructions,
+    }
+    assert "independently" in recovery.verification_instructions.lower()
+    assert "without following symlinks" in recovery.verification_instructions
+    assert not list(tmp_path.glob(".fsync.partial-*"))
+
+    monkeypatch.setattr(selection_module, "_fsync_directory", original_fsync)
+    monkeypatch.setattr(Path, "stat", original_stat)
+    with pytest.raises(FileExistsError):
+        publish_prompt_view_bundle(bundle, output)
+    assert (output / "sentinel").read_text(encoding="utf-8") == "concurrent winner"
     assert not list(tmp_path.glob(".fsync.partial-*"))
 
 
