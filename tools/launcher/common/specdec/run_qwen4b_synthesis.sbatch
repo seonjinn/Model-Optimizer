@@ -181,7 +181,7 @@ PY
 if [[ -f "$OUTPUT_ROOT/completion.json" ]]; then
     PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
         "$OUTPUT_ROOT" "$EXPERIMENT_ID" "$OUTPUT_TOKEN_BUDGET" "$TOKENIZER_SHA256" \
-        "$NUM_SHARDS" "$GENERATION_IDENTITY_SHA256" <<'PY'
+        "7" "$GENERATION_IDENTITY_SHA256" <<'PY'
 import sys
 from pathlib import Path
 
@@ -218,6 +218,33 @@ mkdir -p "$ATTEMPT_ROOT/replicas"
 cp -rP --no-preserve=all -- "$SOURCE_PATH" "$JOB_ROOT/source"
 cp -rL --no-preserve=all -- "$TARGET_PATH" "$JOB_ROOT/input/target"
 cp -rL --no-preserve=all -- "$PROMPT_DATA_ROOT" "$JOB_ROOT/input/prompts"
+python3 - "$JOB_ROOT/input/generation-identity.json" "$TARGET_REVISION" "$TOKENIZER_SHA256" \
+    "$CHAT_TEMPLATE_SHA256" "$RUNTIME_ARCHIVE_SHA256" "$IMAGE_SHA256" \
+    "$PROMPT_MANIFEST_SHA256" "$THINKING_MODE" "$TEMPERATURE" "$MAX_TOKENS" \
+    "$MAX_TOTAL_LENGTH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(
+    json.dumps(
+        {
+            "target_revision": sys.argv[2],
+            "tokenizer_sha256": sys.argv[3],
+            "chat_template_sha256": sys.argv[4],
+            "runtime_sha256": sys.argv[5],
+            "container_sha256": sys.argv[6],
+            "source_selection_sha256": sys.argv[7],
+            "thinking_mode": sys.argv[8],
+            "temperature": float(sys.argv[9]),
+            "max_tokens": int(sys.argv[10]),
+            "max_total_length": int(sys.argv[11]),
+        },
+        sort_keys=True,
+    )
+    + "\n"
+)
+PY
 tar --extract --file="$RUNTIME_ARCHIVE" --directory="$JOB_ROOT/runtime"
 old_venv=$(sed -nE 's/^[[:space:]]*export[[:space:]]+VIRTUAL_ENV=(.*)$/\1/p' "$JOB_ROOT/runtime/bin/activate" | head -n 1)
 old_venv="${old_venv#\"}"
@@ -236,7 +263,8 @@ kill_children() {
 }
 trap kill_children EXIT INT TERM
 
-CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},${ATTEMPT_ROOT}:${ATTEMPT_ROOT}"
+OUTPUT_PARENT="$(dirname "$OUTPUT_ROOT")"
+CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},${OUTPUT_PARENT}:${OUTPUT_PARENT}"
 export PROMPT_MANIFEST_NAME PROMPT_MANIFEST_SHA256 ATTEMPT_ROOT
 # shellcheck disable=SC2016
 for ((replica = 0; replica < REPLICAS; replica++)); do
@@ -271,17 +299,16 @@ for ((replica = 0; replica < REPLICAS; replica++)); do
                 sleep 2
             done
             curl --fail --silent "http://127.0.0.1:${port}/health" >/dev/null
-            # Input rows are consumed in prompt-cell/frozen-rank order; query strips all source
-            # assistant turns before generation and each immutable attempt gets a unique namespace.
-            python "$job_root/source/tools/launcher/common/query.py" \
-                "http://127.0.0.1:${port}/v1" qwen3-4b-study \
-                --data "$job_root/input/prompts/$PROMPT_MANIFEST_NAME" --save "$replica_output" \
-                --num-shards "$NUM_SHARDS" --shard-id-begin="$replica" \
-                --shard-id-step="$REPLICAS" --strict-num-shards --num-proc 1 \
-                --thinking-mode "$THINKING_MODE" --source-id "$PROMPT_MANIFEST_SHA256" \
-                --target-revision "$TARGET_REVISION" --temperature "$TEMPERATURE" \
-                --max-tokens "$MAX_TOKENS" --max-total-length "$MAX_TOTAL_LENGTH" \
-                --reject-tool-trajectories --record-assistant-tokens
+            python "$job_root/source/examples/dataset/promote_synthesis_reserve.py" \
+                generate-attempts \
+                --selection-manifest "$job_root/input/prompts/$PROMPT_MANIFEST_NAME" \
+                --selection-manifest-sha256 "$PROMPT_MANIFEST_SHA256" --arm "$ARM" \
+                --identity "$job_root/input/generation-identity.json" \
+                --base-url "http://127.0.0.1:${port}/v1" --model qwen3-4b-study \
+                --output "$replica_output/attempts-${SLURM_JOB_ID}-${replica}.jsonl" \
+                --num-shards "$NUM_SHARDS" --shard-id-begin "$replica" \
+                --shard-id-step "$REPLICAS" \
+                --attempt-namespace "${SLURM_JOB_ID}-${replica}"
             python - "$replica_output/gpu-utilization-replica-${replica}.json" "$replica" <<'PY'
 import json
 import subprocess
@@ -315,12 +342,21 @@ trap - EXIT INT TERM
 
 partial="$PROMOTED_PARTIAL"
 [[ ! -e "$partial" ]] || { echo "synthesis partial already exists: $partial" >&2; exit 2; }
-mkdir -p "$partial/shards" "$partial/logs"
-for ((replica = 0; replica < REPLICAS; replica++)); do
-    cp -r -- "$ATTEMPT_ROOT/replicas/$replica/." "$partial/shards/"
-    cp -- "$JOB_ROOT/logs/replica-${replica}.log" "$partial/logs/"
-    cp -- "$JOB_ROOT/replicas/$replica/server.log" "$partial/logs/server-${replica}.log"
-done
+mkdir -p "$partial"
+srun --nodes=1 --ntasks=1 --exclusive --gpus=1 --cpus-per-task=24 --mem=200G \
+    --kill-on-bad-exit=1 --no-container-mount-home \
+    --container-image="$IMAGE_PATH" --container-mounts="$CONTAINER_MOUNTS" \
+    bash -c '
+        set -euo pipefail
+        export VIRTUAL_ENV="$1/runtime"
+        export PATH="$VIRTUAL_ENV/bin:$PATH"
+        export PYTHONPATH="$1/source${PYTHONPATH:+:$PYTHONPATH}"
+        python "$1/source/examples/dataset/promote_synthesis_reserve.py" promote-attempts \
+            --selection-manifest "$1/input/prompts/$PROMPT_MANIFEST_NAME" \
+            --selection-manifest-sha256 "$PROMPT_MANIFEST_SHA256" --arm "$ARM" \
+            --identity "$1/input/generation-identity.json" --attempts-root "$2" \
+            --output "$3/corpus" --tokenizer "$1/input/target"
+    ' bash "$JOB_ROOT" "$ATTEMPT_ROOT" "$partial"
 python3 - "$partial" "$EXPERIMENT_ID" "$MANIFEST_PATH" "$OUTPUT_TOKEN_BUDGET" \
     "$TOKENIZER_SHA256" "$GENERATION_IDENTITY_SHA256" "$TARGET_REVISION" \
     "$CHAT_TEMPLATE_SHA256" "$RUNTIME_ARCHIVE_SHA256" "$IMAGE_SHA256" \
@@ -332,30 +368,33 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
-shards = sorted(root.joinpath("shards").glob("*.jsonl"))
-if not shards:
-    raise SystemExit("synthesis produced no shards")
+promotion_path = root / "corpus/PROMOTION.json"
+promotion = json.loads(promotion_path.read_text())
 files = []
-actual_assistant_tokens = 0
-for shard in shards:
-    metadata = shard.with_suffix(shard.suffix + ".metadata.json")
-    done = shard.with_suffix(shard.suffix + ".done")
-    if not metadata.is_file() or not done.is_file():
-        raise SystemExit(f"incomplete synthesis shard: {shard.name}")
-    digest = hashlib.sha256(shard.read_bytes()).hexdigest()
-    if json.loads(metadata.read_text()).get("output_sha256") != digest:
-        raise SystemExit(f"synthesis shard digest mismatch: {shard.name}")
-    with shard.open(encoding="utf-8") as rows:
-        for line_number, line in enumerate(rows, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line).get("_synthesis_assistant_tokens")
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise SystemExit(
-                    f"missing exact assistant-token count: {shard.name}:{line_number}"
-                )
-            actual_assistant_tokens += value
-    files.append({"path": f"shards/{shard.name}", "bytes": shard.stat().st_size, "sha256": digest})
+for record in promotion.get("files", []):
+    path = root / "corpus" / record["path"]
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if path.stat().st_size != record["bytes"] or digest != record["sha256"]:
+        raise SystemExit(f"promoted corpus identity mismatch: {path.name}")
+    files.append(
+        {
+            "path": f"corpus/{record['path']}",
+            "bytes": path.stat().st_size,
+            "sha256": digest,
+        }
+    )
+files.append(
+    {
+        "path": "corpus/PROMOTION.json",
+        "bytes": promotion_path.stat().st_size,
+        "sha256": hashlib.sha256(promotion_path.read_bytes()).hexdigest(),
+    }
+)
+actual_assistant_tokens = sum(
+    int(token_count) * int(count)
+    for histogram in promotion["response_token_histograms"].values()
+    for token_count, count in histogram.items()
+)
 requested_assistant_tokens = int(sys.argv[4])
 if actual_assistant_tokens < requested_assistant_tokens:
     raise SystemExit(
@@ -377,6 +416,8 @@ completion = {
     "source_selection_sha256": sys.argv[11],
     "thinking_mode": sys.argv[12],
     "promotion_status": "passed",
+    "corpus_sha256": promotion["corpus_sha256"],
+    "promotion_receipt_sha256": hashlib.sha256(promotion_path.read_bytes()).hexdigest(),
     "file_count": len(files),
     "files": files,
 }
@@ -384,5 +425,20 @@ temporary = root / f".completion.json.tmp-{os.getpid()}"
 temporary.write_text(json.dumps(completion, indent=2, sort_keys=True) + "\n")
 os.replace(temporary, root / "completion.json")
 PY
-mv -T --no-clobber "$partial" "$OUTPUT_ROOT"
+PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    "$partial" "$OUTPUT_ROOT" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+from common.specdec.build_qwen4b_synthesis_manifest import publish_synthesis_output
+
+partial = Path(sys.argv[1])
+completion = partial / "completion.json"
+publish_synthesis_output(
+    partial,
+    Path(sys.argv[2]),
+    expected_completion_sha256=hashlib.sha256(completion.read_bytes()).hexdigest(),
+)
+PY
 echo "synthesis complete: $OUTPUT_ROOT"

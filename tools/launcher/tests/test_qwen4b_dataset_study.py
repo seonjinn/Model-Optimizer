@@ -29,6 +29,7 @@ from common.specdec.build_qwen4b_synthesis_manifest import (
     SynthesisInputs,
     SynthesisSettings,
     load_synthesis_manifest,
+    publish_synthesis_output,
     tokenizer_snapshot_sha256,
     verify_data_manifest,
     verify_synthesis_completion,
@@ -379,25 +380,62 @@ def test_runner_owns_all_gpus_and_pins_each_shard_to_one_replica() -> None:
     assert "for ((replica = 0; replica < REPLICAS; replica++))" in runner
     assert "--gpus=1" in runner
     assert "--exclusive" in runner
-    assert '--shard-id-begin="$replica"' in runner
-    assert '--shard-id-step="$REPLICAS"' in runner
+    assert '--shard-id-begin "$replica"' in runner
+    assert '--shard-id-step "$REPLICAS"' in runner
     assert '--tensor-parallel-size "$SERVE_TP"' in runner
     assert "wait -n" in runner
     assert "kill_children" in runner
     assert "verify_data_manifest" in runner
     assert "tokenizer_snapshot_sha256" in runner
     assert "verify_synthesis_completion" in runner
-    assert '--data "$job_root/input/prompts/$PROMPT_MANIFEST_NAME"' in runner
-    assert "--reject-tool-trajectories" in runner
-    assert "--record-assistant-tokens" in runner
-    assert "--strict-num-shards" in runner
+    assert "generate-attempts" in runner
+    assert "promote-attempts" in runner
     assert 'replica_output="$ATTEMPT_ROOT/replicas/$replica"' in runner
-    assert "prompt-cell/frozen-rank order" in runner
-    assert "query strips all source" in runner
     assert '"promotion_status": "passed"' in runner
     assert "gpu-utilization-replica-${replica}.json" in runner
     assert 'ATTEMPT_ROOT="${OUTPUT_ROOT}.attempts-${EXPERIMENT_ID}"' in runner
     assert 'PROMOTED_PARTIAL="${OUTPUT_ROOT}.promotion-partial-${SLURM_JOB_ID}"' in runner
+    assert "promote_synthesis_reserve.py" in runner
+    assert "publish_synthesis_output" in runner
+    assert "mv -T --no-clobber" not in runner
+
+
+def test_synthesis_publication_is_no_replace_and_completion_authenticated(tmp_path: Path) -> None:
+    """Publication preserves a winner and rejects unauthenticated partials."""
+    destination = tmp_path / "corpus"
+    destination.mkdir()
+    (destination / "winner").write_text("preserve\n")
+    partial = tmp_path / "partial"
+    partial.mkdir()
+    corpus = partial / "responses.jsonl"
+    corpus.write_text("response\n")
+    completion = partial / "completion.json"
+    completion.write_text(
+        json.dumps(
+            {
+                "promotion_status": "passed",
+                "corpus_sha256": "a" * 64,
+                "file_count": 1,
+                "files": [
+                    {
+                        "path": corpus.name,
+                        "bytes": corpus.stat().st_size,
+                        "sha256": __import__("hashlib").sha256(corpus.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+    digest = __import__("hashlib").sha256(completion.read_bytes()).hexdigest()
+
+    with pytest.raises(FileExistsError):
+        publish_synthesis_output(partial, destination, expected_completion_sha256=digest)
+    assert (destination / "winner").read_text() == "preserve\n"
+    assert partial.is_dir()
+
+    with pytest.raises(ValueError, match="completion identity"):
+        publish_synthesis_output(partial, tmp_path / "other", expected_completion_sha256="0" * 64)
 
 
 def _study_experiment() -> Qwen4BStudyExperiment:

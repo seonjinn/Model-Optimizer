@@ -17,8 +17,11 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
+import platform
 import re
 import tempfile
 from dataclasses import asdict, dataclass
@@ -31,6 +34,7 @@ __all__ = [
     "SynthesisInputs",
     "SynthesisSettings",
     "load_synthesis_manifest",
+    "publish_synthesis_output",
     "tokenizer_snapshot_sha256",
     "verify_data_manifest",
     "verify_synthesis_completion",
@@ -92,6 +96,87 @@ def tokenizer_snapshot_sha256(root: Path) -> str:
     return digest.hexdigest()
 
 
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    if source.parent.resolve() != destination.parent.resolve():
+        raise ValueError("synthesis partial must be a sibling of its destination")
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    system = platform.system()
+    if system == "Linux":
+        try:
+            rename = library.renameat2
+        except AttributeError as error:
+            raise ValueError("atomic no-replace rename is unavailable") from error
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, destination_bytes, 1)
+    elif system == "Darwin":
+        rename = library.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, 0x00000004)
+    else:
+        raise ValueError(f"atomic no-replace rename is unsupported on {system}")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), destination)
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_synthesis_output(
+    partial: Path,
+    destination: Path,
+    *,
+    expected_completion_sha256: str,
+) -> None:
+    """Atomically publish one authenticated promoted corpus without replacement."""
+    _validate_sha("expected_completion_sha256", expected_completion_sha256, _SHA256)
+    if not partial.is_dir():
+        raise ValueError("synthesis publication partial is missing")
+    completion = partial / "completion.json"
+    if _sha256_file(completion) != expected_completion_sha256:
+        raise ValueError("synthesis completion identity mismatch")
+    payload = json.loads(completion.read_text(encoding="utf-8"))
+    if payload.get("promotion_status") != "passed" or not _SHA256.fullmatch(
+        str(payload.get("corpus_sha256", ""))
+    ):
+        raise ValueError("synthesis completion lacks an authenticated promoted corpus")
+    files = _verified_files(partial, payload.get("files"), label="promoted synthesis")
+    if payload.get("file_count") != len(files):
+        raise ValueError("promoted synthesis file count mismatch")
+    created = partial.stat()
+    _fsync_directory(partial)
+    _rename_no_replace(partial, destination)
+    installed = destination.stat()
+    if (installed.st_dev, installed.st_ino) != (created.st_dev, created.st_ino):
+        raise RuntimeError("published synthesis inode does not match authenticated partial")
+    if _sha256_file(destination / "completion.json") != expected_completion_sha256:
+        raise RuntimeError("published synthesis completion identity changed")
+    installed_files = _verified_files(
+        destination, payload.get("files"), label="published synthesis"
+    )
+    if len(installed_files) != len(files):
+        raise RuntimeError("published synthesis file count changed")
+    _fsync_directory(destination.parent)
+
+
 def _verified_files(root: Path, records: Any, *, label: str) -> tuple[Path, ...]:
     if not isinstance(records, list) or not records:
         raise ValueError(f"{label} manifest must contain files")
@@ -126,7 +211,23 @@ def verify_data_manifest(path: Path, expected_sha256: str | None = None) -> tupl
     if expected_sha256 is not None and sha256(data).hexdigest() != expected_sha256:
         raise ValueError("data manifest SHA-256 mismatch")
     payload = json.loads(data)
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    if not isinstance(payload, dict):
+        raise ValueError("unsupported data manifest")
+    if payload.get("schema_version") == 2 and isinstance(payload.get("shards"), list):
+        records = [
+            {
+                "path": record.get("path"),
+                "bytes": record.get("byte_count"),
+                "sha256": record.get("sha256"),
+            }
+            for record in payload["shards"]
+            if isinstance(record, dict)
+        ]
+        files = _verified_files(path.parent, records, label="selection shard")
+        if len(files) != len(payload["shards"]) or payload.get("row_count", 0) < 1:
+            raise ValueError("selection manifest count mismatch")
+        return files
+    if payload.get("schema_version") != 1:
         raise ValueError("unsupported data manifest")
     files = _verified_files(path.parent, payload.get("files"), label="shard")
     if payload.get("file_count") != len(files):
