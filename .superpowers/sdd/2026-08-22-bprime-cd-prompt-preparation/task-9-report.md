@@ -105,3 +105,53 @@
 Corrective verification: focused Task 9 suite PASS (`63 passed`, 336
 pre-existing pytest cleanup warnings); ruff check/format PASS; direct CLI probe
 reaches the expected Task 3 receipt error; `git diff --check` PASS.
+
+## Review round 2 corrective pass
+
+- The paired full-policy API now routes A through the sole A-repair builder,
+  checks the historical `BaselineAudit`, then derives complement composition
+  from selected SQLite rows. Complement UUIDs are rejected if they overlap the
+  historical, evaluator-held-out, or already-selected complement set.
+- Full paired selection now requires typed `SourceInventory`, `BaselineAudit`,
+  `ExclusionIndex`, and typed Task 5 `ExclusionReceipt` values plus a
+  nonzero immutable complement selection digest. These roots are reconciled
+  and carried into both immutable selection identities. B-only remains
+  independently runnable through its authenticated Task 3 wrapper.
+- The cluster CLI now requires a content-addressed JSON held-out UUID artifact
+  and invokes that authenticated B wrapper rather than the low-level selector.
+- Task 7 no longer accepts an arbitrary token-count callback. It invokes the
+  supplied chat tokenizer for complete source-native conversations, validates
+  aligned IDs/assistant masks, applies the final sequence boundary, materializes
+  SQLite token/mask rows, and writes an fsynced immutable token receipt with
+  token/packing/multiplicity/milestone summaries.
+- Task 8 now carries distinct physical-policy and semantic-policy SHA-256
+  fields. It authenticates policy bytes first, parses the authenticated YAML,
+  and reconciles its canonical semantic digest with the selector identity.
+  Schema-v3 Task 9 publications also reconcile selection, inventory, baseline,
+  and held-out roots across every role receipt.
+- The duplicate summaries now distinguish per-UUID natural/total multiplicity
+  from per-source-occurrence constructed reuse, with matching histograms and
+  correct maximum aggregation. B ranking retains exactly
+  `policy_sha || cell || source_identity || row || uuid`.
+
+### Round 2 TDD evidence
+
+1. RED: the policy semantic-hash publication regression failed after adding
+   distinct semantic and physical SHA fields because schema-v3 rejected the
+   additional field before it could authenticate the canonical YAML identity.
+2. GREEN: the regression passes after schema-v3 validates both hashes in the
+   correct phases: descriptor bytes during artifact authentication and parsed
+   canonical YAML during semantic reconciliation.
+3. RED: the B CLI smoke test failed when the new required held-out receipt
+   input was introduced; it passed after the test supplied the explicit JSON
+   artifact and verified dispatch to `select_authenticated_b_balanced_view`.
+
+### Round 2 verification
+
+- Focused Task 9 pytest command: PASS, `63 passed` (336 pre-existing macOS
+  temporary-directory cleanup warnings).
+- Ruff check on changed Task 9 files: PASS.
+- Ruff format applied then checked on changed Task 9 files: PASS.
+- `git diff --check`: PASS.
+- `pre-commit` and Pyright remain unavailable; no environment bootstrapping
+  was performed.

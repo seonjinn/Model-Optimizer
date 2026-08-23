@@ -19,9 +19,11 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
+from audit_ptv2_baseline import BaselineAudit
+from build_specdec_inventory import ExclusionReceipt, make_exclusion_receipt
 from specdec_corpus_contracts import canonical_json
 from specdec_identity import ExclusionIndex, prompt_uuid
-from stage_ptv23_sources import load_source_inventory, stage_source_inventory
+from stage_ptv23_sources import SourceInventory, load_source_inventory, stage_source_inventory
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
@@ -167,6 +169,8 @@ class PTV2StudyView:
     cell_unique_prompt_counts: Mapping[str, int]
     language_unique_prompt_counts: Mapping[str, int]
     maximum_multiplicity: int
+    uuid_multiplicity_histogram: Mapping[int, int]
+    source_occurrence_multiplicity_histogram: Mapping[int, int]
     natural_duplicate_count: int
     constructed_repeat_count: int
     index_path: Path
@@ -175,6 +179,7 @@ class PTV2StudyView:
     ordered_prompt_uuids_sha256: str
     source_response_root_sha256: str
     selection_sha256: str
+    trust_root_sha256: str
     held_out_overlap_count: int
     source_capacity_counts: Mapping[str, int]
 
@@ -279,16 +284,70 @@ def select_ptv2_study_views(
     policy: PTV2StudyPolicy,
     output_root: Path | None = None,
     held_out_prompt_uuids: Iterable[str] = (),
-    baseline: Any | None = None,
-    source_inventory: object | None = None,
+    baseline: BaselineAudit | None = None,
+    source_inventory: SourceInventory | None = None,
     exclusions: ExclusionIndex | None = None,
+    baseline_receipt: ExclusionReceipt | None = None,
+    held_out_receipt: ExclusionReceipt | None = None,
+    complement_selection_sha256: str | None = None,
+    repair_complement_rows: Iterable[PTV2StudySourceRow] | None = None,
+    b_source_rows: Iterable[PTV2StudySourceRow] | None = None,
 ) -> PTV2StudyBundle:
     """Select a paired study only when the full policy has its typed trust roots."""
     if policy.total_occurrences == 2_000_000 and (
-        source_inventory is None or baseline is None or not isinstance(exclusions, ExclusionIndex)
+        not isinstance(source_inventory, SourceInventory)
+        or not isinstance(baseline, BaselineAudit)
+        or not isinstance(exclusions, ExclusionIndex)
+        or not isinstance(baseline_receipt, ExclusionReceipt)
+        or not isinstance(held_out_receipt, ExclusionReceipt)
+        or not isinstance(complement_selection_sha256, str)
+        or repair_complement_rows is None
+        or b_source_rows is None
     ):
         raise PTV2StudyError(
-            "full PTV2 paired selection requires SourceInventory, BaselineAudit, and ExclusionIndex"
+            "full PTV2 paired selection requires typed inventory, baseline, exclusion, and complement roots"
+        )
+    if policy.total_occurrences == 2_000_000:
+        if source_inventory.staged_root is None or any(
+            source.revision != policy.ptv2_revision for source in source_inventory.sources
+        ):
+            raise PTV2StudyError(
+                "paired study SourceInventory is not the approved staged PTV2 root"
+            )
+        _validate_exclusion_receipt(baseline_receipt, "baseline", baseline.occurrence_prompt_ids)
+        _validate_exclusion_receipt(held_out_receipt, "held-out", exclusions.held_out)
+        _require_digest(complement_selection_sha256, "A-repair complement selection")
+        root = _selection_root(output_root)
+        a_repair = select_a_repair_view(
+            source_rows,
+            repair_complement_rows,
+            policy=policy,
+            baseline=baseline,
+            held_out_prompt_uuids=exclusions.held_out,
+            output_root=root,
+            source_inventory=source_inventory,
+            baseline_receipt=baseline_receipt,
+            held_out_receipt=held_out_receipt,
+            complement_selection_sha256=complement_selection_sha256,
+        )
+        b_balanced = select_ptv2_b_balanced_view(
+            b_source_rows,
+            policy=policy,
+            held_out_prompt_uuids=exclusions.held_out,
+            output_root=root,
+            trust_roots=_trusted_roots(
+                source_inventory, baseline_receipt, held_out_receipt, complement_selection_sha256
+            ),
+        )
+        baseline_digest = baseline_receipt.receipt_sha256
+        held_out_digest = held_out_receipt.receipt_sha256
+        return PTV2StudyBundle(
+            policy.policy_sha256,
+            source_inventory.manifest_sha256,
+            baseline_digest,
+            held_out_digest,
+            a_repair,
+            b_balanced,
         )
     root = _selection_root(output_root)
     index_path = root / "ptv2-study-index.sqlite3"
@@ -350,6 +409,7 @@ def select_ptv2_b_balanced_view(
     policy: PTV2StudyPolicy,
     output_root: Path | None = None,
     held_out_prompt_uuids: Iterable[str] = (),
+    trust_roots: Mapping[str, str] | None = None,
 ) -> PTV2StudyView:
     """Build B-balanced independently of the evolving A-repair source-order plan."""
     root = _selection_root(output_root)
@@ -363,7 +423,9 @@ def select_ptv2_b_balanced_view(
         capacities = _capacity_counts(connection)
         _insert_b_balanced(connection, policy)
         connection.commit()
-        view = _build_view(connection, "B-balanced", policy, index_path, held_out, capacities)
+        view = _build_view(
+            connection, "B-balanced", policy, index_path, held_out, capacities, trust_roots
+        )
     finally:
         connection.close()
     _publish_unpublished_index(temporary_index, index_path)
@@ -385,11 +447,18 @@ def select_authenticated_b_balanced_view(
         raise PTV2StudyError("B-balanced production selection requires staged SourceInventory")
     if any(source.revision != policy.ptv2_revision for source in inventory.sources):
         raise PTV2StudyError("SourceInventory revision does not match the study policy")
+    held_out_receipt = make_exclusion_receipt("held-out", tuple(exclusions.held_out))
     return select_ptv2_b_balanced_view(
         iter_ptv2_staged_source_rows(inventory_receipt, policy=policy),
         policy=policy,
         output_root=output_root,
         held_out_prompt_uuids=exclusions.held_out,
+        trust_roots=MappingProxyType(
+            {
+                "source_inventory_sha256": inventory.manifest_sha256,
+                "held_out_receipt_sha256": held_out_receipt.receipt_sha256,
+            }
+        ),
     )
 
 
@@ -398,9 +467,13 @@ def select_a_repair_view(
     repair_complement_rows: Iterable[PTV2StudySourceRow],
     *,
     policy: PTV2StudyPolicy,
-    baseline: object,
+    baseline: BaselineAudit,
     held_out_prompt_uuids: Iterable[str] = (),
     output_root: Path | None = None,
+    source_inventory: SourceInventory | None = None,
+    baseline_receipt: ExclusionReceipt | None = None,
+    held_out_receipt: ExclusionReceipt | None = None,
+    complement_selection_sha256: str | None = None,
 ) -> PTV2StudyView:
     """Materialize A-repair as verified 1.3M history followed by its fixed 700K complement."""
     root = _selection_root(output_root)
@@ -419,7 +492,21 @@ def select_a_repair_view(
         _verify_baseline_prefix(connection, policy, baseline)
         _insert_a_repair_complement(connection, policy, history_count, held_out)
         connection.commit()
-        view = _build_view(connection, "A-repair", policy, index_path, held_out, capacities)
+        trust_roots = None
+        if policy.total_occurrences == 2_000_000:
+            if (
+                not isinstance(source_inventory, SourceInventory)
+                or not isinstance(baseline_receipt, ExclusionReceipt)
+                or not isinstance(held_out_receipt, ExclusionReceipt)
+                or not isinstance(complement_selection_sha256, str)
+            ):
+                raise PTV2StudyError("A-repair production selection requires typed trust roots")
+            trust_roots = _trusted_roots(
+                source_inventory, baseline_receipt, held_out_receipt, complement_selection_sha256
+            )
+        view = _build_view(
+            connection, "A-repair", policy, index_path, held_out, capacities, trust_roots
+        )
     finally:
         connection.close()
     _publish_unpublished_index(temporary_index, index_path)
@@ -549,6 +636,7 @@ def main() -> int:
     parser.add_argument("--durable-root", type=Path)
     parser.add_argument("--scratch-root", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--held-out-uuids", type=Path, required=True)
     args = parser.parse_args()
     if args.source_plan is not None:
         if args.source_cache is None or args.durable_root is None or args.scratch_root is None:
@@ -569,10 +657,17 @@ def main() -> int:
         if inventory_path is None:
             raise AssertionError("argparse requires one source input")
     policy = load_ptv2_study_policy(args.policy)
-    view = select_ptv2_b_balanced_view(
-        iter_ptv2_staged_source_rows(inventory_path, policy=policy),
+    try:
+        held_out = json.loads(args.held_out_uuids.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise PTV2StudyError("--held-out-uuids must be a JSON UUID array") from error
+    if not isinstance(held_out, list) or any(not isinstance(value, str) for value in held_out):
+        raise PTV2StudyError("--held-out-uuids must be a JSON UUID array")
+    view = select_authenticated_b_balanced_view(
+        inventory_path,
         policy=policy,
         output_root=args.output_root,
+        exclusions=ExclusionIndex(held_out=set(held_out)),
     )
     print(
         json.dumps(
@@ -736,6 +831,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX occurrences_strategy_uuid ON occurrences(strategy, prompt_uuid);
         CREATE TABLE historical_uuids(prompt_uuid TEXT PRIMARY KEY);
+        CREATE TABLE repair_uuids(prompt_uuid TEXT PRIMARY KEY);
         """
     )
 
@@ -764,7 +860,6 @@ def _spool_source_rows(
             (
                 policy.policy_sha256
                 + row.cell
-                + row.language
                 + row.source_identity_sha256
                 + str(row.source_row)
                 + row.prompt_uuid
@@ -888,6 +983,10 @@ def _insert_a_repair_complement(
             raise PTV2StudyError("A-repair complement overlaps the historical UUID set")
         if uuid_value in held_out:
             raise PTV2StudyError("A-repair complement overlaps evaluator-held-out UUIDs")
+        try:
+            connection.execute("INSERT INTO repair_uuids VALUES(?)", (uuid_value,))
+        except sqlite3.IntegrityError as error:
+            raise PTV2StudyError("A-repair complement contains a duplicate UUID") from error
         connection.execute(
             "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)",
             (
@@ -1006,6 +1105,7 @@ def _build_view(
     index_path: Path,
     held_out: set[str],
     capacities: Mapping[str, int],
+    trust_roots: Mapping[str, str] | None = None,
 ) -> PTV2StudyView:
     rows = connection.execute(
         "SELECT ordinal,prompt_uuid,source_identity_sha256,source_row,cell,reuse_index,"
@@ -1072,6 +1172,19 @@ def _build_view(
     complete_languages = MappingProxyType(
         {language: language_counts.get(language, 0) for language in policy.multilingual_occurrences}
     )
+    repair_counts = dict.fromkeys(policy.repair_complement_occurrences, 0)
+    if strategy == "A-repair":
+        for cell, language, value in connection.execute(
+            "SELECT occurrences.cell,source_rows.language,count(*) FROM occurrences "
+            "JOIN source_rows ON occurrences.source_identity_sha256=source_rows.source_identity_sha256 "
+            "AND occurrences.source_row=source_rows.source_row "
+            "WHERE occurrences.strategy='A-repair' AND occurrences.ordinal>=? "
+            "GROUP BY occurrences.cell,source_rows.language",
+            (policy.historical_occurrences,),
+        ):
+            key = "stem" if cell == "stem" else str(language)
+            if key in repair_counts:
+                repair_counts[key] += int(value)
     cell_unique_counts = {
         str(cell): int(value)
         for cell, value in connection.execute(
@@ -1090,14 +1203,28 @@ def _build_view(
             (strategy,),
         )
     }
-    maximum_multiplicity = int(
-        connection.execute(
-            "SELECT coalesce(max(multiplicity),0) FROM ("
-            "SELECT count(*) AS multiplicity FROM occurrences WHERE strategy=? "
-            "GROUP BY prompt_uuid,source_identity_sha256,source_row)",
+    uuid_histogram = {
+        int(multiplicity): int(rows)
+        for multiplicity, rows in connection.execute(
+            "SELECT multiplicity,count(*) FROM ("
+            "SELECT prompt_uuid,count(*) AS multiplicity FROM occurrences WHERE strategy=? "
+            "GROUP BY prompt_uuid) GROUP BY multiplicity ORDER BY multiplicity",
             (strategy,),
-        ).fetchone()[0]
-    )
+        )
+    }
+    source_occurrence_histogram = {
+        int(multiplicity): int(rows)
+        for multiplicity, rows in connection.execute(
+            "SELECT multiplicity,count(*) FROM ("
+            "SELECT prompt_uuid,source_identity_sha256,source_row,count(*) AS multiplicity "
+            "FROM occurrences WHERE strategy=? GROUP BY prompt_uuid,source_identity_sha256,source_row) "
+            "GROUP BY multiplicity ORDER BY multiplicity",
+            (strategy,),
+        )
+    }
+    maximum_multiplicity = max(uuid_histogram, default=0)
+    trusted = dict(trust_roots or {})
+    trust_root_sha256 = sha256(canonical_json(trusted)).hexdigest()
     selection = {
         "strategy": strategy,
         "policy_sha256": policy.policy_sha256,
@@ -1105,10 +1232,13 @@ def _build_view(
         "unique_prompt_count": unique,
         "cell_occurrence_counts": dict(complete_cells),
         "multilingual_occurrence_counts": dict(complete_languages),
+        "repair_complement_counts": repair_counts if strategy == "A-repair" else {},
+        "uuid_multiplicity_histogram": uuid_histogram,
         "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
         "ordered_prompt_uuids_sha256": prompt_digest.hexdigest(),
         "source_response_root_sha256": response_digest.hexdigest(),
         "occurrence_multiplicity_sha256": multiplicity_digest.hexdigest(),
+        "trust_roots": trusted,
     }
     return PTV2StudyView(
         strategy,
@@ -1117,9 +1247,7 @@ def _build_view(
         unique,
         complete_cells,
         complete_languages,
-        MappingProxyType(
-            dict(policy.repair_complement_occurrences) if strategy == "A-repair" else {}
-        ),
+        MappingProxyType(repair_counts if strategy == "A-repair" else {}),
         policy.segment_occurrences,
         MappingProxyType({cell: cell_unique_counts.get(cell, 0) for cell in _CELLS}),
         MappingProxyType(
@@ -1129,6 +1257,8 @@ def _build_view(
             }
         ),
         maximum_multiplicity,
+        MappingProxyType(uuid_histogram),
+        MappingProxyType(source_occurrence_histogram),
         natural,
         constructed,
         index_path,
@@ -1137,9 +1267,45 @@ def _build_view(
         prompt_digest.hexdigest(),
         response_digest.hexdigest(),
         sha256(canonical_json(selection)).hexdigest(),
+        trust_root_sha256,
         overlap,
         capacities,
     )
+
+
+def _trusted_roots(
+    inventory: SourceInventory,
+    baseline_receipt: ExclusionReceipt,
+    held_out_receipt: ExclusionReceipt,
+    complement_selection_sha256: str,
+) -> Mapping[str, str]:
+    """Return the typed external roots carried into an immutable selection identity."""
+    for label, digest in (
+        ("source inventory", inventory.manifest_sha256),
+        ("baseline receipt", baseline_receipt.receipt_sha256),
+        ("held-out receipt", held_out_receipt.receipt_sha256),
+        ("A-repair complement selection", complement_selection_sha256),
+    ):
+        _require_digest(digest, label)
+        if digest == "0" * 64:
+            raise PTV2StudyError(f"{label} digest must be nonzero")
+    return MappingProxyType(
+        {
+            "source_inventory_sha256": inventory.manifest_sha256,
+            "baseline_receipt_sha256": baseline_receipt.receipt_sha256,
+            "held_out_receipt_sha256": held_out_receipt.receipt_sha256,
+            "complement_selection_sha256": complement_selection_sha256,
+        }
+    )
+
+
+def _validate_exclusion_receipt(
+    receipt: ExclusionReceipt, kind: Literal["baseline", "held-out"], prompt_ids: Iterable[str]
+) -> None:
+    """Reconcile a typed content-addressed receipt with the consumed exclusion stream."""
+    expected = make_exclusion_receipt(kind, tuple(prompt_ids))
+    if receipt != expected or receipt.receipt_sha256 == "0" * 64:
+        raise PTV2StudyError(f"{kind} exclusion receipt does not match its prompt set")
 
 
 def _source_inventory_digest(connection: sqlite3.Connection) -> str:

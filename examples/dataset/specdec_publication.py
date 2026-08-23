@@ -35,6 +35,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
 
 __all__ = [
     "REQUIRED_ROLES",
@@ -342,6 +343,7 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
     if len(by_role) != len(bundle.artifacts) or set(by_role) != set(REQUIRED_ROLES):
         raise PublicationError(f"artifact roles must be exactly {REQUIRED_ROLES}")
     authenticated: list[_AuthenticatedArtifact] = []
+    payloads: dict[str, dict[str, Any]] = {}
     for role in REQUIRED_ROLES:
         artifact = by_role[role]
         _require_digest(f"{artifact.role} receipt", artifact.receipt_sha256)
@@ -352,6 +354,7 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
         if _sha256_bytes(raw) != artifact.receipt_sha256:
             raise PublicationError(f"{artifact.role} receipt SHA-256 mismatch")
         payload = _receipt_document(raw, artifact.role)
+        payloads[artifact.role] = payload
         claimed = payload.get("receipt_sha256")
         without_claim = {key: value for key, value in payload.items() if key != "receipt_sha256"}
         canonical_identity = json.dumps(
@@ -385,12 +388,56 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
             ):
                 raise PublicationError(f"{artifact.role} declared file authentication failed")
             files.append((relative, path, size, digest))
+        if artifact.role == "selection" and payload.get("schema_version") == 3:
+            _validate_ptv2_selection_policy(payload, files)
         authenticated.append(
             _AuthenticatedArtifact(artifact.role, receipt, artifact.receipt_sha256, tuple(files))
         )
     if bundle.selection_manifest_sha256 != authenticated[1].receipt_sha256:
         raise PublicationError("selection manifest SHA-256 is not the selection receipt")
+    if payloads["selection"].get("schema_version") == 3:
+        _reconcile_ptv2_role_lineage(payloads)
     return tuple(authenticated)
+
+
+def _reconcile_ptv2_role_lineage(payloads: Mapping[str, Mapping[str, Any]]) -> None:
+    """Require every Task 9 role receipt to carry the same authenticated selection roots."""
+    selection = payloads["selection"]
+    expected = {
+        "selection_sha256": selection["selection_sha256"],
+        "source_inventory_sha256": selection["source_inventory_sha256"],
+        "baseline_receipt_sha256": selection["baseline_receipt_sha256"],
+        "held_out_receipt_sha256": selection["held_out_receipt_sha256"],
+    }
+    for role in REQUIRED_ROLES:
+        if role == "selection":
+            continue
+        payload = payloads[role]
+        identity = payload.get("identity")
+        source = identity if isinstance(identity, Mapping) else payload
+        for key, expected_digest in expected.items():
+            actual = source.get(key)
+            if actual != expected_digest:
+                raise PublicationError(f"PTV2 {role} receipt does not reconcile {key}")
+
+
+def _validate_ptv2_selection_policy(
+    payload: Mapping[str, Any], files: list[tuple[str, Path, int, str]]
+) -> None:
+    """Bind a semantic policy digest to the separately authenticated YAML bytes."""
+    policy_file = next((item for item in files if item[0] == payload["policy"]["path"]), None)
+    if policy_file is None:
+        raise PublicationError("PTV2 policy descriptor was not authenticated")
+    if policy_file[3] != payload["policy_file_sha256"]:
+        raise PublicationError("PTV2 policy bytes do not match policy_file_sha256")
+    try:
+        decoded_policy = yaml.safe_load(policy_file[1].read_bytes())
+    except (OSError, yaml.YAMLError) as error:
+        raise PublicationError("PTV2 policy bytes are not valid YAML") from error
+    if not isinstance(decoded_policy, dict):
+        raise PublicationError("PTV2 semantic policy must be a mapping")
+    if _sha256_bytes(_identity_json(decoded_policy)) != payload["policy_sha256"]:
+        raise PublicationError("PTV2 semantic policy does not match policy_sha256")
 
 
 def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -412,6 +459,7 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
         required = {
             "selection_sha256",
             "policy_sha256",
+            "policy_file_sha256",
             "source_inventory_sha256",
             "baseline_receipt_sha256",
             "held_out_receipt_sha256",
@@ -435,6 +483,7 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "root_sha256",
             "selection_sha256",
             "policy_sha256",
+            "policy_file_sha256",
             "source_inventory_sha256",
             "baseline_receipt_sha256",
             "held_out_receipt_sha256",
@@ -442,9 +491,6 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             value = payload[key]
             if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
                 raise PublicationError(f"PTV2 selection receipt {key} is not a SHA-256")
-        policy_descriptor = _file_descriptor(policy, "selection", Path("."))
-        if policy_descriptor[2] != payload["policy_sha256"]:
-            raise PublicationError("PTV2 policy bytes do not match policy_sha256")
         return [*shards, index, policy]
     if role == "tokenized" and payload.get("schema_version") == 1:
         required = {

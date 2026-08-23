@@ -527,12 +527,15 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
     )
     seen: dict[str, object] = {}
 
-    def _rows(_: Path, *, policy):
+    def _authenticated(_: Path, *, policy, exclusions, output_root):
         seen["policy"] = policy
-        return iter(rows)
+        seen["held_out"] = exclusions.held_out
+        return select_ptv2_b_balanced_view(rows, policy=policy, output_root=output_root)
 
     monkeypatch.setattr(study_module, "load_ptv2_study_policy", lambda _: _scaled_policy())
-    monkeypatch.setattr(study_module, "iter_ptv2_staged_source_rows", _rows)
+    monkeypatch.setattr(study_module, "select_authenticated_b_balanced_view", _authenticated)
+    held_out = tmp_path / "held-out.json"
+    held_out.write_text("[]", encoding="utf-8")
     monkeypatch.setattr(
         sys,
         "argv",
@@ -544,8 +547,10 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
             str(tmp_path / "SOURCE_INVENTORY.json"),
             "--output-root",
             str(tmp_path / "out"),
+            "--held-out-uuids",
+            str(held_out),
         ],
     )
 
     assert main() == 0
-    assert seen == {"policy": _scaled_policy()}
+    assert seen == {"policy": _scaled_policy(), "held_out": set()}

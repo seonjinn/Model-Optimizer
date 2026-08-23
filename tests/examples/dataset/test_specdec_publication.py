@@ -98,7 +98,7 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
     policy = tmp_path / "policy.yaml"
     index = tmp_path / "ptv2-study-index.sqlite3"
     shard = tmp_path / "a-prefix.jsonl"
-    policy.write_bytes(b"policy\n")
+    policy.write_bytes(b"seed: 20260822\nstrategy: B-balanced\n")
     index.write_bytes(b"sqlite\n")
     shard.write_bytes(b"occurrence\n")
 
@@ -112,7 +112,10 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
     payload = {
         "schema_version": 3,
         "selection_sha256": "1" * 64,
-        "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
+        "policy_sha256": hashlib.sha256(
+            publication._identity_json({"seed": 20260822, "strategy": "B-balanced"})
+        ).hexdigest(),
+        "policy_file_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
         "source_inventory_sha256": "3" * 64,
         "baseline_receipt_sha256": "4" * 64,
         "held_out_receipt_sha256": "5" * 64,
@@ -127,6 +130,31 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         descriptor(index),
         descriptor(policy),
     ]
+    publication._validate_ptv2_selection_policy(
+        payload,
+        [
+            (shard.name, shard, shard.stat().st_size, descriptor(shard)["sha256"]),
+            (index.name, index, index.stat().st_size, descriptor(index)["sha256"]),
+            (policy.name, policy, policy.stat().st_size, descriptor(policy)["sha256"]),
+        ],
+    )
+
+    semantic_mismatch = dict(payload)
+    semantic_mismatch["policy_sha256"] = "0" * 64
+    semantic_mismatch["root_sha256"] = hashlib.sha256(
+        publication._identity_json(
+            {key: value for key, value in semantic_mismatch.items() if key != "root_sha256"}
+        )
+    ).hexdigest()
+    with pytest.raises(publication.PublicationError, match="semantic policy"):
+        publication._validate_ptv2_selection_policy(
+            semantic_mismatch,
+            [
+                (shard.name, shard, shard.stat().st_size, descriptor(shard)["sha256"]),
+                (index.name, index, index.stat().st_size, descriptor(index)["sha256"]),
+                (policy.name, policy, policy.stat().st_size, descriptor(policy)["sha256"]),
+            ],
+        )
 
     malformed = dict(payload)
     malformed["selection_sha256"] = "not-a-digest"

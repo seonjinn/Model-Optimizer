@@ -22,7 +22,7 @@ import os
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -133,6 +133,17 @@ class PTV2OnePassCorpus:
     training_config_sha256: str
     source_response_root_sha256: str
     ordered_occurrences_sha256: str
+    unique_prompt_count: int = 2_000_000
+    natural_duplicate_count: int = 0
+    constructed_repeat_count: int = 0
+    serialized_tokens: int = 0
+    packed_sequences: int = 0
+    milestone_occurrences: tuple[int, ...] = (500_000, 1_000_000, 1_300_000, 2_000_000)
+    milestone_steps: tuple[int, ...] = (977, 1_954, 2_540, 3_908)
+    tokenized_path: str = ""
+    tokenized_sha256: str = "0" * 64
+    receipt_path: str = ""
+    receipt_sha256: str = "0" * 64
 
 
 @dataclass(frozen=True)
@@ -153,9 +164,13 @@ def derive_ptv2_one_pass_corpus(
     chat_template_sha256: str,
     assistant_loss_target_sha256: str,
     training_config_sha256: str,
-    assistant_token_counter: Callable[[str], int],
+    tokenizer: Any,
+    output_root: Path,
+    sequence_length: int = 4_096,
+    milestone_occurrences: tuple[int, ...] = (500_000, 1_000_000, 1_300_000, 2_000_000),
+    milestone_steps: tuple[int, ...] = (977, 1_954, 2_540, 3_908),
 ) -> PTV2OnePassCorpus:
-    """Derive a one-pass receipt by streaming the selected SQLite occurrences and responses."""
+    """Materialize authenticated assistant masks from the selected SQLite responses."""
     for digest_name, digest in (
         ("tokenizer", tokenizer_sha256),
         ("chat template", chat_template_sha256),
@@ -169,9 +184,34 @@ def derive_ptv2_one_pass_corpus(
     index_path = Path(getattr(view, "index_path", ""))
     if not index_path.is_file() or index_path.is_symlink():
         raise ExposureViewError("PTV2 selection SQLite index is missing or unsafe")
+    if (
+        not isinstance(sequence_length, int)
+        or isinstance(sequence_length, bool)
+        or sequence_length < 1
+        or len(milestone_occurrences) != len(milestone_steps)
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in (*milestone_occurrences, *milestone_steps)
+        )
+    ):
+        raise ExposureViewError("PTV2 sequence and milestone policy is invalid")
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise ExposureViewError("PTV2 tokenized output root is unsafe")
+    database_path = root / f"{strategy.lower()}-tokenized.sqlite3"
+    receipt_path = root / f"{strategy.lower()}-TOKENIZED.json"
+    if database_path.exists() or receipt_path.exists():
+        raise ExposureViewError("PTV2 tokenized output is immutable and already exists")
     occurrence_digest = sha256()
     response_digest = sha256()
-    count = assistant_tokens = 0
+    count = assistant_tokens = serialized_tokens = 0
+    connection_out = sqlite3.connect(database_path)
+    connection_out.execute("PRAGMA synchronous=FULL")
+    connection_out.execute(
+        "CREATE TABLE records(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+        "input_ids_json TEXT NOT NULL,loss_mask_json TEXT NOT NULL,assistant_tokens INTEGER NOT NULL)"
+    )
     connection = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
     try:
         cursor = connection.execute(
@@ -193,11 +233,40 @@ def derive_ptv2_one_pass_corpus(
                 raise ExposureViewError("PTV2 selected conversation hash mismatch")
             if sha256(response.encode("utf-8")).hexdigest() != occurrence[7]:
                 raise ExposureViewError("PTV2 selected assistant response hash mismatch")
-            token_count = assistant_token_counter(response)
-            if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 1:
+            try:
+                canonical = json.loads(conversation)
+            except json.JSONDecodeError as error:
+                raise ExposureViewError("PTV2 selected conversation is invalid JSON") from error
+            if not isinstance(canonical, dict) or not isinstance(canonical.get("messages"), list):
+                raise ExposureViewError("PTV2 selected conversation has no messages")
+            encoded = tokenizer.apply_chat_template(
+                canonical["messages"],
+                tools=canonical.get("tools") or None,
+                tokenize=True,
+                add_generation_prompt=False,
+                return_dict=True,
+                return_assistant_tokens_mask=True,
+            )
+            input_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
+            loss_mask = encoded.get("assistant_masks") if isinstance(encoded, Mapping) else None
+            if loss_mask is None and isinstance(encoded, Mapping):
+                loss_mask = encoded.get("assistant_tokens_mask")
+            if (
+                not isinstance(input_ids, list)
+                or not input_ids
+                or not isinstance(loss_mask, list)
+                or len(input_ids) != len(loss_mask)
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in input_ids)
+                or any(value not in (0, 1) for value in loss_mask)
+            ):
                 raise ExposureViewError(
-                    "PTV2 assistant token counter returned an invalid mask total"
+                    "PTV2 tokenizer did not return aligned IDs and assistant mask"
                 )
+            input_ids = input_ids[:sequence_length]
+            loss_mask = loss_mask[:sequence_length]
+            token_count = sum(loss_mask)
+            if token_count < 1:
+                raise ExposureViewError("PTV2 final training boundary has no assistant tokens")
             occurrence_digest.update(canonical_json(list(occurrence)))
             occurrence_digest.update(b"\n")
             response_digest.update(
@@ -206,8 +275,21 @@ def derive_ptv2_one_pass_corpus(
             response_digest.update(b"\n")
             count += 1
             assistant_tokens += token_count
+            serialized_tokens += len(input_ids)
+            connection_out.execute(
+                "INSERT INTO records VALUES(?,?,?,?,?)",
+                (
+                    occurrence[0],
+                    occurrence[1],
+                    canonical_json(input_ids).decode("utf-8"),
+                    canonical_json(loss_mask).decode("utf-8"),
+                    token_count,
+                ),
+            )
     finally:
         connection.close()
+    connection_out.commit()
+    connection_out.close()
     if count != getattr(view, "occurrence_count", None):
         raise ExposureViewError(
             "PTV2 materialized occurrence count does not match selection receipt"
@@ -218,6 +300,40 @@ def derive_ptv2_one_pass_corpus(
         )
     if response_digest.hexdigest() != getattr(view, "source_response_root_sha256", None):
         raise ExposureViewError("PTV2 materialized response root does not match selection receipt")
+    unique = int(getattr(view, "unique_prompt_count", 0))
+    natural = int(getattr(view, "natural_duplicate_count", 0))
+    constructed = int(getattr(view, "constructed_repeat_count", 0))
+    if unique < 1 or natural < 0 or constructed < 0 or unique + natural + constructed != count:
+        raise ExposureViewError("PTV2 selection multiplicity summary does not reconcile")
+    database_sha256 = _sha256_file(database_path)
+    receipt = {
+        "schema_version": 1,
+        "strategy": strategy,
+        "occurrence_count": count,
+        "trainer_epochs": getattr(view, "trainer_epochs", 0),
+        "assistant_tokens": assistant_tokens,
+        "serialized_tokens": serialized_tokens,
+        "packed_sequences": (serialized_tokens + sequence_length - 1) // sequence_length,
+        "unique_prompt_count": unique,
+        "natural_duplicate_count": natural,
+        "constructed_repeat_count": constructed,
+        "milestone_occurrences": list(milestone_occurrences),
+        "milestone_steps": list(milestone_steps),
+        "tokenizer_sha256": tokenizer_sha256,
+        "chat_template_sha256": chat_template_sha256,
+        "assistant_loss_target_sha256": assistant_loss_target_sha256,
+        "training_config_sha256": training_config_sha256,
+        "source_response_root_sha256": response_digest.hexdigest(),
+        "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
+        "database_path": str(database_path),
+        "database_sha256": database_sha256,
+        "database_bytes": database_path.stat().st_size,
+    }
+    receipt_sha256 = sha256(canonical_json(receipt)).hexdigest()
+    _write_exclusive(
+        receipt_path, canonical_json(receipt | {"receipt_sha256": receipt_sha256}) + b"\n"
+    )
+    _fsync_directory(root)
     return PTV2OnePassCorpus(
         strategy=strategy,
         occurrence_count=count,
@@ -229,6 +345,17 @@ def derive_ptv2_one_pass_corpus(
         training_config_sha256=training_config_sha256,
         source_response_root_sha256=response_digest.hexdigest(),
         ordered_occurrences_sha256=occurrence_digest.hexdigest(),
+        unique_prompt_count=unique,
+        natural_duplicate_count=natural,
+        constructed_repeat_count=constructed,
+        serialized_tokens=serialized_tokens,
+        packed_sequences=receipt["packed_sequences"],
+        milestone_occurrences=milestone_occurrences,
+        milestone_steps=milestone_steps,
+        tokenized_path=str(database_path),
+        tokenized_sha256=database_sha256,
+        receipt_path=str(receipt_path),
+        receipt_sha256=receipt_sha256,
     )
 
 
@@ -278,6 +405,28 @@ def _validate_ptv2_one_pass(corpus: PTV2OnePassCorpus, strategy: str) -> None:
         raise ExposureViewError("PTV2 one-pass receipt must bind exactly one trainer epoch")
     if isinstance(corpus.assistant_tokens, bool) or corpus.assistant_tokens < 1:
         raise ExposureViewError("PTV2 one-pass assistant tokens must be positive")
+    if (
+        corpus.unique_prompt_count < 1
+        or corpus.natural_duplicate_count < 0
+        or corpus.constructed_repeat_count < 0
+        or corpus.unique_prompt_count
+        + corpus.natural_duplicate_count
+        + corpus.constructed_repeat_count
+        != corpus.occurrence_count
+    ):
+        raise ExposureViewError("PTV2 one-pass multiplicity summary does not reconcile")
+    if corpus.milestone_occurrences != (
+        500_000,
+        1_000_000,
+        1_300_000,
+        2_000_000,
+    ) or corpus.milestone_steps != (
+        977,
+        1_954,
+        2_540,
+        3_908,
+    ):
+        raise ExposureViewError("PTV2 one-pass receipt has the wrong optimizer milestones")
     for field in (
         "tokenizer_sha256",
         "chat_template_sha256",
@@ -285,6 +434,8 @@ def _validate_ptv2_one_pass(corpus: PTV2OnePassCorpus, strategy: str) -> None:
         "training_config_sha256",
         "source_response_root_sha256",
         "ordered_occurrences_sha256",
+        "tokenized_sha256",
+        "receipt_sha256",
     ):
         _require_digest(field, getattr(corpus, field))
 
