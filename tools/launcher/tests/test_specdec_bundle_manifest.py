@@ -46,6 +46,19 @@ def test_completion_marker_binds_artifact_source_commit(tmp_path: Path) -> None:
     with pytest.raises(bundle_manifest.BundleError, match="immutable output"):
         bundle_manifest.write_completion(completion, "other", "b" * 64, "a" * 40)
 
+    with pytest.raises(SystemExit):
+        bundle_manifest.main(
+            [
+                "write-completion",
+                "--output",
+                str(tmp_path / "missing-commit.json"),
+                "--artifact-id",
+                "artifact",
+                "--manifest-sha256",
+                "b" * 64,
+            ]
+        )
+
 
 def test_manifest_rejects_changed_or_extra_publication_files(tmp_path: Path) -> None:
     """Transfer verification authenticates the exact published file set and bytes."""

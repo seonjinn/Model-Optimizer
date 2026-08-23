@@ -146,6 +146,8 @@ class PublicationRecoveryState:
     expected_partial_identity: tuple[int, int] | None
     partial_observation: PathObservation
     destination_observation: PathObservation
+    quarantine_path: Path | None
+    quarantine_observation: PathObservation | None
     recovery_required: Literal[True] = True
 
 
@@ -199,11 +201,18 @@ def publish_bundle(
     phase = PublicationPhase.PARTIAL_SETUP
     expected_partial_identity: tuple[int, int] | None = None
     artifact_id: str | None = None
+    quarantine_path: Path | None = None
     try:
         if os.path.lexists(partial):
-            if not _valid_partial_identity(partial, input_identity):
+            expected_partial_identity = _observe(partial).identity
+            if not _valid_partial_identity(partial, input_identity) or not _partial_tree_safe(
+                partial, artifacts
+            ):
                 phase = PublicationPhase.QUARANTINE
-                _quarantine_partial(partial, destination, job_id)
+                quarantine_path = destination.with_name(
+                    f".{destination.name}.quarantine-{job_id}-{uuid4().hex}"
+                )
+                _quarantine_partial(partial, quarantine_path, destination.parent)
         if not os.path.lexists(partial):
             partial.mkdir(mode=0o750)
             metadata = os.lstat(partial)
@@ -286,6 +295,8 @@ def publish_bundle(
             expected_partial_identity=expected_partial_identity,
             partial_observation=_observe(partial),
             destination_observation=_observe(destination),
+            quarantine_path=quarantine_path,
+            quarantine_observation=(None if quarantine_path is None else _observe(quarantine_path)),
         )
         setattr(error, "recovery_state", state)
         raise
@@ -331,7 +342,6 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
     if len(by_role) != len(bundle.artifacts) or set(by_role) != set(REQUIRED_ROLES):
         raise PublicationError(f"artifact roles must be exactly {REQUIRED_ROLES}")
     authenticated: list[_AuthenticatedArtifact] = []
-    allowed_by_root: dict[Path, set[Path]] = {}
     for role in REQUIRED_ROLES:
         artifact = by_role[role]
         _require_digest(f"{artifact.role} receipt", artifact.receipt_sha256)
@@ -341,22 +351,24 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
         raw = receipt.read_bytes()
         if _sha256_bytes(raw) != artifact.receipt_sha256:
             raise PublicationError(f"{artifact.role} receipt SHA-256 mismatch")
-        payload = _canonical_document(raw, f"{artifact.role} receipt")
+        payload = _receipt_document(raw, artifact.role)
         claimed = payload.get("receipt_sha256")
         without_claim = {key: value for key, value in payload.items() if key != "receipt_sha256"}
-        if claimed is not None and claimed != _sha256_bytes(_canonical_json(without_claim)):
+        canonical_identity = json.dumps(
+            without_claim, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if claimed is not None and claimed not in {
+            _sha256_bytes(canonical_identity),
+            _sha256_bytes(canonical_identity + b"\n"),
+        }:
             raise PublicationError(f"{artifact.role} self digest mismatch")
         if payload.get("role") not in {None, artifact.role}:
             raise PublicationError(f"{artifact.role} receipt role mismatch")
-        descriptors = payload.get("files")
-        if not isinstance(descriptors, list) or not descriptors:
-            raise PublicationError(f"{artifact.role} receipt has no declared files")
+        descriptors = _role_file_descriptors(artifact.role, payload)
         files: list[tuple[str, Path, int, str]] = []
         root = receipt.parent.resolve(strict=True)
-        allowed = allowed_by_root.setdefault(root, set())
-        allowed.add(receipt.resolve(strict=True))
         for descriptor in descriptors:
-            relative, size, digest = _file_descriptor(descriptor, artifact.role)
+            relative, size, digest = _file_descriptor(descriptor, artifact.role, root)
             unresolved = receipt.parent / relative
             if unresolved.is_symlink():
                 raise PublicationError(f"{artifact.role} declared file is a symlink")
@@ -372,18 +384,75 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
                 or _sha256_file(path) != digest
             ):
                 raise PublicationError(f"{artifact.role} declared file authentication failed")
-            allowed.add(path)
             files.append((relative, path, size, digest))
         authenticated.append(
             _AuthenticatedArtifact(artifact.role, receipt, artifact.receipt_sha256, tuple(files))
         )
-    for root, allowed in allowed_by_root.items():
-        actual = set(_regular_tree_files(root))
-        if actual != allowed:
-            raise PublicationError("input receipt tree contains missing or extra files")
     if bundle.selection_manifest_sha256 != authenticated[1].receipt_sha256:
         raise PublicationError("selection manifest SHA-256 is not the selection receipt")
     return tuple(authenticated)
+
+
+def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if role == "selection" and payload.get("schema_version") == 2:
+        root_sha256 = payload.get("root_sha256")
+        root_record = {key: value for key, value in payload.items() if key != "root_sha256"}
+        if root_sha256 != _sha256_bytes(_identity_json(root_record)):
+            raise PublicationError("selection manifest root SHA-256 mismatch")
+        shards = payload.get("shards")
+        index = payload.get("index")
+        if not isinstance(shards, list) or not shards or not isinstance(index, dict):
+            raise PublicationError("selection manifest declared files are malformed")
+        return [*shards, index]
+    if role == "tokenized" and payload.get("schema_version") == 1:
+        required = {
+            "database_path",
+            "database_bytes",
+            "database_sha256",
+            "record_count",
+            "total_assistant_tokens",
+            "selection_sha256",
+            "resume_fingerprint",
+        }
+        if not required.issubset(payload):
+            raise PublicationError("tokenized receipt schema is incomplete")
+        return [
+            {
+                "path": payload["database_path"],
+                "bytes": payload["database_bytes"],
+                "sha256": payload["database_sha256"],
+            }
+        ]
+    if role == "exposure" and payload.get("schema_version") == 1:
+        required = {
+            "records_path",
+            "records_bytes",
+            "records_sha256",
+            "row_count",
+            "assistant_tokens",
+            "selection_sha256",
+            "resume_fingerprint",
+        }
+        if not required.issubset(payload):
+            raise PublicationError("exposure receipt schema is incomplete")
+        return [
+            {
+                "path": payload["records_path"],
+                "bytes": payload["records_bytes"],
+                "sha256": payload["records_sha256"],
+            }
+        ]
+    descriptors = payload.get("files")
+    if not isinstance(descriptors, list) or not descriptors:
+        raise PublicationError(f"{role} receipt has no declared files")
+    normalized: list[dict[str, Any]] = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict):
+            raise PublicationError(f"{role} file descriptor is malformed")
+        if "path" not in descriptor and "staged_path" in descriptor:
+            descriptor = descriptor | {"path": descriptor["staged_path"]}
+        normalized.append(descriptor)
+    return normalized
 
 
 def _preflight_rows(bundle: CorpusBundle) -> str:
@@ -456,30 +525,26 @@ def _materialize_shard(
     if index in prior:
         descriptor = prior[index]["shard"]
         _verify_file_record(partial, descriptor)
-        if descriptor["row_count"] != len(rows):
-            raise PublicationError("resumed shard row count mismatch")
+        _verify_parquet_rows(path, rows, descriptor, resumed=True)
         return descriptor
     _call_hook(phase_hook, "shard_open")
     if os.path.lexists(path):
-        raise PublicationError("partial has an unauthenticated shard")
+        descriptor = _parquet_descriptor(partial, path, rows)
+        state = _shard_state(input_identity, index, descriptor)
+        _write_exclusive_durable(partial / f"SHARD_STATE-{index:06d}.json", _canonical_json(state))
+        _call_hook(phase_hook, "shard_closed")
+        return descriptor
     table = pa.Table.from_pylist(rows, schema=_SCHEMA)
-    with path.open("xb") as output:
+    temporary = shards_dir / f".{name}.partial-{uuid4().hex}"
+    with temporary.open("xb") as output:
         pq.write_table(table, output, compression="zstd")
         output.flush()
         os.fsync(output.fileno())
-    descriptor = {
-        "path": f"shards/{name}",
-        "bytes": path.stat().st_size,
-        "sha256": _sha256_file(path),
-        "row_count": len(rows),
-    }
-    _verify_file_record(partial, descriptor)
-    state = {
-        "schema": "modelopt-specdec-partial-shard-v1",
-        "input_identity": input_identity,
-        "shard_index": index,
-        "shard": descriptor,
-    }
+    _call_hook(phase_hook, "shard_temporary_fsynced")
+    _rename_no_replace(temporary, path)
+    _call_hook(phase_hook, "shard_installed")
+    descriptor = _parquet_descriptor(partial, path, rows)
+    state = _shard_state(input_identity, index, descriptor)
     _write_exclusive_durable(partial / f"SHARD_STATE-{index:06d}.json", _canonical_json(state))
     _call_hook(phase_hook, "shard_closed")
     return descriptor
@@ -495,14 +560,76 @@ def _load_shard_states(partial: Path, input_identity: str) -> dict[int, dict[str
             or payload.get("input_identity") != input_identity
             or not isinstance(index, int)
             or index != len(states)
+            or not isinstance(payload.get("shard"), dict)
+            or payload.get("canonical_rows_sha256") != payload["shard"].get("canonical_rows_sha256")
         ):
             raise PublicationError("partial shard state does not match input identity")
         states[index] = payload
     declared = {Path(state["shard"]["path"]).name for state in states.values()}
     actual = {path.name for path in (partial / "shards").glob("*")}
-    if actual != declared:
+    allowed_orphan = f"part-{len(states):06d}.parquet"
+    if not declared.issubset(actual) or actual - declared not in (set(), {allowed_orphan}):
         raise PublicationError("partial contains unauthenticated shard files")
     return states
+
+
+def _shard_state(input_identity: str, index: int, descriptor: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": "modelopt-specdec-partial-shard-v1",
+        "input_identity": input_identity,
+        "shard_index": index,
+        "canonical_rows_sha256": descriptor["canonical_rows_sha256"],
+        "shard": descriptor,
+    }
+
+
+def _parquet_descriptor(partial: Path, path: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    descriptor = {
+        "path": path.relative_to(partial).as_posix(),
+        "bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+        "row_count": len(rows),
+        "assistant_token_count": sum(int(row["assistant_tokens"]) for row in rows),
+        "quarantine_count": sum(row["rejection_reason"] is not None for row in rows),
+        "canonical_rows_sha256": _canonical_rows_sha256(rows),
+    }
+    _verify_file_record(partial, descriptor)
+    _verify_parquet_rows(path, rows, descriptor, resumed=False)
+    return descriptor
+
+
+def _verify_parquet_rows(
+    path: Path,
+    expected_rows: list[dict[str, Any]],
+    descriptor: Mapping[str, Any],
+    *,
+    resumed: bool,
+) -> None:
+    try:
+        table = pq.read_table(path)
+    except Exception as error:
+        raise PublicationError("published Parquet shard cannot be reread") from error
+    actual_rows = table.to_pylist()
+    actual_tokens = sum(int(row["assistant_tokens"]) for row in actual_rows)
+    actual_quarantines = sum(row["rejection_reason"] is not None for row in actual_rows)
+    actual_digest = _canonical_rows_sha256(actual_rows)
+    if (
+        table.schema != _SCHEMA
+        or actual_rows != expected_rows
+        or descriptor.get("row_count") != len(actual_rows)
+        or descriptor.get("assistant_token_count") != actual_tokens
+        or descriptor.get("quarantine_count") != actual_quarantines
+        or descriptor.get("canonical_rows_sha256") != actual_digest
+    ):
+        prefix = "resumed shard" if resumed else "Parquet shard"
+        raise PublicationError(f"{prefix} semantics do not match current batch")
+
+
+def _canonical_rows_sha256(rows: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(_canonical_json(row))
+    return digest.hexdigest()
 
 
 def _normalize_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -635,23 +762,92 @@ def _valid_partial_identity(partial: Path, expected: str) -> bool:
     return payload.get("input_identity") == expected
 
 
-def _quarantine_partial(partial: Path, destination: Path, job_id: str) -> None:
+def _partial_tree_safe(partial: Path, artifacts: tuple[_AuthenticatedArtifact, ...]) -> bool:
+    """Validate a resumable partial without following or opening nested symlinks."""
+    input_files = {Path("inputs") / artifact.role / "receipt.json" for artifact in artifacts} | {
+        Path("inputs") / artifact.role / "files" / relative
+        for artifact in artifacts
+        for relative, _source, _size, _digest in artifact.files
+    }
+    input_directories = {
+        parent for path in input_files for parent in path.parents if parent != Path(".")
+    }
+    try:
+        root_metadata = os.lstat(partial)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            return False
+        for directory, directory_names, file_names in os.walk(partial, followlinks=False):
+            base = Path(directory)
+            for name in directory_names:
+                path = base / name
+                metadata = os.lstat(path)
+                relative = path.relative_to(partial)
+                if not stat.S_ISDIR(metadata.st_mode) or not _allowed_partial_directory(
+                    relative, input_directories
+                ):
+                    return False
+            for name in file_names:
+                path = base / name
+                metadata = os.lstat(path)
+                relative = path.relative_to(partial)
+                if not stat.S_ISREG(metadata.st_mode) or not _allowed_partial_file(
+                    relative, input_files
+                ):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def _allowed_partial_directory(relative: Path, input_directories: set[Path]) -> bool:
+    return relative in input_directories or relative == Path("shards")
+
+
+def _allowed_partial_file(relative: Path, input_files: set[Path]) -> bool:
+    if len(relative.parts) == 1:
+        return relative.name in {
+            "PARTIAL_IDENTITY.json",
+            "CORPUS_MANIFEST.json",
+            "PUBLICATION.json",
+        } or bool(re.fullmatch(r"SHARD_STATE-[0-9]{6}\.json", relative.name))
+    if relative.parts[0] == "inputs":
+        return relative in input_files
+    return (
+        len(relative.parts) == 2
+        and relative.parts[0] == "shards"
+        and re.fullmatch(r"part-[0-9]{6}\.parquet", relative.name) is not None
+    )
+
+
+def _quarantine_partial(partial: Path, quarantine: Path, parent: Path) -> None:
     before = _observe(partial)
-    quarantine = destination.with_name(f".{destination.name}.quarantine-{job_id}-{uuid4().hex}")
     if before.identity is None:
         raise PublicationError("stale partial cannot be safely observed")
     _rename_no_replace(partial, quarantine)
     if _observe(quarantine).identity != before.identity:
         raise PublicationError("quarantined partial inode does not match observed partial")
-    _fsync_directory(destination.parent)
+    _fsync_directory(parent)
 
 
-def _file_descriptor(value: object, role: str) -> tuple[str, int, str]:
+def _file_descriptor(value: object, role: str, root: Path) -> tuple[str, int, str]:
     if not isinstance(value, dict):
         raise PublicationError(f"{role} file descriptor is malformed")
-    relative = _safe_relative(value.get("path"), f"{role} file")
+    raw_path = value.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise PublicationError(f"{role} file path must be a non-empty string")
+    descriptor_path = Path(raw_path)
+    if descriptor_path.is_absolute():
+        try:
+            relative = descriptor_path.resolve(strict=False).relative_to(root).as_posix()
+        except ValueError as error:
+            raise PublicationError(f"{role} file path escapes its receipt root") from error
+    else:
+        relative = _safe_relative(raw_path, f"{role} file")
     size = value.get("bytes", value.get("byte_count", value.get("size")))
     digest = value.get("sha256")
+    unresolved = root / relative
+    if size is None and not unresolved.is_symlink() and unresolved.is_file():
+        size = unresolved.stat(follow_symlinks=False).st_size
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise PublicationError(f"{role} file descriptor has invalid bytes")
     if not isinstance(digest, str):
@@ -691,6 +887,21 @@ def _canonical_document(raw: bytes, label: str) -> dict[str, Any]:
         raise PublicationError(f"{label} is not JSON") from error
     if not isinstance(payload, dict) or raw != _canonical_json(payload):
         raise PublicationError(f"{label} is not canonical JSON")
+    return payload
+
+
+def _receipt_document(raw: bytes, role: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PublicationError(f"{role} receipt is not JSON") from error
+    if not isinstance(payload, dict):
+        raise PublicationError(f"{role} receipt is not a JSON object")
+    allowed_encodings = {_canonical_json(payload)}
+    if role == "source":
+        allowed_encodings.add(json.dumps(payload, indent=2, sort_keys=True).encode())
+    if raw not in allowed_encodings:
+        raise PublicationError(f"{role} receipt is not deterministically encoded JSON")
     return payload
 
 
@@ -790,6 +1001,10 @@ def _require_digest(label: str, value: object) -> None:
 
 def _canonical_json(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _identity_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
 def _call_hook(hook: Callable[[str], None] | None, phase: str) -> None:

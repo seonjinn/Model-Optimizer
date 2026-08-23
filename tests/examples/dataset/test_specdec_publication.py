@@ -25,6 +25,7 @@ import tracemalloc
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -92,7 +93,14 @@ def _bundle(root: Path, *, count: int = 5) -> publication.CorpusBundle:
 
 @pytest.mark.parametrize(
     "phase",
-    ["shard_open", "shard_closed", "manifest", "directory_fsync", "rename"],
+    [
+        "shard_open",
+        "shard_temporary_fsynced",
+        "shard_closed",
+        "manifest",
+        "directory_fsync",
+        "rename",
+    ],
 )
 def test_interruption_preserves_partial_and_retry_resumes_verified_shards(
     tmp_path: Path, phase: str
@@ -147,15 +155,93 @@ def test_stale_partial_is_quarantined_and_collision_is_fail_closed(tmp_path: Pat
         publication.publish_bundle(changed, destination, "other-job", rows_per_shard=2)
 
 
-@pytest.mark.parametrize("mutation", ["missing", "extra", "changed", "symlink"])
+def test_resumed_shard_rejects_forged_state_and_changed_parquet_semantics(tmp_path: Path) -> None:
+    """A mutable state file cannot bless Parquet rows that differ from the current batch."""
+    bundle = _bundle(tmp_path / "inputs")
+    destination = tmp_path / "published"
+
+    def interrupt(phase: str) -> None:
+        if phase == "shard_closed":
+            raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError):
+        publication.publish_bundle(
+            bundle, destination, "resume", rows_per_shard=2, _phase_hook=interrupt
+        )
+    partial = tmp_path / ".published.partial-resume"
+    shard = partial / "shards/part-000000.parquet"
+    changed_rows = [_rows(2)[0] | {"prompt_uuid": "f" * 64}, _rows(2)[1]]
+    normalized = [publication._normalize_row(row) for row in changed_rows]
+    pq.write_table(pa.Table.from_pylist(normalized, schema=publication._SCHEMA), shard)
+    state_path = partial / "SHARD_STATE-000000.json"
+    state = json.loads(state_path.read_bytes())
+    state["shard"]["bytes"] = shard.stat().st_size
+    state["shard"]["sha256"] = hashlib.sha256(shard.read_bytes()).hexdigest()
+    forged_rows_sha256 = hashlib.sha256(b"".join(_canonical(row) for row in normalized)).hexdigest()
+    state["canonical_rows_sha256"] = forged_rows_sha256
+    state["shard"]["canonical_rows_sha256"] = forged_rows_sha256
+    state_path.write_bytes(_canonical(state))
+
+    with pytest.raises(publication.PublicationError, match=r"resumed shard.*current batch"):
+        publication.publish_bundle(bundle, destination, "resume", rows_per_shard=2)
+    assert not destination.exists()
+
+
+def test_interruption_after_parquet_install_before_state_is_resumable(tmp_path: Path) -> None:
+    """An authenticated orphan shard is adopted after interruption before its state write."""
+    bundle = _bundle(tmp_path / "inputs")
+    destination = tmp_path / "published"
+
+    def interrupt(phase: str) -> None:
+        if phase == "shard_installed":
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        publication.publish_bundle(
+            bundle, destination, "orphan", rows_per_shard=2, _phase_hook=interrupt
+        )
+    partial = tmp_path / ".published.partial-orphan"
+    assert (partial / "shards/part-000000.parquet").is_file()
+    assert not (partial / "SHARD_STATE-000000.json").exists()
+
+    publication.publish_bundle(bundle, destination, "orphan", rows_per_shard=2)
+    assert destination.is_dir()
+
+
+def test_resume_quarantines_nested_symlink_before_writing(tmp_path: Path) -> None:
+    """Resume validates the complete partial tree no-follow before copying or sharding."""
+    bundle = _bundle(tmp_path / "inputs")
+    destination = tmp_path / "published"
+
+    def interrupt(phase: str) -> None:
+        if phase == "shard_closed":
+            raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError):
+        publication.publish_bundle(
+            bundle, destination, "symlink", rows_per_shard=2, _phase_hook=interrupt
+        )
+    partial = tmp_path / ".published.partial-symlink"
+    preserved_inputs = tmp_path / "preserved-inputs"
+    (partial / "inputs").rename(preserved_inputs)
+    sentinel = tmp_path / "sentinel"
+    sentinel.mkdir()
+    (sentinel / "keep").write_bytes(b"keep")
+    (partial / "inputs").symlink_to(sentinel, target_is_directory=True)
+
+    publication.publish_bundle(bundle, destination, "symlink", rows_per_shard=2)
+    assert (sentinel / "keep").read_bytes() == b"keep"
+    quarantines = list(tmp_path.glob(".published.quarantine-symlink-*"))
+    assert quarantines and (quarantines[0] / "inputs").is_symlink()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "changed", "symlink"])
 def test_input_receipts_reject_corrupt_or_unlisted_files(tmp_path: Path, mutation: str) -> None:
     bundle = _bundle(tmp_path / "inputs")
     artifact = bundle.artifacts[0]
     declared = artifact.receipt_path.parent / "source.jsonl"
     if mutation == "missing":
         declared.unlink()
-    elif mutation == "extra":
-        (artifact.receipt_path.parent / "unlisted.bin").write_bytes(b"extra")
     elif mutation == "changed":
         declared.write_bytes(b"changed")
     else:
@@ -195,13 +281,167 @@ def test_complete_role_set_and_count_reconciliation_are_required(tmp_path: Path)
         publication.publish_bundle(wrong_count, tmp_path / "published", "job-2")
 
 
+def test_task5_selection_and_task7_tokenized_exposure_receipts_publish_together(
+    tmp_path: Path,
+) -> None:
+    """Production Task 5/7 receipt schemas authenticate their native declared artifacts."""
+    base = _bundle(tmp_path / "generic")
+    source_root = tmp_path / "source"
+    source_file = source_root / "sources/repo/data.jsonl"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_bytes(_canonical({"messages": []}))
+    source_body = {
+        "schema_version": 1,
+        "name": "ptv23",
+        "source_manifest_sha256": "1" * 64,
+        "complete": True,
+        "raw_counts": {"math": 1},
+        "files": [
+            {
+                "repository_id": "owner/repo",
+                "configuration": "default",
+                "split": "train",
+                "revision": "a" * 40,
+                "license_expression": "Apache-2.0",
+                "approved_use": True,
+                "cell": "math",
+                "lane": "target-synthesis",
+                "source_path": "data.jsonl",
+                "staged_path": "sources/repo/data.jsonl",
+                "bytes": source_file.stat().st_size,
+                "sha256": hashlib.sha256(source_file.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    source_receipt = source_root / "SOURCE_INVENTORY.json"
+    source_receipt.write_text(json.dumps(source_body, indent=2, sort_keys=True))
+    source_artifact = publication.InputArtifact(
+        "source",
+        source_receipt,
+        hashlib.sha256(source_receipt.read_bytes()).hexdigest(),
+    )
+    selection_root = tmp_path / "selection"
+    (selection_root / "shards").mkdir(parents=True)
+    selection_shard = selection_root / "shards/rows-000001.jsonl"
+    selection_shard.write_bytes(_canonical({"prompt_uuid": "1" * 64}))
+    selection_index = selection_root / "selection-index.sqlite3"
+    selection_index.write_bytes(b"sqlite-index")
+    selection_body = {
+        "schema_version": 2,
+        "selection_sha256": "2" * 64,
+        "paired_cd_sha256": "3" * 64,
+        "identity": {"policy_sha256": "4" * 64},
+        "arms": {},
+        "row_count": 1,
+        "rows_per_shard": 1,
+        "shards": [
+            {
+                "path": "shards/rows-000001.jsonl",
+                "row_count": 1,
+                "byte_count": selection_shard.stat().st_size,
+                "sha256": hashlib.sha256(selection_shard.read_bytes()).hexdigest(),
+            }
+        ],
+        "index": {
+            "path": selection_index.name,
+            "sha256": hashlib.sha256(selection_index.read_bytes()).hexdigest(),
+        },
+    }
+    selection_body["root_sha256"] = hashlib.sha256(
+        json.dumps(selection_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    selection_receipt = selection_root / "SELECTION_MANIFEST.json"
+    selection_receipt.write_bytes(_canonical(selection_body))
+    selection_artifact = publication.InputArtifact(
+        "selection",
+        selection_receipt,
+        hashlib.sha256(selection_receipt.read_bytes()).hexdigest(),
+    )
+
+    task7_root = tmp_path / "task7"
+    task7_root.mkdir()
+    database = task7_root / "tokenized.sqlite3"
+    database.write_bytes(b"sqlite-tokenized")
+    tokenized_body = {
+        "schema_version": 1,
+        "arm": "B",
+        "selection_sha256": "2" * 64,
+        "record_count": 1,
+        "total_assistant_tokens": 1,
+        "database_path": str(database),
+        "database_bytes": database.stat().st_size,
+        "database_sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
+        "resume_fingerprint": "5" * 64,
+    }
+    tokenized_body["receipt_sha256"] = hashlib.sha256(
+        json.dumps(tokenized_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    tokenized_receipt = task7_root / "TOKENIZED.json"
+    tokenized_receipt.write_bytes(_canonical(tokenized_body))
+    tokenized_artifact = publication.InputArtifact(
+        "tokenized",
+        tokenized_receipt,
+        hashlib.sha256(tokenized_receipt.read_bytes()).hexdigest(),
+    )
+
+    records = task7_root / "one-pass.jsonl"
+    records.write_bytes(_canonical(_rows(1)[0]))
+    exposure_body = {
+        "schema_version": 1,
+        "name": "one-pass",
+        "selection_sha256": "2" * 64,
+        "assistant_tokens": 1,
+        "row_count": 1,
+        "records_path": str(records),
+        "records_bytes": records.stat().st_size,
+        "records_sha256": hashlib.sha256(records.read_bytes()).hexdigest(),
+        "resume_fingerprint": "5" * 64,
+    }
+    exposure_body["receipt_sha256"] = hashlib.sha256(
+        json.dumps(exposure_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    exposure_receipt = task7_root / "one-pass.json"
+    exposure_receipt.write_bytes(_canonical(exposure_body))
+    exposure_artifact = publication.InputArtifact(
+        "exposure",
+        exposure_receipt,
+        hashlib.sha256(exposure_receipt.read_bytes()).hexdigest(),
+    )
+    replacements = {
+        "source": source_artifact,
+        "selection": selection_artifact,
+        "tokenized": tokenized_artifact,
+        "exposure": exposure_artifact,
+    }
+    artifacts = tuple(replacements.get(artifact.role, artifact) for artifact in base.artifacts)
+    bundle = publication.CorpusBundle(
+        artifacts=artifacts,
+        rows=base.rows,
+        prompt_count=base.prompt_count,
+        assistant_token_count=base.assistant_token_count,
+        quarantine_count=base.quarantine_count,
+        selection_manifest_sha256=selection_artifact.receipt_sha256,
+        artifact_source_commit=base.artifact_source_commit,
+    )
+
+    publication.publish_bundle(bundle, tmp_path / "published", "native", rows_per_shard=2)
+    assert (tmp_path / "published/inputs/source/files/sources/repo/data.jsonl").is_file()
+    assert (tmp_path / "published/inputs/selection/files/shards/rows-000001.jsonl").is_file()
+    assert (tmp_path / "published/inputs/tokenized/files/tokenized.sqlite3").is_file()
+    assert (tmp_path / "published/inputs/exposure/files/one-pass.jsonl").is_file()
+
+
 def test_rename_races_preserve_every_observed_inode(tmp_path: Path, monkeypatch: Any) -> None:
     """An ambiguous rename never causes the publisher to delete either pathname."""
     bundle = _bundle(tmp_path / "inputs")
     destination = tmp_path / "published"
     preserved = tmp_path / "preserved-partial"
+    rename = publication._rename_no_replace
 
     def racing_rename(source: Path, target: Path) -> None:
+        if target != destination:
+            rename(source, target)
+            return
         source.rename(preserved)
         target.mkdir()
         (target / "sentinel").write_bytes(b"winner")
@@ -227,7 +467,8 @@ def test_successful_but_raised_rename_and_parent_fsync_are_typed(
 
     def ambiguous_rename(source: Path, target: Path) -> None:
         rename(source, target)
-        raise RuntimeError("helper lost acknowledgement")
+        if target == destination:
+            raise RuntimeError("helper lost acknowledgement")
 
     monkeypatch.setattr(publication, "_rename_no_replace", ambiguous_rename)
     with pytest.raises(RuntimeError) as captured:
@@ -252,6 +493,39 @@ def test_successful_but_raised_rename_and_parent_fsync_are_typed(
     assert second.is_dir()
     assert fsync_state.phase is publication.PublicationPhase.PARENT_FSYNC
     assert fsync_state.destination_observation.identity == fsync_state.expected_partial_identity
+
+
+def test_quarantine_acknowledgement_failure_records_new_path(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Recovery identifies a stale partial after quarantine rename succeeds ambiguously."""
+    original = _bundle(tmp_path / "first")
+    destination = tmp_path / "published"
+
+    def interrupt(phase: str) -> None:
+        if phase == "shard_closed":
+            raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError):
+        publication.publish_bundle(
+            original, destination, "quarantine", rows_per_shard=2, _phase_hook=interrupt
+        )
+    changed = _bundle(tmp_path / "second", count=3)
+    rename = publication._rename_no_replace
+
+    def ambiguous_quarantine(source: Path, target: Path) -> None:
+        rename(source, target)
+        raise OSError("quarantine acknowledgement lost")
+
+    monkeypatch.setattr(publication, "_rename_no_replace", ambiguous_quarantine)
+    with pytest.raises(OSError) as captured:
+        publication.publish_bundle(changed, destination, "quarantine", rows_per_shard=2)
+    state = publication.publication_recovery_state(captured.value)
+    assert state.phase is publication.PublicationPhase.QUARANTINE
+    assert state.quarantine_path is not None
+    assert state.quarantine_observation is not None
+    assert state.quarantine_observation.status == "present"
+    assert state.quarantine_observation.identity == state.expected_partial_identity
 
 
 def test_streaming_publication_has_bounded_memory_and_byte_idempotent_receipt(

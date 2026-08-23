@@ -204,6 +204,7 @@ def test_upload_writes_content_manifest_and_reuses_exact_completed_bundle(
     assert hashlib.sha256(manifest_bytes).hexdigest() == digest
     assert completion == {
         "artifact_id": context.artifact_id,
+        "artifact_source_commit": _ARTIFACT_SOURCE_COMMIT,
         "complete": True,
         "manifest_sha256": digest,
         "schema": "modelopt-specdec-completion-v1",
@@ -433,6 +434,20 @@ def test_download_verifies_manifest_bytes_then_atomically_installs(tmp_path: Pat
     assert not list(context.destination.parent.glob(f"{context.destination.name}.partial-*"))
     local_marker = context.durable / "transfers" / context.artifact_id / digest / "completion.json"
     assert local_marker.is_file()
+
+
+def test_download_requires_artifact_source_commit_before_remote_access(tmp_path: Path) -> None:
+    """Corpus completion and manifest verification require the producing source commit."""
+    context = _transfer_context(tmp_path)
+    result = _run_transfer(
+        context,
+        "download",
+        manifest_sha256="a" * 64,
+        artifact_source_commit=None,
+    )
+
+    assert result.returncode == 2
+    assert not context.calls.exists()
 
 
 def test_download_corruption_never_reaches_final_destination(tmp_path: Path) -> None:
@@ -684,6 +699,7 @@ def _run_transfer(
     extra_env: dict[str, str] | None = None,
     launcher_commit: str = _HEAD,
     allocation_env: dict[str, str | None] | None = None,
+    artifact_source_commit: str | None = _ARTIFACT_SOURCE_COMMIT,
 ) -> subprocess.CompletedProcess[str]:
     process = _start_transfer(
         context,
@@ -694,6 +710,7 @@ def _run_transfer(
         extra_env=extra_env,
         launcher_commit=launcher_commit,
         allocation_env=allocation_env,
+        artifact_source_commit=artifact_source_commit,
     )
     stdout, stderr = process.communicate(timeout=20)
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
@@ -709,6 +726,7 @@ def _start_transfer(
     extra_env: dict[str, str] | None = None,
     launcher_commit: str = _HEAD,
     allocation_env: dict[str, str | None] | None = None,
+    artifact_source_commit: str | None = _ARTIFACT_SOURCE_COMMIT,
 ) -> subprocess.Popen[str]:
     local_flag = "--source" if direction == "upload" else "--destination"
     local_path = context.source if direction == "upload" else context.destination
@@ -728,8 +746,8 @@ def _start_transfer(
         "--launcher-commit",
         launcher_commit,
     ]
-    if direction == "upload":
-        arguments.extend(("--artifact-source-commit", _ARTIFACT_SOURCE_COMMIT))
+    if artifact_source_commit is not None:
+        arguments.extend(("--artifact-source-commit", artifact_source_commit))
     if manifest_sha256 is not None:
         arguments.extend(("--manifest-sha256", manifest_sha256))
     environment = {

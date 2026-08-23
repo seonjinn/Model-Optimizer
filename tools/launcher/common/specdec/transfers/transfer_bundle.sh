@@ -22,7 +22,7 @@ LAUNCHER_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 MANIFEST_TOOL="${SCRIPT_DIR}/bundle_manifest.py"
 DIRECTION="${1:-}"
 [[ "$DIRECTION" == "upload" || "$DIRECTION" == "download" ]] || {
-    echo "usage: $0 upload|download --cluster-profile PATH --artifact-id ID --remote-root REMOTE:PATH (--source PATH | --destination PATH) [--manifest-sha256 SHA256] [--rclone-bin PATH]" >&2
+    echo "usage: $0 upload|download --cluster-profile PATH --artifact-id ID --artifact-source-commit COMMIT --remote-root REMOTE:PATH (--source PATH | --destination PATH) [--manifest-sha256 SHA256] [--rclone-bin PATH]" >&2
     exit 2
 }
 shift
@@ -38,7 +38,7 @@ ARTIFACT_SOURCE_COMMIT=""
 RCLONE_BIN="rclone"
 
 usage() {
-    echo "usage: $0 $DIRECTION --cluster-profile PATH --artifact-id ID --remote-root REMOTE:PATH (--source PATH | --destination PATH) [--manifest-sha256 SHA256] [--rclone-bin PATH]" >&2
+    echo "usage: $0 $DIRECTION --cluster-profile PATH --artifact-id ID --artifact-source-commit COMMIT --remote-root REMOTE:PATH (--source PATH | --destination PATH) [--manifest-sha256 SHA256] [--rclone-bin PATH]" >&2
     exit 2
 }
 
@@ -69,7 +69,7 @@ if [[ "$DIRECTION" == "upload" ]]; then
     [[ -d "$SOURCE" && -z "$DESTINATION" && -z "$MANIFEST_SHA256" && "$ARTIFACT_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || usage
     LOCAL_PATH="$SOURCE"
 else
-    [[ -z "$SOURCE" && -n "$DESTINATION" && "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || usage
+    [[ -z "$SOURCE" && -n "$DESTINATION" && "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ && "$ARTIFACT_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || usage
     LOCAL_PATH="$DESTINATION"
 fi
 [[ "$LAUNCHER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || usage
@@ -235,7 +235,7 @@ record_verified_state() {
 verify_remote_upload() {
     local completion="$1"
     local remote_manifest="$2"
-    python3 "$MANIFEST_TOOL" verify-completion --completion "$completion" --artifact-id "$ARTIFACT_ID" --manifest-sha256 "$MANIFEST_SHA256"
+    python3 "$MANIFEST_TOOL" verify-completion --completion "$completion" --artifact-id "$ARTIFACT_ID" --manifest-sha256 "$MANIFEST_SHA256" --artifact-source-commit "$ARTIFACT_SOURCE_COMMIT"
     fetch_remote "${REMOTE_BUNDLE}/manifest.json" "$remote_manifest" || return $?
     python3 "$MANIFEST_TOOL" verify-manifest --manifest "$remote_manifest" --expected-sha256 "$MANIFEST_SHA256" --expected-artifact-source-commit "$ARTIFACT_SOURCE_COMMIT"
     cmp -s -- "$LOCAL_MANIFEST" "$remote_manifest" || {
@@ -285,7 +285,7 @@ if [[ "$DIRECTION" == "upload" ]]; then
     fi
 
     LOCAL_COMPLETION="${TRANSFER_WORK}/completion.json"
-    python3 "$MANIFEST_TOOL" write-completion --output "$LOCAL_COMPLETION" --artifact-id "$ARTIFACT_ID" --manifest-sha256 "$MANIFEST_SHA256"
+    python3 "$MANIFEST_TOOL" write-completion --output "$LOCAL_COMPLETION" --artifact-id "$ARTIFACT_ID" --manifest-sha256 "$MANIFEST_SHA256" --artifact-source-commit "$ARTIFACT_SOURCE_COMMIT"
     run_rclone copyto "$LOCAL_COMPLETION" "${REMOTE_BUNDLE}/completion.json" --checksum
     fetch_remote "${REMOTE_BUNDLE}/completion.json" "$EXISTING_COMPLETION" || {
         status=$?; echo "could not verify published completion marker" >&2; exit "$status";
@@ -308,13 +308,13 @@ else
         *) echo "could not fetch remote completion marker: $ARTIFACT_ID" >&2; exit "$marker_status" ;;
     esac
 fi
-python3 "$MANIFEST_TOOL" verify-completion --completion "$REMOTE_COMPLETION" --artifact-id "$ARTIFACT_ID" --manifest-sha256 "$MANIFEST_SHA256"
+python3 "$MANIFEST_TOOL" verify-completion --completion "$REMOTE_COMPLETION" --artifact-id "$ARTIFACT_ID" --manifest-sha256 "$MANIFEST_SHA256" --artifact-source-commit "$ARTIFACT_SOURCE_COMMIT"
 if fetch_remote "${REMOTE_BUNDLE}/manifest.json" "$REMOTE_MANIFEST"; then
     :
 else
     status=$?; echo "could not fetch remote manifest: $ARTIFACT_ID" >&2; exit "$status"
 fi
-python3 "$MANIFEST_TOOL" verify-manifest --manifest "$REMOTE_MANIFEST" --expected-sha256 "$MANIFEST_SHA256"
+python3 "$MANIFEST_TOOL" verify-manifest --manifest "$REMOTE_MANIFEST" --expected-sha256 "$MANIFEST_SHA256" --expected-artifact-source-commit "$ARTIFACT_SOURCE_COMMIT"
 
 if [[ -e "$LOCAL_PATH" || -L "$LOCAL_PATH" ]]; then
     if python3 "$MANIFEST_TOOL" verify-tree --manifest "$REMOTE_MANIFEST" --root "$LOCAL_PATH"; then
