@@ -226,3 +226,30 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
 - `git diff --check`: PASS.
 - Pyright and the repository `pre-commit` command remain unavailable in the
   local environment; no tool bootstrapping was performed.
+
+## Round 3 adversarial corrective pass
+
+- A-repair production pairing now requires a canonical Task 5 complement
+  receipt with a content-addressed rows artifact, source-inventory root, and
+  selection root; it no longer derives a purported complement identity by
+  hashing an arbitrary physical tail. The parser rejects unsafe, undeclared,
+  or byte/digest-mutated row streams before row decoding.
+- Task 7 now publishes the SQLite and its receipt together as a private token
+  bundle directory. The private bundle is fsynced, checked for no-follow
+  regular children, then installed as one immutable directory; preserved
+  partials raise `PTV2TokenizedRecoveryError` rather than permitting a poisoned
+  retry. Exposure output is kept outside the immutable token bundle and uses
+  no-follow exclusive writes.
+- One-pass semantic validation recounts the token SQLite and rechecks every
+  stored mask against its stored assistant token count. The segment reset cursor
+  is exactly `1300000`; the receipt retains `2540 + 1368 = 3908` steps and
+  valid tails `32/96`. The public field is now explicitly
+  `packed_sequence_lower_bound`, not a falsely measured packing count.
+
+### Adversarial-pass verification
+
+- Direct Task 5 artifact mutation probe: GREEN; an unlisted/mutated rows stream
+  is rejected before it can enter A-repair.
+- Focused Task 9 suite: PASS, `66 passed` (336 pre-existing macOS pytest
+  cleanup warnings).
+- Ruff check/format and `git diff --check`: PASS.

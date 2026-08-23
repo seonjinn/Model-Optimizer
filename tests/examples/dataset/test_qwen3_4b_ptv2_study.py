@@ -28,6 +28,7 @@ try:
         iter_ptv2_staged_source_rows,
         iter_ptv2_study_occurrences,
         load_ptv2_study_policy,
+        load_task5_complement_artifact,
         main,
         select_a_repair_view,
         select_authenticated_b_balanced_view,
@@ -346,6 +347,26 @@ def test_authenticated_b_selection_rejects_untyped_exclusion_root(tmp_path: Path
             policy=load_ptv2_study_policy(POLICY),
             exclusions=object(),  # type: ignore[arg-type]
         )
+
+
+def test_task5_complement_artifact_rejects_an_unlisted_or_mutated_row_stream(
+    tmp_path: Path,
+) -> None:
+    """A-repair cannot label a raw tail as a Task 5 complement artifact."""
+    rows = tmp_path / "rows.jsonl"
+    rows.write_bytes(b"{}\n")
+    receipt = {
+        "schema_version": 1,
+        "selection_sha256": "1" * 64,
+        "source_inventory_sha256": "2" * 64,
+        "rows": {"path": rows.name, "bytes": rows.stat().st_size, "sha256": "0" * 64},
+    }
+    receipt["root_sha256"] = sha256(canonical_json(receipt)).hexdigest()
+    path = tmp_path / "TASK5_COMPLEMENT.json"
+    path.write_bytes(canonical_json(receipt) + b"\n")
+
+    with pytest.raises(PTV2StudyError, match="rows do not match"):
+        load_task5_complement_artifact(path)
 
 
 def test_b_index_publication_is_no_replace_and_preserves_prior_receipt(tmp_path: Path) -> None:

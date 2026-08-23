@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import uuid
 from collections import Counter
 from collections.abc import Iterator, Mapping
@@ -38,6 +39,7 @@ __all__ = [
     "ExposureViewError",
     "PTV2OnePassCorpus",
     "PTV2StudyExposureViews",
+    "PTV2TokenizedRecoveryError",
     "PairedExposureViews",
     "build_exposure_views",
     "build_paired_exposure_views",
@@ -61,6 +63,10 @@ _EXPOSURE_POLICY_SHA256 = sha256(
 
 class ExposureViewError(ValueError):
     """An exact-token staging identity or record contract is invalid."""
+
+
+class PTV2TokenizedRecoveryError(ExposureViewError):
+    """A preserved Task 7 partial requires an explicit operator recovery action."""
 
 
 @dataclass(frozen=True)
@@ -140,8 +146,8 @@ class PTV2OnePassCorpus:
     serialized_tokens: int = 0
     # This is a lower bound until a concrete packer receipt is attached.  It is
     # deliberately not described as a measured packed-sequence count.
-    packed_sequences: int = 0
-    milestone_occurrences: tuple[int, ...] = (500_224, 1_000_448, 1_300_480, 2_000_000)
+    packed_sequence_lower_bound: int = 0
+    milestone_occurrences: tuple[int, ...] = (500_224, 1_000_448, 1_300_000, 2_000_000)
     milestone_steps: tuple[int, ...] = (977, 1_954, 2_540, 3_908)
     segment_occurrences: tuple[int, int] = (1_300_000, 700_000)
     segment_steps: tuple[int, int] = (2_540, 1_368)
@@ -176,7 +182,7 @@ def derive_ptv2_one_pass_corpus(
     tokenizer: Any,
     output_root: Path,
     sequence_length: int = 4_096,
-    milestone_occurrences: tuple[int, ...] = (500_224, 1_000_448, 1_300_480, 2_000_000),
+    milestone_occurrences: tuple[int, ...] = (500_224, 1_000_448, 1_300_000, 2_000_000),
     milestone_steps: tuple[int, ...] = (977, 1_954, 2_540, 3_908),
 ) -> PTV2OnePassCorpus:
     """Materialize authenticated assistant masks from the selected SQLite responses."""
@@ -218,9 +224,12 @@ def derive_ptv2_one_pass_corpus(
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir():
         raise ExposureViewError("PTV2 tokenized output root is unsafe")
-    database_path = root / f"{strategy.lower()}-tokenized.sqlite3"
-    receipt_path = root / f"{strategy.lower()}-TOKENIZED.json"
-    temporary_database = _prepare_ptv2_tokenized_database(root, database_path, receipt_path)
+    bundle_path = root / f"{strategy.lower()}-tokenized"
+    temporary_bundle = _prepare_ptv2_tokenized_bundle(root, bundle_path)
+    temporary_database = temporary_bundle / "records.sqlite3"
+    temporary_receipt = temporary_bundle / "TOKENIZED.json"
+    database_path = bundle_path / "records.sqlite3"
+    receipt_path = bundle_path / "TOKENIZED.json"
     occurrence_digest = sha256()
     response_digest = sha256()
     count = assistant_tokens = serialized_tokens = 0
@@ -336,8 +345,7 @@ def derive_ptv2_one_pass_corpus(
     if unique < 1 or natural < 0 or constructed < 0 or unique + natural + constructed != count:
         raise ExposureViewError("PTV2 selection multiplicity summary does not reconcile")
     _fsync_file(temporary_database)
-    _publish_ptv2_tokenized_database(temporary_database, database_path)
-    database_sha256 = _sha256_file(database_path)
+    database_sha256 = _sha256_file(temporary_database)
     receipt = {
         "schema_version": 1,
         "strategy": strategy,
@@ -361,15 +369,17 @@ def derive_ptv2_one_pass_corpus(
         "training_config_sha256": training_config_sha256,
         "source_response_root_sha256": response_digest.hexdigest(),
         "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
-        "database_path": str(database_path),
+        "database_path": "records.sqlite3",
         "database_sha256": database_sha256,
-        "database_bytes": database_path.stat().st_size,
+        "database_bytes": temporary_database.stat().st_size,
     }
     receipt_sha256 = sha256(canonical_json(receipt)).hexdigest()
     _write_exclusive(
-        receipt_path, canonical_json(receipt | {"receipt_sha256": receipt_sha256}) + b"\n"
+        temporary_receipt, canonical_json(receipt | {"receipt_sha256": receipt_sha256}) + b"\n"
     )
-    _fsync_directory(root)
+    _fsync_file(temporary_receipt)
+    _fsync_directory(temporary_bundle)
+    _publish_ptv2_tokenized_bundle(temporary_bundle, bundle_path)
     return PTV2OnePassCorpus(
         strategy=strategy,
         occurrence_count=count,
@@ -385,7 +395,7 @@ def derive_ptv2_one_pass_corpus(
         natural_duplicate_count=natural,
         constructed_repeat_count=constructed,
         serialized_tokens=serialized_tokens,
-        packed_sequences=receipt["packed_sequence_lower_bound"],
+        packed_sequence_lower_bound=receipt["packed_sequence_lower_bound"],
         milestone_occurrences=milestone_occurrences,
         milestone_steps=milestone_steps,
         tokenized_path=str(database_path),
@@ -446,7 +456,10 @@ def build_ptv2_study_exposures(
 
 def _materialize_ptv2_exposure(corpus: PTV2OnePassCorpus, target_tokens: int) -> str:
     """Persist an exact mask-trimmed prefix rather than reporting a scalar claim."""
-    root = Path(corpus.tokenized_path).parent
+    root = Path(corpus.tokenized_path).parent.parent / f"{corpus.strategy.lower()}-exposures"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise ExposureViewError("PTV2 exposure output root is unsafe")
     stem = f"{corpus.strategy.lower()}-{target_tokens}-assistant-tokens"
     records_path = root / f"{stem}.jsonl"
     receipt_path = root / f"{stem}.json"
@@ -457,7 +470,7 @@ def _materialize_ptv2_exposure(corpus: PTV2OnePassCorpus, target_tokens: int) ->
     rows = 0
     connection = sqlite3.connect(f"file:{corpus.tokenized_path}?mode=ro", uri=True)
     try:
-        with records_path.open("xb") as output:
+        with _open_nofollow_exclusive(records_path) as output:
             for ordinal, ids_json, mask_json, available in connection.execute(
                 "SELECT ordinal,input_ids_json,loss_mask_json,assistant_tokens FROM records ORDER BY ordinal"
             ):
@@ -499,9 +512,10 @@ def _materialize_ptv2_exposure(corpus: PTV2OnePassCorpus, target_tokens: int) ->
         "assistant_loss_target_sha256": corpus.assistant_loss_target_sha256,
     }
     receipt_sha256 = sha256(canonical_json(receipt)).hexdigest()
-    _write_exclusive(
-        receipt_path, canonical_json(receipt | {"receipt_sha256": receipt_sha256}) + b"\n"
-    )
+    with _open_nofollow_exclusive(receipt_path) as output:
+        output.write(canonical_json(receipt | {"receipt_sha256": receipt_sha256}) + b"\n")
+        output.flush()
+        os.fsync(output.fileno())
     _fsync_directory(root)
     return receipt_sha256
 
@@ -528,7 +542,7 @@ def _validate_ptv2_one_pass(corpus: PTV2OnePassCorpus, strategy: str) -> None:
     if corpus.milestone_occurrences != (
         500_224,
         1_000_448,
-        1_300_480,
+        1_300_000,
         2_000_000,
     ) or corpus.milestone_steps != (
         977,
@@ -583,6 +597,30 @@ def _validate_ptv2_one_pass(corpus: PTV2OnePassCorpus, strategy: str) -> None:
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ExposureViewError("PTV2 one-pass receipt does not match the claimed corpus")
+    connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    try:
+        row = connection.execute(
+            "SELECT COUNT(*),COALESCE(SUM(assistant_tokens),0) FROM records"
+        ).fetchone()
+        if row != (corpus.occurrence_count, corpus.assistant_tokens):
+            raise ExposureViewError("PTV2 tokenized SQLite totals do not match its receipt")
+        for ids_json, mask_json, assistant_tokens in connection.execute(
+            "SELECT input_ids_json,loss_mask_json,assistant_tokens FROM records"
+        ):
+            ids = json.loads(ids_json)
+            mask = json.loads(mask_json)
+            if (
+                not isinstance(ids, list)
+                or not isinstance(mask, list)
+                or len(ids) != len(mask)
+                or any(value not in (0, 1) for value in mask)
+                or sum(mask) != assistant_tokens
+            ):
+                raise ExposureViewError("PTV2 tokenized SQLite mask semantics are invalid")
+    except sqlite3.Error as error:
+        raise ExposureViewError("PTV2 tokenized SQLite cannot be semantically recounted") from error
+    finally:
+        connection.close()
 
 
 @dataclass(frozen=True)
@@ -648,6 +686,13 @@ def _write_exclusive(path: Path, payload: bytes) -> None:
         os.fsync(output.fileno())
 
 
+def _open_nofollow_exclusive(path: Path):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.fdopen(os.open(path, flags, 0o600), "wb")
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -664,18 +709,19 @@ def _fsync_file(path: Path) -> None:
         os.close(descriptor)
 
 
-def _prepare_ptv2_tokenized_database(root: Path, destination: Path, receipt: Path) -> Path:
-    """Reserve a private no-follow SQLite staging file without touching the final name."""
-    if os.path.lexists(destination) or os.path.lexists(receipt):
+def _prepare_ptv2_tokenized_bundle(root: Path, destination: Path) -> Path:
+    """Create a private bundle so SQLite and its receipt publish as one unit."""
+    if os.path.lexists(destination):
         raise ExposureViewError("PTV2 tokenized output is immutable and already exists")
     partials = tuple(root.glob(f".{destination.name}.partial-*"))
     if partials:
-        raise ExposureViewError("PTV2 tokenized partial requires explicit recovery")
+        raise PTV2TokenizedRecoveryError("PTV2 tokenized partial requires typed recovery")
     temporary = root / f".{destination.name}.partial-{uuid.uuid4().hex}"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(temporary, flags, 0o600)
+    temporary.mkdir(mode=0o700)
+    metadata = os.lstat(temporary)
+    if temporary.is_symlink() or not stat.S_ISDIR(metadata.st_mode) or metadata.st_nlink != 2:
+        raise ExposureViewError("PTV2 tokenized partial is not a private directory")
+    descriptor = os.open(temporary, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(descriptor)
     finally:
@@ -683,17 +729,28 @@ def _prepare_ptv2_tokenized_database(root: Path, destination: Path, receipt: Pat
     return temporary
 
 
-def _publish_ptv2_tokenized_database(temporary: Path, destination: Path) -> None:
-    """Durably install a private tokenized index without replacing prior evidence."""
+def _publish_ptv2_tokenized_bundle(temporary: Path, destination: Path) -> None:
+    """Durably install the fully authenticated token bundle without replacement."""
     metadata = os.lstat(temporary)
-    if not temporary.is_file() or temporary.is_symlink() or metadata.st_nlink != 1:
-        raise ExposureViewError("PTV2 tokenized partial is not a private regular file")
+    if (
+        not temporary.is_dir()
+        or temporary.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_nlink != 2
+        or any(
+            (temporary / name).is_symlink() or not (temporary / name).is_file()
+            for name in ("records.sqlite3", "TOKENIZED.json")
+        )
+    ):
+        raise ExposureViewError("PTV2 tokenized partial is not a private bundle")
+    if os.path.lexists(destination):
+        raise ExposureViewError("PTV2 tokenized output is immutable and already exists")
     try:
-        os.link(temporary, destination, follow_symlinks=False)
+        os.rename(temporary, destination)
     except FileExistsError as error:
         raise ExposureViewError("PTV2 tokenized output is immutable and already exists") from error
-    _fsync_directory(destination.parent)
-    temporary.unlink()
+    if not destination.is_dir() or destination.is_symlink():
+        raise ExposureViewError("PTV2 published tokenized bundle is unsafe")
     _fsync_directory(destination.parent)
 
 
