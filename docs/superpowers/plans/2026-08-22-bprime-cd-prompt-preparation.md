@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prepare the Qwen3-4B full-PTV2 A-prefix/B-balanced diversity study, immutable B′ 700K and paired C/D 2M prompt views, target-specific response corpora, exact assistant-token exposure views, and fail-closed cutover/evaluation receipts without disturbing the drafter jobs that still train on the historical 1.3M PTV2 prefix.
+**Goal:** Prepare the Qwen3-4B A-repair/B-balanced diversity study, immutable B′ 700K and paired C/D 2M prompt views, target-specific response corpora, exact assistant-token exposure views, and fail-closed cutover/evaluation receipts without disturbing the drafter jobs that still train on the historical 1.3M PTV2 prefix.
 
-**Architecture:** Extend the existing canonical audit, inventory, trajectory, selection, and transfer tools with exact occurrence-count policy layers. Before cluster readiness, build one Qwen3-4B A-prefix view from the exact first 2M authenticated source occurrences and one B-balanced view with exact five-cell occurrence quotas, then train each view once while checkpointing at four occurrence milestones; keep B′/C/D as separate complement and mixed-source experiments. Preserve A's natural duplicates and both arms' source-native assistant completions, authenticate B's deliberate occurrence reuse, and derive one-pass plus reachable exact-token views from immutable source-response corpora. Keep source staging, replay validation, publication, cluster readiness, account-bound test-only scheduling, weight-only checkpoint adoption, training, evaluation, and report refresh as separately testable receipt boundaries.
+**Architecture:** Extend the existing canonical audit, inventory, trajectory, selection, and transfer tools with exact occurrence-count policy layers. Build A-repair from the exact historical 1.3M source-native occurrence stream followed by an exact 700K STEM/multilingual complement, and build B-balanced from exact five-cell and five-language quotas. Train both with the same two-segment 1.3M-plus-700K optimizer schedule and exact scientific boundaries. B has independent readiness: execute B inventory, a 200-step 16-node GBS512 canary, and the B full run first; prepare A-repair later from the same verified parent. Keep B′/C/D as separate complement and mixed-source experiments, and keep source staging, replay validation, publication, readiness, account-bound scheduling, weight-only checkpoint adoption, training, evaluation, and report refresh as separately testable receipt boundaries.
 
 **Tech Stack:** Python 3.12+, dataclasses and `TypedDict`, PyArrow/Parquet Zstd, Hugging Face `datasets` and `transformers`, YAML, Bash/SLURM/Pyxis, PDX/PBSS `rclone`, ModelOpt DFlash/DSpark training, Speculators and SPEED-Bench evaluators, pytest, Pyright, Ruff, ShellCheck, pre-commit.
 
@@ -14,15 +14,18 @@
 
 - The historical source is exactly 1,309,377 row occurrences, and the training prefix is exactly the first 1,300,000 occurrences in Hugging Face streaming order; the excluded tail is exactly 9,377 German occurrences.
 - The historical prefix histogram is Chat 627,720, Code 175,000, Math 239,467, German 257,813, and zero for STEM, Japanese, Spanish, French, Italian, and explicit SWE/Agentic/Tool.
-- The historical prefix contains exactly 931,363 unique canonical prompt UUIDs. Preserve all duplicate occurrences in lineage. Exclude those UUIDs from complement B′/C/D views; the separate A-prefix/B-balanced study intentionally uses the complete authenticated PTV2 occurrence pool without evaluator-held-out filtering and reports any held-out overlap.
-- The Qwen3-4B PTV2 study is separate from B′. A-prefix is exactly the first
-  2,000,000 authenticated source occurrences in Hugging Face/source order and
-  preserves natural duplicates. It never deduplicates or constructs repeats.
+- The historical prefix contains exactly 931,363 unique canonical prompt UUIDs. Preserve all duplicate occurrences in lineage. Exclude those UUIDs from every 700K complement selection and from B′/C/D views. B-balanced independently samples the complete authenticated PTV2 occurrence pool and reports evaluator-held-out overlap.
+- A-repair phase 1 is exactly the historical 1,300,000 authenticated source
+  occurrences in Hugging Face/source order with natural duplicates preserved.
+  Phase 2 is exactly 700,000 complement occurrences: STEM 200,000 and
+  JA/ES/FR/IT 125,000 each, with German zero. It never uses the next 700K
+  source-order occurrences.
 - B-balanced contains exactly 2,000,000 materialized occurrences:
   Math 500,000; Code 400,000; STEM 500,000; Chat 400,000; Multilingual 200,000.
-  It uses seeded within-cell ranking and records explicit occurrence
-  multiplicity when a cell must cycle through limited source capacity. It
-  never borrows or renormalizes.
+  Multilingual is exactly DE/JA/ES/FR/IT 40,000 each. It uses seeded
+  within-cell and within-language ranking and records explicit occurrence
+  multiplicity when a cell or language subcell must cycle through limited
+  source capacity. It never borrows or renormalizes across cells or languages.
 - A and B are matched on occurrence count, not unique UUID count. Every receipt
   reports unique UUIDs, natural duplicates, deliberate B reuse, per-cell unique
   counts, and multiplicity histograms independently.
@@ -32,9 +35,13 @@
   assistant-loss target/mask, sequence-length policy, and training
   configuration. A/B performs no response stripping, regeneration, retry
   promotion, or synthesis reserve substitution.
-- Each arm trains for exactly one pass. At global batch 512, checkpoint after
-  500K/1M/1.3M/2M occurrences at steps 977/1,954/2,540/3,907; the final step
-  uses an exact 128-occurrence partial batch/mask. The old `s25391` schedule is
+- Each arm uses the same two-segment GBS512 schedule. Segment 1 consumes
+  exactly 1,300,000 occurrences in 2,540 steps with 32 valid occurrences in
+  its final batch. Segment 2 consumes exactly 700,000 occurrences in 1,368
+  additional steps with 96 valid occurrences in its final batch, for 3,908
+  cumulative steps. Optimizer/scheduler state continues across the boundary;
+  batch alignment restarts. Optional within-segment labels are nominal and
+  bind exact batch-aligned cursors. The old `s25391` schedule is
   approximately ten passes over 1.3M and is forbidden for this study.
 - The 64M assistant-token boundary is runtime/gating only. Publish a 256M
   assistant-token checkpoint only when both 2M-occurrence one-pass receipts
@@ -76,11 +83,12 @@
 - `examples/dataset/promote_synthesis_reserve.py` — validate target outputs and deterministically promote successful reserve rows.
 - `examples/dataset/build_assistant_token_views.py` — exact 256M/1B/common token views and one-pass receipts.
 - `examples/dataset/specdec_publication.py` — verified resumable shard writing and no-replace atomic publication.
-- `examples/dataset/qwen3_4b_ptv2_study.py` — exact A-prefix/B-balanced policy,
-  source-order and balanced occurrence selection, multiplicity proofs, and
-  study receipts.
+- `examples/dataset/qwen3_4b_ptv2_study.py` — exact A-repair/B-balanced policy,
+  historical-plus-complement and balanced occurrence selection, multiplicity
+  proofs, and study receipts.
 - `examples/dataset/qwen3_4b_ptv2_study.yaml` — exact 2M occurrence arms,
-  balanced cell quotas, occurrence milestones, seed, and exposure gates.
+  repair/complement and balanced quotas, exact segment boundaries, seed, and
+  exposure gates.
 - `examples/dataset/ptv23_builder_readiness.py` — aggregate source, count, reserve, replay, generation, exposure, and publication blockers.
 - `tools/launcher/common/specdec/run_ptv23_source_stage.sbatch` — CPU source staging and digest validation.
 - `tools/launcher/common/specdec/run_bprime_cd_builder.sbatch` — CPU prompt selection/publication and bounded GPU synthesis entrypoint.
@@ -121,7 +129,9 @@ The implementation keeps these signatures stable across tasks:
 - `promote_responses(view: PromptView, attempts: Iterable[GenerationAttempt], identity: GenerationIdentity) -> ResponseCorpus`
 - `build_exposure_view(corpus: ResponseCorpus, target_tokens: int) -> ExposureView`
 - `load_ptv2_study_policy(path: Path) -> PTV2StudyPolicy`
-- `select_ptv2_study_views(sources: SourceInventory, baseline: BaselineAudit, held_out: ExclusionIndex, policy: PTV2StudyPolicy) -> PTV2StudyBundle`
+- `select_a_repair_view(sources: SourceInventory, baseline: BaselineAudit, complement: PromptView, held_out: ExclusionIndex, policy: PTV2StudyPolicy) -> PTV2StudyView`
+- `select_b_balanced_view(sources: SourceInventory, held_out: ExclusionIndex, policy: PTV2StudyPolicy) -> PTV2StudyView`
+- `assemble_ptv2_study_bundle(a_repair: PTV2StudyView, b_balanced: PTV2StudyView, policy: PTV2StudyPolicy) -> PTV2StudyBundle`
 - `iter_ptv2_study_occurrences(view: PTV2StudyView) -> Iterator[StudyOccurrence]`
 - `publish_bundle(bundle: CorpusBundle, destination: Path, job_id: str) -> PublicationReceipt`
 - `assess_readiness(inputs: ReadinessInputs) -> ReadinessReceipt`
@@ -518,7 +528,7 @@ git add examples/dataset/specdec_publication.py tests/examples/dataset/test_spec
 git commit -s -S -m "feat(specdec): publish immutable prompt corpus bundles"
 ```
 
-### Task 9: Build the Qwen3-4B full-PTV2 A-prefix/B-balanced study
+### Task 9: Build the Qwen3-4B A-repair/B-balanced study
 
 **Files:**
 - Create: `examples/dataset/qwen3_4b_ptv2_study.py`
@@ -534,18 +544,23 @@ git commit -s -S -m "feat(specdec): publish immutable prompt corpus bundles"
   `BaselineAudit`, content-addressed evaluator `ExclusionIndex` for overlap
   reporting, authenticated source-native assistant responses, and Task 7
   tokenizer/template/assistant-loss-target identity.
-- Produces: `PTV2StudyPolicy`, exact A-prefix and B-balanced `PTV2StudyView`
-  values, `PTV2StudyBundle`, 500K/1M/1.3M/2M occurrence milestone receipts,
+- Produces: `PTV2StudyPolicy`, exact A-repair and B-balanced `PTV2StudyView`
+  values, `PTV2StudyBundle`, exact 1.3M and 2M scientific-boundary receipts,
   exact 2M-occurrence one-pass receipts, a reachable paired 256M token receipt,
   and one immutable Task 8 publication per strategy.
 
 - [ ] **Step 1: Add RED policy and arithmetic tests.** Require exactly two
-  strategies and reject all unique-pool scale lists. Assert A uses source-order
-  `take(2_000_000)` with duplicates preserved; assert B has exact
+  strategies and reject all unique-pool scale lists. Assert A-repair uses the
+  exact historical source-order `take(1_300_000)` with duplicates preserved,
+  followed by exact complement quotas STEM 200K and JA/ES/FR/IT 125K each with
+  German zero. Assert B has exact
   Math/Code/STEM/Chat/Multilingual occurrence counts
-  `500K/400K/500K/400K/200K`. Require one trainer epoch, GBS512, occurrence
-  milestones `500K/1M/1.3M/2M`, exact checkpoint steps
-  `977/1,954/2,540/3,907`, and an exact 128-occurrence final partial batch.
+  `500K/400K/500K/400K/200K`, with Multilingual split exactly
+  DE/JA/ES/FR/IT `40K/40K/40K/40K/40K`. Require one trainer epoch, GBS512,
+  exact segment sizes `1_300_000/700_000`, segment steps `2_540/1_368`,
+  cumulative steps `2_540/3_908`, and final valid counts `32/96`. Both arms
+  must use this same two-segment schedule. Optional within-segment snapshots
+  must bind their exact batch-aligned cursor and remain nominal.
   Require source-native assistant responses with per-occurrence conversation
   and response hashes. Reject unknown cells, floating counts, target synthesis,
   a scientific 64M milestone, any required 1B milestone, or the historical
@@ -554,7 +569,15 @@ git commit -s -S -m "feat(specdec): publish immutable prompt corpus bundles"
 ```python
 def test_approved_ptv2_study_policy_is_exact() -> None:
     policy = load_ptv2_study_policy(POLICY)
-    assert policy.prefix_occurrences == 2_000_000
+    assert policy.historical_occurrences == 1_300_000
+    assert policy.repair_complement_occurrences == {
+        "stem": 200_000,
+        "ja": 125_000,
+        "es": 125_000,
+        "fr": 125_000,
+        "it": 125_000,
+        "de": 0,
+    }
     assert policy.balanced_occurrences == {
         "math": 500_000,
         "code": 400_000,
@@ -562,44 +585,68 @@ def test_approved_ptv2_study_policy_is_exact() -> None:
         "chat": 400_000,
         "multilingual": 200_000,
     }
-    assert policy.occurrence_milestones == (500_000, 1_000_000, 1_300_000, 2_000_000)
-    assert policy.milestone_steps == (977, 1_954, 2_540, 3_907)
+    assert policy.multilingual_occurrences == {
+        "de": 40_000,
+        "ja": 40_000,
+        "es": 40_000,
+        "fr": 40_000,
+        "it": 40_000,
+    }
+    assert policy.segment_occurrences == (1_300_000, 700_000)
+    assert policy.segment_steps == (2_540, 1_368)
+    assert policy.cumulative_steps == (2_540, 3_908)
+    assert policy.segment_final_valid_occurrences == (32, 96)
     assert policy.runtime_screen_tokens == 64_000_000
     assert policy.conditional_scientific_tokens == 256_000_000
     assert policy.assistant_responses == "source-native"
     assert policy.trainer_epochs == 1
 ```
 
-- [ ] **Step 2: Add RED A-prefix tests.** Use a scaled source fixture whose
-  first occurrences include natural duplicate UUIDs and evaluator-held-out
-  matches. Assert A preserves exact authenticated file/row order and every
-  natural duplicate through its occurrence boundary; it does not deduplicate,
-  shuffle, balance, skip a held-out row, or synthesize a repeated occurrence.
-  In the production arithmetic test, require A's first 1.3M occurrence prefix,
+- [ ] **Step 2: Add RED A-repair tests.** Use a scaled historical fixture whose
+  occurrences include natural duplicate UUIDs plus a disjoint complement
+  fixture. Assert phase 1 preserves exact authenticated historical file/row
+  order and every natural duplicate; it does not deduplicate, shuffle,
+  balance, or skip a historical row. Assert phase 2 contains only the selected
+  repair complement with exact scaled STEM/JA/ES/FR/IT quotas and German zero;
+  it never admits the next source-order tail, a historical UUID, or a held-out
+  UUID. In the production arithmetic test, require phase 1's 1.3M occurrences,
   931,363 unique UUID count, ordered occurrence digest, and split histogram to
-  match `BaselineAudit` before allowing the final 700K source occurrences.
+  match `BaselineAudit`, then require the immutable 700K complement selection
+  receipt before constructing A's exact 2M view.
 
 ```python
-def test_prefix_preserves_source_occurrences_and_natural_duplicates() -> None:
-    view = select_ptv2_study_views(SOURCES, BASELINE, HELD_OUT, POLICY).a_prefix
-    assert tuple(iter_ptv2_study_occurrences(view)) == EXPECTED_FIRST_SOURCE_ROWS
-    assert view.occurrence_count == len(EXPECTED_FIRST_SOURCE_ROWS)
+def test_repair_preserves_history_then_appends_exact_complement() -> None:
+    view = select_a_repair_view(SOURCES, BASELINE, COMPLEMENT, HELD_OUT, POLICY)
+    assert tuple(iter_ptv2_study_occurrences(view)) == EXPECTED_HISTORY_PLUS_COMPLEMENT
+    assert view.segment_occurrence_counts == (1_300_000, 700_000)
     assert view.unique_prompt_count < view.occurrence_count
     assert view.constructed_repeat_count == 0
+    assert view.repair_complement_counts == {
+        "stem": 200_000,
+        "ja": 125_000,
+        "es": 125_000,
+        "fr": 125_000,
+        "it": 125_000,
+        "de": 0,
+    }
 ```
 
 - [ ] **Step 3: Add RED B-balanced tests.** Deterministically rank authenticated
-  source occurrences within each of the five cells. Use a scaled fixture in
-  which Code and Multilingual require cycling. Assert exact cell occurrence
-  counts, stable order across input permutations, explicit per-source-row and
-  per-UUID multiplicity, and an independently recomputed unique UUID count.
-  Reject borrowing, renormalization, an empty cell, an unapproved source, or a
-  receipt that relabels constructed reuse as a trainer epoch. Do not require
-  A/B unique UUID counts or multiplicity histograms to match.
+  source occurrences within each of the five cells and within each approved
+  multilingual language. Use a scaled fixture in which Code and at least two
+  multilingual language subcells require cycling. Assert exact cell and
+  DE/JA/ES/FR/IT subcell occurrence counts, stable order across input
+  permutations, explicit per-source-row and per-UUID multiplicity, and an
+  independently recomputed unique UUID count. Reject borrowing or
+  renormalization across cells or languages, an empty required cell/language,
+  an unapproved source, or a receipt that relabels constructed reuse as a
+  trainer epoch. Do not require A/B unique UUID counts or multiplicity
+  histograms to match; A-repair has its independently authenticated
+  historical-plus-complement composition.
 
 ```python
 def test_balanced_view_repeats_within_cell_without_renormalizing() -> None:
-    view = select_ptv2_study_views(SOURCES, BASELINE, HELD_OUT, POLICY).b_balanced
+    view = select_b_balanced_view(SOURCES, HELD_OUT, POLICY)
     assert view.cell_occurrence_counts == {
         "math": 500_000,
         "code": 400_000,
@@ -608,6 +655,14 @@ def test_balanced_view_repeats_within_cell_without_renormalizing() -> None:
         "multilingual": 200_000,
     }
     assert view.occurrence_count == 2_000_000
+    assert view.segment_occurrence_counts == (1_300_000, 700_000)
+    assert view.multilingual_occurrence_counts == {
+        "de": 40_000,
+        "ja": 40_000,
+        "es": 40_000,
+        "fr": 40_000,
+        "it": 40_000,
+    }
     assert view.constructed_repeat_count > 0
     assert view.trainer_epochs == 1
 ```
@@ -621,7 +676,8 @@ def test_balanced_view_repeats_within_cell_without_renormalizing() -> None:
   target/mask, sequence-length policy, and training configuration across A/B.
   Require the one-pass receipt to
   bind exact 2M occurrence count, observed unique UUIDs, natural/constructed
-  multiplicity, trainer epoch `1`, occurrence milestones, and
+  multiplicity, trainer epoch `1`, exact segment boundary/step/final-valid
+  receipts, and
   `U2M(strategy)`. Label 64M only as a canary/runtime receipt; reject a 256M
   checkpoint when either one-pass total is below that boundary; reject any
   second trainer epoch; and verify deterministic occurrence order, final
@@ -650,22 +706,28 @@ authenticated selection and source-response receipts.
 
 - [ ] **Step 6: Implement the exact policy and disk-backed selectors.** Write
   this complete policy and reject any decoded representation that differs from
-  it in counts, occurrence milestones, exposure classes, seed, or source
-  revision:
+  it in repair composition, balanced counts, multilingual subquotas, exact
+  segment boundaries, exposure classes, seed, or source revision:
 
 ```yaml
 schema_version: 1
 seed: 20260822
 ptv2_revision: 5c89e01dd720ae0f4058445ed49c5fb68a03c76e
-prefix: {selection: source-order, occurrences: 2000000, preserve_duplicates: true}
+repair:
+  historical: {selection: source-order, occurrences: 1300000, preserve_duplicates: true}
+  complement: {stem: 200000, ja: 125000, es: 125000, fr: 125000, it: 125000, de: 0}
 balanced:
   selection: seeded-within-cell
   occurrences: {math: 500000, code: 400000, stem: 500000, chat: 400000, multilingual: 200000}
+  multilingual_occurrences: {de: 40000, ja: 40000, es: 40000, fr: 40000, it: 40000}
   capacity_shortfall: deterministic-within-cell-cycle
 assistant_responses: source-native
 trainer_epochs: 1
 global_batch_size: 512
-occurrence_milestones: [500000, 1000000, 1300000, 2000000]
+segment_occurrences: [1300000, 700000]
+segment_steps: [2540, 1368]
+cumulative_steps: [2540, 3908]
+segment_final_valid_occurrences: [32, 96]
 runtime_screen_tokens: 64000000
 scientific_exposures: [one-pass]
 conditional_scientific_tokens: 256000000
@@ -673,11 +735,15 @@ sequence_length: 4096
 ```
 
 Stream the authenticated source inventory into a SQLite ranking/index file.
-For A-prefix, stream the exact first 2M authenticated source rows without any
-UUID-based filtering or constructed repetition and reconcile its first 1.3M
-with `BaselineAudit`. For B-balanced, rank source occurrences independently by
-`SHA256(policy_sha256 || cell || source_identity || source_row || prompt_uuid)`;
-cycle only within a deficient cell until its exact occurrence quota is met.
+For A-repair, stream the exact historical 1.3M authenticated source rows
+without filtering or constructed repetition and reconcile them with
+`BaselineAudit`; then append only the authenticated 700K complement selection
+in frozen order. Reject German, historical/held-out UUID overlap, a source-tail
+substitution, or any complement count mismatch. For B-balanced, rank source
+occurrences independently by
+`SHA256(policy_sha256 || cell || language || source_identity || source_row || prompt_uuid)`;
+cycle only within a deficient cell or multilingual language subcell until its
+exact occurrence quota is met. Never borrow or renormalize across languages.
 Persist source capacities, held-out overlap, natural and constructed duplicate
 counts, per-UUID/source-row multiplicity, cell counts, ordered occurrence
 digest, and unique UUID digest without holding production rows in memory.
@@ -696,11 +762,14 @@ class StudyOccurrence:
 
 @dataclass(frozen=True)
 class PTV2StudyView:
-    strategy: Literal["A-prefix", "B-balanced"]
+    strategy: Literal["A-repair", "B-balanced"]
     occurrence_count: Literal[2_000_000]
     trainer_epochs: Literal[1]
+    segment_occurrence_counts: tuple[Literal[1_300_000], Literal[700_000]]
     unique_prompt_count: int
     cell_occurrence_counts: Mapping[str, int]
+    multilingual_occurrence_counts: Mapping[str, int]
+    repair_complement_counts: Mapping[str, int]
     natural_duplicate_count: int
     constructed_repeat_count: int
     index_path: Path
@@ -708,6 +777,7 @@ class PTV2StudyView:
     ordered_occurrences_sha256: str
     ordered_prompt_uuids_sha256: str
     source_response_root_sha256: str
+    repair_complement_sha256: str | None
     selection_sha256: str
 
 @dataclass(frozen=True)
@@ -716,7 +786,7 @@ class PTV2StudyBundle:
     source_inventory_sha256: str
     baseline_receipt_sha256: str
     held_out_receipt_sha256: str
-    a_prefix: PTV2StudyView
+    a_repair: PTV2StudyView
     b_balanced: PTV2StudyView
 ```
 
@@ -727,12 +797,16 @@ class PTV2StudyBundle:
   every occurrence's canonical conversation/content hash, assistant-response
   hash, source identity, and source row before tokenization; it must reject any
   response mutation or target-synthesis artifact. Materialize and authenticate
-  each exact 2M occurrence stream before training. Build each
+  each exact 2M occurrence stream before training. Keep B selection,
+  publication, and readiness callable without constructing A-repair; assemble
+  `PTV2StudyBundle` only when both independently published views exist. Build each
   one-pass view first; expose paired 256M checkpoints only when both
   authenticated 2M-pass token totals reach the boundary. Record unique UUIDs,
-  natural/constructed multiplicity, `U2M(strategy)`, cumulative exposure,
-  trainer epoch fixed at `1`, milestone trims, total serialized tokens, packed
-  sequences, and exact occurrence/optimizer-step stops. Publish each
+  natural/constructed multiplicity, exact B multilingual subquotas,
+  `U2M(strategy)`, cumulative exposure, trainer epoch fixed at `1`, exact
+  1.3M/2M segment boundaries, segment/cumulative steps, final-valid counts
+  `32/96`, total serialized tokens, packed sequences, and optimizer-state
+  continuity. Publish each
   complete source/selection/response/tokenized/exposure/rejection set through
   `publish_bundle(...)`; do not add cluster submission to this task.
 
@@ -763,24 +837,29 @@ git commit -s -S -m "feat(specdec): prepare Qwen3-4B PTV2 A B study"
 - Create: `tools/launcher/common/specdec/submit_bprime_cd_study.sh`
 
 **Interfaces:**
-- Consumes: all upstream receipts including both Qwen3-4B PTV2 A/B
+- Consumes: all upstream receipts including Qwen3-4B A-repair/B-balanced
   publications, cluster profile, destination receipt, bounded target and
   training inputs.
 - Produces: per-arm A/B and per-arm B′/C/D `ReadinessReceipt`,
   synthesis-canary receipt, runtime-only 64M training-screen receipt,
   evaluator-canary receipt, and dependency-safe submission IDs.
 
-- [ ] **Step 1: Add RED readiness tests.** Require A's exact first 2M source
-  occurrences and preserved duplicate proof; B's exact five cell counts,
-  deterministic ranking, and explicit constructed multiplicity; independent
-  A/B unique counts; authenticated source-native conversation/content and
+- [ ] **Step 1: Add RED readiness tests.** Require A-repair's exact historical
+  1.3M source-order duplicate proof plus exact 700K STEM/JA/ES/FR/IT
+  complement and German-zero proof; require B's exact five cell counts,
+  exact DE/JA/ES/FR/IT 40K subquotas, deterministic ranking, no language
+  borrowing, and explicit constructed multiplicity; independent A/B unique
+  counts; authenticated source-native conversation/content and
   assistant-response hashes; identical tokenizer/template/loss-target
-  identities; 500K/1M/1.3M/2M milestone identities; one-pass totals;
+  identities; exact 1.3M/2M boundaries at cumulative steps 2,540/3,908 with
+  final-valid counts 32/96; one-pass totals;
   in-pass 256M reachability; source approvals; file hashes; replay lane counts;
   paired C/D proof; context floors; generation identities; exposure views;
   atomic publication; and destination receipt.
   Assert every missing gate has a stable blocker code, 64M cannot set a
-  scientific-ready flag, and no weights are renormalized.
+  scientific-ready flag, and no weights are renormalized. Prove B readiness is
+  independent of A-repair readiness and can become ready while A is absent or
+  blocked.
 
 - [ ] **Step 2: Add RED launcher tests.** Accept test-only scheduling only with
   `nemotron_sw_post` or `nemotron_n4_post`; reject every other or missing
@@ -799,28 +878,33 @@ Expected: new prompt-count gates and launcher contract fail.
 
 - [ ] **Step 4: Implement aggregate readiness.** Define `ReadinessInputs` as
   the complete upstream receipt set and `ReadinessReceipt` as per-arm readiness
-  plus stable blocker codes. Verify A-prefix exact source order and natural
-  duplicates; B-balanced `500K/400K/500K/400K/200K` counts and disclosed
-  constructed reuse; independent unique UUID counts; trainer epoch `1`;
-  occurrence checkpoints at steps `977/1,954/2,540/3,907`; in-pass 256M
+  plus stable blocker codes. Verify A-repair's exact historical 1.3M source
+  order and exact 700K repair composition; verify B-balanced
+  `500K/400K/500K/400K/200K` counts and disclosed
+  constructed reuse plus exact DE/JA/ES/FR/IT `40K` subquotas with no language
+  borrowing; independent unique UUID counts; trainer epoch `1`; exact segment
+  sizes `1300000/700000`, segment steps `2540/1368`, cumulative steps
+  `2540/3908`, and final-valid counts `32/96`; in-pass 256M
   eligibility; account binding; and Task 8 identities before emitting Qwen3-4B
   study readiness. Reject the historical `s25391` schedule. For B′/C/D,
   replace nonzero-token checks with exact per-cell unique-count and 20%-reserve
   checks, require pinned interactive-SWE and
   generic-tool inventories, verify all receipt digests transitively, and emit
-  readiness independently for A, B, B′, C, and D.
+  readiness independently for A, B, B′, C, and D. B readiness and launch
+  authorization must not depend on A-repair readiness.
 
-- [ ] **Step 5: Implement bounded canaries.** Run the Qwen3-4B A/B
-  materialization canary first with scaled source-prefix and exact five-cell
-  occurrence policies, preserving and authenticating every source-native
-  completion. Run the separate B′/C/D synthesis canary with one primary
-  failure and same-cell reserve promotion. The training canary runs 20
-  optimizer steps, may continue to the 64M runtime screen, saves and reloads a
+- [ ] **Step 5: Implement bounded canaries.** Execute B inventory and
+  publication first, then run a 200-step B-balanced canary on 16 nodes at
+  GBS512 before authorizing the B full run. Its scaled fixture preserves exact
+  five-cell/five-language policies and every source-native completion. B must
+  not wait for A-repair. Prepare A-repair later from the same verified parent
+  and require its own independent readiness/canary receipt. Run the separate
+  B′/C/D synthesis canary with one primary failure and same-cell reserve
+  promotion. Each training canary saves and reloads a
   checkpoint, exports the drafter, records finite loss and per-GPU DCGM
   activity, and runs a small evaluator bundle. Its receipt says
   `scientific_milestone: false`; only authenticated one-pass/256M artifacts can
-  enable scientific submission. B′/C/D canaries remain blocked until the A/B
-  readiness sequence completes or records an explicit study-stop decision.
+  enable scientific submission.
 
 - [ ] **Step 6: Run GREEN and static checks.**
 
@@ -854,7 +938,7 @@ git commit -s -S -m "feat(specdec): gate PTV2 and B-prime C D canaries"
 
 - [ ] **Step 1: Add RED adoption tests.** Accept identical model/drafter tensors and reject name, shape, dtype, or hash mismatch. Prove optimizer, scheduler, scaler, RNG, loader cursor, epoch, global step, and W&B resume state are absent from the new run and the parent hash remains recorded as lineage.
 
-- [ ] **Step 2: Add RED token-budget tests.** Simulate distributed ranks with different local loss-mask and occurrence counts, require all-reduced cumulative assistant tokens, checkpoint exactly at reachable 64M/256M boundaries, and terminate Qwen3-4B A/B only after exactly 2M occurrences and trainer epoch `1`. Classify 64M as runtime-only, forbid a second epoch to reach an unavailable 256M milestone, checkpoint both counters and the fingerprint, and reject resume with another corpus, seed, target, mode, method, block size, or parent.
+- [ ] **Step 2: Add RED token-budget tests.** Simulate distributed ranks with different local loss-mask and occurrence counts, require all-reduced cumulative assistant tokens, checkpoint exactly at reachable 64M/256M boundaries, and enforce the matched Qwen3-4B A/B two-segment schedule: exact 1.3M at step 2,540 with 32 valid final occurrences, then exact 700K at segment step 1,368/cumulative step 3,908 with 96 valid final occurrences and trainer epoch `1`. Prove optimizer/scheduler continuity across the reset batch alignment. Classify 64M as runtime-only, forbid a second epoch to reach an unavailable 256M milestone, checkpoint both counters and the fingerprint, and reject resume with another corpus, seed, target, mode, method, block size, or parent.
 
 ```python
 @dataclass(frozen=True)
@@ -877,7 +961,7 @@ Expected: new adoption and token-budget modules are absent.
 
 - [ ] **Step 4: Implement weight-only adoption.** Define `ExperimentIdentity` in the launcher manifest and `AdoptionReceipt` in the adoption module. Inventory parent tensors, compare against the initialized child, load model/drafter weights only, assert fresh training state, and write an atomic adoption receipt before the first optimizer step.
 
-- [ ] **Step 5: Integrate exact-token and occurrence state.** Count the actual loss mask and materialized occurrences used in each distributed batch and all-reduce both increments. For Qwen3-4B A/B, run the exact 2M-occurrence one-pass view as the primary arm. Materialize 64M and reachable 256M as separate deterministic prefix exposure views from the same parent and corpus identity, with a final assistant-mask trim; never append a second epoch when the one-pass receipt cannot supply 256M. Persist cumulative tokens, occurrences, trainer epoch, and fingerprint with checkpoints, and keep historical source occurrence exposure as separate lineage metadata.
+- [ ] **Step 5: Integrate exact-token and occurrence state.** Count the actual loss mask and materialized occurrences used in each distributed batch and all-reduce both increments. For Qwen3-4B A/B, run the exact 1.3M-plus-700K segmented view as the primary arm, reset only batch alignment at the boundary, and continue optimizer/scheduler state. Materialize 64M and reachable 256M as separate deterministic prefix exposure views from the same parent and corpus identity, with a final assistant-mask trim; never append a second epoch when the one-pass receipt cannot supply 256M. Persist segment-local and cumulative steps, final-valid occurrence counts, cumulative tokens, occurrences, trainer epoch, and fingerprint with checkpoints, and keep historical source occurrence exposure as separate lineage metadata.
 
 - [ ] **Step 6: Run GREEN, related trainer tests, and commit.**
 
@@ -908,7 +992,7 @@ git commit -s -S -m "feat(specdec): cut over with exact assistant-token state"
 
 - [ ] **Step 1: Add RED evaluator tests.** Require identical target/runtime/hardware/K/CUDA-graph/concurrency/request identities within comparisons; validate SPEED-Bench 1K/4K/8K/16K/32K buckets, acceptance counters, latency/throughput, Math/Code/STEM/multilingual/Chat/SWE/tool category coverage, tool-schema validity, and lossless target equivalence.
 
-- [ ] **Step 2: Add RED progress-page tests.** Provide one completed, one running, one blocked, and one planned fixture. Assert escaped output, no credentials or raw environment values, measured-result provenance links, correct historical `1.3M occurrences / 931,363 unique`, exact A/B occurrence and B′/C/D tables, A/B `2M occurrences / 1 trainer epoch` labeling, separation of natural/constructed multiplicity from epochs, 64M runtime-only labeling, one-pass/reachable-256M status, blocker codes, account identity, checkpoint step/hash, and no numeric result rendered for a non-completed evaluator.
+- [ ] **Step 2: Add RED progress-page tests.** Provide one completed, one running, one blocked, and one planned fixture. Assert escaped output, no credentials or raw environment values, measured-result provenance links, correct historical `1.3M occurrences / 931,363 unique`, exact A-repair composition and B/B′/C/D tables, B's exact DE/JA/ES/FR/IT 40K subquotas, A/B `2M occurrences / 1 trainer epoch` labeling, exact 1.3M/2M boundaries with segment/cumulative steps and final-valid counts, separation of natural/constructed multiplicity from epochs, 64M runtime-only labeling, one-pass/reachable-256M status, independent B/A readiness, blocker codes, account identity, checkpoint step/hash, and no numeric result rendered for a non-completed evaluator.
 
 ```python
 def test_page_never_labels_planned_metrics_as_measured(tmp_path: Path) -> None:
@@ -923,7 +1007,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tools/launcher/tes
 
 Expected: result collector and renderer are absent, and the evaluator lacks the expanded category/context contract.
 
-- [ ] **Step 4: Implement result collection.** Define `ResultInputs` as validated corpus/training/evaluator receipt paths and `ProgressReport` as immutable status plus measured metrics. Bind every metric row to evaluator revision, prompt digest, target, drafter checkpoint, K, concurrency, hardware/runtime, account, and timestamp. Compute paired deltas only when identities match. Record A-prefix and B-balanced unique UUID counts independently, exact 2M occurrence counts, natural/constructed multiplicity, trainer epoch `1`, 500K/1M/1.3M/2M results, one-pass tokens, reachable 256M result, and runtime-only 64M status before recording parent, B′ 256M, B′ 700K, C/D 256M, C/D 1B, and common-boundary status independently.
+- [ ] **Step 4: Implement result collection.** Define `ResultInputs` as validated corpus/training/evaluator receipt paths and `ProgressReport` as immutable status plus measured metrics. Bind every metric row to evaluator revision, prompt digest, target, drafter checkpoint, K, concurrency, hardware/runtime, account, and timestamp. Compute paired deltas only when identities match. Record A-repair and B-balanced unique UUID counts independently, A's exact historical-1.3M plus STEM200K/JA/ES/FR/IT125K/DE0 repair composition, exact 2M occurrence counts, B's exact DE/JA/ES/FR/IT 40K subquotas, natural/constructed multiplicity, trainer epoch `1`, exact 1.3M/2M results at segment steps 2,540/1,368 and cumulative steps 2,540/3,908 with final-valid counts 32/96, one-pass tokens, reachable 256M result, runtime-only 64M status, and independent B/A execution status before recording parent, B′ 256M, B′ 700K, C/D 256M, C/D 1B, and common-boundary status independently.
 
 - [ ] **Step 5: Implement deterministic page rendering.** Render a single compact page with four sections: current cluster/checkpoint status, prompt/corpus readiness, training milestones, and measured evaluator comparisons. Read only validated `bprime_cd_progress.json`, include source/job/log/W&B links when present, and label missing source capacity as blocked rather than estimated.
 
@@ -963,7 +1047,7 @@ Run: `bash -n tools/launcher/common/specdec/*.sh tools/launcher/common/specdec/*
 
 Run: `shellcheck -S warning tools/launcher/common/specdec/*.sh tools/launcher/common/specdec/*.sbatch`
 
-- [ ] **Step 3: Run canonical fixture dry runs.** Build scaled A-prefix and B-balanced fixtures that preserve their distinct source-order and exact-cell occurrence policies plus scaled B′/C/D source inventories, candidate reserves, exact prompt views, source-native A/B response authentication, B′/C/D response promotion, exact 2M occurrence views, one-pass and in-pass token milestone views, atomic corpus, readiness receipt, transfer bundle, adoption receipt, evaluator bundle, and HTML report twice; compare all canonical JSON and HTML bytes between runs.
+- [ ] **Step 3: Run canonical fixture dry runs.** Build scaled A-repair and B-balanced fixtures that preserve exact historical-plus-complement and exact-cell/language policies plus scaled B′/C/D source inventories, candidate reserves, exact prompt views, source-native A/B response authentication, B′/C/D response promotion, exact 1.3M/2M segmented occurrence views, one-pass and in-pass token milestone views, atomic corpus, independent readiness receipts, transfer bundle, adoption receipt, evaluator bundle, and HTML report twice; compare all canonical JSON and HTML bytes between runs. Prove B reaches ready/canary/full authorization without an A-repair receipt.
 
 - [ ] **Step 4: Run cluster test-only checks.** After `git pull --ff-only` on the selected cluster checkout, run the source-stage, builder, and canary submitters with `--test-only`. For Qwen3-4B A/B, resolve only `nemotron_sw_post` or `nemotron_n4_post`, pass it explicitly to `sbatch --test-only`, and verify the canonical receipt binds the exact account. Record partition, node/GPU topology, command, source commit, and receipt digests. Do not submit a real job from this step.
 
@@ -989,10 +1073,12 @@ exclusive:
 4. Run Task 6 after Task 5. Task 7 may begin its token-view unit layer after
    Task 2, but integrate it only after Task 6 freezes `ResponseCorpus`.
 5. Run Task 8 after Task 7; it owns publication and transfer binding.
-6. Run Task 9 after Tasks 3–8; it owns the full-PTV2 A-prefix/B-balanced
-   selection, exposure, and publication adapters.
-7. Run Task 10 after Tasks 3–9; it owns readiness and canary launchers and must
-   gate the Qwen3-4B A/B study before B′/C/D readiness.
+6. Run Task 9 after Tasks 3–8; it owns independently callable A-repair and
+   B-balanced selection, exposure, and publication adapters. Complete B first;
+   A-repair may follow later.
+7. Run Task 10 after B's Task 9 artifacts exist; it owns readiness and canary
+   launchers. B readiness and the 200-step 16-node canary must not depend on
+   A-repair artifacts.
 8. Run Task 11 after Tasks 7 and 10; it owns checkpoint adoption and training
    exposure state.
 9. Run Task 12 after Tasks 8–11; it owns evaluator aggregation and report files.

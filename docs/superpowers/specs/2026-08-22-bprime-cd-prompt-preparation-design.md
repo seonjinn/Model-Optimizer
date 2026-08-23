@@ -3,7 +3,7 @@
 ## Decision and purpose
 
 Prepare the prompts now, while the existing Nemotron-v2 drafter jobs continue.
-The prepared artifacts support two related but distinct experiments:
+The prepared artifacts support three related but distinct experiments:
 
 1. **B-prime (`B′`)** continues an existing drafter with 700,000 previously
    unseen PTV2 prompts, bringing the named source-row exposure from 1.3M to
@@ -11,10 +11,11 @@ The prepared artifacts support two related but distinct experiments:
 2. **C and D** are alternative 2,000,000-prompt balanced views. They use the
    same top-level domain counts; D changes only the response source within the
    SWE/Agentic/Tool lane.
-3. **Qwen3-4B PTV2 A/B** is a separate, earlier study that compares a
-   source-order prefix strategy with a balanced strategy over the complete
-   PTV2 Math, Code, STEM, Chat, and Multilingual pool. It does not use the B′
-   complement cells as a proxy for balanced PTV2.
+3. **Qwen3-4B PTV2 A/B** compares A-repair—the exact historical 1.3M followed
+   by its exact 700K STEM/JA/ES/FR/IT complement—with B-balanced over the
+   complete PTV2 Math, Code, STEM, Chat, and Multilingual pool. B has an
+   independent readiness and execution path and runs first; A-repair follows
+   later from the same parent.
 
 This document supersedes the B/C/D row counts and domain weights in
 `2026-08-22-ptv2-complement-ptv3-agentic-design.md`. The older document remains
@@ -24,9 +25,10 @@ them. The checked-in percentage-only B/C/D configuration is not by itself
 production-ready. The Qwen3-4B study uses the exact 2M-occurrence A/B contract
 below, while B′/C/D use their separate approved quotas.
 
-Approval of this design authorizes prompt preparation and validation only. It
-does not itself authorize a production training submission, cancellation, or
-replacement of a running job.
+Approval of this design authorizes B-first ordering and independent readiness.
+Actual cluster submission still follows the account-bound launcher gates; this
+document does not perform submission, cancellation, or replacement of a
+running job.
 
 ## Audited 1.3M lineage
 
@@ -64,18 +66,20 @@ The baseline receipt binds:
 
 A complement build stops if any of these values fails to reproduce.
 
-## Qwen3-4B full-PTV2 A-prefix versus B-balanced study
+## Qwen3-4B A-repair versus B-balanced study
 
-This study runs before the B′/C/D cluster-readiness task and answers a narrower
-question: for Qwen3-4B drafter data with source-native PTV2 completions, does deterministic
-balancing over the complete PTV2 pool improve over the historical source-order
-prefix strategy? Its arms are:
+This study is separate from B′/C/D readiness and answers a narrower question:
+for Qwen3-4B drafter data with source-native PTV2 completions, does
+full-pool balancing improve over repairing the historical corpus with its exact
+missing-domain complement? Its arms are:
 
-- **A-prefix:** the exact first 2,000,000 authenticated PTV2 source occurrences
-  in Hugging Face/source order. It preserves every natural duplicate and never
-  deduplicates, shuffles, balances, or constructs repeats to reach 2M. The
-  first 1.3M occurrences must reproduce the audited historical boundary and
-  its 931,363 unique UUIDs exactly.
+- **A-repair:** phase 1 is the exact authenticated historical 1,300,000 PTV2
+  source occurrences in Hugging Face/source order, including every natural
+  duplicate and the audited 931,363 unique UUIDs. Phase 2 is exactly 700,000
+  complement occurrences: STEM 200,000 plus Japanese, Spanish, French, and
+  Italian 125,000 each, with German zero. The complement uses the immutable
+  complement selection identity and preserves source-native responses; it does
+  not extend A with the next 700K source-order occurrences.
 - **B-balanced:** exactly 2,000,000 materialized occurrences selected by a
   seeded deterministic ranking over the complete approved PTV2
   Math/Code/STEM/Chat/Multilingual inventory. Its exact occurrence quotas are:
@@ -89,14 +93,30 @@ prefix strategy? Its arms are:
 | Multilingual | 10% | 200,000 |
 | **Total** | **100%** | **2,000,000** |
 
-B-balanced first ranks each authenticated source occurrence within its cell.
-When a cell contains fewer eligible source occurrences than its exact quota,
-it cycles through that ranked cell deterministically and records every reused
-UUID and source occurrence multiplicity. It never borrows from another cell or
-renormalizes. A-prefix and B-balanced are matched on exactly 2M occurrences,
-not on unique UUID count. Each arm reports its independently observed unique
-UUID total, duplicate histogram, maximum multiplicity, per-cell unique counts,
-and held-out overlap; none of those values is forced to match.
+The B-balanced Multilingual cell has a second exact quota layer:
+
+| Multilingual language | Occurrences |
+|---|---:|
+| German (DE) | 40,000 |
+| Japanese (JA) | 40,000 |
+| Spanish (ES) | 40,000 |
+| French (FR) | 40,000 |
+| Italian (IT) | 40,000 |
+| **Total** | **200,000** |
+
+B-balanced first ranks each authenticated source occurrence within its cell
+and, for Multilingual, within its language subcell. When a cell or language
+subcell contains fewer eligible source occurrences than its exact quota, it
+cycles through only that ranked cell or subcell deterministically and records
+every reused UUID and source occurrence multiplicity. It never borrows or
+renormalizes across cells or languages. A-repair preserves exact historical
+source order only through phase 1; phase 2 has German zero and the exact repair
+quotas above. A-repair and B-balanced are matched on exact 1.3M and 2M
+scientific occurrence boundaries, not on unique UUID count. Each arm reports
+its independently
+observed unique UUID total, duplicate histogram, maximum multiplicity,
+per-cell and per-language unique counts, and held-out overlap; none of those
+values is forced to match.
 
 Both strategies preserve each selected PTV2 occurrence's authenticated,
 source-native assistant completion. They do not strip, regenerate, replace, or
@@ -108,19 +128,22 @@ source-native response for a deliberate B-balanced occurrence does not turn
 that occurrence reuse into another trainer epoch. Target synthesis remains a
 separate later C/D experiment and is not part of this A/B comparison.
 
-The occurrence milestones are checkpoints within one run per arm:
+Both arms use the same two-segment GBS512 optimizer schedule so the scientific
+boundaries are exact rather than nominal:
 
-| Occurrences consumed | GBS512 optimizer step |
-|---:|---:|
-| 500,000 | 977 |
-| 1,000,000 | 1,954 |
-| 1,300,000 | 2,540 |
-| 2,000,000 | 3,907 |
+| Scientific boundary | Segment occurrences | Segment steps | Cumulative steps | Valid occurrences in final segment batch |
+|---|---:|---:|---:|---:|
+| exact 1.3M | 1,300,000 | 2,540 | 2,540 | 32 |
+| exact 2M | 700,000 | 1,368 | 3,908 | 96 |
 
-The stop is exact: `ceil(N / 512)` identifies the checkpointing step and the
-final 2M endpoint uses an exact 128-occurrence partial batch/mask. The four
-milestones expose how the A/B ranking changes with consumed data size without
-training separate unique-pool arms. The historical `s25391` schedule is
+The optimizer and scheduler continue across the segment boundary, while the
+second segment starts a new batch alignment. Each arm therefore records an
+exact 1.3M checkpoint after 2,540 steps and an exact 2M checkpoint after 1,368
+additional steps, for 3,908 total. B-balanced must use this same segmentation
+even though its source view is already materialized as 2M occurrences. Any
+optional within-segment snapshot uses a nominal label plus its exact
+batch-aligned cursor; it cannot be presented as an exact scientific boundary.
+The historical `s25391` schedule is
 approximately `1,300,000 * 10 / 512` and therefore about ten passes over the
 old 1.3M view; it must not be reused or described as this study's target.
 
@@ -148,13 +171,13 @@ Equal occurrence exposure does not imply equal unique coverage,
 assistant-token exposure, or compute, so reports retain total serialized
 tokens, packed sequences, optimizer steps, and measured throughput separately.
 
-The study may proceed only after source, source-native response/content,
-selection, tokenization, immutable Task 8 publication, destination,
-checkpoint-adoption, and 20-step GPU-canary receipts pass for both arms. No
-result is called A/B science if the arms differ in parent weights, tokenizer,
-chat template, assistant-loss target/mask, optimizer schedule, training seed,
-evaluator identity, or exact occurrence milestone. Held-out overlap is
-reported, not filtered, because A must remain the exact source prefix.
+The execution order is B inventory, B readiness, a 200-step B canary at 16
+nodes and GBS512, then the B full run. B has independent readiness and canary
+receipts and must not wait for A-repair. A-repair is prepared and run later
+from the same verified parent checkpoint, tokenizer/template/loss-target
+identity, and two-segment optimizer schedule. No result is called A/B science
+if the arms differ in those matched identities, training seed, evaluator
+identity, or exact 1.3M/2M boundary.
 
 Cluster scheduling remains test-only until separately authorized. The A/B
 launcher may resolve only `nemotron_sw_post` or `nemotron_n4_post`; it runs
@@ -459,11 +482,13 @@ proposed K within a paired comparison.
 
 Milestones are:
 
-1. **Qwen3-4B PTV2 runtime gate:** run the paired A-prefix/B-balanced 20-step
-   canary and allow it to stream through 64M tokens only for runtime validation.
-2. **Qwen3-4B PTV2 A/B:** checkpoint both single-pass runs after exactly
-   500K, 1M, 1.3M, and 2M occurrences. Publish an additional exact 256M
-   assistant-token comparison only when both one-pass receipts reach it.
+1. **B-balanced execution gate:** build and publish B inventory, pass
+   independent readiness, then run a 200-step 16-node GBS512 B canary before
+   the B full run. B does not wait for A-repair.
+2. **Qwen3-4B A/B:** checkpoint B and, later, A-repair at exact 1.3M and 2M
+   scientific boundaries using the same 2,540-step plus 1,368-step schedule.
+   Publish an additional exact 256M assistant-token comparison only when both
+   one-pass receipts reach it. A-repair starts from the same parent as B.
 3. **Parent:** evaluate the frozen B′/C/D cutover checkpoint before new data.
 4. **B′ 256M tokens:** early gap-fill signal.
 5. **B′ 700K prompts:** one complete complement pass; report cumulative source
@@ -490,15 +515,22 @@ Publication and training fail closed when any of the following occurs:
 - baseline count, boundary, unique UUID count, or file digest does not match;
 - any source lacks an exact revision, license, physical-file hash, or approved
   use;
-- a complement B′/C/D view admits an historical or held-out UUID; A-prefix
-  instead preserves its exact source occurrences and reports held-out overlap;
-- A-prefix differs from the exact authenticated first 2M source occurrences,
-  drops a natural duplicate, or constructs a repeated occurrence;
+- the A-repair phase-2 complement or a B′/C/D view admits an historical or
+  held-out UUID;
+- A-repair phase 1 differs from the exact authenticated historical 1.3M source
+  occurrences or drops a natural duplicate, or phase 2 differs from exact
+  STEM200K/JA125K/ES125K/FR125K/IT125K/DE0 composition;
 - B-balanced misses its exact `500K/400K/500K/400K/200K`
   Math/Code/STEM/Chat/Multilingual occurrence quota, fails to disclose reused
   occurrence multiplicity, borrows from another cell, or renormalizes;
+- B-balanced misses exact DE/JA/ES/FR/IT `40K/40K/40K/40K/40K`
+  multilingual subquotas, borrows between languages, or renormalizes a
+  language shortfall;
 - an A/B arm schedules more or fewer than 2,000,000 occurrences, uses more
   than one trainer epoch, or derives the occurrence stop from assistant tokens;
+- an A/B run misses the exact 1.3M boundary at 2,540 steps with 32 valid final
+  occurrences, misses the 700K segment boundary at 1,368 additional steps with
+  96 valid final occurrences, or does not total 3,908 steps;
 - a claimed 256M A/B milestone lies beyond either member's authenticated
   2M-occurrence one-pass assistant-token total;
 - an A/B occurrence lacks its authenticated source-native conversation/content
@@ -525,10 +557,13 @@ publication under a misleading dataset name.
 
 ## Final decision
 
-- Run the Qwen3-4B full-PTV2 A-prefix/B-balanced study before B′/C/D readiness,
-  using the exact first 2M source occurrences for A and exact
+- Run B-balanced first: inventory, independent readiness, 200-step 16-node
+  GBS512 canary, then full training. Use exact
   `500K/400K/500K/400K/200K` Math/Code/STEM/Chat/Multilingual occurrences for
-  B. Compare one run per arm at 500K/1M/1.3M/2M occurrence milestones, report
+  B, including exact DE/JA/ES/FR/IT 40K subquotas with no language borrowing.
+  Prepare A-repair later from the same parent with exact historical 1.3M then
+  exact STEM200K/JA125K/ES125K/FR125K/IT125K/DE0 complement. Compare exact
+  1.3M and 2M boundaries using the same 2,540 plus 1,368 step schedule, report
   unique UUIDs and multiplicity without forcing equality, treat 64M as
   runtime-only, and publish 256M only when reachable. Never reuse the
   historical approximately ten-epoch `s25391` schedule for this study.
