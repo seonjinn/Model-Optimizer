@@ -12,8 +12,12 @@ import re
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from specdec_corpus_contracts import SourceFile, canonical_json, sha256_bytes
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+from specdec_corpus_contracts import SourceFile, canonical_json, sha256_bytes, sha256_canonical_json
 from specdec_identity import prompt_uuid
 
 __all__ = [
@@ -34,6 +38,7 @@ class BaselineExpectation:
     source_revision: str
     shard_count: int
     split_rows: dict[str, int]
+    unique_prompt_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -50,7 +55,12 @@ class BaselineAudit:
     row_count: int
     split_rows: dict[str, int]
     files: tuple[SourceFile, ...]
-    prompt_uuids: tuple[str, ...]
+    occurrence_count: int
+    unique_prompt_count: int
+    occurrence_prompt_ids: Sequence[str]
+    occurrence_prompt_ids_sha256: str
+    exclusion_prompt_ids: Sequence[str]
+    exclusion_prompt_ids_sha256: str
     duplicate_uuid_multiplicity: dict[str, int]
     physical_row_count: int
     selection_policy: str
@@ -61,6 +71,7 @@ EXPECTED_BASELINE = BaselineExpectation(
     "5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
     26,
     {"chat": 627720, "code": 175000, "math": 239467, "multilingual_de": 257813},
+    931363,
 )
 
 
@@ -90,7 +101,7 @@ def _prompt_messages(messages: object) -> list[dict[str, object]]:
 
 
 def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE) -> BaselineAudit:
-    """Verify shard identity/histogram and reconstruct sorted canonical prompt UUIDs."""
+    """Verify the selected stream and reconstruct occurrence and exclusion identities."""
     import pyarrow.parquet as pq
 
     links = sorted(path for path in root.iterdir() if path.is_symlink())
@@ -99,6 +110,7 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
     files: list[SourceFile] = []
     splits: Counter[str] = Counter()
     uuid_counts: Counter[str] = Counter()
+    occurrence_prompt_ids: list[str] = []
     selected_total = 0
     physical_total = 0
     target_total = sum(expected.split_rows.values())
@@ -133,6 +145,7 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
                 messages = _prompt_messages(_decode(row[message_column]))
                 tools = _decode(row.get("tools")) if row.get("tools") is not None else None
                 uuid = prompt_uuid(messages, tools)
+                occurrence_prompt_ids.append(uuid)
                 uuid_counts[uuid] += 1
             remaining_rows -= len(rows)
             if remaining_rows == 0:
@@ -143,15 +156,33 @@ def audit_baseline(root: Path, expected: BaselineExpectation = EXPECTED_BASELINE
         raise AuditError(f"histogram mismatch: {actual} != {wanted}")
     if boundary is None or selected_total != target_total:
         raise AuditError("sorted stream is shorter than sample_size")
+    exclusion_prompt_ids = tuple(sorted(uuid_counts))
     duplicates = {uuid: count for uuid, count in sorted(uuid_counts.items()) if count > 1}
-    if len(uuid_counts) + sum(count - 1 for count in duplicates.values()) != sum(actual.values()):
+    if len(occurrence_prompt_ids) != sum(actual.values()):
+        raise AuditError("UUID occurrence count mismatch")
+    if len(exclusion_prompt_ids) + sum(count - 1 for count in duplicates.values()) != len(
+        occurrence_prompt_ids
+    ):
         raise AuditError("UUID occurrence reconciliation mismatch")
+    if (
+        expected.unique_prompt_count is not None
+        and len(exclusion_prompt_ids) != expected.unique_prompt_count
+    ):
+        raise AuditError(
+            "unique prompt count mismatch: "
+            f"{len(exclusion_prompt_ids)} != {expected.unique_prompt_count}"
+        )
     return BaselineAudit(
         expected.source_revision,
         sum(actual.values()),
         actual,
         tuple(files),
-        tuple(sorted(uuid_counts)),
+        len(occurrence_prompt_ids),
+        len(exclusion_prompt_ids),
+        tuple(occurrence_prompt_ids),
+        sha256_canonical_json(occurrence_prompt_ids),
+        exclusion_prompt_ids,
+        sha256_canonical_json(exclusion_prompt_ids),
         duplicates,
         physical_total,
         "hf-streaming-sorted-parquet-take",

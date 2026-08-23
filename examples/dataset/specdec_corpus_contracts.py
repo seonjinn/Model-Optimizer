@@ -8,8 +8,18 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-__all__ = ["CanonicalPrompt", "SourceFile", "canonical_json", "sha256_bytes"]
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+__all__ = [
+    "CanonicalPrompt",
+    "SourceFile",
+    "canonical_json",
+    "sha256_bytes",
+    "sha256_canonical_json",
+]
 
 
 def canonical_json(value: object) -> bytes:
@@ -20,6 +30,11 @@ def canonical_json(value: object) -> bytes:
 def sha256_bytes(value: bytes) -> str:
     """Return the lowercase SHA-256 digest of bytes."""
     return hashlib.sha256(value).hexdigest()
+
+
+def sha256_canonical_json(value: Sequence[str]) -> str:
+    """Return the deterministic digest of an ordered identifier sequence."""
+    return sha256_bytes(canonical_json(value))
 
 
 @dataclass(frozen=True)
