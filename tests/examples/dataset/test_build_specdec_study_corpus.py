@@ -258,6 +258,16 @@ def test_manifest_rejects_more_than_two_epochs() -> None:
         )
 
 
+def test_exposure_policy_keeps_runtime_screen_separate_from_production_views() -> None:
+    module = _load_module()
+
+    policy = module.exposure_policy_manifest()
+
+    assert policy["production_assistant_token_boundaries"] == [256_000_000, 1_000_000_000]
+    assert policy["runtime_screen_assistant_tokens"] == 64_000_000
+    assert 64_000_000 not in policy["production_assistant_token_boundaries"]
+
+
 def test_materialize_parquet_is_atomic_and_checksum_manifested(tmp_path: Path) -> None:
     module = _load_module()
     selected = _candidates(10)[:5]

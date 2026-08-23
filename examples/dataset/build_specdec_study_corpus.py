@@ -33,6 +33,17 @@ if TYPE_CHECKING:
 
 import yaml
 
+PRODUCTION_ASSISTANT_TOKEN_BOUNDARIES = (256_000_000, 1_000_000_000)
+RUNTIME_SCREEN_ASSISTANT_TOKENS = 64_000_000
+
+
+def exposure_policy_manifest() -> dict[str, Any]:
+    """Return production comparison boundaries and the separate runtime screen."""
+    return {
+        "production_assistant_token_boundaries": list(PRODUCTION_ASSISTANT_TOKEN_BOUNDARIES),
+        "runtime_screen_assistant_tokens": RUNTIME_SCREEN_ASSISTANT_TOKENS,
+    }
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
