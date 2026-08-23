@@ -23,6 +23,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import weakref
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -150,11 +151,25 @@ class DiskBackedCandidateRows(Sequence[CandidatePrompt]):
         count: int,
         source_manifest_sha256: str,
         tokenizer_sha256: str,
+        storage_root: Path,
     ) -> None:
         self.storage_path = storage_path
         self._count = count
         self.source_manifest_sha256 = source_manifest_sha256
         self.tokenizer_sha256 = tokenizer_sha256
+        self._closed = False
+        self._finalizer = weakref.finalize(self, shutil.rmtree, storage_root, True)
+
+    def close(self) -> None:
+        """Release and remove the temporary storage owned by this sequence."""
+        if self._closed:
+            return
+        self._closed = True
+        self._finalizer()
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("candidate inventory is closed")
 
     def __len__(self) -> int:
         return self._count
@@ -182,12 +197,14 @@ class DiskBackedCandidateRows(Sequence[CandidatePrompt]):
         )
 
     def __iter__(self):
+        self._require_open()
         query = f"SELECT {', '.join(_CANDIDATE_COLUMNS)} FROM candidates ORDER BY prompt_uuid"
         with sqlite3.connect(self.storage_path) as connection:
             for record in connection.execute(query):
                 yield self._candidate(record)
 
     def _at(self, index: int) -> CandidatePrompt:
+        self._require_open()
         if index < 0:
             index += self._count
         if index < 0 or index >= self._count:
@@ -223,6 +240,19 @@ class CandidateInventory:
     capacity: Mapping[CandidateCell, int]
     quarantine_counts: Mapping[str, int]
     inventory_sha256: str
+
+    def close(self) -> None:
+        """Release temporary row storage after all sequence consumers finish."""
+        if isinstance(self.rows, DiskBackedCandidateRows):
+            self.rows.close()
+
+    def __enter__(self) -> "CandidateInventory":
+        if isinstance(self.rows, DiskBackedCandidateRows):
+            self.rows._require_open()
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CandidateInventory):
@@ -356,14 +386,14 @@ def _iter_candidate_rows(path: Path):
                 yield row_index, value if isinstance(value, dict) else None
                 row_index += 1
         return
-    with path.open(encoding="utf-8") as source:
+    with path.open("rb") as source:
         row_index = 0
-        for line in source:
-            if not line.strip():
+        for raw_line in source:
+            if not raw_line.strip():
                 continue
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
+                value = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 value = None
             yield row_index, value if isinstance(value, dict) else None
             row_index += 1
@@ -746,6 +776,7 @@ def build_candidate_inventory(
         accepted_count,
         source_inventory.manifest_sha256,
         tokenizer_sha256,
+        storage_root,
     )
     digest = hashlib.sha256()
     for chunk in _identity_chunks(rows, capacity, quarantine_counts):

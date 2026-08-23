@@ -96,6 +96,32 @@ def _declared_functions(tools: list[Any], source_id: str) -> set[str]:
     return declared
 
 
+def _validated_tool_calls_by_message(
+    messages: list[dict[str, Any]], source_id: str
+) -> list[list[dict[str, Any]]]:
+    validated: list[list[dict[str, Any]]] = []
+    for index, message in enumerate(messages):
+        raw_calls = message.get("tool_calls")
+        if raw_calls is None:
+            validated.append([])
+            continue
+        if not isinstance(raw_calls, list):
+            _reject(
+                "invalid_tool_calls",
+                f"{source_id}: message {index} tool_calls must be a list",
+            )
+        calls: list[dict[str, Any]] = []
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                _reject(
+                    "invalid_tool_call",
+                    f"{source_id}: message {index} tool call is not a mapping",
+                )
+            calls.append(call)
+        validated.append(calls)
+    return validated
+
+
 def _storage_normalized_trajectory(
     example: dict[str, Any], source_id: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bytes]:
@@ -117,6 +143,7 @@ def _storage_normalized_trajectory(
 def _validate_referential_integrity(
     messages: list[dict[str, Any]], tools: list[dict[str, Any]], source_id: str
 ) -> int:
+    calls_by_message = _validated_tool_calls_by_message(messages, source_id)
     declared_functions = _declared_functions(tools, source_id)
     pending: dict[str, str] = {}
     seen_calls: set[str] = set()
@@ -133,13 +160,7 @@ def _validate_referential_integrity(
         if role in {"system", "user", "developer"}:
             continue
         if role == "assistant":
-            raw_calls = message.get("tool_calls")
-            if raw_calls is None:
-                calls: list[Any] = []
-            elif not isinstance(raw_calls, list):
-                _reject("invalid_tool_calls", f"{source_id}: assistant tool_calls must be a list")
-            else:
-                calls = raw_calls
+            calls = calls_by_message[index]
             for call in calls:
                 call_id, function_name = _validate_tool_call(call, source_id, declared_functions)
                 if call_id in seen_calls:
@@ -222,10 +243,15 @@ def _tool_transactions(messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
     pending: set[str] = set()
     start = -1
     for index, message in enumerate(messages):
-        calls = message.get("tool_calls") or []
+        raw_calls = message.get("tool_calls") if message.get("role") == "assistant" else None
+        calls = raw_calls if isinstance(raw_calls, list) else []
         if calls:
             start = index
-            pending = {str(call.get("id") or call.get("tool_call_id")) for call in calls}
+            pending = {
+                str(call.get("id") or call.get("tool_call_id"))
+                for call in calls
+                if isinstance(call, dict)
+            }
         if message["role"] == "tool":
             call_id = str(message.get("tool_call_id") or message.get("id"))
             pending.remove(call_id)

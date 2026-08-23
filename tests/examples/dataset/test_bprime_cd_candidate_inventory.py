@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import importlib.util
 import json
@@ -383,6 +384,21 @@ def test_malformed_jsonl_record_is_quarantined_without_aborting(tmp_path: Path) 
     assert candidates.quarantine_counts == {"invalid_row": 1}
 
 
+def test_invalid_utf8_jsonl_record_is_quarantined_without_aborting(tmp_path: Path) -> None:
+    module = _load_module()
+    directory = tmp_path / "first"
+    directory.mkdir()
+    path = directory / "first.jsonl"
+    path.write_bytes(b'\xff\n{"messages":[{"role":"user","content":"valid"}],"language":"en"}\n')
+    source = _source(module, split="first", path=path)
+
+    candidates = _build(module, _inventory(module, tmp_path, (source,)))
+
+    assert len(candidates.rows) == 1
+    assert candidates.rows[0].canonical_bytes
+    assert candidates.quarantine_counts == {"invalid_row": 1}
+
+
 def test_malformed_parquet_raw_json_is_quarantined_without_aborting(tmp_path: Path) -> None:
     module = _load_module()
     import pyarrow as pa  # pyright: ignore[reportMissingImports]
@@ -413,3 +429,62 @@ def test_malformed_parquet_raw_json_is_quarantined_without_aborting(tmp_path: Pa
 
     assert len(candidates.rows) == 1
     assert candidates.quarantine_counts == {"invalid_row": 1}
+
+
+def test_candidate_inventory_storage_lives_until_explicit_close(tmp_path: Path) -> None:
+    module = _load_module()
+    path = _write_rows(
+        tmp_path,
+        "first",
+        [{"messages": [{"role": "user", "content": "available"}], "language": "en"}],
+    )
+    source = _source(module, split="first", path=path)
+    candidates = _build(module, _inventory(module, tmp_path, (source,)))
+    assert isinstance(candidates.rows, module.DiskBackedCandidateRows)
+    storage_root = candidates.rows.storage_path.parent
+
+    assert storage_root.is_dir()
+    assert candidates.rows[0].canonical_bytes
+    assert module.candidate_inventory_bytes(candidates)
+
+    candidates.close()
+    candidates.close()
+    assert not storage_root.exists()
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = candidates.rows[0]
+
+
+def test_candidate_inventory_context_manager_cleans_owned_storage(tmp_path: Path) -> None:
+    module = _load_module()
+    path = _write_rows(
+        tmp_path,
+        "first",
+        [{"messages": [{"role": "user", "content": "context"}], "language": "en"}],
+    )
+    source = _source(module, split="first", path=path)
+
+    with _build(module, _inventory(module, tmp_path, (source,))) as candidates:
+        assert isinstance(candidates.rows, module.DiskBackedCandidateRows)
+        storage_root = candidates.rows.storage_path.parent
+        assert storage_root.is_dir()
+        assert list(candidates.rows)
+
+    assert not storage_root.exists()
+
+
+def test_candidate_inventory_finalizer_cleans_abandoned_storage(tmp_path: Path) -> None:
+    module = _load_module()
+    path = _write_rows(
+        tmp_path,
+        "first",
+        [{"messages": [{"role": "user", "content": "abandoned"}], "language": "en"}],
+    )
+    source = _source(module, split="first", path=path)
+
+    candidates = _build(module, _inventory(module, tmp_path, (source,)))
+    assert isinstance(candidates.rows, module.DiskBackedCandidateRows)
+    storage_root = candidates.rows.storage_path.parent
+    del candidates
+    gc.collect()
+
+    assert not storage_root.exists()

@@ -304,6 +304,34 @@ def test_invalid_replay_is_quarantined(mutation: str, reason: str) -> None:
     )
 
 
+@pytest.mark.parametrize("role", ["system", "user", "developer", "assistant", "tool"])
+@pytest.mark.parametrize(
+    ("tool_calls", "reason"),
+    [
+        ({"id": "call-1"}, "invalid_tool_calls"),
+        ([42], "invalid_tool_call"),
+    ],
+)
+def test_malformed_tool_calls_are_quarantined_on_every_message_role(
+    role: str, tool_calls: object, reason: str
+) -> None:
+    module = _load_module()
+    row = _multi_call_trajectory()
+    if role == "developer":
+        row["messages"].insert(
+            1,
+            {"role": "developer", "content": "Follow policy.", "tool_calls": tool_calls},
+        )
+    else:
+        message = next(message for message in row["messages"] if message["role"] == role)
+        message["tool_calls"] = tool_calls
+
+    assert (
+        module.quarantine_reason(row, source_id=f"fixture:{role}", lane="generic-tool-replay")
+        == reason
+    )
+
+
 class _BoundaryTokenizer:
     def apply_chat_template(self, messages, **kwargs):
         del kwargs
