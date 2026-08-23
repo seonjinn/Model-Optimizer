@@ -11,13 +11,18 @@ The prepared artifacts support two related but distinct experiments:
 2. **C and D** are alternative 2,000,000-prompt balanced views. They use the
    same top-level domain counts; D changes only the response source within the
    SWE/Agentic/Tool lane.
+3. **Qwen3-4B PTV2 A/B** is a separate, earlier study that compares a
+   source-order prefix strategy with a balanced strategy over the complete
+   PTV2 Math, Code, STEM, Chat, and Multilingual pool. It does not use the B′
+   complement cells as a proxy for balanced PTV2.
 
 This document supersedes the B/C/D row counts and domain weights in
 `2026-08-22-ptv2-complement-ptv3-agentic-design.md`. The older document remains
 the source for the canonical record, trajectory-integrity, atomic publication,
 and cross-cluster transfer contracts unless this document explicitly changes
-them. In particular, the checked-in `25/25/20/20/10` B configuration and
-`35/25/15/15/5/5` C/D configuration are not production-ready for this decision.
+them. The checked-in percentage-only B/C/D configuration is not by itself
+production-ready. The Qwen3-4B study uses the exact 2M-occurrence A/B contract
+below, while B′/C/D use their separate approved quotas.
 
 Approval of this design authorizes prompt preparation and validation only. It
 does not itself authorize a production training submission, cancellation, or
@@ -58,6 +63,105 @@ The baseline receipt binds:
 - the split histogram above and the excluded 9,377-row tail.
 
 A complement build stops if any of these values fails to reproduce.
+
+## Qwen3-4B full-PTV2 A-prefix versus B-balanced study
+
+This study runs before the B′/C/D cluster-readiness task and answers a narrower
+question: for Qwen3-4B drafter data with source-native PTV2 completions, does deterministic
+balancing over the complete PTV2 pool improve over the historical source-order
+prefix strategy? Its arms are:
+
+- **A-prefix:** the exact first 2,000,000 authenticated PTV2 source occurrences
+  in Hugging Face/source order. It preserves every natural duplicate and never
+  deduplicates, shuffles, balances, or constructs repeats to reach 2M. The
+  first 1.3M occurrences must reproduce the audited historical boundary and
+  its 931,363 unique UUIDs exactly.
+- **B-balanced:** exactly 2,000,000 materialized occurrences selected by a
+  seeded deterministic ranking over the complete approved PTV2
+  Math/Code/STEM/Chat/Multilingual inventory. Its exact occurrence quotas are:
+
+| B-balanced cell | Share | Occurrences |
+|---|---:|---:|
+| Math | 25% | 500,000 |
+| Code | 20% | 400,000 |
+| STEM | 25% | 500,000 |
+| Chat/Instruction | 20% | 400,000 |
+| Multilingual | 10% | 200,000 |
+| **Total** | **100%** | **2,000,000** |
+
+B-balanced first ranks each authenticated source occurrence within its cell.
+When a cell contains fewer eligible source occurrences than its exact quota,
+it cycles through that ranked cell deterministically and records every reused
+UUID and source occurrence multiplicity. It never borrows from another cell or
+renormalizes. A-prefix and B-balanced are matched on exactly 2M occurrences,
+not on unique UUID count. Each arm reports its independently observed unique
+UUID total, duplicate histogram, maximum multiplicity, per-cell unique counts,
+and held-out overlap; none of those values is forced to match.
+
+Both strategies preserve each selected PTV2 occurrence's authenticated,
+source-native assistant completion. They do not strip, regenerate, replace, or
+promote responses. Every occurrence binds its canonical conversation/content
+hash, assistant-response hash, source identity, and source row. Both arms use
+the identical tokenizer revision, chat template, assistant-loss target/mask,
+sequence-length policy, and training configuration. Reusing a selected
+source-native response for a deliberate B-balanced occurrence does not turn
+that occurrence reuse into another trainer epoch. Target synthesis remains a
+separate later C/D experiment and is not part of this A/B comparison.
+
+The occurrence milestones are checkpoints within one run per arm:
+
+| Occurrences consumed | GBS512 optimizer step |
+|---:|---:|
+| 500,000 | 977 |
+| 1,000,000 | 1,954 |
+| 1,300,000 | 2,540 |
+| 2,000,000 | 3,907 |
+
+The stop is exact: `ceil(N / 512)` identifies the checkpointing step and the
+final 2M endpoint uses an exact 128-occurrence partial batch/mask. The four
+milestones expose how the A/B ranking changes with consumed data size without
+training separate unique-pool arms. The historical `s25391` schedule is
+approximately `1,300,000 * 10 / 512` and therefore about ten passes over the
+old 1.3M view; it must not be reused or described as this study's target.
+
+Unique UUID coverage, source duplicate multiplicity, deliberate B-balanced
+occurrence reuse, trainer epochs, and assistant-token exposure are separate
+quantities. Task 7 emits a one-pass receipt for each exact 2M occurrence view
+with assistant-loss-token total `U2M(strategy)`:
+
+- 64M assistant-loss tokens is a runtime and pipeline gate only. It cannot rank
+  A against B and is never reported as a scientific endpoint.
+- The primary scientific endpoint is one exact pass over 2M occurrences.
+  Publish an exact 256M assistant-token checkpoint only when both one-pass
+  receipts reach 256M within that occurrence pass.
+
+The 64M and reachable 256M artifacts are deterministic prefix exposure views
+from the same parent and immutable 2M corpus identity. Their
+final assistant mask may be trimmed to the exact token boundary. The primary
+one-pass run consumes the untrimmed 2M occurrence view; a trimmed milestone run
+is not resumed into it and does not alter its occurrence accounting.
+
+Every receipt reports exact occurrence count, unique UUID count, natural and
+deliberate occurrence multiplicity, 2M-pass assistant tokens, cumulative
+assistant-token exposure, trainer epoch count `1`, and any milestone trim.
+Equal occurrence exposure does not imply equal unique coverage,
+assistant-token exposure, or compute, so reports retain total serialized
+tokens, packed sequences, optimizer steps, and measured throughput separately.
+
+The study may proceed only after source, source-native response/content,
+selection, tokenization, immutable Task 8 publication, destination,
+checkpoint-adoption, and 20-step GPU-canary receipts pass for both arms. No
+result is called A/B science if the arms differ in parent weights, tokenizer,
+chat template, assistant-loss target/mask, optimizer schedule, training seed,
+evaluator identity, or exact occurrence milestone. Held-out overlap is
+reported, not filtered, because A must remain the exact source prefix.
+
+Cluster scheduling remains test-only until separately authorized. The A/B
+launcher may resolve only `nemotron_sw_post` or `nemotron_n4_post`; it runs
+`sbatch --test-only` with the selected account and binds the exact account,
+cluster profile, partition, source commit, and all corpus receipts into the
+launcher/readiness receipt. An unrecorded account or any other account fails
+closed.
 
 ## B-prime: exact 700K PTV2 complement
 
@@ -355,14 +459,19 @@ proposed K within a paired comparison.
 
 Milestones are:
 
-1. **Parent:** evaluate the frozen cutover checkpoint before new data.
-2. **B′ 256M tokens:** early gap-fill signal.
-3. **B′ 700K prompts:** one complete complement pass; report cumulative source
+1. **Qwen3-4B PTV2 runtime gate:** run the paired A-prefix/B-balanced 20-step
+   canary and allow it to stream through 64M tokens only for runtime validation.
+2. **Qwen3-4B PTV2 A/B:** checkpoint both single-pass runs after exactly
+   500K, 1M, 1.3M, and 2M occurrences. Publish an additional exact 256M
+   assistant-token comparison only when both one-pass receipts reach it.
+3. **Parent:** evaluate the frozen B′/C/D cutover checkpoint before new data.
+4. **B′ 256M tokens:** early gap-fill signal.
+5. **B′ 700K prompts:** one complete complement pass; report cumulative source
    occurrences, unique UUIDs, and assistant tokens.
-4. **C/D 256M tokens:** pipeline and early ranking; no arm is eliminated solely
+6. **C/D 256M tokens:** pipeline and early ranking; no arm is eliminated solely
    for placing third.
-5. **C/D 1B tokens:** first substantive equal-exposure comparison.
-6. **C/D common full boundary:** evaluate at the largest exact assistant-token
+7. **C/D 1B tokens:** first substantive equal-exposure comparison.
+8. **C/D common full boundary:** evaluate at the largest exact assistant-token
    boundary supported by both 2M prompt views, and separately report each
    arm's full-prompt token total.
 
@@ -381,12 +490,26 @@ Publication and training fail closed when any of the following occurs:
 - baseline count, boundary, unique UUID count, or file digest does not match;
 - any source lacks an exact revision, license, physical-file hash, or approved
   use;
-- an historical or held-out UUID is admitted;
+- a complement B′/C/D view admits an historical or held-out UUID; A-prefix
+  instead preserves its exact source occurrences and reports held-out overlap;
+- A-prefix differs from the exact authenticated first 2M source occurrences,
+  drops a natural duplicate, or constructs a repeated occurrence;
+- B-balanced misses its exact `500K/400K/500K/400K/200K`
+  Math/Code/STEM/Chat/Multilingual occurrence quota, fails to disclose reused
+  occurrence multiplicity, borrows from another cell, or renormalizes;
+- an A/B arm schedules more or fewer than 2,000,000 occurrences, uses more
+  than one trainer epoch, or derives the occurrence stop from assistant tokens;
+- a claimed 256M A/B milestone lies beyond either member's authenticated
+  2M-occurrence one-pass assistant-token total;
+- an A/B occurrence lacks its authenticated source-native conversation/content
+  or assistant-response hash, mutates the response, or uses a different
+  tokenizer, chat template, assistant-loss target/mask, sequence-length
+  policy, or training configuration between arms;
 - a B′, C, D, language, lane, or context cell misses its exact prompt quota;
 - the 20% reserve is absent before synthesis begins;
 - C and D non-agentic paired UUIDs or context floors differ;
-- a target response is partial, conflicting, mixed-mode, or generated by the
-  wrong target/runtime identity;
+- a B′/C/D synthesized target response is partial, conflicting, mixed-mode, or
+  generated by the wrong target/runtime identity;
 - a replay trajectory fails schema or referential-integrity validation;
 - token IDs and loss masks are unaligned or use the wrong tokenizer/template;
 - an exact exposure view misses its assistant-token quota;
@@ -402,6 +525,13 @@ publication under a misleading dataset name.
 
 ## Final decision
 
+- Run the Qwen3-4B full-PTV2 A-prefix/B-balanced study before B′/C/D readiness,
+  using the exact first 2M source occurrences for A and exact
+  `500K/400K/500K/400K/200K` Math/Code/STEM/Chat/Multilingual occurrences for
+  B. Compare one run per arm at 500K/1M/1.3M/2M occurrence milestones, report
+  unique UUIDs and multiplicity without forcing equality, treat 64M as
+  runtime-only, and publish 256M only when reachable. Never reuse the
+  historical approximately ten-epoch `s25391` schedule for this study.
 - Prepare B′ now as the exact 700K PTV2 gap fill: STEM 200K and
   Japanese/Spanish/French/Italian 125K each, with German excluded.
 - Prepare C and D as paired 2M-prompt views with exact

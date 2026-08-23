@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prepare immutable B′ 700K and paired C/D 2M prompt views, target-specific response corpora, exact assistant-token exposure views, and fail-closed cutover/evaluation receipts without disturbing the drafter jobs that still train on the historical 1.3M PTV2 prefix.
+**Goal:** Prepare the Qwen3-4B full-PTV2 A-prefix/B-balanced diversity study, immutable B′ 700K and paired C/D 2M prompt views, target-specific response corpora, exact assistant-token exposure views, and fail-closed cutover/evaluation receipts without disturbing the drafter jobs that still train on the historical 1.3M PTV2 prefix.
 
-**Architecture:** Extend the existing canonical audit, inventory, trajectory, selection, and transfer tools with a prompt-count policy layer. Freeze exact prompt UUID views before target regeneration, promote successful responses from a 20% per-cell reserve, then derive exact assistant-loss-token exposure views from the immutable response corpus. Keep source staging, replay validation, publication, cluster readiness, weight-only checkpoint adoption, training, evaluation, and report refresh as separately testable receipt boundaries.
+**Architecture:** Extend the existing canonical audit, inventory, trajectory, selection, and transfer tools with exact occurrence-count policy layers. Before cluster readiness, build one Qwen3-4B A-prefix view from the exact first 2M authenticated source occurrences and one B-balanced view with exact five-cell occurrence quotas, then train each view once while checkpointing at four occurrence milestones; keep B′/C/D as separate complement and mixed-source experiments. Preserve A's natural duplicates and both arms' source-native assistant completions, authenticate B's deliberate occurrence reuse, and derive one-pass plus reachable exact-token views from immutable source-response corpora. Keep source staging, replay validation, publication, cluster readiness, account-bound test-only scheduling, weight-only checkpoint adoption, training, evaluation, and report refresh as separately testable receipt boundaries.
 
 **Tech Stack:** Python 3.12+, dataclasses and `TypedDict`, PyArrow/Parquet Zstd, Hugging Face `datasets` and `transformers`, YAML, Bash/SLURM/Pyxis, PDX/PBSS `rclone`, ModelOpt DFlash/DSpark training, Speculators and SPEED-Bench evaluators, pytest, Pyright, Ruff, ShellCheck, pre-commit.
 
@@ -14,19 +14,47 @@
 
 - The historical source is exactly 1,309,377 row occurrences, and the training prefix is exactly the first 1,300,000 occurrences in Hugging Face streaming order; the excluded tail is exactly 9,377 German occurrences.
 - The historical prefix histogram is Chat 627,720, Code 175,000, Math 239,467, German 257,813, and zero for STEM, Japanese, Spanish, French, Italian, and explicit SWE/Agentic/Tool.
-- The historical prefix contains exactly 931,363 unique canonical prompt UUIDs. Preserve all duplicate occurrences in lineage, but exclude the 931,363 unique UUIDs from new prompt views.
+- The historical prefix contains exactly 931,363 unique canonical prompt UUIDs. Preserve all duplicate occurrences in lineage. Exclude those UUIDs from complement B′/C/D views; the separate A-prefix/B-balanced study intentionally uses the complete authenticated PTV2 occurrence pool without evaluator-held-out filtering and reports any held-out overlap.
+- The Qwen3-4B PTV2 study is separate from B′. A-prefix is exactly the first
+  2,000,000 authenticated source occurrences in Hugging Face/source order and
+  preserves natural duplicates. It never deduplicates or constructs repeats.
+- B-balanced contains exactly 2,000,000 materialized occurrences:
+  Math 500,000; Code 400,000; STEM 500,000; Chat 400,000; Multilingual 200,000.
+  It uses seeded within-cell ranking and records explicit occurrence
+  multiplicity when a cell must cycle through limited source capacity. It
+  never borrows or renormalizes.
+- A and B are matched on occurrence count, not unique UUID count. Every receipt
+  reports unique UUIDs, natural duplicates, deliberate B reuse, per-cell unique
+  counts, and multiplicity histograms independently.
+- Both A/B arms preserve authenticated source-native assistant completions.
+  Bind canonical conversation/content and assistant-response hashes per
+  occurrence, and use an identical tokenizer revision, chat template,
+  assistant-loss target/mask, sequence-length policy, and training
+  configuration. A/B performs no response stripping, regeneration, retry
+  promotion, or synthesis reserve substitution.
+- Each arm trains for exactly one pass. At global batch 512, checkpoint after
+  500K/1M/1.3M/2M occurrences at steps 977/1,954/2,540/3,907; the final step
+  uses an exact 128-occurrence partial batch/mask. The old `s25391` schedule is
+  approximately ten passes over 1.3M and is forbidden for this study.
+- The 64M assistant-token boundary is runtime/gating only. Publish a 256M
+  assistant-token checkpoint only when both 2M-occurrence one-pass receipts
+  reach it; do not add epochs to manufacture it.
+- Test-only A/B scheduling permits only `nemotron_sw_post` or
+  `nemotron_n4_post`. The resolved account, cluster profile, partition, source
+  commit, and corpus receipts are mandatory fields in the launcher/readiness
+  receipt.
 - PTV2 revision is exactly `5c89e01dd720ae0f4058445ed49c5fb68a03c76e`; every PTV2/PTV3 source also requires its exact file path, byte size, SHA-256, license expression, configuration, and split.
 - B′ contains exactly 700,000 unique prompts after historical, held-out, and within-view exclusion: STEM 200,000; Japanese, Spanish, French, and Italian 125,000 each; German, Chat, Math, Code, and SWE zero.
 - C and D each contain exactly 2,000,000 unique prompts: SWE/Agentic/Tool 600,000; Math 400,000; Code 200,000; STEM/Science 400,000; Multilingual 300,000; Instruction/Chat 100,000.
 - D's 600,000 SWE/Agentic/Tool prompts are exactly 200,000 agentless-SWE target synthesis, 200,000 validated interactive-SWE replay, and 200,000 validated generic-agentic/tool replay.
 - C and D share all eligible non-agentic prompt UUIDs and the same frozen context-bucket floors. Only D's replay lanes intentionally differ.
-- Every populated prompt cell has at least 20% reserve after all UUID, held-out, source, schema, language, and context exclusions; a shortfall is fatal and never triggers borrowing or renormalization.
+- Every populated B′/C/D prompt cell has at least 20% reserve after all UUID, held-out, source, schema, language, and context exclusions; a shortfall is fatal and never triggers borrowing or renormalization.
 - Canonical prompt identity preserves roles, content, message order, top-level tools, tool calls, and call IDs. It removes only storage fields and hashes deterministic JSON with SHA-256.
 - Held-out SPEED, Math, Code, SWE, multilingual, and tool/agentic UUID manifests are content-addressed inputs to selection identity.
-- Target-synthesis lanes strip source completions and regenerate with an exact target, tokenizer, chat template, thinking mode, generation configuration, runtime digest, and retry identity.
+- B′/C/D target-synthesis lanes strip source completions and regenerate with an exact target, tokenizer, chat template, thinking mode, generation configuration, runtime digest, and retry identity. This does not apply to the source-native A/B study.
 - Replay preserves recorded schemas, calls, IDs, results, order, and reasoning. It never flattens a trajectory, invents execution, or manufactures a thinking-mode label.
 - Context buckets derive from full serialized length: `le4k` through 4,096, `4k_16k` through 16,384, and `16k_32k` through 32,768. A 4K view that splits a tool transaction is ineligible.
-- Prompt counts measure coverage. Scientific comparisons stop at exact 256M, 1B, and largest-common assistant-loss-token boundaries; only assistant-owned unmasked tokens count.
+- Prompt counts measure coverage. Qwen3-4B A/B primarily compares one exact pass over 2M occurrences, with exact assistant-token receipts and a reachable in-pass 256M comparison. B′/C/D scientific comparisons stop at exact 256M, 1B, and largest-common assistant-loss-token boundaries; only assistant-owned unmasked tokens count.
 - Source, selection, response, tokenized corpus, exposure, transfer, cutover, canary, and evaluator receipts are immutable canonical JSON bound by SHA-256.
 - Publication writes and verifies a job-unique sibling partial tree, `fsync`s it, and atomically renames into a previously absent final namespace. It never replaces an existing final artifact.
 - Existing drafter jobs continue independently. Every B′/C/D family adopts one identical verified parent checkpoint by weights only, resets optimizer/scheduler/scaler/RNG/loader/step/W&B state, and writes a new experiment namespace.
@@ -48,6 +76,11 @@
 - `examples/dataset/promote_synthesis_reserve.py` — validate target outputs and deterministically promote successful reserve rows.
 - `examples/dataset/build_assistant_token_views.py` — exact 256M/1B/common token views and one-pass receipts.
 - `examples/dataset/specdec_publication.py` — verified resumable shard writing and no-replace atomic publication.
+- `examples/dataset/qwen3_4b_ptv2_study.py` — exact A-prefix/B-balanced policy,
+  source-order and balanced occurrence selection, multiplicity proofs, and
+  study receipts.
+- `examples/dataset/qwen3_4b_ptv2_study.yaml` — exact 2M occurrence arms,
+  balanced cell quotas, occurrence milestones, seed, and exposure gates.
 - `examples/dataset/ptv23_builder_readiness.py` — aggregate source, count, reserve, replay, generation, exposure, and publication blockers.
 - `tools/launcher/common/specdec/run_ptv23_source_stage.sbatch` — CPU source staging and digest validation.
 - `tools/launcher/common/specdec/run_bprime_cd_builder.sbatch` — CPU prompt selection/publication and bounded GPU synthesis entrypoint.
@@ -68,6 +101,8 @@ Type ownership is fixed: `bprime_cd_policy.py` defines `PromptCell`,
 `PromptViewBundle`; `promote_synthesis_reserve.py` defines
 `GenerationIdentity`, `GenerationAttempt`, and `ResponseCorpus`;
 `build_assistant_token_views.py` defines `ExposureView`;
+`qwen3_4b_ptv2_study.py` defines `PTV2StudyPolicy`, `StudyOccurrence`,
+`PTV2StudyView`, and `PTV2StudyBundle`;
 `specdec_publication.py` defines `CorpusBundle` and `PublicationReceipt`;
 `ptv23_builder_readiness.py` defines `ReadinessInputs` and `ReadinessReceipt`;
 `bprime_cd_study_manifest.py` defines `ExperimentIdentity`;
@@ -85,6 +120,9 @@ The implementation keeps these signatures stable across tasks:
 - `select_prompt_views(inventory: CandidateInventory, policy: PromptPolicy) -> PromptViewBundle`
 - `promote_responses(view: PromptView, attempts: Iterable[GenerationAttempt], identity: GenerationIdentity) -> ResponseCorpus`
 - `build_exposure_view(corpus: ResponseCorpus, target_tokens: int) -> ExposureView`
+- `load_ptv2_study_policy(path: Path) -> PTV2StudyPolicy`
+- `select_ptv2_study_views(sources: SourceInventory, baseline: BaselineAudit, held_out: ExclusionIndex, policy: PTV2StudyPolicy) -> PTV2StudyBundle`
+- `iter_ptv2_study_occurrences(view: PTV2StudyView) -> Iterator[StudyOccurrence]`
 - `publish_bundle(bundle: CorpusBundle, destination: Path, job_id: str) -> PublicationReceipt`
 - `assess_readiness(inputs: ReadinessInputs) -> ReadinessReceipt`
 - `adopt_weights(parent: Path, model: torch.nn.Module, identity: ExperimentIdentity) -> AdoptionReceipt`
@@ -480,7 +518,240 @@ git add examples/dataset/specdec_publication.py tests/examples/dataset/test_spec
 git commit -s -S -m "feat(specdec): publish immutable prompt corpus bundles"
 ```
 
-### Task 9: Aggregate readiness and run bounded cluster canaries
+### Task 9: Build the Qwen3-4B full-PTV2 A-prefix/B-balanced study
+
+**Files:**
+- Create: `examples/dataset/qwen3_4b_ptv2_study.py`
+- Create: `examples/dataset/qwen3_4b_ptv2_study.yaml`
+- Create: `tests/examples/dataset/test_qwen3_4b_ptv2_study.py`
+- Modify: `examples/dataset/build_assistant_token_views.py`
+- Modify: `tests/examples/dataset/test_build_assistant_token_views.py`
+- Modify: `examples/dataset/specdec_publication.py`
+- Modify: `tests/examples/dataset/test_specdec_publication.py`
+
+**Interfaces:**
+- Consumes: authenticated full PTV2 `SourceInventory`, exact historical
+  `BaselineAudit`, content-addressed evaluator `ExclusionIndex` for overlap
+  reporting, authenticated source-native assistant responses, and Task 7
+  tokenizer/template/assistant-loss-target identity.
+- Produces: `PTV2StudyPolicy`, exact A-prefix and B-balanced `PTV2StudyView`
+  values, `PTV2StudyBundle`, 500K/1M/1.3M/2M occurrence milestone receipts,
+  exact 2M-occurrence one-pass receipts, a reachable paired 256M token receipt,
+  and one immutable Task 8 publication per strategy.
+
+- [ ] **Step 1: Add RED policy and arithmetic tests.** Require exactly two
+  strategies and reject all unique-pool scale lists. Assert A uses source-order
+  `take(2_000_000)` with duplicates preserved; assert B has exact
+  Math/Code/STEM/Chat/Multilingual occurrence counts
+  `500K/400K/500K/400K/200K`. Require one trainer epoch, GBS512, occurrence
+  milestones `500K/1M/1.3M/2M`, exact checkpoint steps
+  `977/1,954/2,540/3,907`, and an exact 128-occurrence final partial batch.
+  Require source-native assistant responses with per-occurrence conversation
+  and response hashes. Reject unknown cells, floating counts, target synthesis,
+  a scientific 64M milestone, any required 1B milestone, or the historical
+  `25_391` approximately ten-epoch schedule.
+
+```python
+def test_approved_ptv2_study_policy_is_exact() -> None:
+    policy = load_ptv2_study_policy(POLICY)
+    assert policy.prefix_occurrences == 2_000_000
+    assert policy.balanced_occurrences == {
+        "math": 500_000,
+        "code": 400_000,
+        "stem": 500_000,
+        "chat": 400_000,
+        "multilingual": 200_000,
+    }
+    assert policy.occurrence_milestones == (500_000, 1_000_000, 1_300_000, 2_000_000)
+    assert policy.milestone_steps == (977, 1_954, 2_540, 3_907)
+    assert policy.runtime_screen_tokens == 64_000_000
+    assert policy.conditional_scientific_tokens == 256_000_000
+    assert policy.assistant_responses == "source-native"
+    assert policy.trainer_epochs == 1
+```
+
+- [ ] **Step 2: Add RED A-prefix tests.** Use a scaled source fixture whose
+  first occurrences include natural duplicate UUIDs and evaluator-held-out
+  matches. Assert A preserves exact authenticated file/row order and every
+  natural duplicate through its occurrence boundary; it does not deduplicate,
+  shuffle, balance, skip a held-out row, or synthesize a repeated occurrence.
+  In the production arithmetic test, require A's first 1.3M occurrence prefix,
+  931,363 unique UUID count, ordered occurrence digest, and split histogram to
+  match `BaselineAudit` before allowing the final 700K source occurrences.
+
+```python
+def test_prefix_preserves_source_occurrences_and_natural_duplicates() -> None:
+    view = select_ptv2_study_views(SOURCES, BASELINE, HELD_OUT, POLICY).a_prefix
+    assert tuple(iter_ptv2_study_occurrences(view)) == EXPECTED_FIRST_SOURCE_ROWS
+    assert view.occurrence_count == len(EXPECTED_FIRST_SOURCE_ROWS)
+    assert view.unique_prompt_count < view.occurrence_count
+    assert view.constructed_repeat_count == 0
+```
+
+- [ ] **Step 3: Add RED B-balanced tests.** Deterministically rank authenticated
+  source occurrences within each of the five cells. Use a scaled fixture in
+  which Code and Multilingual require cycling. Assert exact cell occurrence
+  counts, stable order across input permutations, explicit per-source-row and
+  per-UUID multiplicity, and an independently recomputed unique UUID count.
+  Reject borrowing, renormalization, an empty cell, an unapproved source, or a
+  receipt that relabels constructed reuse as a trainer epoch. Do not require
+  A/B unique UUID counts or multiplicity histograms to match.
+
+```python
+def test_balanced_view_repeats_within_cell_without_renormalizing() -> None:
+    view = select_ptv2_study_views(SOURCES, BASELINE, HELD_OUT, POLICY).b_balanced
+    assert view.cell_occurrence_counts == {
+        "math": 500_000,
+        "code": 400_000,
+        "stem": 500_000,
+        "chat": 400_000,
+        "multilingual": 200_000,
+    }
+    assert view.occurrence_count == 2_000_000
+    assert view.constructed_repeat_count > 0
+    assert view.trainer_epochs == 1
+```
+
+- [ ] **Step 4: Add RED response, exposure, and publication tests.** Prove both
+  strategies preserve the exact authenticated source-native assistant
+  completion for every selected source occurrence. Bind canonical
+  conversation/content hash, assistant-response hash, source identity, and
+  source row; reject stripped, regenerated, substituted, or mutated responses.
+  Require identical tokenizer revision, chat template, assistant-loss
+  target/mask, sequence-length policy, and training configuration across A/B.
+  Require the one-pass receipt to
+  bind exact 2M occurrence count, observed unique UUIDs, natural/constructed
+  multiplicity, trainer epoch `1`, occurrence milestones, and
+  `U2M(strategy)`. Label 64M only as a canary/runtime receipt; reject a 256M
+  checkpoint when either one-pass total is below that boundary; reject any
+  second trainer epoch; and verify deterministic occurrence order, final
+  assistant-mask trim, Task 8 prompt/occurrence/token reconciliation, and
+  byte-identical publication receipts on exact retries. A missing or invalid
+  source-native completion blocks the arm without regeneration, retry
+  promotion, or reserve substitution.
+
+```python
+def test_milestone_cannot_extend_past_the_2m_occurrence_pass() -> None:
+    with pytest.raises(ExposureViewError, match="one-pass does not reach 256M"):
+        build_ptv2_study_exposures(
+            PREFIX_CORPUS_WITH_200M_ONE_PASS,
+            BALANCED_CORPUS_WITH_240M_ONE_PASS,
+            scientific_tokens=256_000_000,
+        )
+```
+
+- [ ] **Step 5: Run RED.**
+
+Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q --confcutdir=tests/examples/dataset tests/examples/dataset/test_qwen3_4b_ptv2_study.py tests/examples/dataset/test_build_assistant_token_views.py tests/examples/dataset/test_specdec_publication.py`
+
+Expected: collection fails because the PTV2 study policy, selectors, and paired
+exposure adapter do not exist; existing publication paths reject the new
+authenticated selection and source-response receipts.
+
+- [ ] **Step 6: Implement the exact policy and disk-backed selectors.** Write
+  this complete policy and reject any decoded representation that differs from
+  it in counts, occurrence milestones, exposure classes, seed, or source
+  revision:
+
+```yaml
+schema_version: 1
+seed: 20260822
+ptv2_revision: 5c89e01dd720ae0f4058445ed49c5fb68a03c76e
+prefix: {selection: source-order, occurrences: 2000000, preserve_duplicates: true}
+balanced:
+  selection: seeded-within-cell
+  occurrences: {math: 500000, code: 400000, stem: 500000, chat: 400000, multilingual: 200000}
+  capacity_shortfall: deterministic-within-cell-cycle
+assistant_responses: source-native
+trainer_epochs: 1
+global_batch_size: 512
+occurrence_milestones: [500000, 1000000, 1300000, 2000000]
+runtime_screen_tokens: 64000000
+scientific_exposures: [one-pass]
+conditional_scientific_tokens: 256000000
+sequence_length: 4096
+```
+
+Stream the authenticated source inventory into a SQLite ranking/index file.
+For A-prefix, stream the exact first 2M authenticated source rows without any
+UUID-based filtering or constructed repetition and reconcile its first 1.3M
+with `BaselineAudit`. For B-balanced, rank source occurrences independently by
+`SHA256(policy_sha256 || cell || source_identity || source_row || prompt_uuid)`;
+cycle only within a deficient cell until its exact occurrence quota is met.
+Persist source capacities, held-out overlap, natural and constructed duplicate
+counts, per-UUID/source-row multiplicity, cell counts, ordered occurrence
+digest, and unique UUID digest without holding production rows in memory.
+
+```python
+@dataclass(frozen=True)
+class StudyOccurrence:
+    ordinal: int
+    prompt_uuid: str
+    source_identity_sha256: str
+    source_row: int
+    cell: str
+    reuse_index: int
+    conversation_sha256: str
+    assistant_response_sha256: str
+
+@dataclass(frozen=True)
+class PTV2StudyView:
+    strategy: Literal["A-prefix", "B-balanced"]
+    occurrence_count: Literal[2_000_000]
+    trainer_epochs: Literal[1]
+    unique_prompt_count: int
+    cell_occurrence_counts: Mapping[str, int]
+    natural_duplicate_count: int
+    constructed_repeat_count: int
+    index_path: Path
+    occurrence_multiplicity_sha256: str
+    ordered_occurrences_sha256: str
+    ordered_prompt_uuids_sha256: str
+    source_response_root_sha256: str
+    selection_sha256: str
+
+@dataclass(frozen=True)
+class PTV2StudyBundle:
+    policy_sha256: str
+    source_inventory_sha256: str
+    baseline_receipt_sha256: str
+    held_out_receipt_sha256: str
+    a_prefix: PTV2StudyView
+    b_balanced: PTV2StudyView
+```
+
+- [ ] **Step 7: Integrate Task 7 and Task 8 authentication.** Add a
+  role-specific study-selection adapter that authenticates the policy,
+  SQLite/index bytes, row shards, cell/count proofs, source-order proof, and
+  external selection root. Add a source-response adapter that authenticates
+  every occurrence's canonical conversation/content hash, assistant-response
+  hash, source identity, and source row before tokenization; it must reject any
+  response mutation or target-synthesis artifact. Materialize and authenticate
+  each exact 2M occurrence stream before training. Build each
+  one-pass view first; expose paired 256M checkpoints only when both
+  authenticated 2M-pass token totals reach the boundary. Record unique UUIDs,
+  natural/constructed multiplicity, `U2M(strategy)`, cumulative exposure,
+  trainer epoch fixed at `1`, milestone trims, total serialized tokens, packed
+  sequences, and exact occurrence/optimizer-step stops. Publish each
+  complete source/selection/response/tokenized/exposure/rejection set through
+  `publish_bundle(...)`; do not add cluster submission to this task.
+
+- [ ] **Step 8: Run GREEN and static checks.**
+
+Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q --confcutdir=tests/examples/dataset tests/examples/dataset/test_qwen3_4b_ptv2_study.py tests/examples/dataset/test_build_assistant_token_views.py tests/examples/dataset/test_specdec_publication.py`
+
+Run: `.venv/bin/ruff check examples/dataset/qwen3_4b_ptv2_study.py examples/dataset/build_assistant_token_views.py examples/dataset/specdec_publication.py tests/examples/dataset/test_qwen3_4b_ptv2_study.py tests/examples/dataset/test_build_assistant_token_views.py tests/examples/dataset/test_specdec_publication.py`
+
+Run: `.venv/bin/pyright examples/dataset/qwen3_4b_ptv2_study.py examples/dataset/build_assistant_token_views.py examples/dataset/specdec_publication.py`
+
+- [ ] **Step 9: Commit the immutable PTV2 study artifacts.**
+
+```bash
+git add examples/dataset/qwen3_4b_ptv2_study.py examples/dataset/qwen3_4b_ptv2_study.yaml tests/examples/dataset/test_qwen3_4b_ptv2_study.py examples/dataset/build_assistant_token_views.py tests/examples/dataset/test_build_assistant_token_views.py examples/dataset/specdec_publication.py tests/examples/dataset/test_specdec_publication.py
+git commit -s -S -m "feat(specdec): prepare Qwen3-4B PTV2 A B study"
+```
+
+### Task 10: Aggregate readiness and run bounded cluster canaries
 
 **Files:**
 - Modify: `examples/dataset/ptv23_builder_readiness.py`
@@ -492,12 +763,33 @@ git commit -s -S -m "feat(specdec): publish immutable prompt corpus bundles"
 - Create: `tools/launcher/common/specdec/submit_bprime_cd_study.sh`
 
 **Interfaces:**
-- Consumes: all upstream receipts, cluster profile, destination receipt, bounded target and training inputs.
-- Produces: per-arm `ReadinessReceipt`, synthesis-canary receipt, training-canary receipt, evaluator-canary receipt, and dependency-safe submission IDs.
+- Consumes: all upstream receipts including both Qwen3-4B PTV2 A/B
+  publications, cluster profile, destination receipt, bounded target and
+  training inputs.
+- Produces: per-arm A/B and per-arm B′/C/D `ReadinessReceipt`,
+  synthesis-canary receipt, runtime-only 64M training-screen receipt,
+  evaluator-canary receipt, and dependency-safe submission IDs.
 
-- [ ] **Step 1: Add RED readiness tests.** Require exact unique counts, reserve counts, source approvals, file hashes, replay lane counts, paired C/D proof, context floors, generation identities, exposure views, atomic publication, and destination receipt. Assert every missing gate has a stable blocker code and no weights are renormalized.
+- [ ] **Step 1: Add RED readiness tests.** Require A's exact first 2M source
+  occurrences and preserved duplicate proof; B's exact five cell counts,
+  deterministic ranking, and explicit constructed multiplicity; independent
+  A/B unique counts; authenticated source-native conversation/content and
+  assistant-response hashes; identical tokenizer/template/loss-target
+  identities; 500K/1M/1.3M/2M milestone identities; one-pass totals;
+  in-pass 256M reachability; source approvals; file hashes; replay lane counts;
+  paired C/D proof; context floors; generation identities; exposure views;
+  atomic publication; and destination receipt.
+  Assert every missing gate has a stable blocker code, 64M cannot set a
+  scientific-ready flag, and no weights are renormalized.
 
-- [ ] **Step 2: Add RED launcher tests.** Verify cluster/account/partition policy, `--gpus-per-node` rather than job-wide `--gpus`, all allocated GPU ranks have work, unique output/W&B identity, immutable receipt arguments, no login-node bulk copy, dependency wiring, and refusal to submit production from a canary-only command.
+- [ ] **Step 2: Add RED launcher tests.** Accept test-only scheduling only with
+  `nemotron_sw_post` or `nemotron_n4_post`; reject every other or missing
+  account. Assert `sbatch --test-only` receives the selected account and the
+  immutable manifest/readiness receipt binds the exact account, cluster,
+  partition, source commit, and corpus receipts. Also verify
+  `--gpus-per-node` rather than job-wide `--gpus`, all allocated GPU ranks have
+  work, unique output/W&B identity, no login-node bulk copy, dependency wiring,
+  and refusal to submit production from a canary-only command.
 
 - [ ] **Step 3: Run RED.**
 
@@ -505,9 +797,30 @@ Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/examples/dat
 
 Expected: new prompt-count gates and launcher contract fail.
 
-- [ ] **Step 4: Implement aggregate readiness.** Define `ReadinessInputs` as the complete upstream receipt set and `ReadinessReceipt` as per-arm readiness plus stable blocker codes. Replace nonzero-token checks with exact per-cell unique-count and 20%-reserve checks, require pinned interactive-SWE and generic-tool inventories, verify all receipt digests transitively, and emit `ready` independently for B′, C, and D.
+- [ ] **Step 4: Implement aggregate readiness.** Define `ReadinessInputs` as
+  the complete upstream receipt set and `ReadinessReceipt` as per-arm readiness
+  plus stable blocker codes. Verify A-prefix exact source order and natural
+  duplicates; B-balanced `500K/400K/500K/400K/200K` counts and disclosed
+  constructed reuse; independent unique UUID counts; trainer epoch `1`;
+  occurrence checkpoints at steps `977/1,954/2,540/3,907`; in-pass 256M
+  eligibility; account binding; and Task 8 identities before emitting Qwen3-4B
+  study readiness. Reject the historical `s25391` schedule. For B′/C/D,
+  replace nonzero-token checks with exact per-cell unique-count and 20%-reserve
+  checks, require pinned interactive-SWE and
+  generic-tool inventories, verify all receipt digests transitively, and emit
+  readiness independently for A, B, B′, C, and D.
 
-- [ ] **Step 5: Implement bounded canaries.** The builder canary uses scaled exact quotas in every cell. The synthesis canary exercises one primary failure and same-cell reserve promotion. The training canary runs 20 optimizer steps, saves and reloads a checkpoint, exports the drafter, records finite loss and per-GPU DCGM activity, and runs a small evaluator bundle.
+- [ ] **Step 5: Implement bounded canaries.** Run the Qwen3-4B A/B
+  materialization canary first with scaled source-prefix and exact five-cell
+  occurrence policies, preserving and authenticating every source-native
+  completion. Run the separate B′/C/D synthesis canary with one primary
+  failure and same-cell reserve promotion. The training canary runs 20
+  optimizer steps, may continue to the 64M runtime screen, saves and reloads a
+  checkpoint, exports the drafter, records finite loss and per-GPU DCGM
+  activity, and runs a small evaluator bundle. Its receipt says
+  `scientific_milestone: false`; only authenticated one-pass/256M artifacts can
+  enable scientific submission. B′/C/D canaries remain blocked until the A/B
+  readiness sequence completes or records an explicit study-stop decision.
 
 - [ ] **Step 6: Run GREEN and static checks.**
 
@@ -521,10 +834,10 @@ Run: `shellcheck -S warning tools/launcher/common/specdec/run_bprime_cd_builder.
 
 ```bash
 git add examples/dataset/ptv23_builder_readiness.py tests/examples/dataset/test_ptv23_builder_readiness.py tools/launcher/common/specdec/bprime_cd_study_manifest.py tools/launcher/tests/test_bprime_cd_study_manifest.py tools/launcher/common/specdec/run_bprime_cd_builder.sbatch tools/launcher/common/specdec/run_bprime_cd_canary.sbatch tools/launcher/common/specdec/submit_bprime_cd_study.sh
-git commit -s -S -m "feat(specdec): gate B-prime C D cluster canaries"
+git commit -s -S -m "feat(specdec): gate PTV2 and B-prime C D canaries"
 ```
 
-### Task 10: Adopt one parent checkpoint and enforce exact-token training
+### Task 11: Adopt one parent checkpoint and enforce exact-token training
 
 **Files:**
 - Create: `examples/speculative_decoding/checkpoint_adoption.py`
@@ -541,7 +854,7 @@ git commit -s -S -m "feat(specdec): gate B-prime C D cluster canaries"
 
 - [ ] **Step 1: Add RED adoption tests.** Accept identical model/drafter tensors and reject name, shape, dtype, or hash mismatch. Prove optimizer, scheduler, scaler, RNG, loader cursor, epoch, global step, and W&B resume state are absent from the new run and the parent hash remains recorded as lineage.
 
-- [ ] **Step 2: Add RED token-budget tests.** Simulate distributed ranks with different local loss-mask counts, require all-reduced cumulative assistant tokens, stop exactly at 256M/1B/common boundaries, checkpoint the counter and fingerprint, and reject resume with another corpus, seed, target, mode, method, block size, or parent.
+- [ ] **Step 2: Add RED token-budget tests.** Simulate distributed ranks with different local loss-mask and occurrence counts, require all-reduced cumulative assistant tokens, checkpoint exactly at reachable 64M/256M boundaries, and terminate Qwen3-4B A/B only after exactly 2M occurrences and trainer epoch `1`. Classify 64M as runtime-only, forbid a second epoch to reach an unavailable 256M milestone, checkpoint both counters and the fingerprint, and reject resume with another corpus, seed, target, mode, method, block size, or parent.
 
 ```python
 @dataclass(frozen=True)
@@ -564,7 +877,7 @@ Expected: new adoption and token-budget modules are absent.
 
 - [ ] **Step 4: Implement weight-only adoption.** Define `ExperimentIdentity` in the launcher manifest and `AdoptionReceipt` in the adoption module. Inventory parent tensors, compare against the initialized child, load model/drafter weights only, assert fresh training state, and write an atomic adoption receipt before the first optimizer step.
 
-- [ ] **Step 5: Integrate exact-token state.** Count the actual loss mask used in each distributed batch, all-reduce the increment, persist cumulative tokens and fingerprint with checkpoints, stop on the exact masked boundary, and keep historical source occurrence exposure as report metadata rather than optimizer state.
+- [ ] **Step 5: Integrate exact-token and occurrence state.** Count the actual loss mask and materialized occurrences used in each distributed batch and all-reduce both increments. For Qwen3-4B A/B, run the exact 2M-occurrence one-pass view as the primary arm. Materialize 64M and reachable 256M as separate deterministic prefix exposure views from the same parent and corpus identity, with a final assistant-mask trim; never append a second epoch when the one-pass receipt cannot supply 256M. Persist cumulative tokens, occurrences, trainer epoch, and fingerprint with checkpoints, and keep historical source occurrence exposure as separate lineage metadata.
 
 - [ ] **Step 6: Run GREEN, related trainer tests, and commit.**
 
@@ -575,7 +888,7 @@ git add examples/speculative_decoding/checkpoint_adoption.py tests/examples/spec
 git commit -s -S -m "feat(specdec): cut over with exact assistant-token state"
 ```
 
-### Task 11: Validate evaluators and refresh the concise HTML progress page
+### Task 12: Validate evaluators and refresh the concise HTML progress page
 
 **Files:**
 - Create: `tools/launcher/common/specdec/collect_bprime_cd_results.py`
@@ -588,12 +901,14 @@ git commit -s -S -m "feat(specdec): cut over with exact assistant-token state"
 - Modify: `tools/launcher/tests/test_speculators_eval.py`
 
 **Interfaces:**
-- Consumes: parent/B′/C/D checkpoint receipts, evaluator manifests and CSV/JSON, corpus/readiness receipts, job/log/W&B links.
+- Consumes: Qwen3-4B PTV2 A/B and parent/B′/C/D checkpoint receipts,
+  evaluator manifests and CSV/JSON, corpus/readiness receipts, job/log/W&B
+  links.
 - Produces: canonical `ProgressReport` JSON and deterministic concise HTML showing measured, running, blocked, and planned states without converting planned values into results.
 
 - [ ] **Step 1: Add RED evaluator tests.** Require identical target/runtime/hardware/K/CUDA-graph/concurrency/request identities within comparisons; validate SPEED-Bench 1K/4K/8K/16K/32K buckets, acceptance counters, latency/throughput, Math/Code/STEM/multilingual/Chat/SWE/tool category coverage, tool-schema validity, and lossless target equivalence.
 
-- [ ] **Step 2: Add RED progress-page tests.** Provide one completed, one running, one blocked, and one planned fixture. Assert escaped output, no credentials or raw environment values, measured-result provenance links, correct historical `1.3M occurrences / 931,363 unique`, exact B′/C/D tables, blocker codes, checkpoint step/hash, and no numeric result rendered for a non-completed evaluator.
+- [ ] **Step 2: Add RED progress-page tests.** Provide one completed, one running, one blocked, and one planned fixture. Assert escaped output, no credentials or raw environment values, measured-result provenance links, correct historical `1.3M occurrences / 931,363 unique`, exact A/B occurrence and B′/C/D tables, A/B `2M occurrences / 1 trainer epoch` labeling, separation of natural/constructed multiplicity from epochs, 64M runtime-only labeling, one-pass/reachable-256M status, blocker codes, account identity, checkpoint step/hash, and no numeric result rendered for a non-completed evaluator.
 
 ```python
 def test_page_never_labels_planned_metrics_as_measured(tmp_path: Path) -> None:
@@ -608,7 +923,7 @@ Run: `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tools/launcher/tes
 
 Expected: result collector and renderer are absent, and the evaluator lacks the expanded category/context contract.
 
-- [ ] **Step 4: Implement result collection.** Define `ResultInputs` as validated corpus/training/evaluator receipt paths and `ProgressReport` as immutable status plus measured metrics. Bind every metric row to evaluator revision, prompt digest, target, drafter checkpoint, K, concurrency, hardware/runtime, and timestamp. Compute paired deltas only when identities match. Record parent, B′ 256M, B′ 700K, C/D 256M, C/D 1B, and common-boundary status independently.
+- [ ] **Step 4: Implement result collection.** Define `ResultInputs` as validated corpus/training/evaluator receipt paths and `ProgressReport` as immutable status plus measured metrics. Bind every metric row to evaluator revision, prompt digest, target, drafter checkpoint, K, concurrency, hardware/runtime, account, and timestamp. Compute paired deltas only when identities match. Record A-prefix and B-balanced unique UUID counts independently, exact 2M occurrence counts, natural/constructed multiplicity, trainer epoch `1`, 500K/1M/1.3M/2M results, one-pass tokens, reachable 256M result, and runtime-only 64M status before recording parent, B′ 256M, B′ 700K, C/D 256M, C/D 1B, and common-boundary status independently.
 
 - [ ] **Step 5: Implement deterministic page rendering.** Render a single compact page with four sections: current cluster/checkpoint status, prompt/corpus readiness, training milestones, and measured evaluator comparisons. Read only validated `bprime_cd_progress.json`, include source/job/log/W&B links when present, and label missing source capacity as blocked rather than estimated.
 
@@ -625,13 +940,13 @@ git add tools/launcher/common/specdec/collect_bprime_cd_results.py tools/launche
 git commit -s -S -m "feat(specdec): report B-prime C D progress and results"
 ```
 
-### Task 12: Run the integrated dry run and prepare authorized submissions
+### Task 13: Run the integrated dry run and prepare authorized submissions
 
 **Files:**
-- Modify only if verification exposes a defect in a file owned by Tasks 1–11.
+- Modify only if verification exposes a defect in a file owned by Tasks 1–12.
 
 **Interfaces:**
-- Consumes: the complete implementation and fixture manifests.
+- Consumes: the complete implementation and fixture manifests from Tasks 1–12.
 - Produces: local verification evidence, canonical dry-run receipts, and test-only SLURM evidence. It does not submit production jobs or push a branch.
 
 - [ ] **Step 1: Run all focused dataset and launcher suites.**
@@ -648,9 +963,9 @@ Run: `bash -n tools/launcher/common/specdec/*.sh tools/launcher/common/specdec/*
 
 Run: `shellcheck -S warning tools/launcher/common/specdec/*.sh tools/launcher/common/specdec/*.sbatch`
 
-- [ ] **Step 3: Run canonical fixture dry runs.** Build a scaled B′/C/D source inventory, candidate reserve, exact prompt views, response promotion, exposure views, atomic corpus, readiness receipt, transfer bundle, adoption receipt, evaluator bundle, and HTML report twice; compare all canonical JSON and HTML bytes between runs.
+- [ ] **Step 3: Run canonical fixture dry runs.** Build scaled A-prefix and B-balanced fixtures that preserve their distinct source-order and exact-cell occurrence policies plus scaled B′/C/D source inventories, candidate reserves, exact prompt views, source-native A/B response authentication, B′/C/D response promotion, exact 2M occurrence views, one-pass and in-pass token milestone views, atomic corpus, readiness receipt, transfer bundle, adoption receipt, evaluator bundle, and HTML report twice; compare all canonical JSON and HTML bytes between runs.
 
-- [ ] **Step 4: Run cluster test-only checks.** After `git pull --ff-only` on the selected cluster checkout, run the source-stage, builder, and canary submitters with `--test-only`. Record resolved account, partition, node/GPU topology, command, source commit, and receipt digests. Do not submit a real job from this step.
+- [ ] **Step 4: Run cluster test-only checks.** After `git pull --ff-only` on the selected cluster checkout, run the source-stage, builder, and canary submitters with `--test-only`. For Qwen3-4B A/B, resolve only `nemotron_sw_post` or `nemotron_n4_post`, pass it explicitly to `sbatch --test-only`, and verify the canonical receipt binds the exact account. Record partition, node/GPU topology, command, source commit, and receipt digests. Do not submit a real job from this step.
 
 - [ ] **Step 5: Run pre-commit and inspect the final diff.**
 
@@ -674,11 +989,14 @@ exclusive:
 4. Run Task 6 after Task 5. Task 7 may begin its token-view unit layer after
    Task 2, but integrate it only after Task 6 freezes `ResponseCorpus`.
 5. Run Task 8 after Task 7; it owns publication and transfer binding.
-6. Run Task 9 after Tasks 3–8; it owns readiness and canary launchers.
-7. Run Task 10 after Tasks 7 and 9; it owns checkpoint adoption and training
+6. Run Task 9 after Tasks 3–8; it owns the full-PTV2 A-prefix/B-balanced
+   selection, exposure, and publication adapters.
+7. Run Task 10 after Tasks 3–9; it owns readiness and canary launchers and must
+   gate the Qwen3-4B A/B study before B′/C/D readiness.
+8. Run Task 11 after Tasks 7 and 10; it owns checkpoint adoption and training
    exposure state.
-8. Run Task 11 after Tasks 8–10; it owns evaluator aggregation and report files.
-9. Run Task 12 serially as the final repository and cluster test-only gate.
+9. Run Task 12 after Tasks 8–11; it owns evaluator aggregation and report files.
+10. Run Task 13 serially as the final repository and cluster test-only gate.
 
 Workers are not alone in the codebase. Each worker must preserve unrelated
 changes, modify only its assigned files, and stop for coordination if another
