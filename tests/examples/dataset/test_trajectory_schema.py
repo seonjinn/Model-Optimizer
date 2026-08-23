@@ -14,6 +14,7 @@ def _load_module():
     spec = importlib.util.spec_from_file_location("trajectory_schema", MODULE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -161,3 +162,121 @@ def test_conversation_normalizer_routes_tool_trajectories_through_validator() ->
     assert normalized["tools"] == row["tools"]
     assert normalized["messages"][3]["tool_call_id"] == "call-1"
     assert normalized["trajectory_sha256"]
+
+
+def _multi_call_trajectory() -> dict:
+    row = _trajectory()
+    row["messages"][2]["tool_calls"].append(
+        {
+            "id": "call-2",
+            "type": "function",
+            "function": {"name": "shell", "arguments": '{"cmd":"ruff check"}'},
+        }
+    )
+    row["messages"].insert(
+        4,
+        {
+            "role": "tool",
+            "name": "shell",
+            "tool_call_id": "call-2",
+            "content": "All checks passed",
+        },
+    )
+    return row
+
+
+def _replay_fixture(mutation: str) -> dict:
+    row = _multi_call_trajectory()
+    if mutation == "declarations_only":
+        row["messages"] = row["messages"][:2] + row["messages"][-1:]
+    elif mutation == "undeclared_function":
+        row["messages"][2]["tool_calls"][0]["function"]["name"] = "python"
+    elif mutation == "duplicate_call_id":
+        row["messages"][2]["tool_calls"][1]["id"] = "call-1"
+    elif mutation == "orphan_result":
+        row["messages"][3]["tool_call_id"] = "missing"
+        row["messages"][3].pop("id", None)
+    elif mutation == "open_call":
+        del row["messages"][3:5]
+    elif mutation == "malformed_arguments":
+        row["messages"][2]["tool_calls"][0]["function"]["arguments"] = "[]"
+    elif mutation == "unsupported_role":
+        row["messages"][1]["role"] = "function"
+    elif mutation == "reasoning_mode_mismatch":
+        row["reasoning_mode"] = "reasoning_off"
+    elif mutation == "wrong_result_name":
+        row["messages"][3]["name"] = "python"
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    return row
+
+
+@pytest.mark.parametrize("lane", ["interactive-swe-replay", "generic-tool-replay"])
+def test_validate_trajectory_accepts_multi_call_replay_lanes(lane: str) -> None:
+    module = _load_module()
+
+    validation = module.validate_trajectory(
+        _multi_call_trajectory(), source_id=f"fixture:{lane}", lane=lane
+    )
+
+    assert validation.tool_call_count == 2
+    assert validation.canonical["messages"][3]["tool_call_id"] == "call-1"
+    assert validation.canonical["messages"][4]["tool_call_id"] == "call-2"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("declarations_only", "no_assistant_tool_call"),
+        ("undeclared_function", "undeclared_function"),
+        ("duplicate_call_id", "duplicate_tool_call_id"),
+        ("orphan_result", "orphan_tool_result"),
+        ("open_call", "unresolved_tool_call"),
+        ("malformed_arguments", "malformed_arguments"),
+        ("unsupported_role", "unsupported_role"),
+        ("reasoning_mode_mismatch", "reasoning_mode_mismatch"),
+        ("wrong_result_name", "tool_result_name_mismatch"),
+    ],
+)
+def test_invalid_replay_is_quarantined(mutation: str, reason: str) -> None:
+    module = _load_module()
+
+    assert (
+        module.quarantine_reason(
+            _replay_fixture(mutation), source_id="fixture:replay", lane="generic-tool-replay"
+        )
+        == reason
+    )
+
+
+class _BoundaryTokenizer:
+    def apply_chat_template(self, messages, **kwargs):
+        del kwargs
+        return {"input_ids": list(range(1_500 * len(messages)))}
+
+
+def test_4k_cut_splitting_tool_call_and_results_is_quarantined() -> None:
+    module = _load_module()
+
+    reason = module.quarantine_reason(
+        _multi_call_trajectory(),
+        source_id="fixture:cut",
+        lane="interactive-swe-replay",
+        tokenizer=_BoundaryTokenizer(),
+        training_seq_len=4_096,
+    )
+
+    assert reason == "split_tool_transaction"
+
+
+def test_expected_reasoning_mode_must_match_replay_content() -> None:
+    module = _load_module()
+
+    reason = module.quarantine_reason(
+        _multi_call_trajectory(),
+        source_id="fixture:reasoning-off",
+        lane="generic-tool-replay",
+        reasoning_mode="reasoning_off",
+    )
+
+    assert reason == "reasoning_mode_mismatch"

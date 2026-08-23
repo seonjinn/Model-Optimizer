@@ -20,14 +20,95 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
+from specdec_corpus_contracts import CanonicalPrompt, canonical_json, sha256_bytes
+from specdec_identity import canonicalize_prompt
+from stage_ptv23_sources import SourceFile, SourceIdentity, SourceInventory
+from trajectory_schema import TrajectoryValidationError, validate_trajectory
+
+__all__ = [
+    "CandidateCell",
+    "CandidateInventory",
+    "CandidatePrompt",
+    "InventorySource",
+    "SourceFile",
+    "SourceIdentity",
+    "SourceInventory",
+    "build_candidate_inventory",
+    "build_inventory_rows",
+    "candidate_inventory_bytes",
+    "sha256_file",
+    "tokenizer_snapshot_sha256",
+]
 
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_REVISION = re.compile(r"^[0-9a-f]{40}$")
+_LANGUAGE = re.compile(r"^[a-z]{2,3}$")
+_LANGUAGE_ALIASES = {
+    "english": "en",
+    "french": "fr",
+    "german": "de",
+    "italian": "it",
+    "japanese": "ja",
+    "spanish": "es",
+}
+_CANDIDATE_QUARANTINE_CODES = frozenset(
+    {
+        "context_too_long",
+        "invalid_language",
+        "invalid_row",
+        "invalid_tokenization",
+        "invalid_tools",
+        "missing_messages",
+        "wrong_lane",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CandidateCell:
+    """One capacity cell after canonical exclusion and replay validation."""
+
+    arm_domain: str
+    lane: str
+    language: str
+    context_bucket: str
+
+
+@dataclass(frozen=True)
+class CandidatePrompt(CanonicalPrompt):
+    """A canonical prompt plus deterministic selection and tokenization metadata."""
+
+    lane: str
+    context_bucket: str
+    full_token_count: int
+    source_manifest_sha256: str
+    source_file_path: str
+    input_ids: tuple[int, ...]
+    tokenizer_sha256: str
+    replay_valid: bool
+
+    @property
+    def arm_domain(self) -> str:
+        return self.domain
+
+
+@dataclass(frozen=True)
+class CandidateInventory:
+    """Canonical candidates, usable capacity, and stable rejection receipts."""
+
+    rows: Sequence[CanonicalPrompt]
+    capacity: Mapping[CandidateCell, int]
+    quarantine_counts: Mapping[str, int]
+    inventory_sha256: str
 
 
 def sha256_file(path: Path) -> str:
@@ -121,7 +202,7 @@ def _verified_files(manifest_path: Path) -> tuple[str, list[Path]]:
 
 def _iter_rows(path: Path):
     if path.suffix == ".parquet":
-        import pyarrow.parquet as pq
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
 
         for row in pq.read_table(path).to_pylist():
             yield json.loads(row["raw_json"]) if set(row) == {"raw_json"} else row
@@ -143,6 +224,356 @@ def _context_bucket(token_count: int) -> str:
     if token_count <= 32768:
         return "16k_32k"
     raise ValueError(f"conversation exceeds the 32K inventory limit: {token_count}")
+
+
+def _source_key(source: SourceIdentity) -> tuple[str, ...]:
+    return (
+        source.repository_id,
+        source.configuration,
+        source.split,
+        source.revision,
+        source.cell,
+        source.lane,
+    )
+
+
+def _staged_path(root: Path, source: SourceIdentity, file: SourceFile) -> Path:
+    return root / "sources" / source.repository_id / source.revision / file.path
+
+
+def _verified_candidate_files(
+    inventory: SourceInventory,
+) -> list[tuple[SourceIdentity, SourceFile, Path]]:
+    if inventory.schema_version != 1 or inventory.staged_root is None:
+        raise ValueError("candidate inventory requires a staged version-1 SourceInventory")
+    root = inventory.staged_root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("staged source root is not a directory")
+    if (
+        _SHA256.fullmatch(inventory.manifest_sha256) is None
+        or hashlib.sha256(inventory.canonical_manifest).hexdigest() != inventory.manifest_sha256
+    ):
+        raise ValueError("source inventory manifest identity mismatch")
+    verified: list[tuple[SourceIdentity, SourceFile, Path]] = []
+    logical_files: set[tuple[str, str, str]] = set()
+    for source in sorted(inventory.sources, key=_source_key):
+        if not source.approved_use or _REVISION.fullmatch(source.revision) is None:
+            raise ValueError(f"unapproved or unpinned source identity: {source.repository_id}")
+        if source.lane not in {
+            "target-synth",
+            "agentless-swe",
+            "interactive-swe-replay",
+            "generic-tool-replay",
+        }:
+            raise ValueError(f"unsupported source lane: {source.lane}")
+        for file in sorted(source.files, key=lambda descriptor: descriptor.path):
+            key = (source.repository_id, source.revision, file.path)
+            if key in logical_files:
+                raise ValueError(f"duplicate logical source file: {key}")
+            logical_files.add(key)
+            path = _staged_path(root, source, file).resolve(strict=False)
+            if (
+                not path.is_relative_to(root)
+                or not path.is_file()
+                or path.stat().st_size != file.bytes
+                or sha256_file(path) != file.sha256
+            ):
+                raise ValueError(
+                    f"source file identity mismatch: {source.repository_id}:{file.path}"
+                )
+            verified.append((source, file, path))
+    return verified
+
+
+def _normalize_language(value: Any, source: SourceIdentity) -> str:
+    if value is None:
+        suffix = source.split.rsplit("_", maxsplit=1)[-1].lower()
+        value = suffix if _LANGUAGE.fullmatch(suffix) else "en"
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid_language")
+    normalized = value.strip().lower().replace("_", "-")
+    normalized = _LANGUAGE_ALIASES.get(normalized, normalized.split("-", maxsplit=1)[0])
+    if _LANGUAGE.fullmatch(normalized) is None:
+        raise ValueError("invalid_language")
+    return normalized
+
+
+def _row_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
+    messages = row.get("messages") or row.get("conversations")
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not all(isinstance(message, dict) for message in messages)
+    ):
+        raise ValueError("missing_messages")
+    return deepcopy(messages)
+
+
+def _target_prompt(row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    messages = _row_messages(row)
+    tools = deepcopy(row.get("tools") or [])
+    if not isinstance(tools, list):
+        raise ValueError("invalid_tools")
+    if messages[-1].get("role") == "assistant":
+        messages.pop()
+    if not messages:
+        raise ValueError("missing_messages")
+    has_tool_exchange = bool(tools) or any(
+        message.get("role") == "tool" or message.get("tool_calls") for message in messages
+    )
+    if has_tool_exchange:
+        raise ValueError("wrong_lane")
+    return messages, tools
+
+
+def _candidate_tokenize(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    *,
+    add_generation_prompt: bool,
+) -> tuple[int, ...]:
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tools=tools or None,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
+        return_dict=True,
+    )
+    input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else encoded
+    if not isinstance(input_ids, list) or any(
+        isinstance(token, bool) or not isinstance(token, int) for token in input_ids
+    ):
+        raise ValueError("invalid_tokenization")
+    return tuple(input_ids)
+
+
+def _quarantine(counts: dict[str, int], reason: str) -> None:
+    counts[reason] = counts.get(reason, 0) + 1
+
+
+def _inventory_digest_payload(
+    rows: Sequence[CandidatePrompt],
+    capacity: Mapping[CandidateCell, int],
+    quarantine_counts: Mapping[str, int],
+    source_manifest_sha256: str,
+    tokenizer_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "source_manifest_sha256": source_manifest_sha256,
+        "tokenizer_sha256": tokenizer_sha256,
+        "rows": [
+            {
+                "prompt_uuid": row.prompt_uuid,
+                "canonical_sha256": sha256_bytes(row.canonical_bytes),
+                "source_id": row.source_id,
+                "source_revision": row.source_revision,
+                "source_file_sha256": row.source_file_sha256,
+                "source_row_index": row.source_row_index,
+                "domain": row.domain,
+                "lane": row.lane,
+                "language": row.language,
+                "context_bucket": row.context_bucket,
+                "full_token_count": row.full_token_count,
+                "input_ids": row.input_ids,
+                "tokenizer_sha256": row.tokenizer_sha256,
+                "replay_valid": row.replay_valid,
+            }
+            for row in rows
+        ],
+        "capacity": [
+            {
+                "arm_domain": cell.arm_domain,
+                "lane": cell.lane,
+                "language": cell.language,
+                "context_bucket": cell.context_bucket,
+                "count": count,
+            }
+            for cell, count in sorted(
+                capacity.items(),
+                key=lambda item: (
+                    item[0].arm_domain,
+                    item[0].lane,
+                    item[0].language,
+                    item[0].context_bucket,
+                ),
+            )
+        ],
+        "quarantine_counts": dict(sorted(quarantine_counts.items())),
+    }
+
+
+def build_candidate_inventory(
+    source_inventory: SourceInventory,
+    *,
+    tokenizer: Any,
+    tokenizer_sha256: str,
+    historical_prompt_ids: set[str],
+    held_out_prompt_ids: set[str],
+    training_seq_len: int = 4_096,
+) -> CandidateInventory:
+    """Build canonical B-prime/C/D candidates from one verified staged inventory."""
+    if _SHA256.fullmatch(tokenizer_sha256) is None or training_seq_len < 1:
+        raise ValueError("tokenizer digest and training sequence length must be pinned")
+    files = _verified_candidate_files(source_inventory)
+    candidates: list[CandidatePrompt] = []
+    admitted: dict[str, bytes] = {}
+    capacity: dict[CandidateCell, int] = {}
+    quarantine_counts: dict[str, int] = {}
+    for source, descriptor, path in files:
+        source_id = f"{source.repository_id}:{source.configuration}:{source.split}"
+        for row_index, raw_row in enumerate(_iter_rows(path)):
+            if not isinstance(raw_row, dict):
+                _quarantine(quarantine_counts, "invalid_row")
+                continue
+            row = dict(raw_row)
+            try:
+                if source.lane in {"interactive-swe-replay", "generic-tool-replay"}:
+                    validation = validate_trajectory(
+                        row,
+                        source_id=f"{source_id}:{row_index}",
+                        lane=source.lane,
+                        tokenizer=tokenizer,
+                        training_seq_len=training_seq_len,
+                    )
+                    messages = validation.canonical["messages"]
+                    tools = validation.canonical["tools"]
+                    replay_valid = True
+                else:
+                    messages, tools = _target_prompt(row)
+                    replay_valid = False
+                canonical_bytes = canonicalize_prompt(messages, tools)
+                canonical_prompt = json.loads(canonical_bytes)
+                messages = canonical_prompt["messages"]
+                tools = canonical_prompt["tools"]
+                uuid = sha256_bytes(canonical_bytes)
+                if uuid in historical_prompt_ids:
+                    _quarantine(quarantine_counts, "historical_exclusion")
+                    continue
+                if uuid in held_out_prompt_ids:
+                    _quarantine(quarantine_counts, "heldout_exclusion")
+                    continue
+                previous = admitted.get(uuid)
+                if previous is not None:
+                    reason = (
+                        "duplicate_prompt_uuid"
+                        if previous == canonical_bytes
+                        else "prompt_uuid_collision"
+                    )
+                    _quarantine(quarantine_counts, reason)
+                    continue
+                language = _normalize_language(row.get("language"), source)
+                input_ids = _candidate_tokenize(
+                    tokenizer,
+                    messages,
+                    tools,
+                    add_generation_prompt=not replay_valid,
+                )
+                context_bucket = _context_bucket(len(input_ids))
+            except TrajectoryValidationError as error:
+                _quarantine(quarantine_counts, error.reason)
+                continue
+            except ValueError as error:
+                reason = str(error)
+                if reason.startswith("conversation exceeds the 32K inventory limit"):
+                    reason = "context_too_long"
+                if reason not in _CANDIDATE_QUARANTINE_CODES:
+                    raise
+                _quarantine(quarantine_counts, reason)
+                continue
+            admitted[uuid] = canonical_bytes
+            candidate = CandidatePrompt(
+                prompt_uuid=uuid,
+                canonical_bytes=canonical_bytes,
+                source_id=source_id,
+                source_revision=source.revision,
+                source_file_sha256=descriptor.sha256,
+                source_row_index=row_index,
+                domain=source.cell,
+                language=language,
+                lane=source.lane,
+                context_bucket=context_bucket,
+                full_token_count=len(input_ids),
+                source_manifest_sha256=source_inventory.manifest_sha256,
+                source_file_path=descriptor.path,
+                input_ids=input_ids,
+                tokenizer_sha256=tokenizer_sha256,
+                replay_valid=replay_valid,
+            )
+            candidates.append(candidate)
+            cell = CandidateCell(source.cell, source.lane, language, context_bucket)
+            capacity[cell] = capacity.get(cell, 0) + 1
+    rows = tuple(sorted(candidates, key=lambda candidate: candidate.prompt_uuid))
+    capacity = dict(
+        sorted(
+            capacity.items(),
+            key=lambda item: (
+                item[0].arm_domain,
+                item[0].lane,
+                item[0].language,
+                item[0].context_bucket,
+            ),
+        )
+    )
+    quarantine_counts = dict(sorted(quarantine_counts.items()))
+    digest_payload = _inventory_digest_payload(
+        rows,
+        capacity,
+        quarantine_counts,
+        source_inventory.manifest_sha256,
+        tokenizer_sha256,
+    )
+    return CandidateInventory(
+        rows=rows,
+        capacity=MappingProxyType(capacity),
+        quarantine_counts=MappingProxyType(quarantine_counts),
+        inventory_sha256=sha256_bytes(canonical_json(digest_payload)),
+    )
+
+
+def candidate_inventory_bytes(inventory: CandidateInventory) -> bytes:
+    """Serialize one candidate inventory deterministically for publication checks."""
+    rows: list[dict[str, Any]] = []
+    for prompt in inventory.rows:
+        if not isinstance(prompt, CandidatePrompt):
+            raise TypeError("candidate inventory contains a non-candidate prompt")
+        rows.append(
+            {
+                "prompt_uuid": prompt.prompt_uuid,
+                "canonical_prompt": json.loads(prompt.canonical_bytes),
+                "source_id": prompt.source_id,
+                "source_revision": prompt.source_revision,
+                "source_file_sha256": prompt.source_file_sha256,
+                "source_row_index": prompt.source_row_index,
+                "source_manifest_sha256": prompt.source_manifest_sha256,
+                "source_file_path": prompt.source_file_path,
+                "arm_domain": prompt.arm_domain,
+                "lane": prompt.lane,
+                "language": prompt.language,
+                "context_bucket": prompt.context_bucket,
+                "full_token_count": prompt.full_token_count,
+                "input_ids": prompt.input_ids,
+                "tokenizer_sha256": prompt.tokenizer_sha256,
+                "replay_valid": prompt.replay_valid,
+            }
+        )
+    payload = {
+        "schema_version": 1,
+        "inventory_sha256": inventory.inventory_sha256,
+        "rows": rows,
+        "capacity": [
+            {
+                "arm_domain": cell.arm_domain,
+                "lane": cell.lane,
+                "language": cell.language,
+                "context_bucket": cell.context_bucket,
+                "count": count,
+            }
+            for cell, count in inventory.capacity.items()
+        ],
+        "quarantine_counts": dict(inventory.quarantine_counts),
+    }
+    return canonical_json(payload) + b"\n"
 
 
 def _tokenize(tokenizer: Any, row: dict[str, Any]) -> tuple[list[int], list[int]]:
@@ -262,7 +693,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer  # pyright: ignore[reportMissingImports]
 
     config = yaml.safe_load(args.sources_config.read_text(encoding="utf-8"))
     sources = [

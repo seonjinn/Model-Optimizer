@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -29,7 +31,12 @@ def _load_module():
     spec = importlib.util.spec_from_file_location("build_specdec_inventory", MODULE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    sys.path.insert(0, str(MODULE_PATH.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
     return module
 
 
@@ -190,8 +197,8 @@ def test_tokenizer_digest_binds_exact_serialization_files(tmp_path: Path) -> Non
 
 def test_inventory_reads_explicit_raw_json_parquet_shards(tmp_path: Path) -> None:
     module = _load_module()
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+    import pyarrow as pa  # pyright: ignore[reportMissingImports]
+    import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
 
     path = tmp_path / "raw.parquet"
     pq.write_table(
@@ -215,3 +222,69 @@ def test_inventory_reads_explicit_raw_json_parquet_shards(tmp_path: Path) -> Non
     )
 
     assert next(iter(module._iter_rows(path)))["prompt_id"] == "raw-1"
+
+
+def test_candidate_inventory_verifies_every_source_before_parsing_rows(tmp_path: Path) -> None:
+    module = _load_module()
+    valid = tmp_path / "valid.jsonl"
+    valid.write_text("not-json\n")
+    malformed = tmp_path / "malformed.jsonl"
+    malformed.write_text('{"messages":[{"role":"user","content":"valid"}]}\n')
+    first_staged = tmp_path / "sources/fixture/source" / ("a" * 40) / valid.name
+    first_staged.parent.mkdir(parents=True)
+    first_staged.write_bytes(valid.read_bytes())
+    second_staged = tmp_path / "sources/fixture/source" / ("b" * 40) / malformed.name
+    second_staged.parent.mkdir(parents=True)
+    second_staged.write_bytes(malformed.read_bytes())
+    canonical_manifest = b"{}\n"
+    inventory = module.SourceInventory(
+        schema_version=1,
+        name="fixture",
+        sources=(
+            module.SourceIdentity(
+                repository_id="fixture/source",
+                configuration="default",
+                split="valid",
+                revision="a" * 40,
+                license_expression="Apache-2.0",
+                approved_use=True,
+                cell="math",
+                lane="target-synth",
+                files=(
+                    module.SourceFile(
+                        "valid.jsonl", valid.stat().st_size, module.sha256_file(valid)
+                    ),
+                ),
+            ),
+            module.SourceIdentity(
+                repository_id="fixture/source",
+                configuration="default",
+                split="malformed",
+                revision="b" * 40,
+                license_expression="Apache-2.0",
+                approved_use=True,
+                cell="math",
+                lane="target-synth",
+                files=(
+                    module.SourceFile(
+                        "malformed.jsonl",
+                        malformed.stat().st_size + 1,
+                        module.sha256_file(malformed),
+                    ),
+                ),
+            ),
+        ),
+        manifest_sha256=hashlib.sha256(canonical_manifest).hexdigest(),
+        canonical_manifest=canonical_manifest,
+        raw_counts={"math": 2},
+        staged_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="source file identity mismatch"):
+        module.build_candidate_inventory(
+            inventory,
+            tokenizer=FakeTokenizer(),
+            tokenizer_sha256="f" * 64,
+            historical_prompt_ids=set(),
+            held_out_prompt_ids=set(),
+        )
