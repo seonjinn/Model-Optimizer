@@ -301,7 +301,18 @@ def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
     output = tmp_path / "fsync"
     displaced = tmp_path / "published-before-swap"
     original_fsync = selection_module._fsync_directory
+    original_rename = selection_module._rename_no_replace
     original_stat = Path.stat
+    former_partial: Path | None = None
+
+    def rename_then_recreate_partial(source: Path, destination: Path) -> None:
+        nonlocal former_partial
+        original_rename(source, destination)
+        former_partial = source
+        former_partial.mkdir()
+        (former_partial / "sentinel").write_text(
+            "concurrent former-partial owner", encoding="utf-8"
+        )
 
     def fail_parent(path: Path) -> None:
         if path == output.parent:
@@ -321,15 +332,20 @@ def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
         return identity
 
     monkeypatch.setattr(selection_module, "_fsync_directory", fail_parent)
+    monkeypatch.setattr(selection_module, "_rename_no_replace", rename_then_recreate_partial)
     monkeypatch.setattr(Path, "stat", swap_after_identity_check)
     with pytest.raises(PromptPublicationDurabilityError) as caught:
         publish_prompt_view_bundle(bundle, output)
 
     recovery = caught.value
+    assert former_partial is not None
     displaced_identity = original_stat(displaced, follow_symlinks=False)
     displaced_manifest = json.loads((displaced / "SELECTION_MANIFEST.json").read_bytes())
     assert swapped
     assert (output / "sentinel").read_text(encoding="utf-8") == "concurrent winner"
+    assert (former_partial / "sentinel").read_text(encoding="utf-8") == (
+        "concurrent former-partial owner"
+    )
     assert recovery.__cause__ is not None
     assert str(recovery.__cause__) == "parent fsync failed"
     assert recovery.recovery_required is True
@@ -354,14 +370,17 @@ def test_postrename_fsync_failure_preserves_a_concurrent_winner_for_recovery(
     }
     assert "independently" in recovery.verification_instructions.lower()
     assert "without following symlinks" in recovery.verification_instructions
-    assert not list(tmp_path.glob(".fsync.partial-*"))
+    assert set(tmp_path.glob(".fsync.partial-*")) == {former_partial}
 
     monkeypatch.setattr(selection_module, "_fsync_directory", original_fsync)
     monkeypatch.setattr(Path, "stat", original_stat)
     with pytest.raises(FileExistsError):
         publish_prompt_view_bundle(bundle, output)
     assert (output / "sentinel").read_text(encoding="utf-8") == "concurrent winner"
-    assert not list(tmp_path.glob(".fsync.partial-*"))
+    assert (former_partial / "sentinel").read_text(encoding="utf-8") == (
+        "concurrent former-partial owner"
+    )
+    assert set(tmp_path.glob(".fsync.partial-*")) == {former_partial}
 
 
 def test_inspector_accepts_exact_odd_d_lane_bucket_floor_proofs(tmp_path: Path) -> None:

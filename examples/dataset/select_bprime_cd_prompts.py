@@ -952,6 +952,7 @@ def publish_prompt_view_bundle(
     shard_hasher = sha256()
     shard_count = 0
     shard_path = ""
+    rename_completed: bool = False
 
     def finish_shard() -> None:
         nonlocal shard_file, shard_hasher, shard_count
@@ -1083,6 +1084,7 @@ def publish_prompt_view_bundle(
         _fsync_directory(partial)
         partial_identity = partial.stat(follow_symlinks=False)
         _rename_no_replace(partial, output_dir)
+        rename_completed = True
         try:
             _fsync_directory(output_dir.parent)
         except BaseException as fsync_error:
@@ -1102,7 +1104,8 @@ def publish_prompt_view_bundle(
             shard_file.close()
         if index is not None:
             index.close()
-        shutil.rmtree(partial, ignore_errors=True)
+        if not rename_completed:
+            shutil.rmtree(partial, ignore_errors=True)
         raise
     return PublishedPromptViews(
         output_dir / "SELECTION_MANIFEST.json",
