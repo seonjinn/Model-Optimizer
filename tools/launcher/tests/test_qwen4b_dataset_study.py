@@ -66,6 +66,7 @@ def _manifest() -> Qwen4BSynthesisManifest:
             target_path="/lustre/models/Qwen3-4B",
             target_revision="1cfa9a7208912126459214e8b04321603b3df60c",
             tokenizer_sha256="d" * 64,
+            chat_template_sha256="0" * 64,
             prompt_manifest_path="/lustre/study/prompts/C.json",
             prompt_manifest_sha256="e" * 64,
             trace_manifest_path="/lustre/study/traces/C.json",
@@ -123,6 +124,20 @@ def test_synthesis_identity_separates_thinking_modes_and_response_sources() -> N
 
     assert manifest.experiment_id != replace(manifest, thinking_mode="off").experiment_id
     assert manifest.experiment_id != replace(manifest, response_source="trace-replay").experiment_id
+    assert (
+        manifest.generation_identity_sha256
+        != replace(
+            manifest,
+            inputs=replace(manifest.inputs, chat_template_sha256="1" * 64),
+        ).generation_identity_sha256
+    )
+    assert (
+        manifest.generation_identity_sha256
+        != replace(
+            manifest,
+            settings=replace(manifest.settings, max_tokens=2048),
+        ).generation_identity_sha256
+    )
 
 
 def test_synthesis_manifest_round_trip_is_canonical_and_immutable(tmp_path: Path) -> None:
@@ -376,8 +391,13 @@ def test_runner_owns_all_gpus_and_pins_each_shard_to_one_replica() -> None:
     assert "--reject-tool-trajectories" in runner
     assert "--record-assistant-tokens" in runner
     assert "--strict-num-shards" in runner
-    assert 'SYNTHESIS_WORK_ROOT="${OUTPUT_ROOT}.work-${EXPERIMENT_ID}"' in runner
-    assert 'replica_output="$SYNTHESIS_WORK_ROOT/replicas/$replica"' in runner
+    assert 'replica_output="$ATTEMPT_ROOT/replicas/$replica"' in runner
+    assert "prompt-cell/frozen-rank order" in runner
+    assert "query strips all source" in runner
+    assert '"promotion_status": "passed"' in runner
+    assert "gpu-utilization-replica-${replica}.json" in runner
+    assert 'ATTEMPT_ROOT="${OUTPUT_ROOT}.attempts-${EXPERIMENT_ID}"' in runner
+    assert 'PROMOTED_PARTIAL="${OUTPUT_ROOT}.promotion-partial-${SLURM_JOB_ID}"' in runner
 
 
 def _study_experiment() -> Qwen4BStudyExperiment:

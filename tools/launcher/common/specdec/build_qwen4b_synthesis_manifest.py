@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Immutable manifests for Qwen3-4B response synthesis and trace replay."""
 
@@ -131,6 +143,7 @@ def verify_synthesis_completion(
     expected_output_token_budget: int,
     expected_tokenizer_sha256: str,
     expected_file_count: int,
+    expected_generation_identity_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Revalidate immutable synthesis output before reuse."""
     payload = json.loads((root / "completion.json").read_text(encoding="utf-8"))
@@ -142,6 +155,9 @@ def verify_synthesis_completion(
         "tokenizer_sha256": expected_tokenizer_sha256,
         "file_count": expected_file_count,
     }
+    if expected_generation_identity_sha256 is not None:
+        immutable_contract["generation_identity_sha256"] = expected_generation_identity_sha256
+        immutable_contract["promotion_status"] = "passed"
     if (
         any(payload.get(field) != value for field, value in immutable_contract.items())
         or len(files) != expected_file_count
@@ -179,6 +195,7 @@ class SynthesisInputs:
     output_root: str
     trace_manifest_path: str | None = None
     trace_manifest_sha256: str | None = None
+    chat_template_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -207,6 +224,8 @@ class SynthesisInputs:
             "prompt_manifest_sha256",
         ):
             _validate_sha(name, getattr(self, name), _SHA256)
+        if self.chat_template_sha256 is not None:
+            _validate_sha("chat_template_sha256", self.chat_template_sha256, _SHA256)
         if (self.trace_manifest_path is None) != (self.trace_manifest_sha256 is None):
             raise ValueError("trace manifest path and SHA-256 must be provided together")
         if self.trace_manifest_sha256 is not None:
@@ -270,6 +289,25 @@ class Qwen4BSynthesisManifest:
     def experiment_id(self) -> str:
         """Return a stable identity over every immutable synthesis input."""
         return sha256(_canonical_bytes(asdict(self))).hexdigest()[:16]
+
+    @property
+    def generation_identity_sha256(self) -> str:
+        """Bind every input that can change target-native completion bytes."""
+        if self.inputs.chat_template_sha256 is None:
+            raise ValueError("target synthesis requires an exact chat-template identity")
+        identity = {
+            "target_revision": self.inputs.target_revision,
+            "tokenizer_sha256": self.inputs.tokenizer_sha256,
+            "chat_template_sha256": self.inputs.chat_template_sha256,
+            "runtime_sha256": self.inputs.runtime_archive_sha256,
+            "container_sha256": self.inputs.image_sha256,
+            "source_selection_sha256": self.inputs.prompt_manifest_sha256,
+            "thinking_mode": self.thinking_mode,
+            "temperature": self.settings.temperature,
+            "max_tokens": self.settings.max_tokens,
+            "max_total_length": self.settings.max_total_length,
+        }
+        return sha256(_canonical_bytes(identity)).hexdigest()
 
 
 def _canonical_bytes(value: Any) -> bytes:

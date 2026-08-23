@@ -83,6 +83,7 @@ for value in (
     manifest.inputs.target_path,
     manifest.inputs.target_revision,
     manifest.inputs.tokenizer_sha256,
+    manifest.inputs.chat_template_sha256,
     manifest.inputs.prompt_manifest_path,
     manifest.inputs.prompt_manifest_sha256,
     manifest.inputs.output_root,
@@ -93,11 +94,12 @@ for value in (
     manifest.settings.temperature,
     manifest.settings.max_tokens,
     manifest.settings.max_total_length,
+    manifest.generation_identity_sha256,
 ):
     print(value)
 PY
 )
-(( ${#values[@]} == 22 )) || { echo "synthesis manifest entry is unavailable" >&2; exit 2; }
+(( ${#values[@]} == 24 )) || { echo "synthesis manifest entry is unavailable" >&2; exit 2; }
 EXPERIMENT_ID="${values[0]}"
 ARM="${values[1]}"
 THINKING_MODE="${values[2]}"
@@ -110,18 +112,21 @@ RUNTIME_ARCHIVE_SHA256="${values[8]}"
 TARGET_PATH="${values[9]}"
 TARGET_REVISION="${values[10]}"
 TOKENIZER_SHA256="${values[11]}"
-PROMPT_MANIFEST="${values[12]}"
-PROMPT_MANIFEST_SHA256="${values[13]}"
-OUTPUT_ROOT="${values[14]}"
-REPLICAS="${values[15]}"
-SERVE_TP="${values[16]}"
-NUM_SHARDS="${values[17]}"
-OUTPUT_TOKEN_BUDGET="${values[18]}"
-TEMPERATURE="${values[19]}"
-MAX_TOKENS="${values[20]}"
-MAX_TOTAL_LENGTH="${values[21]}"
+CHAT_TEMPLATE_SHA256="${values[12]}"
+PROMPT_MANIFEST="${values[13]}"
+PROMPT_MANIFEST_SHA256="${values[14]}"
+OUTPUT_ROOT="${values[15]}"
+REPLICAS="${values[16]}"
+SERVE_TP="${values[17]}"
+NUM_SHARDS="${values[18]}"
+OUTPUT_TOKEN_BUDGET="${values[19]}"
+TEMPERATURE="${values[20]}"
+MAX_TOKENS="${values[21]}"
+MAX_TOTAL_LENGTH="${values[22]}"
+GENERATION_IDENTITY_SHA256="${values[23]}"
 readonly EXPERIMENT_ID ARM THINKING_MODE SOURCE_PATH SOURCE_SHA IMAGE_PATH IMAGE_SHA256
 readonly RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH TARGET_REVISION TOKENIZER_SHA256
+readonly CHAT_TEMPLATE_SHA256 GENERATION_IDENTITY_SHA256
 readonly PROMPT_MANIFEST PROMPT_MANIFEST_SHA256 OUTPUT_ROOT REPLICAS SERVE_TP NUM_SHARDS
 readonly OUTPUT_TOKEN_BUDGET TEMPERATURE MAX_TOKENS MAX_TOTAL_LENGTH
 export ARM THINKING_MODE TARGET_REVISION NUM_SHARDS SERVE_TP REPLICAS TEMPERATURE MAX_TOKENS MAX_TOTAL_LENGTH
@@ -167,11 +172,16 @@ if snapshot.get("source_identity") != sys.argv[4]:
 if tokenizer_snapshot_sha256(target) != sys.argv[5]:
     raise SystemExit("target tokenizer identity mismatch")
 PY
+[[ -f "$TARGET_PATH/chat_template.jinja" ]] || { echo "target chat template is missing" >&2; exit 2; }
+[[ "$(sha256sum "$TARGET_PATH/chat_template.jinja" | cut -d' ' -f1)" == "$CHAT_TEMPLATE_SHA256" ]] || {
+    echo "target chat template identity mismatch" >&2
+    exit 2
+}
 
 if [[ -f "$OUTPUT_ROOT/completion.json" ]]; then
     PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
         "$OUTPUT_ROOT" "$EXPERIMENT_ID" "$OUTPUT_TOKEN_BUDGET" "$TOKENIZER_SHA256" \
-        "$NUM_SHARDS" <<'PY'
+        "$NUM_SHARDS" "$GENERATION_IDENTITY_SHA256" <<'PY'
 import sys
 from pathlib import Path
 
@@ -183,6 +193,7 @@ verify_synthesis_completion(
     expected_output_token_budget=int(sys.argv[3]),
     expected_tokenizer_sha256=sys.argv[4],
     expected_file_count=int(sys.argv[5]),
+    expected_generation_identity_sha256=sys.argv[6],
 )
 PY
     echo "reusing completed synthesis output: $OUTPUT_ROOT"
@@ -192,16 +203,18 @@ fi
 
 PROMPT_DATA_ROOT="$(dirname "$PROMPT_MANIFEST")"
 PROMPT_MANIFEST_NAME="$(basename "$PROMPT_MANIFEST")"
-SYNTHESIS_WORK_ROOT="${OUTPUT_ROOT}.work-${EXPERIMENT_ID}"
-[[ "$SYNTHESIS_WORK_ROOT" == /lustre/*.work-"$EXPERIMENT_ID" ]] || {
-    echo "invalid durable synthesis work root" >&2
+ATTEMPT_ROOT="${OUTPUT_ROOT}.attempts-${EXPERIMENT_ID}"
+PROMOTED_PARTIAL="${OUTPUT_ROOT}.promotion-partial-${SLURM_JOB_ID}"
+readonly ATTEMPT_ROOT PROMOTED_PARTIAL
+[[ "$ATTEMPT_ROOT" == /lustre/*.attempts-"$EXPERIMENT_ID" ]] || {
+    echo "invalid durable synthesis attempt root" >&2
     exit 2
 }
 JOB_ROOT="${SCRATCH_ROOT%/}/${USER}/${SLURM_JOB_ID}/qwen4b-synthesis-${EXPERIMENT_ID}"
 [[ "$JOB_ROOT" == "${SCRATCH_ROOT%/}/${USER}/${SLURM_JOB_ID}/"* ]] || { echo "unsafe scratch path" >&2; exit 2; }
 rm -rf -- "$JOB_ROOT"
 mkdir -p "$JOB_ROOT/input" "$JOB_ROOT/runtime" "$JOB_ROOT/replicas" "$JOB_ROOT/logs"
-mkdir -p "$SYNTHESIS_WORK_ROOT/replicas"
+mkdir -p "$ATTEMPT_ROOT/replicas"
 cp -rP --no-preserve=all -- "$SOURCE_PATH" "$JOB_ROOT/source"
 cp -rL --no-preserve=all -- "$TARGET_PATH" "$JOB_ROOT/input/target"
 cp -rL --no-preserve=all -- "$PROMPT_DATA_ROOT" "$JOB_ROOT/input/prompts"
@@ -223,12 +236,12 @@ kill_children() {
 }
 trap kill_children EXIT INT TERM
 
-CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},${SYNTHESIS_WORK_ROOT}:${SYNTHESIS_WORK_ROOT}"
-export PROMPT_MANIFEST_NAME PROMPT_MANIFEST_SHA256 SYNTHESIS_WORK_ROOT
+CONTAINER_MOUNTS="${SCRATCH_ROOT}:${SCRATCH_ROOT},${ATTEMPT_ROOT}:${ATTEMPT_ROOT}"
+export PROMPT_MANIFEST_NAME PROMPT_MANIFEST_SHA256 ATTEMPT_ROOT
 # shellcheck disable=SC2016
 for ((replica = 0; replica < REPLICAS; replica++)); do
     replica_root="$JOB_ROOT/replicas/$replica"
-    replica_output="$SYNTHESIS_WORK_ROOT/replicas/$replica"
+    replica_output="$ATTEMPT_ROOT/replicas/$replica"
     mkdir -p "$replica_root"
     srun --nodes=1 --ntasks=1 --exclusive --gpus=1 --cpus-per-task=24 --mem=200G \
         --kill-on-bad-exit=1 --no-container-mount-home \
@@ -258,6 +271,8 @@ for ((replica = 0; replica < REPLICAS; replica++)); do
                 sleep 2
             done
             curl --fail --silent "http://127.0.0.1:${port}/health" >/dev/null
+            # Input rows are consumed in prompt-cell/frozen-rank order; query strips all source
+            # assistant turns before generation and each immutable attempt gets a unique namespace.
             python "$job_root/source/tools/launcher/common/query.py" \
                 "http://127.0.0.1:${port}/v1" qwen3-4b-study \
                 --data "$job_root/input/prompts/$PROMPT_MANIFEST_NAME" --save "$replica_output" \
@@ -267,6 +282,23 @@ for ((replica = 0; replica < REPLICAS; replica++)); do
                 --target-revision "$TARGET_REVISION" --temperature "$TEMPERATURE" \
                 --max-tokens "$MAX_TOKENS" --max-total-length "$MAX_TOTAL_LENGTH" \
                 --reject-tool-trajectories --record-assistant-tokens
+            python - "$replica_output/gpu-utilization-replica-${replica}.json" "$replica" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+output = subprocess.run(
+    ["nvidia-smi", "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout
+Path(sys.argv[-2]).write_text(
+    json.dumps({"replica": int(sys.argv[-1]), "gpu_utilization": output.splitlines()}, sort_keys=True)
+    + "\n"
+)
+PY
         ' bash "$replica" "$replica_root" "$JOB_ROOT" "$replica_output" \
         >"$JOB_ROOT/logs/replica-${replica}.log" 2>&1 &
     CHILD_PIDS+=("$!")
@@ -281,15 +313,18 @@ done
 CHILD_PIDS=()
 trap - EXIT INT TERM
 
-partial="${OUTPUT_ROOT}.partial-${SLURM_JOB_ID}"
+partial="$PROMOTED_PARTIAL"
 [[ ! -e "$partial" ]] || { echo "synthesis partial already exists: $partial" >&2; exit 2; }
 mkdir -p "$partial/shards" "$partial/logs"
 for ((replica = 0; replica < REPLICAS; replica++)); do
-    cp -r -- "$SYNTHESIS_WORK_ROOT/replicas/$replica/." "$partial/shards/"
+    cp -r -- "$ATTEMPT_ROOT/replicas/$replica/." "$partial/shards/"
     cp -- "$JOB_ROOT/logs/replica-${replica}.log" "$partial/logs/"
     cp -- "$JOB_ROOT/replicas/$replica/server.log" "$partial/logs/server-${replica}.log"
 done
-python3 - "$partial" "$EXPERIMENT_ID" "$MANIFEST_PATH" "$OUTPUT_TOKEN_BUDGET" "$TOKENIZER_SHA256" <<'PY'
+python3 - "$partial" "$EXPERIMENT_ID" "$MANIFEST_PATH" "$OUTPUT_TOKEN_BUDGET" \
+    "$TOKENIZER_SHA256" "$GENERATION_IDENTITY_SHA256" "$TARGET_REVISION" \
+    "$CHAT_TEMPLATE_SHA256" "$RUNTIME_ARCHIVE_SHA256" "$IMAGE_SHA256" \
+    "$PROMPT_MANIFEST_SHA256" "$THINKING_MODE" <<'PY'
 import hashlib
 import json
 import os
@@ -334,6 +369,14 @@ completion = {
     "requested_output_token_budget": requested_assistant_tokens,
     "actual_assistant_tokens": actual_assistant_tokens,
     "tokenizer_sha256": sys.argv[5],
+    "generation_identity_sha256": sys.argv[6],
+    "target_revision": sys.argv[7],
+    "chat_template_sha256": sys.argv[8],
+    "runtime_sha256": sys.argv[9],
+    "container_sha256": sys.argv[10],
+    "source_selection_sha256": sys.argv[11],
+    "thinking_mode": sys.argv[12],
+    "promotion_status": "passed",
     "file_count": len(files),
     "files": files,
 }
@@ -342,5 +385,4 @@ temporary.write_text(json.dumps(completion, indent=2, sort_keys=True) + "\n")
 os.replace(temporary, root / "completion.json")
 PY
 mv -T --no-clobber "$partial" "$OUTPUT_ROOT"
-rm -rf -- "$SYNTHESIS_WORK_ROOT"
 echo "synthesis complete: $OUTPUT_ROOT"
