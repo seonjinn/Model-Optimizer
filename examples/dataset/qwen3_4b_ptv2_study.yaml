@@ -1,16 +1,21 @@
 schema_version: 1
 seed: 20260822
 ptv2_revision: 5c89e01dd720ae0f4058445ed49c5fb68a03c76e
-prefix: {selection: source-order, occurrences: 2000000, preserve_duplicates: true}
+repair:
+  historical: {selection: source-order, occurrences: 1300000, preserve_duplicates: true}
+  complement: {stem: 200000, ja: 125000, es: 125000, fr: 125000, it: 125000, de: 0}
 balanced:
   selection: seeded-within-cell
   occurrences: {math: 500000, code: 400000, stem: 500000, chat: 400000, multilingual: 200000}
+  multilingual_occurrences: {de: 40000, ja: 40000, es: 40000, fr: 40000, it: 40000}
   capacity_shortfall: deterministic-within-cell-cycle
-multilingual: {de: 40000, ja: 40000, es: 40000, fr: 40000, it: 40000}
 assistant_responses: source-native
 trainer_epochs: 1
 global_batch_size: 512
-occurrence_milestones: [500000, 1000000, 1300000, 2000000]
+segment_occurrences: [1300000, 700000]
+segment_steps: [2540, 1368]
+cumulative_steps: [2540, 3908]
+segment_final_valid_occurrences: [32, 96]
 runtime_screen_tokens: 64000000
 scientific_exposures: [one-pass]
 conditional_scientific_tokens: 256000000

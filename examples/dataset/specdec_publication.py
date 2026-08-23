@@ -419,7 +419,7 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "index",
             "shards",
         }
-        if not required.issubset(payload):
+        if set(payload) != required | {"schema_version", "root_sha256"}:
             raise PublicationError("PTV2 selection receipt schema is incomplete")
         policy = payload["policy"]
         index = payload["index"]
@@ -431,6 +431,20 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             or not shards
         ):
             raise PublicationError("PTV2 selection receipt declared files are malformed")
+        for key in (
+            "root_sha256",
+            "selection_sha256",
+            "policy_sha256",
+            "source_inventory_sha256",
+            "baseline_receipt_sha256",
+            "held_out_receipt_sha256",
+        ):
+            value = payload[key]
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise PublicationError(f"PTV2 selection receipt {key} is not a SHA-256")
+        policy_descriptor = _file_descriptor(policy, "selection", Path("."))
+        if policy_descriptor[2] != payload["policy_sha256"]:
+            raise PublicationError("PTV2 policy bytes do not match policy_sha256")
         return [*shards, index, policy]
     if role == "tokenized" and payload.get("schema_version") == 1:
         required = {

@@ -10,6 +10,7 @@ import sys
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,9 +29,13 @@ try:
         iter_ptv2_study_occurrences,
         load_ptv2_study_policy,
         main,
+        select_a_repair_view,
+        select_authenticated_b_balanced_view,
         select_ptv2_b_balanced_view,
         select_ptv2_study_views,
     )
+    from specdec_corpus_contracts import canonical_json
+    from specdec_identity import prompt_uuid
     from stage_ptv23_sources import (
         SourceFile,
         SourceIdentity,
@@ -65,11 +70,18 @@ def _scaled_policy():
     policy = load_ptv2_study_policy(POLICY)
     return replace(
         policy,
-        prefix_occurrences=5,
+        historical_occurrences=3,
+        repair_complement_occurrences={"stem": 1, "de": 0, "ja": 1, "es": 0, "fr": 0, "it": 0},
         balanced_occurrences={"math": 2, "code": 3, "stem": 2, "chat": 2, "multilingual": 2},
-        occurrence_milestones=(2, 3, 4, 5),
-        milestone_steps=(1, 2, 3, 4),
+        segment_occurrences=(3, 2),
+        segment_steps=(1, 1),
+        cumulative_steps=(1, 2),
+        segment_final_valid_occurrences=(3, 2),
     )
+
+
+def _fixture_policy():
+    return replace(load_ptv2_study_policy(POLICY), ptv2_revision="a" * 40)
 
 
 def _write_authenticated_staged_parquet(tmp_path: Path) -> tuple[Path, Path]:
@@ -90,7 +102,16 @@ def _write_authenticated_staged_parquet(tmp_path: Path) -> tuple[Path, Path]:
             {"role": "assistant", "content": "answer-second"},
         ],
     ]
-    pq.write_table(pa.table({"messages": [json.dumps(value) for value in messages]}), source_path)
+    tools = [[{"type": "function", "function": {"name": "tool"}}] for _ in messages]
+    pq.write_table(
+        pa.table(
+            {
+                "messages": [json.dumps(value) for value in messages],
+                "tools": [json.dumps(value) for value in tools],
+            }
+        ),
+        source_path,
+    )
     data = source_path.read_bytes()
     manifest = tmp_path / "SOURCE_PLAN.json"
     manifest.write_text(
@@ -140,7 +161,15 @@ def test_approved_ptv2_study_policy_is_exact() -> None:
     """Changing one-pass arithmetic or source-native response policy must fail."""
     policy = load_ptv2_study_policy(POLICY)
 
-    assert policy.prefix_occurrences == 2_000_000
+    assert policy.historical_occurrences == 1_300_000
+    assert policy.repair_complement_occurrences == {
+        "stem": 200_000,
+        "ja": 125_000,
+        "es": 125_000,
+        "fr": 125_000,
+        "it": 125_000,
+        "de": 0,
+    }
     assert policy.balanced_occurrences == {
         "math": 500_000,
         "code": 400_000,
@@ -148,15 +177,15 @@ def test_approved_ptv2_study_policy_is_exact() -> None:
         "chat": 400_000,
         "multilingual": 200_000,
     }
-    assert policy.occurrence_milestones == (500_000, 1_000_000, 1_300_000, 2_000_000)
-    assert policy.milestone_steps == (977, 1_954, 2_540, 3_907)
-    assert policy.milestone_cursors == (500_224, 1_000_448, 1_300_480, 2_000_000)
+    assert policy.segment_occurrences == (1_300_000, 700_000)
+    assert policy.segment_steps == (2_540, 1_368)
+    assert policy.cumulative_steps == (2_540, 3_908)
+    assert policy.segment_final_valid_occurrences == (32, 96)
     assert policy.runtime_screen_tokens == 64_000_000
     assert policy.conditional_scientific_tokens == 256_000_000
     assert policy.assistant_responses == "source-native"
     assert policy.trainer_epochs == 1
     assert policy.global_batch_size == 512
-    assert policy.final_partial_batch_occurrences == 128
     assert policy.multilingual_occurrences == {
         "de": 40_000,
         "ja": 40_000,
@@ -172,7 +201,8 @@ def test_approved_ptv2_study_policy_is_exact() -> None:
         ("math: 500000", "math: 0.25"),
         ("scientific_exposures: [one-pass]", "scientific_exposures: [64000000]"),
         ("trainer_epochs: 1", "trainer_epochs: 2"),
-        ("occurrences: 2000000", "occurrences: 25391"),
+        ("occurrences: 1300000", "occurrences: 25391"),
+        ("schema_version: 1", "schema_version: 1.0"),
     ],
 )
 def test_policy_rejects_nonapproved_study_representations(
@@ -222,6 +252,38 @@ def test_prefix_preserves_source_occurrences_and_natural_duplicates(tmp_path: Pa
     assert view.constructed_repeat_count == 0
     assert view.held_out_overlap_count == 1
     assert view.index_path.is_file()
+
+
+def test_a_repair_preserves_history_then_appends_only_the_repair_complement(tmp_path: Path) -> None:
+    """A's second segment is not the next source-order tail and excludes German."""
+    policy = _scaled_policy()
+    history = (
+        _row("chat", 0, "history-a"),
+        _row("chat", 1, "history-a"),
+        _row("code", 2, "history-b"),
+    )
+    baseline_ids = tuple(row.prompt_uuid for row in history)
+    baseline = SimpleNamespace(
+        occurrence_count=3,
+        occurrence_prompt_ids=baseline_ids,
+        occurrence_prompt_ids_sha256=sha256(canonical_json(list(baseline_ids))).hexdigest(),
+        unique_prompt_count=2,
+    )
+    complement = (
+        _row("multilingual", 3, "wrong-de", language="de"),
+        _row("stem", 4, "stem"),
+        _row("multilingual", 5, "ja", language="ja"),
+        _row("chat", 6, "wrong-tail"),
+    )
+
+    view = select_a_repair_view(
+        history, complement, policy=policy, baseline=baseline, output_root=tmp_path
+    )
+
+    selected = tuple(iter_ptv2_study_occurrences(view))
+    assert [row.source_row for row in selected] == [0, 1, 2, 4, 5]
+    assert view.strategy == "A-repair"
+    assert view.repair_complement_counts["de"] == 0
 
 
 def test_balanced_view_repeats_within_cell_without_renormalizing(tmp_path: Path) -> None:
@@ -274,6 +336,16 @@ def test_b_balanced_readiness_does_not_require_an_a_prefix(tmp_path: Path) -> No
 
     assert view.strategy == "B-balanced"
     assert view.occurrence_count == 11
+
+
+def test_authenticated_b_selection_rejects_untyped_exclusion_root(tmp_path: Path) -> None:
+    """Production B cannot substitute a caller-provided digest/list for ExclusionIndex."""
+    with pytest.raises(PTV2StudyError, match="requires an ExclusionIndex"):
+        select_authenticated_b_balanced_view(
+            tmp_path / "SOURCE_INVENTORY.json",
+            policy=load_ptv2_study_policy(POLICY),
+            exclusions=object(),  # type: ignore[arg-type]
+        )
 
 
 def test_b_index_publication_is_no_replace_and_preserves_prior_receipt(tmp_path: Path) -> None:
@@ -355,7 +427,7 @@ def test_full_policy_rejects_multilingual_rows_without_an_approved_language(tmp_
     policy = load_ptv2_study_policy(POLICY)
 
     with pytest.raises(PTV2StudyError, match="approved language"):
-        select_ptv2_study_views(
+        select_ptv2_b_balanced_view(
             (_row("multilingual", 0, "unlabelled"),), policy=policy, output_root=tmp_path
         )
 
@@ -389,31 +461,38 @@ def test_b_balanced_multilingual_quota_is_per_language_without_borrowing(tmp_pat
 
 
 def test_staged_inventory_authenticates_declared_bytes_and_physical_row_order(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Task3's published receipt binds the source file, native response, and row order."""
     receipt, staged_file = _write_authenticated_staged_parquet(tmp_path)
 
-    rows = tuple(iter_ptv2_staged_source_rows(receipt))
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+    rows = tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))
 
     assert [(row.source_row, row.cell) for row in rows] == [(0, "math"), (1, "math")]
     assert [json.loads(row.assistant_response)["content"] for row in rows] == [
         "answer-first",
         "answer-second",
     ]
+    assert rows[0].prompt_uuid == prompt_uuid(
+        [{"role": "user", "content": "first"}], [{"type": "function", "function": {"name": "tool"}}]
+    )
     staged_file.write_bytes(b"mutated payload")
     with pytest.raises(SourceManifestError, match="stale staged file"):
-        tuple(iter_ptv2_staged_source_rows(receipt))
+        tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))
 
 
-def test_staged_inventory_rejects_undeclared_orphan_parquet(tmp_path: Path) -> None:
+def test_staged_inventory_rejects_undeclared_orphan_parquet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The known multilingual orphan cannot enter B through a physical-directory scan."""
     receipt, staged_file = _write_authenticated_staged_parquet(tmp_path)
     orphan = staged_file.parent / "multilingual-00000-of-00001.parquet"
     orphan.write_bytes(staged_file.read_bytes())
 
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
     with pytest.raises(PTV2StudyError, match="undeclared or missing Parquet"):
-        tuple(iter_ptv2_staged_source_rows(receipt))
+        tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))
 
 
 def test_staged_inventory_requires_a_published_task3_receipt(
@@ -435,10 +514,10 @@ def test_staged_inventory_requires_a_published_task3_receipt(
     monkeypatch.setattr(study_module, "load_source_inventory", lambda _: inventory)
 
     with pytest.raises(PTV2StudyError, match="authenticated staged SourceInventory"):
-        tuple(iter_ptv2_staged_source_rows(tmp_path / "SOURCE_PLAN.json"))
+        tuple(iter_ptv2_staged_source_rows(tmp_path / "SOURCE_PLAN.json", policy=_fixture_policy()))
 
 
-def test_b_cli_requires_the_full_declared_shard_count(
+def test_b_cli_uses_the_immutable_declared_shard_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The executable B path defaults to the audited 201 declared PTV2 shards."""
@@ -446,10 +525,10 @@ def test_b_cli_requires_the_full_declared_shard_count(
         _row(cell, index, cell)
         for index, cell in enumerate(("math", "code", "stem", "chat", "multilingual"))
     )
-    seen: dict[str, int] = {}
+    seen: dict[str, object] = {}
 
-    def _rows(_: Path, *, expected_declared_shards: int | None = None):
-        seen["expected_declared_shards"] = expected_declared_shards or 0
+    def _rows(_: Path, *, policy):
+        seen["policy"] = policy
         return iter(rows)
 
     monkeypatch.setattr(study_module, "load_ptv2_study_policy", lambda _: _scaled_policy())
@@ -469,4 +548,4 @@ def test_b_cli_requires_the_full_declared_shard_count(
     )
 
     assert main() == 0
-    assert seen == {"expected_declared_shards": 201}
+    assert seen == {"policy": _scaled_policy()}

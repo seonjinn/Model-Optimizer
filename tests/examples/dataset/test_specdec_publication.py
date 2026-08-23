@@ -112,7 +112,7 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
     payload = {
         "schema_version": 3,
         "selection_sha256": "1" * 64,
-        "policy_sha256": "2" * 64,
+        "policy_sha256": hashlib.sha256(policy.read_bytes()).hexdigest(),
         "source_inventory_sha256": "3" * 64,
         "baseline_receipt_sha256": "4" * 64,
         "held_out_receipt_sha256": "5" * 64,
@@ -127,6 +127,17 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         descriptor(index),
         descriptor(policy),
     ]
+
+    malformed = dict(payload)
+    malformed["selection_sha256"] = "not-a-digest"
+    malformed["unknown"] = True
+    malformed["root_sha256"] = hashlib.sha256(
+        publication._identity_json(
+            {key: value for key, value in malformed.items() if key != "root_sha256"}
+        )
+    ).hexdigest()
+    with pytest.raises(publication.PublicationError, match="schema is incomplete"):
+        publication._role_file_descriptors("selection", malformed)
 
 
 @pytest.mark.parametrize(

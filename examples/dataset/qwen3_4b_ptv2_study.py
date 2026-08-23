@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 from specdec_corpus_contracts import canonical_json
-from specdec_identity import prompt_uuid
+from specdec_identity import ExclusionIndex, prompt_uuid
 from stage_ptv23_sources import load_source_inventory, stage_source_inventory
 
 if TYPE_CHECKING:
@@ -37,6 +37,8 @@ __all__ = [
     "iter_ptv2_staged_source_rows",
     "iter_ptv2_study_occurrences",
     "load_ptv2_study_policy",
+    "select_a_repair_view",
+    "select_authenticated_b_balanced_view",
     "select_ptv2_b_balanced_view",
     "select_ptv2_study_views",
 ]
@@ -51,19 +53,33 @@ _BALANCED_COUNTS = {
     "chat": 400_000,
     "multilingual": 200_000,
 }
-_MILESTONES = (500_000, 1_000_000, 1_300_000, 2_000_000)
+_REPAIR_COMPLEMENT_COUNTS = {
+    "stem": 200_000,
+    "ja": 125_000,
+    "es": 125_000,
+    "fr": 125_000,
+    "it": 125_000,
+    "de": 0,
+}
+_SEGMENT_OCCURRENCES = (1_300_000, 700_000)
+_SEGMENT_STEPS = (2_540, 1_368)
+_CUMULATIVE_STEPS = (2_540, 3_908)
+_SEGMENT_FINAL_VALID = (32, 96)
+_DECLARED_PTV2_PARQUET_SHARDS = 201
 _ROOT_KEYS = frozenset(
     {
         "schema_version",
         "seed",
         "ptv2_revision",
-        "prefix",
+        "repair",
         "balanced",
-        "multilingual",
         "assistant_responses",
         "trainer_epochs",
         "global_batch_size",
-        "occurrence_milestones",
+        "segment_occurrences",
+        "segment_steps",
+        "cumulative_steps",
+        "segment_final_valid_occurrences",
         "runtime_screen_tokens",
         "scientific_exposures",
         "conditional_scientific_tokens",
@@ -87,20 +103,26 @@ class PTV2StudyPolicy:
     schema_version: int
     seed: int
     ptv2_revision: str
-    prefix_occurrences: int
+    historical_occurrences: int
+    repair_complement_occurrences: Mapping[str, int]
     balanced_occurrences: Mapping[str, int]
     multilingual_occurrences: Mapping[str, int]
-    occurrence_milestones: tuple[int, ...]
-    milestone_steps: tuple[int, ...]
-    milestone_cursors: tuple[int, ...]
+    segment_occurrences: tuple[int, int]
+    segment_steps: tuple[int, int]
+    cumulative_steps: tuple[int, int]
+    segment_final_valid_occurrences: tuple[int, int]
     runtime_screen_tokens: int
     conditional_scientific_tokens: int
     assistant_responses: Literal["source-native"]
     trainer_epochs: int
     global_batch_size: int
-    final_partial_batch_occurrences: int
     sequence_length: int
     policy_sha256: str
+
+    @property
+    def total_occurrences(self) -> int:
+        """The immutable 1.3M plus 700K one-pass occurrence total."""
+        return sum(self.segment_occurrences)
 
 
 @dataclass(frozen=True)
@@ -134,11 +156,17 @@ class StudyOccurrence:
 class PTV2StudyView:
     """A disk-backed exact occurrence view for one PTV2 strategy."""
 
-    strategy: Literal["A-prefix", "B-balanced"]
+    strategy: Literal["A-repair", "B-balanced"]
     occurrence_count: int
     trainer_epochs: int
     unique_prompt_count: int
     cell_occurrence_counts: Mapping[str, int]
+    multilingual_occurrence_counts: Mapping[str, int]
+    repair_complement_counts: Mapping[str, int]
+    segment_occurrence_counts: tuple[int, int]
+    cell_unique_prompt_counts: Mapping[str, int]
+    language_unique_prompt_counts: Mapping[str, int]
+    maximum_multiplicity: int
     natural_duplicate_count: int
     constructed_repeat_count: int
     index_path: Path
@@ -159,8 +187,13 @@ class PTV2StudyBundle:
     source_inventory_sha256: str
     baseline_receipt_sha256: str
     held_out_receipt_sha256: str
-    a_prefix: PTV2StudyView
+    a_repair: PTV2StudyView
     b_balanced: PTV2StudyView
+
+    @property
+    def a_prefix(self) -> PTV2StudyView:
+        """Compatibility alias for pre-repair callers; production receipts use A-repair."""
+        return self.a_repair
 
 
 def load_ptv2_study_policy(path: Path) -> PTV2StudyPolicy:
@@ -171,40 +204,70 @@ def load_ptv2_study_policy(path: Path) -> PTV2StudyPolicy:
         raise PTV2StudyError(f"unable to read PTV2 study policy: {path}") from error
     root = _mapping(raw, "policy")
     _exact_keys(root, _ROOT_KEYS, "policy")
-    prefix = _mapping(root["prefix"], "prefix")
-    _exact_keys(prefix, frozenset({"selection", "occurrences", "preserve_duplicates"}), "prefix")
+    repair = _mapping(root["repair"], "repair")
+    _exact_keys(repair, frozenset({"historical", "complement"}), "repair")
+    historical = _mapping(repair["historical"], "repair.historical")
+    _exact_keys(
+        historical,
+        frozenset({"selection", "occurrences", "preserve_duplicates"}),
+        "repair.historical",
+    )
     balanced = _mapping(root["balanced"], "balanced")
     _exact_keys(
         balanced,
-        frozenset({"selection", "occurrences", "capacity_shortfall"}),
+        frozenset({"selection", "occurrences", "multilingual_occurrences", "capacity_shortfall"}),
         "balanced",
     )
     counts = _positive_count_mapping(balanced["occurrences"], "balanced.occurrences")
-    multilingual = _language_counts(root["multilingual"])
-    milestones = _positive_int_tuple(root["occurrence_milestones"], "occurrence_milestones")
-    global_batch_size = _positive_int(root["global_batch_size"], "global_batch_size")
-    steps = tuple(_ceil_div(value, global_batch_size) for value in milestones)
-    _require_approved_policy(root, prefix, balanced, counts, milestones, steps)
+    multilingual = _language_counts(balanced["multilingual_occurrences"])
+    complement = _repair_counts(repair["complement"])
+    segment_occurrences = _strict_int_tuple(root["segment_occurrences"], "segment_occurrences")
+    segment_steps = _strict_int_tuple(root["segment_steps"], "segment_steps")
+    cumulative_steps = _strict_int_tuple(root["cumulative_steps"], "cumulative_steps")
+    segment_final_valid = _strict_int_tuple(
+        root["segment_final_valid_occurrences"], "segment_final_valid_occurrences"
+    )
+    _positive_int(root["global_batch_size"], "global_batch_size")
+    _positive_int(root["schema_version"], "schema_version")
+    _positive_int(root["seed"], "seed")
+    _positive_int(historical["occurrences"], "repair.historical.occurrences")
+    if not isinstance(historical["preserve_duplicates"], bool):
+        raise PTV2StudyError("repair.historical.preserve_duplicates must be boolean")
+    _positive_int(root["trainer_epochs"], "trainer_epochs")
+    _positive_int(root["runtime_screen_tokens"], "runtime_screen_tokens")
+    _positive_int(root["conditional_scientific_tokens"], "conditional_scientific_tokens")
+    _positive_int(root["sequence_length"], "sequence_length")
+    _require_approved_policy(
+        root,
+        historical,
+        balanced,
+        counts,
+        complement,
+        segment_occurrences,
+        segment_steps,
+        cumulative_steps,
+        segment_final_valid,
+    )
     policy_sha256 = sha256(canonical_json(root)).hexdigest()
     return PTV2StudyPolicy(
         schema_version=1,
         seed=int(root["seed"]),
         ptv2_revision=str(root["ptv2_revision"]),
-        prefix_occurrences=int(prefix["occurrences"]),
+        historical_occurrences=_positive_int(
+            historical["occurrences"], "repair.historical.occurrences"
+        ),
+        repair_complement_occurrences=MappingProxyType(complement),
         balanced_occurrences=MappingProxyType(counts),
         multilingual_occurrences=MappingProxyType(multilingual),
-        occurrence_milestones=milestones,
-        milestone_steps=steps,
-        milestone_cursors=(
-            *(step * global_batch_size for step in steps[:-1]),
-            int(prefix["occurrences"]),
-        ),
+        segment_occurrences=(segment_occurrences[0], segment_occurrences[1]),
+        segment_steps=(segment_steps[0], segment_steps[1]),
+        cumulative_steps=(cumulative_steps[0], cumulative_steps[1]),
+        segment_final_valid_occurrences=(segment_final_valid[0], segment_final_valid[1]),
         runtime_screen_tokens=int(root["runtime_screen_tokens"]),
         conditional_scientific_tokens=int(root["conditional_scientific_tokens"]),
         assistant_responses="source-native",
         trainer_epochs=1,
         global_batch_size=int(root["global_batch_size"]),
-        final_partial_batch_occurrences=int(prefix["occurrences"]) % int(root["global_batch_size"]),
         sequence_length=int(root["sequence_length"]),
         policy_sha256=policy_sha256,
     )
@@ -217,35 +280,44 @@ def select_ptv2_study_views(
     output_root: Path | None = None,
     held_out_prompt_uuids: Iterable[str] = (),
     baseline: Any | None = None,
-    source_inventory_sha256: str | None = None,
-    baseline_receipt_sha256: str | None = None,
-    held_out_receipt_sha256: str | None = None,
+    source_inventory: object | None = None,
+    exclusions: ExclusionIndex | None = None,
 ) -> PTV2StudyBundle:
-    """Stream authenticated source rows into exact A-prefix and B-balanced SQLite views."""
+    """Select a paired study only when the full policy has its typed trust roots."""
+    if policy.total_occurrences == 2_000_000 and (
+        source_inventory is None or baseline is None or not isinstance(exclusions, ExclusionIndex)
+    ):
+        raise PTV2StudyError(
+            "full PTV2 paired selection requires SourceInventory, BaselineAudit, and ExclusionIndex"
+        )
     root = _selection_root(output_root)
     index_path = root / "ptv2-study-index.sqlite3"
     temporary_index = _prepare_unpublished_index(root, index_path)
-    held_out = _held_out_set(held_out_prompt_uuids)
+    held_out = _held_out_set(
+        exclusions.held_out if exclusions is not None else held_out_prompt_uuids
+    )
     connection = sqlite3.connect(temporary_index)
     try:
         _create_schema(connection)
         _spool_source_rows(connection, source_rows, policy)
         capacities = _capacity_counts(connection)
-        _insert_a_prefix(connection, policy.prefix_occurrences)
+        _insert_a_prefix(connection, policy.total_occurrences)
         _verify_baseline_prefix(connection, policy, baseline)
         _insert_b_balanced(connection, policy)
         connection.commit()
-        inventory_digest = source_inventory_sha256 or _source_inventory_digest(connection)
-        _require_digest(inventory_digest, "source inventory")
-        baseline_digest = baseline_receipt_sha256 or _baseline_digest(baseline)
-        held_out_digest = (
-            held_out_receipt_sha256 or sha256(canonical_json(sorted(held_out))).hexdigest()
+        inventory_digest = (
+            getattr(source_inventory, "manifest_sha256", None)
+            if source_inventory is not None
+            else _source_inventory_digest(connection)
         )
+        _require_digest(inventory_digest, "source inventory")
+        baseline_digest = _baseline_digest(baseline)
+        held_out_digest = sha256(canonical_json(sorted(held_out))).hexdigest()
         _require_digest(baseline_digest, "baseline receipt")
         _require_digest(held_out_digest, "held-out receipt")
         a_prefix = _build_view(
             connection,
-            "A-prefix",
+            "A-repair",
             policy,
             index_path,
             held_out,
@@ -298,8 +370,64 @@ def select_ptv2_b_balanced_view(
     return view
 
 
+def select_authenticated_b_balanced_view(
+    inventory_receipt: Path,
+    *,
+    policy: PTV2StudyPolicy,
+    exclusions: ExclusionIndex,
+    output_root: Path | None = None,
+) -> PTV2StudyView:
+    """Production B entrypoint: derive rows and overlap state from authenticated roots only."""
+    if not isinstance(exclusions, ExclusionIndex):
+        raise PTV2StudyError("B-balanced production selection requires an ExclusionIndex")
+    inventory = load_source_inventory(inventory_receipt)
+    if inventory.staged_root is None:
+        raise PTV2StudyError("B-balanced production selection requires staged SourceInventory")
+    if any(source.revision != policy.ptv2_revision for source in inventory.sources):
+        raise PTV2StudyError("SourceInventory revision does not match the study policy")
+    return select_ptv2_b_balanced_view(
+        iter_ptv2_staged_source_rows(inventory_receipt, policy=policy),
+        policy=policy,
+        output_root=output_root,
+        held_out_prompt_uuids=exclusions.held_out,
+    )
+
+
+def select_a_repair_view(
+    historical_rows: Iterable[PTV2StudySourceRow],
+    repair_complement_rows: Iterable[PTV2StudySourceRow],
+    *,
+    policy: PTV2StudyPolicy,
+    baseline: object,
+    held_out_prompt_uuids: Iterable[str] = (),
+    output_root: Path | None = None,
+) -> PTV2StudyView:
+    """Materialize A-repair as verified 1.3M history followed by its fixed 700K complement."""
+    root = _selection_root(output_root)
+    index_path = root / "ptv2-a-repair-index.sqlite3"
+    temporary_index = _prepare_unpublished_index(root, index_path)
+    held_out = _held_out_set(held_out_prompt_uuids)
+    connection = sqlite3.connect(temporary_index)
+    try:
+        _create_schema(connection)
+        history_count = _spool_source_rows(connection, historical_rows, policy)
+        if history_count != policy.historical_occurrences:
+            raise PTV2StudyError("A-repair historical stream is not exactly 1.3M occurrences")
+        _spool_source_rows(connection, repair_complement_rows, policy, start_ordinal=history_count)
+        capacities = _capacity_counts(connection)
+        _insert_a_historical(connection, history_count)
+        _verify_baseline_prefix(connection, policy, baseline)
+        _insert_a_repair_complement(connection, policy, history_count, held_out)
+        connection.commit()
+        view = _build_view(connection, "A-repair", policy, index_path, held_out, capacities)
+    finally:
+        connection.close()
+    _publish_unpublished_index(temporary_index, index_path)
+    return view
+
+
 def iter_ptv2_staged_source_rows(
-    inventory_path: Path, *, expected_declared_shards: int | None = None
+    inventory_path: Path, *, policy: PTV2StudyPolicy
 ) -> Iterator[PTV2StudySourceRow]:
     """Stream only receipt-declared staged PTV2 Parquet rows and native assistants."""
     inventory = load_source_inventory(inventory_path)
@@ -318,11 +446,13 @@ def iter_ptv2_staged_source_rows(
             )
             expected[path] = (source, source_file)
             ordered_paths.append(path)
-    if expected_declared_shards is not None and len(expected) != expected_declared_shards:
+    if len(expected) != _DECLARED_PTV2_PARQUET_SHARDS:
         raise PTV2StudyError(
             f"PTV2 staged inventory declares {len(expected)} Parquet shards, "
-            f"expected {expected_declared_shards}"
+            f"expected {_DECLARED_PTV2_PARQUET_SHARDS}"
         )
+    if any(source.revision != policy.ptv2_revision for source in inventory.sources):
+        raise PTV2StudyError("staged PTV2 SourceInventory revision does not match the study policy")
     actual = set((inventory.staged_root / "sources").rglob("*.parquet"))
     if actual != set(expected):
         raise PTV2StudyError("staged PTV2 contains undeclared or missing Parquet shards")
@@ -350,7 +480,8 @@ def iter_ptv2_staged_source_rows(
         if "messages" not in names:
             raise PTV2StudyError(f"PTV2 shard has no messages column: {path}")
         source_row = 0
-        for batch in parquet.iter_batches(columns=["messages"], batch_size=8192):
+        columns = ["messages"] + (["tools"] if "tools" in names else [])
+        for batch in parquet.iter_batches(columns=columns, batch_size=8192):
             for offset, record in enumerate(batch.to_pylist()):
                 messages = record["messages"]
                 if isinstance(messages, str):
@@ -364,8 +495,20 @@ def iter_ptv2_staged_source_rows(
                     raise PTV2StudyError("PTV2 row has no source-native assistant response")
                 response = canonical_json(assistants[-1]).decode("utf-8")
                 conversation = canonical_json({"messages": messages}).decode("utf-8")
+                tools = record.get("tools")
+                if isinstance(tools, str):
+                    tools = json.loads(tools)
+                if tools is not None and (
+                    not isinstance(tools, list) or not all(isinstance(item, dict) for item in tools)
+                ):
+                    raise PTV2StudyError("PTV2 tools must be a list of mappings")
+                prompt_messages = [
+                    item for item in messages if item.get("role") in {"system", "developer", "user"}
+                ]
+                if not prompt_messages:
+                    raise PTV2StudyError("PTV2 row has no prompt-bearing message")
                 yield PTV2StudySourceRow(
-                    prompt_uuid=prompt_uuid(messages, None),
+                    prompt_uuid=prompt_uuid(prompt_messages, tools),
                     source_identity_sha256=identity,
                     source_row=source_row + offset,
                     cell=cell,
@@ -405,11 +548,8 @@ def main() -> int:
     parser.add_argument("--source-cache", type=Path)
     parser.add_argument("--durable-root", type=Path)
     parser.add_argument("--scratch-root", type=Path)
-    parser.add_argument("--expected-declared-shards", type=int, default=201)
     parser.add_argument("--output-root", type=Path, required=True)
     args = parser.parse_args()
-    if args.expected_declared_shards < 1:
-        parser.error("--expected-declared-shards must be positive")
     if args.source_plan is not None:
         if args.source_cache is None or args.durable_root is None or args.scratch_root is None:
             parser.error(
@@ -430,9 +570,7 @@ def main() -> int:
             raise AssertionError("argparse requires one source input")
     policy = load_ptv2_study_policy(args.policy)
     view = select_ptv2_b_balanced_view(
-        iter_ptv2_staged_source_rows(
-            inventory_path, expected_declared_shards=args.expected_declared_shards
-        ),
+        iter_ptv2_staged_source_rows(inventory_path, policy=policy),
         policy=policy,
         output_root=args.output_root,
     )
@@ -447,10 +585,6 @@ def main() -> int:
         )
     )
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 def iter_ptv2_study_occurrences(view: PTV2StudyView) -> Iterator[StudyOccurrence]:
@@ -471,45 +605,51 @@ def iter_ptv2_study_occurrences(view: PTV2StudyView) -> Iterator[StudyOccurrence
 
 def _require_approved_policy(
     root: Mapping[str, Any],
-    prefix: Mapping[str, Any],
+    historical: Mapping[str, Any],
     balanced: Mapping[str, Any],
     counts: Mapping[str, int],
-    milestones: tuple[int, ...],
-    steps: tuple[int, ...],
+    complement: Mapping[str, int],
+    segment_occurrences: tuple[int, ...],
+    segment_steps: tuple[int, ...],
+    cumulative_steps: tuple[int, ...],
+    segment_final_valid: tuple[int, ...],
 ) -> None:
-    if root["schema_version"] != 1 or _positive_int(root["seed"], "seed") != 20_260_822:
+    if (
+        _positive_int(root["schema_version"], "schema_version") != 1
+        or _positive_int(root["seed"], "seed") != 20_260_822
+    ):
         raise PTV2StudyError("policy schema_version and seed must be approved values")
     revision = root["ptv2_revision"]
     if not isinstance(revision, str) or _REVISION.fullmatch(revision) is None:
         raise PTV2StudyError("ptv2_revision must be an exact commit")
     if revision != "5c89e01dd720ae0f4058445ed49c5fb68a03c76e":
         raise PTV2StudyError("ptv2_revision is not the approved PTV2 revision")
-    if prefix != {
+    if historical != {
         "selection": "source-order",
-        "occurrences": 2_000_000,
+        "occurrences": 1_300_000,
         "preserve_duplicates": True,
     }:
-        raise PTV2StudyError("prefix must be source-order take(2000000) with duplicates preserved")
+        raise PTV2StudyError(
+            "repair historical must be source-order take(1300000) with duplicates preserved"
+        )
+    if complement != _REPAIR_COMPLEMENT_COUNTS:
+        raise PTV2StudyError("repair complement must be STEM200K plus JA/ES/FR/IT125K and DE0")
     if balanced.get("selection") != "seeded-within-cell" or counts != _BALANCED_COUNTS:
         raise PTV2StudyError("balanced occurrence counts do not match approved semantic quotas")
     if balanced.get("capacity_shortfall") != "deterministic-within-cell-cycle":
         raise PTV2StudyError("balanced capacity shortfall must cycle within its cell")
-    if root["multilingual"] != {
-        "de": 40_000,
-        "ja": 40_000,
-        "es": 40_000,
-        "fr": 40_000,
-        "it": 40_000,
-    }:
-        raise PTV2StudyError("multilingual must allocate exactly 40K to each approved language")
     if root["assistant_responses"] != "source-native":
         raise PTV2StudyError("assistant responses must be source-native")
     if _positive_int(root["trainer_epochs"], "trainer_epochs") != 1:
         raise PTV2StudyError("trainer_epochs must be exactly one")
     if _positive_int(root["global_batch_size"], "global_batch_size") != 512:
         raise PTV2StudyError("global_batch_size must be exactly 512")
-    if milestones != _MILESTONES or steps != (977, 1_954, 2_540, 3_907):
-        raise PTV2StudyError("occurrence milestones must have exact one-pass checkpoint steps")
+    if segment_occurrences != _SEGMENT_OCCURRENCES:
+        raise PTV2StudyError("PTV2 must have exact 1.3M plus 700K segments")
+    if segment_steps != _SEGMENT_STEPS or cumulative_steps != _CUMULATIVE_STEPS:
+        raise PTV2StudyError("PTV2 must use the exact 2540 plus 1368 segment schedule")
+    if segment_final_valid != _SEGMENT_FINAL_VALID:
+        raise PTV2StudyError("PTV2 segment final valid occurrence counts must be 32 and 96")
     if _positive_int(root["runtime_screen_tokens"], "runtime_screen_tokens") != 64_000_000:
         raise PTV2StudyError("runtime_screen_tokens must be exactly 64000000")
     if root["scientific_exposures"] != ["one-pass"]:
@@ -595,6 +735,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
           assistant_response_sha256 TEXT NOT NULL, PRIMARY KEY(strategy, ordinal)
         );
         CREATE INDEX occurrences_strategy_uuid ON occurrences(strategy, prompt_uuid);
+        CREATE TABLE historical_uuids(prompt_uuid TEXT PRIMARY KEY);
         """
     )
 
@@ -603,13 +744,16 @@ def _spool_source_rows(
     connection: sqlite3.Connection,
     source_rows: Iterable[PTV2StudySourceRow],
     policy: PTV2StudyPolicy,
-) -> None:
-    for ordinal, row in enumerate(source_rows):
+    *,
+    start_ordinal: int = 0,
+) -> int:
+    next_ordinal = start_ordinal
+    for ordinal, row in enumerate(source_rows, start=start_ordinal):
         if not isinstance(row, PTV2StudySourceRow):
             raise PTV2StudyError("source rows must be PTV2StudySourceRow values")
         _validate_source_row(row)
         if (
-            policy.prefix_occurrences == 2_000_000
+            policy.total_occurrences == 2_000_000
             and row.cell == "multilingual"
             and row.language not in policy.multilingual_occurrences
         ):
@@ -620,6 +764,7 @@ def _spool_source_rows(
             (
                 policy.policy_sha256
                 + row.cell
+                + row.language
                 + row.source_identity_sha256
                 + str(row.source_row)
                 + row.prompt_uuid
@@ -641,8 +786,10 @@ def _spool_source_rows(
                 rank,
             ),
         )
+        next_ordinal = ordinal + 1
     if connection.execute("SELECT count(*) FROM source_rows").fetchone()[0] == 0:
         raise PTV2StudyError("authenticated source inventory is empty")
+    return next_ordinal
 
 
 def _validate_source_row(row: PTV2StudySourceRow) -> None:
@@ -679,21 +826,95 @@ def _capacity_counts(connection: sqlite3.Connection) -> Mapping[str, int]:
 def _insert_a_prefix(connection: sqlite3.Connection, count: int) -> None:
     available = int(connection.execute("SELECT count(*) FROM source_rows").fetchone()[0])
     if available < count:
-        raise PTV2StudyError(f"A-prefix source stream is shorter than {count} occurrences")
+        raise PTV2StudyError(f"A-repair source stream is shorter than {count} occurrences")
     connection.execute(
         "INSERT INTO occurrences "
-        "SELECT 'A-prefix',source_ordinal,prompt_uuid,source_identity_sha256,source_row,cell,0,"
+        "SELECT 'A-repair',source_ordinal,prompt_uuid,source_identity_sha256,source_row,cell,0,"
         "conversation_sha256,assistant_response_sha256 FROM source_rows "
         "ORDER BY source_ordinal LIMIT ?",
         (count,),
     )
 
 
+def _insert_a_historical(connection: sqlite3.Connection, count: int) -> None:
+    connection.execute(
+        "INSERT INTO occurrences "
+        "SELECT 'A-repair',source_ordinal,prompt_uuid,source_identity_sha256,source_row,cell,0,"
+        "conversation_sha256,assistant_response_sha256 FROM source_rows "
+        "WHERE source_ordinal<? ORDER BY source_ordinal",
+        (count,),
+    )
+
+
+def _insert_a_repair_complement(
+    connection: sqlite3.Connection,
+    policy: PTV2StudyPolicy,
+    history_count: int,
+    held_out: set[str],
+) -> None:
+    """Append only frozen source-order complement rows meeting the repair quota contract."""
+    quotas = dict(policy.repair_complement_occurrences)
+    selected = dict.fromkeys(quotas, 0)
+    connection.execute(
+        "INSERT OR IGNORE INTO historical_uuids SELECT prompt_uuid FROM source_rows WHERE source_ordinal<?",
+        (history_count,),
+    )
+    ordinal = history_count
+    rows = connection.execute(
+        "SELECT source_ordinal,prompt_uuid,source_identity_sha256,source_row,cell,language,"
+        "conversation_sha256,assistant_response_sha256 FROM source_rows "
+        "WHERE source_ordinal>=? ORDER BY source_ordinal",
+        (history_count,),
+    )
+    for (
+        _source_ordinal,
+        uuid_value,
+        identity,
+        source_row,
+        cell,
+        language,
+        conversation,
+        response,
+    ) in rows:
+        key = "stem" if cell == "stem" else language if cell == "multilingual" else ""
+        if key not in quotas or quotas[key] == 0 or selected[key] >= quotas[key]:
+            continue
+        if (
+            connection.execute(
+                "SELECT 1 FROM historical_uuids WHERE prompt_uuid=?", (uuid_value,)
+            ).fetchone()
+            is not None
+        ):
+            raise PTV2StudyError("A-repair complement overlaps the historical UUID set")
+        if uuid_value in held_out:
+            raise PTV2StudyError("A-repair complement overlaps evaluator-held-out UUIDs")
+        connection.execute(
+            "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                "A-repair",
+                ordinal,
+                uuid_value,
+                identity,
+                source_row,
+                cell,
+                0,
+                conversation,
+                response,
+            ),
+        )
+        selected[key] += 1
+        ordinal += 1
+    if selected != quotas:
+        raise PTV2StudyError(
+            f"A-repair complement counts do not match immutable policy: {selected}"
+        )
+
+
 def _insert_b_balanced(connection: sqlite3.Connection, policy: PTV2StudyPolicy) -> None:
     ordinal = 0
     for cell in _CELLS:
         quota = policy.balanced_occurrences[cell]
-        if cell != "multilingual" or policy.prefix_occurrences != 2_000_000:
+        if cell != "multilingual" or policy.total_occurrences != 2_000_000:
             ordinal = _insert_b_cell(connection, cell, quota, ordinal)
             continue
         if sum(policy.multilingual_occurrences.values()) != quota:
@@ -748,20 +969,19 @@ def _verify_baseline_prefix(
 ) -> None:
     if baseline is None:
         return
-    if policy.prefix_occurrences != 2_000_000:
-        raise PTV2StudyError("baseline reconciliation requires the full 2M policy")
     expected_ids = getattr(baseline, "occurrence_prompt_ids", None)
     expected_digest = getattr(baseline, "occurrence_prompt_ids_sha256", None)
     expected_count = getattr(baseline, "occurrence_count", None)
-    if expected_count != 1_300_000 or not isinstance(expected_ids, tuple):
-        raise PTV2StudyError("BaselineAudit must prove the first 1.3M occurrences")
+    if expected_count != policy.historical_occurrences or not isinstance(expected_ids, tuple):
+        raise PTV2StudyError("BaselineAudit must prove the exact historical segment")
     actual_digest = sha256()
     actual_digest.update(b"[")
     matches = True
     count = 0
     for count, (actual_id,) in enumerate(
         connection.execute(
-            "SELECT prompt_uuid FROM occurrences WHERE strategy='A-prefix' ORDER BY ordinal LIMIT 1300000"
+            "SELECT prompt_uuid FROM occurrences WHERE strategy='A-repair' ORDER BY ordinal LIMIT ?",
+            (policy.historical_occurrences,),
         ),
         start=1,
     ):
@@ -771,14 +991,17 @@ def _verify_baseline_prefix(
         matches = matches and actual_id == expected_ids[count - 1]
     actual_digest.update(b"]")
     if count != len(expected_ids) or not matches or actual_digest.hexdigest() != expected_digest:
-        raise PTV2StudyError("A-prefix first 1.3M does not match BaselineAudit")
-    if getattr(baseline, "unique_prompt_count", None) != 931_363:
+        raise PTV2StudyError("A-repair first 1.3M does not match BaselineAudit")
+    if (
+        policy.historical_occurrences == 1_300_000
+        and getattr(baseline, "unique_prompt_count", None) != 931_363
+    ):
         raise PTV2StudyError("BaselineAudit unique UUID count is not the historical 931363")
 
 
 def _build_view(
     connection: sqlite3.Connection,
-    strategy: Literal["A-prefix", "B-balanced"],
+    strategy: Literal["A-repair", "B-balanced"],
     policy: PTV2StudyPolicy,
     index_path: Path,
     held_out: set[str],
@@ -835,12 +1058,53 @@ def _build_view(
         )
     }
     complete_cells = MappingProxyType({cell: cell_counts.get(cell, 0) for cell in _CELLS})
+    language_counts = {
+        str(language): int(value)
+        for language, value in connection.execute(
+            "SELECT source_rows.language,count(*) FROM occurrences "
+            "JOIN source_rows ON occurrences.source_identity_sha256=source_rows.source_identity_sha256 "
+            "AND occurrences.source_row=source_rows.source_row "
+            "WHERE occurrences.strategy=? AND occurrences.cell='multilingual' "
+            "GROUP BY source_rows.language",
+            (strategy,),
+        )
+    }
+    complete_languages = MappingProxyType(
+        {language: language_counts.get(language, 0) for language in policy.multilingual_occurrences}
+    )
+    cell_unique_counts = {
+        str(cell): int(value)
+        for cell, value in connection.execute(
+            "SELECT cell,count(DISTINCT prompt_uuid) FROM occurrences WHERE strategy=? GROUP BY cell",
+            (strategy,),
+        )
+    }
+    language_unique_counts = {
+        str(language): int(value)
+        for language, value in connection.execute(
+            "SELECT source_rows.language,count(DISTINCT occurrences.prompt_uuid) FROM occurrences "
+            "JOIN source_rows ON occurrences.source_identity_sha256=source_rows.source_identity_sha256 "
+            "AND occurrences.source_row=source_rows.source_row "
+            "WHERE occurrences.strategy=? AND occurrences.cell='multilingual' "
+            "GROUP BY source_rows.language",
+            (strategy,),
+        )
+    }
+    maximum_multiplicity = int(
+        connection.execute(
+            "SELECT coalesce(max(multiplicity),0) FROM ("
+            "SELECT count(*) AS multiplicity FROM occurrences WHERE strategy=? "
+            "GROUP BY prompt_uuid,source_identity_sha256,source_row)",
+            (strategy,),
+        ).fetchone()[0]
+    )
     selection = {
         "strategy": strategy,
         "policy_sha256": policy.policy_sha256,
         "occurrence_count": count,
         "unique_prompt_count": unique,
         "cell_occurrence_counts": dict(complete_cells),
+        "multilingual_occurrence_counts": dict(complete_languages),
         "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
         "ordered_prompt_uuids_sha256": prompt_digest.hexdigest(),
         "source_response_root_sha256": response_digest.hexdigest(),
@@ -852,6 +1116,19 @@ def _build_view(
         policy.trainer_epochs,
         unique,
         complete_cells,
+        complete_languages,
+        MappingProxyType(
+            dict(policy.repair_complement_occurrences) if strategy == "A-repair" else {}
+        ),
+        policy.segment_occurrences,
+        MappingProxyType({cell: cell_unique_counts.get(cell, 0) for cell in _CELLS}),
+        MappingProxyType(
+            {
+                language: language_unique_counts.get(language, 0)
+                for language in policy.multilingual_occurrences
+            }
+        ),
+        maximum_multiplicity,
         natural,
         constructed,
         index_path,
@@ -878,7 +1155,7 @@ def _source_inventory_digest(connection: sqlite3.Connection) -> str:
 
 def _baseline_digest(baseline: Any | None) -> str:
     if baseline is None:
-        return "0" * 64
+        return sha256(canonical_json({"fixture_baseline": None})).hexdigest()
     return sha256(canonical_json(getattr(baseline, "occurrence_prompt_ids_sha256", ""))).hexdigest()
 
 
@@ -926,7 +1203,20 @@ def _language_counts(value: object) -> dict[str, int]:
     }
 
 
-def _positive_int_tuple(value: object, name: str) -> tuple[int, ...]:
+def _repair_counts(value: object) -> dict[str, int]:
+    mapping = _mapping(value, "repair.complement")
+    if set(mapping) != set(_REPAIR_COMPLEMENT_COUNTS):
+        raise PTV2StudyError("repair complement must contain STEM, DE, JA, ES, FR, and IT")
+    result: dict[str, int] = {}
+    for language in _REPAIR_COMPLEMENT_COUNTS:
+        item = mapping[language]
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise PTV2StudyError(f"repair.complement.{language} must be a nonnegative integer")
+        result[language] = item
+    return result
+
+
+def _strict_int_tuple(value: object, name: str) -> tuple[int, ...]:
     if not isinstance(value, list):
         raise PTV2StudyError(f"{name} must be a list of positive integers")
     return tuple(_positive_int(item, f"{name}[{index}]") for index, item in enumerate(value))
@@ -955,3 +1245,7 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

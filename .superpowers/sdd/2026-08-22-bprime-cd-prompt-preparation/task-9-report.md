@@ -72,3 +72,36 @@
   path is intentionally prepared for the authorized cluster run and fails
   closed unless its Task 3 receipt has exactly the 201 declared shards and no
   physical orphan.
+
+## Review round 1 corrective pass
+
+- Replaced the obsolete A-prefix policy with A-repair: exact historical 1.3M,
+  then the explicit STEM200K/JA125K/ES125K/FR125K/IT125K/DE0 complement. The
+  selector refuses historical and held-out UUID overlap and no longer extends
+  the next source-order tail.
+- Replaced the continuous 3,907-step arithmetic with the required two-segment
+  receipt: occurrence segments `1300000/700000`, segment steps `2540/1368`,
+  cumulative steps `2540/3908`, and valid terminal counts `32/96`.
+- Moved the executable module guard to EOF. A direct policy-loading CLI probe
+  now reaches the intended Task 3 missing-receipt failure and does not raise
+  `NameError`.
+- Staged Parquet UUIDs now use only prompt-bearing system/developer/user
+  messages plus top-level tools, matching `BaselineAudit`; full conversations
+  and native assistant responses remain separately content-hashed.
+- The production B wrapper requires a staged Task 3 receipt and typed
+  `ExclusionIndex`; full paired selection requires typed source, baseline, and
+  exclusion roots. The `201` declared-shard contract is a fixed code constant,
+  with revision equality to the policy; it is no longer an operator CLI knob.
+- Added persisted/public view summaries for per-cell/per-language counts and
+  unique counts, repair composition, segment counts, and maximum multiplicity.
+- Added a materialized Task 7 adapter which streams the immutable selection
+  SQLite join, rechecks occurrence/conversation/response hashes, derives the
+  response root and one-pass token count through the supplied assistant-mask
+  counter, and rejects source-response mutation.
+- Tightened Task 8 selection-v3 receipts to exact keys, SHA-256 syntax, and
+  policy-byte/policy-digest equality; malformed lineage claims or added fields
+  fail closed.
+
+Corrective verification: focused Task 9 suite PASS (`63 passed`, 336
+pre-existing pytest cleanup warnings); ruff check/format PASS; direct CLI probe
+reaches the expected Task 3 receipt error; `git diff --check` PASS.

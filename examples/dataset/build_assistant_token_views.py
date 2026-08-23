@@ -22,7 +22,7 @@ import os
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -41,6 +41,7 @@ __all__ = [
     "build_exposure_views",
     "build_paired_exposure_views",
     "build_ptv2_study_exposures",
+    "derive_ptv2_one_pass_corpus",
 ]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -122,7 +123,7 @@ class PairedExposureViews:
 class PTV2OnePassCorpus:
     """Authenticated token totals for one exact 2M-occurrence PTV2 arm."""
 
-    strategy: Literal["A-prefix", "B-balanced"]
+    strategy: Literal["A-repair", "B-balanced"]
     occurrence_count: int
     trainer_epochs: int
     assistant_tokens: int
@@ -145,6 +146,92 @@ class PTV2StudyExposureViews:
     paired_scientific_reached: bool
 
 
+def derive_ptv2_one_pass_corpus(
+    view: Any,
+    *,
+    tokenizer_sha256: str,
+    chat_template_sha256: str,
+    assistant_loss_target_sha256: str,
+    training_config_sha256: str,
+    assistant_token_counter: Callable[[str], int],
+) -> PTV2OnePassCorpus:
+    """Derive a one-pass receipt by streaming the selected SQLite occurrences and responses."""
+    for digest_name, digest in (
+        ("tokenizer", tokenizer_sha256),
+        ("chat template", chat_template_sha256),
+        ("assistant loss target", assistant_loss_target_sha256),
+        ("training config", training_config_sha256),
+    ):
+        _require_digest(digest_name, digest)
+    strategy = getattr(view, "strategy", None)
+    if strategy not in {"A-repair", "B-balanced"}:
+        raise ExposureViewError("PTV2 materialized view strategy is invalid")
+    index_path = Path(getattr(view, "index_path", ""))
+    if not index_path.is_file() or index_path.is_symlink():
+        raise ExposureViewError("PTV2 selection SQLite index is missing or unsafe")
+    occurrence_digest = sha256()
+    response_digest = sha256()
+    count = assistant_tokens = 0
+    connection = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
+    try:
+        cursor = connection.execute(
+            "SELECT occurrences.ordinal,occurrences.prompt_uuid,occurrences.source_identity_sha256,"
+            "occurrences.source_row,occurrences.cell,occurrences.reuse_index,"
+            "occurrences.conversation_sha256,occurrences.assistant_response_sha256,"
+            "source_rows.canonical_conversation,source_rows.assistant_response "
+            "FROM occurrences JOIN source_rows "
+            "ON occurrences.source_identity_sha256=source_rows.source_identity_sha256 "
+            "AND occurrences.source_row=source_rows.source_row "
+            "WHERE occurrences.strategy=? ORDER BY occurrences.ordinal",
+            (strategy,),
+        )
+        for row in cursor:
+            occurrence = row[:8]
+            conversation = row[8]
+            response = row[9]
+            if sha256(conversation.encode("utf-8")).hexdigest() != occurrence[6]:
+                raise ExposureViewError("PTV2 selected conversation hash mismatch")
+            if sha256(response.encode("utf-8")).hexdigest() != occurrence[7]:
+                raise ExposureViewError("PTV2 selected assistant response hash mismatch")
+            token_count = assistant_token_counter(response)
+            if isinstance(token_count, bool) or not isinstance(token_count, int) or token_count < 1:
+                raise ExposureViewError(
+                    "PTV2 assistant token counter returned an invalid mask total"
+                )
+            occurrence_digest.update(canonical_json(list(occurrence)))
+            occurrence_digest.update(b"\n")
+            response_digest.update(
+                canonical_json([occurrence[2], occurrence[3], occurrence[6], occurrence[7]])
+            )
+            response_digest.update(b"\n")
+            count += 1
+            assistant_tokens += token_count
+    finally:
+        connection.close()
+    if count != getattr(view, "occurrence_count", None):
+        raise ExposureViewError(
+            "PTV2 materialized occurrence count does not match selection receipt"
+        )
+    if occurrence_digest.hexdigest() != getattr(view, "ordered_occurrences_sha256", None):
+        raise ExposureViewError(
+            "PTV2 materialized occurrence order does not match selection receipt"
+        )
+    if response_digest.hexdigest() != getattr(view, "source_response_root_sha256", None):
+        raise ExposureViewError("PTV2 materialized response root does not match selection receipt")
+    return PTV2OnePassCorpus(
+        strategy=strategy,
+        occurrence_count=count,
+        trainer_epochs=getattr(view, "trainer_epochs", 0),
+        assistant_tokens=assistant_tokens,
+        tokenizer_sha256=tokenizer_sha256,
+        chat_template_sha256=chat_template_sha256,
+        assistant_loss_target_sha256=assistant_loss_target_sha256,
+        training_config_sha256=training_config_sha256,
+        source_response_root_sha256=response_digest.hexdigest(),
+        ordered_occurrences_sha256=occurrence_digest.hexdigest(),
+    )
+
+
 def build_ptv2_study_exposures(
     prefix: PTV2OnePassCorpus,
     balanced: PTV2OnePassCorpus,
@@ -157,7 +244,7 @@ def build_ptv2_study_exposures(
         raise ExposureViewError("PTV2 scientific tokens must be exactly 256M")
     if runtime_screen_tokens != 64_000_000:
         raise ExposureViewError("PTV2 runtime screen must be exactly 64M")
-    _validate_ptv2_one_pass(prefix, "A-prefix")
+    _validate_ptv2_one_pass(prefix, "A-repair")
     _validate_ptv2_one_pass(balanced, "B-balanced")
     identity_fields = (
         "tokenizer_sha256",

@@ -175,7 +175,7 @@ def test_ptv2_scientific_milestone_cannot_extend_past_the_2m_occurrence_pass() -
     """A 256M receipt is invalid until both authenticated one-pass totals reach it."""
     module = _load_module()
     prefix = module.PTV2OnePassCorpus(
-        strategy="A-prefix",
+        strategy="A-repair",
         occurrence_count=2_000_000,
         trainer_epochs=1,
         assistant_tokens=200_000_000,
