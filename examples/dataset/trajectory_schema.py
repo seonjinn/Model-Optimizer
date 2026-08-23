@@ -11,6 +11,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
+from specdec_identity import canonicalize_prompt
+
 __all__ = [
     "TrajectoryValidation",
     "TrajectoryValidationError",
@@ -37,6 +39,7 @@ class TrajectoryValidation:
     """Canonical replay data proven safe for deterministic truncation."""
 
     canonical: dict[str, Any]
+    canonical_bytes: bytes
     tool_call_count: int
 
 
@@ -44,12 +47,18 @@ def _reject(reason: str, detail: str) -> NoReturn:
     raise TrajectoryValidationError(reason, detail)
 
 
-def _canonical_tool_call(
-    call: dict[str, Any], source_id: str, declared_functions: set[str]
-) -> dict[str, Any]:
+def _validate_tool_call(call: Any, source_id: str, declared_functions: set[str]) -> tuple[str, str]:
+    if not isinstance(call, dict):
+        _reject("invalid_tool_call", f"{source_id}: assistant tool call is not a mapping")
     call_id = str(call.get("id") or call.get("tool_call_id") or "")
     if not call_id:
         _reject("missing_tool_call_id", f"{source_id}: assistant tool call has no ID")
+    call_type = call.get("type", "function")
+    if call_type != "function":
+        _reject(
+            "unsupported_tool_call_type",
+            f"{source_id}: tool call {call_id} has unsupported type {call_type!r}",
+        )
     function = call.get("function")
     if not isinstance(function, dict) or not function.get("name"):
         _reject("missing_function_name", f"{source_id}: tool call {call_id} has no function name")
@@ -65,106 +74,98 @@ def _canonical_tool_call(
         _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
     if not isinstance(parsed_arguments, dict):
         _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
-    return {
-        "id": call_id,
-        "type": str(call.get("type") or "function"),
-        "function": deepcopy(function),
-    }
+    return call_id, name
 
 
-def canonicalize_trajectory(example: dict[str, Any], *, source_id: str) -> dict[str, Any]:
-    messages = example.get("messages") or example.get("conversations")
+def _declared_functions(tools: list[Any], source_id: str) -> set[str]:
+    declared: set[str] = set()
+    for index, tool in enumerate(tools):
+        if not isinstance(tool, dict) or not isinstance(tool.get("function"), dict):
+            _reject(
+                "invalid_tool_declaration", f"{source_id}: tool declaration {index} is malformed"
+            )
+        function = tool["function"]
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            _reject(
+                "invalid_tool_declaration", f"{source_id}: tool declaration {index} has no name"
+            )
+        if name in declared:
+            _reject("duplicate_tool_declaration", f"{source_id}: duplicate tool declaration {name}")
+        declared.add(name)
+    return declared
+
+
+def _storage_normalized_trajectory(
+    example: dict[str, Any], source_id: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bytes]:
+    messages = example.get("messages") if "messages" in example else example.get("conversations")
     if not isinstance(messages, list) or not messages:
         _reject("missing_messages", f"{source_id}: trajectory has no messages")
-
-    tools = deepcopy(example.get("tools") or [])
+    if not all(isinstance(message, dict) for message in messages):
+        _reject("invalid_message", f"{source_id}: trajectory message is not a mapping")
+    tools = example.get("tools")
+    if tools is None:
+        tools = []
     if not isinstance(tools, list):
         _reject("invalid_tool_declarations", f"{source_id}: tools must be a list")
-    declared_functions = {
-        str(tool["function"]["name"])
-        for tool in tools
-        if isinstance(tool, dict)
-        and isinstance(tool.get("function"), dict)
-        and tool["function"].get("name")
-    }
-    normalized: list[dict[str, Any]] = []
+    canonical_bytes = canonicalize_prompt(deepcopy(messages), deepcopy(tools))
+    payload = json.loads(canonical_bytes)
+    return payload["messages"], payload["tools"], canonical_bytes
+
+
+def _validate_referential_integrity(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]], source_id: str
+) -> int:
+    declared_functions = _declared_functions(tools, source_id)
     pending: dict[str, str] = {}
     seen_calls: set[str] = set()
+    tool_call_count = 0
 
-    for index, original in enumerate(messages):
-        if not isinstance(original, dict):
-            _reject("invalid_message", f"{source_id}: message {index} is not a mapping")
-        role = original.get("role")
+    for index, message in enumerate(messages):
+        role = message.get("role")
         if role != "tool" and pending:
             unresolved = ", ".join(sorted(pending))
             _reject(
                 "unresolved_tool_call",
                 f"{source_id}: unresolved tool call(s) {unresolved} before message {index}",
             )
-
         if role in {"system", "user", "developer"}:
-            normalized.append(
-                {
-                    "role": "system" if role == "developer" else role,
-                    "content": original.get("content") or "",
-                }
-            )
             continue
-
         if role == "assistant":
-            message: dict[str, Any] = {
-                "role": "assistant",
-                "content": original.get("content") or "",
-            }
-            if "reasoning_content" in original:
-                message["reasoning_content"] = original.get("reasoning_content") or ""
-            calls = [
-                _canonical_tool_call(call, source_id, declared_functions)
-                for call in (original.get("tool_calls") or [])
-            ]
+            raw_calls = message.get("tool_calls")
+            if raw_calls is None:
+                calls: list[Any] = []
+            elif not isinstance(raw_calls, list):
+                _reject("invalid_tool_calls", f"{source_id}: assistant tool_calls must be a list")
+            else:
+                calls = raw_calls
             for call in calls:
-                call_id = call["id"]
+                call_id, function_name = _validate_tool_call(call, source_id, declared_functions)
                 if call_id in seen_calls:
                     _reject(
                         "duplicate_tool_call_id",
                         f"{source_id}: duplicate tool call ID {call_id}",
                     )
                 seen_calls.add(call_id)
-                pending[call_id] = str(call["function"]["name"])
-            if calls:
-                if not tools:
-                    _reject(
-                        "missing_tool_declarations",
-                        f"{source_id}: tool calls are present but top-level tools are missing",
-                    )
-                message["tool_calls"] = calls
-            normalized.append(message)
+                pending[call_id] = function_name
+                tool_call_count += 1
             continue
-
         if role == "tool":
-            call_id = str(original.get("tool_call_id") or original.get("id") or "")
+            call_id = str(message.get("tool_call_id") or message.get("id") or "")
             if not call_id or call_id not in pending:
                 _reject(
                     "orphan_tool_result",
                     f"{source_id}: tool result references missing call {call_id!r}",
                 )
-            result_name = original.get("name")
+            result_name = message.get("name")
             if result_name is not None and str(result_name) != pending[call_id]:
                 _reject(
                     "tool_result_name_mismatch",
                     f"{source_id}: tool result {call_id} names the wrong function",
                 )
-            message = {
-                "role": "tool",
-                "content": original.get("content") or "",
-                "tool_call_id": call_id,
-            }
-            if original.get("name"):
-                message["name"] = original["name"]
-            normalized.append(message)
             del pending[call_id]
             continue
-
         _reject(
             "unsupported_role", f"{source_id}: unsupported message role {role!r} at index {index}"
         )
@@ -175,8 +176,21 @@ def canonicalize_trajectory(example: dict[str, Any], *, source_id: str) -> dict[
             "unresolved_tool_call",
             f"{source_id}: unresolved tool call(s) {unresolved} at end of trajectory",
         )
+    return tool_call_count
 
-    return {"source_id": source_id, "tools": tools, "messages": normalized}
+
+def _validated_native_trajectory(
+    example: dict[str, Any], source_id: str
+) -> tuple[dict[str, Any], bytes, int]:
+    messages, tools, canonical_bytes = _storage_normalized_trajectory(example, source_id)
+    tool_call_count = _validate_referential_integrity(messages, tools, source_id)
+    canonical = {"source_id": source_id, "tools": tools, "messages": messages}
+    return canonical, canonical_bytes, tool_call_count
+
+
+def canonicalize_trajectory(example: dict[str, Any], *, source_id: str) -> dict[str, Any]:
+    canonical, _, _ = _validated_native_trajectory(example, source_id)
+    return canonical
 
 
 def trajectory_digest(trajectory: dict[str, Any]) -> str:
@@ -211,9 +225,10 @@ def _tool_transactions(messages: list[dict[str, Any]]) -> list[tuple[int, int]]:
         calls = message.get("tool_calls") or []
         if calls:
             start = index
-            pending = {str(call["id"]) for call in calls}
+            pending = {str(call.get("id") or call.get("tool_call_id")) for call in calls}
         if message["role"] == "tool":
-            pending.remove(str(message["tool_call_id"]))
+            call_id = str(message.get("tool_call_id") or message.get("id"))
+            pending.remove(call_id)
             if not pending:
                 transactions.append((start, index))
     return transactions
@@ -264,8 +279,7 @@ def validate_trajectory(
     if training_seq_len < 1:
         raise ValueError("training_seq_len must be positive")
     _validate_reasoning_mode(example, source_id, reasoning_mode)
-    canonical = canonicalize_trajectory(example, source_id=source_id)
-    tool_call_count = sum(len(message.get("tool_calls") or []) for message in canonical["messages"])
+    canonical, canonical_bytes, tool_call_count = _validated_native_trajectory(example, source_id)
     if tool_call_count == 0:
         _reject("no_assistant_tool_call", f"{source_id}: replay has no assistant tool call")
     if tokenizer is not None:
@@ -277,7 +291,11 @@ def validate_trajectory(
                     "split_tool_transaction",
                     f"{source_id}: {training_seq_len}-token cut splits a tool transaction",
                 )
-    return TrajectoryValidation(canonical=canonical, tool_call_count=tool_call_count)
+    return TrajectoryValidation(
+        canonical=canonical,
+        canonical_bytes=canonical_bytes,
+        tool_call_count=tool_call_count,
+    )
 
 
 def quarantine_reason(

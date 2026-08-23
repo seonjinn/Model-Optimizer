@@ -288,3 +288,26 @@ def test_candidate_inventory_verifies_every_source_before_parsing_rows(tmp_path:
             historical_prompt_ids=set(),
             held_out_prompt_ids=set(),
         )
+
+
+@pytest.mark.parametrize(
+    ("token_count", "bucket"),
+    [
+        (4_096, "le4k"),
+        (4_097, "4k_16k"),
+        (16_384, "4k_16k"),
+        (16_385, "16k_32k"),
+        (32_768, "16k_32k"),
+    ],
+)
+def test_context_bucket_exact_boundaries(token_count: int, bucket: str) -> None:
+    module = _load_module()
+
+    assert module._context_bucket(token_count) == bucket
+
+
+def test_context_bucket_rejects_above_32k() -> None:
+    module = _load_module()
+
+    with pytest.raises(ValueError, match="32K inventory limit"):
+        module._context_bucket(32_769)

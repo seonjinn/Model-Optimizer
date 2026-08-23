@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -15,7 +16,11 @@ def _load_module():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    sys.path.insert(0, str(MODULE_PATH.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
     return module
 
 
@@ -24,6 +29,22 @@ def _load_conversation_utils():
     spec = importlib.util.spec_from_file_location("conversation_utils_for_test", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(module_path.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
+def _load_identity_module():
+    module_path = REPO_ROOT / "examples/dataset/specdec_identity.py"
+    spec = importlib.util.spec_from_file_location(
+        "specdec_identity_for_trajectory_test", module_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     sys.path.insert(0, str(module_path.parent))
     try:
         spec.loader.exec_module(module)
@@ -79,12 +100,40 @@ def test_canonicalize_preserves_tool_schema_calls_results_and_reasoning() -> Non
     assert canonical["tools"][0]["function"]["name"] == "shell"
     assert canonical["messages"][2]["reasoning_content"] == "I should inspect failures."
     assert canonical["messages"][2]["tool_calls"][0]["id"] == "call-1"
-    assert canonical["messages"][3] == {
-        "role": "tool",
-        "content": "1 failed",
-        "name": "shell",
-        "tool_call_id": "call-1",
-    }
+    assert canonical["messages"][3] == _trajectory()["messages"][3]
+
+
+def test_replay_canonicalization_preserves_source_native_semantics_and_shared_uuid() -> None:
+    module = _load_module()
+    identity = _load_identity_module()
+    row = _trajectory()
+    row["messages"].insert(
+        1,
+        {
+            "role": "developer",
+            "name": "repo-policy",
+            "content": "Preserve this role.",
+            "row_index": 99,
+        },
+    )
+    row["messages"][3]["name"] = "assistant-native-name"
+    original = json.loads(json.dumps(row))
+
+    validation = module.validate_trajectory(
+        row, source_id="swe-v1:native", lane="interactive-swe-replay"
+    )
+    shared = json.loads(identity.canonicalize_prompt(row["messages"], row["tools"]))
+
+    assert row == original
+    assert validation.canonical["messages"] == shared["messages"]
+    assert validation.canonical["tools"] == shared["tools"]
+    assert validation.canonical["messages"][1]["role"] == "developer"
+    assert validation.canonical["messages"][3]["name"] == "assistant-native-name"
+    assert identity.prompt_uuid(row["messages"], row["tools"]) == identity.sha256_bytes(
+        identity.canonicalize_prompt(
+            validation.canonical["messages"], validation.canonical["tools"]
+        )
+    )
 
 
 def test_dangling_tool_result_is_rejected_with_source_context() -> None:
@@ -149,7 +198,7 @@ def test_normalize_messages_preserves_top_level_tool_schema() -> None:
     normalized = module.normalize_trajectory_for_dataset(_trajectory(), source_id="agentic-v2:3")
 
     assert set(normalized) == {"messages", "tools", "source_id", "trajectory_sha256"}
-    assert normalized["messages"][3]["tool_call_id"] == "call-1"
+    assert normalized["messages"][3]["id"] == "call-1"
 
 
 def test_conversation_normalizer_routes_tool_trajectories_through_validator() -> None:
@@ -160,7 +209,7 @@ def test_conversation_normalizer_routes_tool_trajectories_through_validator() ->
 
     assert normalized["source_id"] == "row-17"
     assert normalized["tools"] == row["tools"]
-    assert normalized["messages"][3]["tool_call_id"] == "call-1"
+    assert normalized["messages"][3]["id"] == "call-1"
     assert normalized["trajectory_sha256"]
 
 
@@ -206,6 +255,10 @@ def _replay_fixture(mutation: str) -> dict:
         row["reasoning_mode"] = "reasoning_off"
     elif mutation == "wrong_result_name":
         row["messages"][3]["name"] = "python"
+    elif mutation == "tool_calls_mapping":
+        row["messages"][2]["tool_calls"] = {"id": "call-1"}
+    elif mutation == "tool_calls_element":
+        row["messages"][2]["tool_calls"] = [42]
     else:
         raise AssertionError(f"unknown mutation: {mutation}")
     return row
@@ -220,7 +273,7 @@ def test_validate_trajectory_accepts_multi_call_replay_lanes(lane: str) -> None:
     )
 
     assert validation.tool_call_count == 2
-    assert validation.canonical["messages"][3]["tool_call_id"] == "call-1"
+    assert validation.canonical["messages"][3]["id"] == "call-1"
     assert validation.canonical["messages"][4]["tool_call_id"] == "call-2"
 
 
@@ -236,6 +289,8 @@ def test_validate_trajectory_accepts_multi_call_replay_lanes(lane: str) -> None:
         ("unsupported_role", "unsupported_role"),
         ("reasoning_mode_mismatch", "reasoning_mode_mismatch"),
         ("wrong_result_name", "tool_result_name_mismatch"),
+        ("tool_calls_mapping", "invalid_tool_calls"),
+        ("tool_calls_element", "invalid_tool_call"),
     ],
 )
 def test_invalid_replay_is_quarantined(mutation: str, reason: str) -> None:

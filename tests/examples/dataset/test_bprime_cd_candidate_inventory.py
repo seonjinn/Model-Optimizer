@@ -7,7 +7,10 @@ import hashlib
 import importlib.util
 import json
 import sys
+import tracemalloc
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MODULE_PATH = REPO_ROOT / "examples/dataset/build_specdec_inventory.py"
@@ -92,6 +95,7 @@ def _build(
     *,
     historical: frozenset[str] | set[str] = frozenset(),
     held_out: frozenset[str] | set[str] = frozenset(),
+    storage_dir: Path | None = None,
 ):
     return module.build_candidate_inventory(
         inventory,
@@ -99,6 +103,7 @@ def _build(
         tokenizer_sha256="f" * 64,
         historical_prompt_ids=set(historical),
         held_out_prompt_ids=set(held_out),
+        storage_dir=storage_dir or inventory.staged_root / "candidate-storage",
     )
 
 
@@ -175,14 +180,14 @@ def test_target_completion_is_stripped_before_uuid_and_full_context_bucket(
     assert row.arm_domain == "math"
 
 
-def test_uuid_collision_is_quarantined_with_stable_code(tmp_path: Path, monkeypatch) -> None:
+def test_uuid_collision_is_fatal(tmp_path: Path, monkeypatch) -> None:
     module = _load_module()
     path = _write_rows(
         tmp_path,
         "first",
         [
-            {"messages": [{"role": "user", "content": "one"}]},
-            {"messages": [{"role": "user", "content": "two"}]},
+            {"messages": [{"role": "user", "content": "one"}], "language": "en"},
+            {"messages": [{"role": "user", "content": "two"}], "language": "en"},
         ],
     )
     source = _source(module, split="first", path=path)
@@ -193,10 +198,8 @@ def test_uuid_collision_is_quarantined_with_stable_code(tmp_path: Path, monkeypa
         lambda value: "c" * 64 if value.startswith(b'{"messages"') else original_sha256(value),
     )
 
-    candidates = _build(module, _inventory(module, tmp_path, (source,)))
-
-    assert len(candidates.rows) == 1
-    assert candidates.quarantine_counts == {"prompt_uuid_collision": 1}
+    with pytest.raises(module.UUIDCollisionError, match="UUID collision"):
+        _build(module, _inventory(module, tmp_path, (source,)))
 
 
 def test_replay_validation_precedes_capacity_counting(tmp_path: Path) -> None:
@@ -233,6 +236,11 @@ def test_replay_validation_precedes_capacity_counting(tmp_path: Path) -> None:
     cell = module.CandidateCell("swe-agentic-tool", "generic-tool-replay", "en", "le4k")
     assert candidates.capacity == {cell: 1}
     assert candidates.rows[0].replay_valid is True
+    assert candidates.rows[0].prompt_uuid == _canonical_uuid(messages, tools)
+    assert json.loads(candidates.rows[0].canonical_bytes) == {
+        "messages": messages,
+        "tools": tools,
+    }
     assert candidates.quarantine_counts == {"no_assistant_tool_call": 1}
 
 
@@ -260,3 +268,148 @@ def test_candidate_inventory_is_source_order_invariant(tmp_path: Path) -> None:
     assert [row.prompt_uuid for row in forward.rows] == sorted(
         row.prompt_uuid for row in forward.rows
     )
+
+
+@pytest.mark.parametrize(
+    ("repository_id", "split", "expected"),
+    [
+        ("nvidia/Nemotron-Math-v2", "low", "en"),
+        ("nvidia/Nemotron-Science-v1", "RQA", "en"),
+        ("nvidia/Nemotron-SFT-Instruction-Following-Chat-v2", "reasoning_off", "en"),
+        ("nvidia/Nemotron-SFT-Multilingual-v1", "stem_zh", "zh"),
+    ],
+)
+def test_missing_language_uses_only_approved_source_split_mapping(
+    repository_id: str, split: str, expected: str
+) -> None:
+    module = _load_module()
+    source = module.SourceIdentity(
+        repository_id=repository_id,
+        configuration="default",
+        split=split,
+        revision="a" * 40,
+        license_expression="Apache-2.0",
+        approved_use=True,
+        cell="math",
+        lane="target-synth",
+        files=(),
+    )
+
+    assert module._normalize_language(None, source) == expected
+
+
+@pytest.mark.parametrize("split", ["low", "RQA", "reasoning_off", "xy"])
+def test_missing_language_rejects_unmapped_source_suffix(split: str) -> None:
+    module = _load_module()
+    source = module.SourceIdentity(
+        repository_id="fixture/unknown",
+        configuration="default",
+        split=split,
+        revision="a" * 40,
+        license_expression="Apache-2.0",
+        approved_use=True,
+        cell="math",
+        lane="target-synth",
+        files=(),
+    )
+
+    with pytest.raises(ValueError, match="invalid_language"):
+        module._normalize_language(None, source)
+
+
+def _write_many_rows(root: Path, split: str, count: int) -> Path:
+    directory = root / split
+    directory.mkdir(parents=True)
+    path = directory / f"{split}.jsonl"
+    with path.open("w", encoding="utf-8") as stream:
+        for index in range(count):
+            stream.write(
+                json.dumps(
+                    {
+                        "messages": [{"role": "user", "content": f"prompt-{index:06d}"}],
+                        "language": "en",
+                    }
+                )
+                + "\n"
+            )
+    return path
+
+
+def _measured_build(module, root: Path, count: int):
+    path = _write_many_rows(root, "first", count)
+    source = _source(module, split="first", path=path)
+    tracemalloc.start()
+    inventory = _build(
+        module,
+        _inventory(module, root, (source,)),
+        storage_dir=root / "candidate-storage",
+    )
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return inventory, peak
+
+
+def test_candidate_rows_are_disk_backed_and_memory_bounded_at_scale(tmp_path: Path) -> None:
+    module = _load_module()
+    small, small_peak = _measured_build(module, tmp_path / "small", 100)
+    large, large_peak = _measured_build(module, tmp_path / "large", 4_000)
+
+    assert isinstance(large.rows, module.DiskBackedCandidateRows)
+    assert large.rows.resident_row_count == 0
+    assert len(large.rows) == 4_000
+    assert large_peak < small_peak + 6_000_000
+    digest = hashlib.sha256()
+    for chunk in module.iter_candidate_inventory_bytes(large):
+        digest.update(chunk)
+    assert digest.hexdigest() == large.inventory_sha256
+    expected_prompt_uuids = sorted(
+        _canonical_uuid([{"role": "user", "content": f"prompt-{index:06d}"}])
+        for index in range(4_000)
+    )
+    assert [row.prompt_uuid for row in large.rows] == expected_prompt_uuids
+
+
+def test_malformed_jsonl_record_is_quarantined_without_aborting(tmp_path: Path) -> None:
+    module = _load_module()
+    directory = tmp_path / "first"
+    directory.mkdir()
+    path = directory / "first.jsonl"
+    path.write_text('not-json\n{"messages":[{"role":"user","content":"valid"}],"language":"en"}\n')
+    source = _source(module, split="first", path=path)
+
+    candidates = _build(module, _inventory(module, tmp_path, (source,)))
+
+    assert len(candidates.rows) == 1
+    assert candidates.quarantine_counts == {"invalid_row": 1}
+
+
+def test_malformed_parquet_raw_json_is_quarantined_without_aborting(tmp_path: Path) -> None:
+    module = _load_module()
+    import pyarrow as pa  # pyright: ignore[reportMissingImports]
+    import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
+
+    directory = tmp_path / "first"
+    directory.mkdir()
+    path = directory / "first.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "raw_json": [
+                    "not-json",
+                    json.dumps(
+                        {
+                            "messages": [{"role": "user", "content": "valid"}],
+                            "language": "en",
+                        }
+                    ),
+                ]
+            }
+        ),
+        path,
+    )
+    source = _source(module, split="first", path=path)
+
+    candidates = _build(module, _inventory(module, tmp_path, (source,)))
+
+    assert len(candidates.rows) == 1
+    assert candidates.quarantine_counts == {"invalid_row": 1}
