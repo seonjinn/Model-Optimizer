@@ -314,7 +314,7 @@ def test_task5_selection_and_task7_tokenized_exposure_receipts_publish_together(
         ],
     }
     source_receipt = source_root / "SOURCE_INVENTORY.json"
-    source_receipt.write_text(json.dumps(source_body, indent=2, sort_keys=True))
+    source_receipt.write_text(json.dumps(source_body, indent=2, sort_keys=True) + "\n")
     source_artifact = publication.InputArtifact(
         "source",
         source_receipt,

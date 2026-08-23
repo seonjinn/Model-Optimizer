@@ -899,7 +899,7 @@ def _receipt_document(raw: bytes, role: str) -> dict[str, Any]:
         raise PublicationError(f"{role} receipt is not a JSON object")
     allowed_encodings = {_canonical_json(payload)}
     if role == "source":
-        allowed_encodings.add(json.dumps(payload, indent=2, sort_keys=True).encode())
+        allowed_encodings.add((json.dumps(payload, indent=2, sort_keys=True) + "\n").encode())
     if raw not in allowed_encodings:
         raise PublicationError(f"{role} receipt is not deterministically encoded JSON")
     return payload
