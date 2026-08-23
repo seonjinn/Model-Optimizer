@@ -120,15 +120,34 @@ def parse_args():
     return parser.parse_args()
 
 
+def auto_map_modules(config: dict) -> set[str]:
+    """Module basenames referenced by a config's ``auto_map``, e.g. {"modeling_x"}.
+
+    Values are either ``"modeling_x.XModel"`` or, for tokenizers, a list whose entries may
+    be null (``[null, "tokenization_x.XTokenizerFast"]``); a ``repo--`` prefix points at
+    another repository and is not a local file.
+    """
+    modules = set()
+    for value in (config.get("auto_map") or {}).values():
+        for ref in value if isinstance(value, list) else [value]:
+            if isinstance(ref, str) and "." in ref:
+                modules.add(ref.split("--")[-1].rsplit(".", 1)[0])
+    return modules
+
+
 def load_drafter(drafter_path: str) -> tuple[Path, dict[str, torch.Tensor]]:
     """Resolve a local dir or HF repo id to (dir, state_dict)."""
     local_dir = Path(drafter_path)
     if not local_dir.is_dir():
         from huggingface_hub import snapshot_download
 
+        # A drafter that ships custom modeling code references it from auto_map, and the
+        # export carries that config verbatim -- so those .py files have to be fetched too
+        # or the exported references dangle.
         local_dir = Path(
             snapshot_download(
-                drafter_path, allow_patterns=["*.safetensors", "config.json", *SIDECAR_FILES]
+                drafter_path,
+                allow_patterns=["*.safetensors", "config.json", "*.py", *SIDECAR_FILES],
             )
         )
 
@@ -332,11 +351,10 @@ def main():
     # A drafter that ships custom modeling code points at it from auto_map; the export
     # carries that config verbatim, so the .py files have to come along or the reference
     # dangles. (The DFlash/DSpark exports have no auto_map -- this is for the ones that do.)
-    if config.get("auto_map"):
-        for module in {ref.split("--")[-1].split(".")[0] for ref in config["auto_map"].values()}:
-            source_py = source_dir / f"{module}.py"
-            if source_py.is_file():
-                shutil.copy2(source_py, export_dir / source_py.name)
+    for module in auto_map_modules(config):
+        source_py = source_dir / f"{module}.py"
+        if source_py.is_file():
+            shutil.copy2(source_py, export_dir / source_py.name)
 
     before = sum(v.numel() * v.element_size() for v in state_dict.values())
     after = sum(v.numel() * v.element_size() for v in export_sd.values())
