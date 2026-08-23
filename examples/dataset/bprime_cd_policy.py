@@ -34,12 +34,36 @@ _ROOT_KEYS = frozenset(
 _ARM_KEYS = frozenset({"prompt_count", "cells", "lanes"})
 _LANGUAGE_KEYS = frozenset({"allowed", "denied"})
 _RESERVE_KEYS = frozenset({"numerator", "denominator"})
-_ARM_CELLS = {
-    "B-prime": frozenset({"math", "code", "stem", "chat", "multilingual"}),
-    "C": frozenset({"math", "code", "stem", "chat", "multilingual", "swe"}),
-    "D": frozenset({"math", "code", "stem", "chat", "multilingual", "swe"}),
+_ARM_CELL_QUOTAS = {
+    "B-prime": {
+        "stem": 200_000,
+        "japanese": 125_000,
+        "spanish": 125_000,
+        "french": 125_000,
+        "italian": 125_000,
+    },
+    "C": {
+        "swe-agentic-tool": 600_000,
+        "math": 400_000,
+        "code": 200_000,
+        "stem-science": 400_000,
+        "multilingual": 300_000,
+        "instruction-chat": 100_000,
+    },
+    "D": {
+        "swe-agentic-tool": 600_000,
+        "math": 400_000,
+        "code": 200_000,
+        "stem-science": 400_000,
+        "multilingual": 300_000,
+        "instruction-chat": 100_000,
+    },
 }
-_D_LANES = frozenset({"agentless-swe", "interactive-swe-replay", "generic-tool-replay"})
+_D_LANE_QUOTAS = {
+    "agentless-swe": 200_000,
+    "interactive-swe-replay": 200_000,
+    "generic-tool-replay": 200_000,
+}
 
 
 @dataclass(frozen=True)
@@ -127,9 +151,9 @@ def load_prompt_policy(path: Path) -> PromptPolicy:
         raise ValueError("allowed and denied languages must not overlap")
 
     raw_arms = _mapping(root["arms"], "arms")
-    if set(raw_arms) != set(_ARM_CELLS):
+    if set(raw_arms) != set(_ARM_CELL_QUOTAS):
         raise ValueError("arms must contain exactly B-prime, C, and D")
-    arms = {name: _parse_arm(name, raw_arms[name]) for name in _ARM_CELLS}
+    arms = {name: _parse_arm(name, raw_arms[name]) for name in _ARM_CELL_QUOTAS}
 
     exposure_tokens = _positive_int_tuple(root["exposure_tokens"], "exposure_tokens")
     if exposure_tokens != (256_000_000, 1_000_000_000):
@@ -161,7 +185,7 @@ def _parse_arm(name: str, raw: Any) -> ArmPolicy:
     arm = _mapping(raw, f"arms.{name}")
     _require_exact_keys(arm, _ARM_KEYS, f"arms.{name}")
     cells = _mapping(arm["cells"], f"arms.{name}.cells")
-    if set(cells) != _ARM_CELLS[name]:
+    if set(cells) != set(_ARM_CELL_QUOTAS[name]):
         raise ValueError(f"arms.{name}.cells must contain its exact policy cells")
     parsed_cells = {
         cell_name: PromptCell(_positive_int(value, f"arms.{name}.cells.{cell_name}"))
@@ -170,17 +194,21 @@ def _parse_arm(name: str, raw: Any) -> ArmPolicy:
     prompt_count = _positive_int(arm["prompt_count"], f"arms.{name}.prompt_count")
     if sum(cell.prompt_count for cell in parsed_cells.values()) != prompt_count:
         raise ValueError(f"arms.{name}.prompt_count does not match its cells")
+    if {
+        cell_name: cell.prompt_count for cell_name, cell in parsed_cells.items()
+    } != _ARM_CELL_QUOTAS[name]:
+        raise ValueError(f"arms.{name}.cells do not match approved semantic quotas")
 
     lanes = _mapping(arm["lanes"], f"arms.{name}.lanes")
-    expected_lanes = _D_LANES if name == "D" else frozenset()
-    if set(lanes) != expected_lanes:
+    expected_lanes = _D_LANE_QUOTAS if name == "D" else {}
+    if set(lanes) != set(expected_lanes):
         raise ValueError(f"arms.{name}.lanes must contain its exact policy lanes")
     parsed_lanes = {
         lane_name: _positive_int(value, f"arms.{name}.lanes.{lane_name}")
         for lane_name, value in lanes.items()
     }
-    if name == "D" and sum(parsed_lanes.values()) != 600_000:
-        raise ValueError("arms.D lanes must total 600000")
+    if parsed_lanes != expected_lanes:
+        raise ValueError(f"arms.{name}.lanes do not match approved lane quotas")
     return ArmPolicy(prompt_count, MappingProxyType(parsed_cells), MappingProxyType(parsed_lanes))
 
 

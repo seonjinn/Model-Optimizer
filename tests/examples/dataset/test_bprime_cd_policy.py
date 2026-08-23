@@ -39,10 +39,50 @@ def test_approved_policy_has_exact_integer_counts() -> None:
     assert policy.exposure_tokens == (256_000_000, 1_000_000_000)
 
 
+def test_approved_policy_has_exact_semantic_cell_quotas() -> None:
+    """Swapping semantic cells despite preserving an arm total fails here."""
+    policy = load_prompt_policy(POLICY)
+
+    assert {name: cell.prompt_count for name, cell in policy.arms["B-prime"].cells.items()} == {
+        "stem": 200_000,
+        "japanese": 125_000,
+        "spanish": 125_000,
+        "french": 125_000,
+        "italian": 125_000,
+    }
+    assert {"german", "math", "code", "chat", "swe"}.isdisjoint(policy.arms["B-prime"].cells)
+    expected_cd = {
+        "swe-agentic-tool": 600_000,
+        "math": 400_000,
+        "code": 200_000,
+        "stem-science": 400_000,
+        "multilingual": 300_000,
+        "instruction-chat": 100_000,
+    }
+    assert {name: cell.prompt_count for name, cell in policy.arms["C"].cells.items()} == expected_cd
+    assert {name: cell.prompt_count for name, cell in policy.arms["D"].cells.items()} == expected_cd
+
+
+def test_policy_rejects_swapped_semantic_cells_that_preserve_totals(tmp_path: Path) -> None:
+    """A same-total sweep/math swap must not silently alter semantic sampling quotas."""
+    invalid = tmp_path / "swapped-policy.yaml"
+    invalid.write_text(
+        POLICY.read_text(encoding="utf-8").replace(
+            "swe-agentic-tool: 600000\n      math: 400000",
+            "swe-agentic-tool: 400000\n      math: 600000",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="approved semantic quotas"):
+        load_prompt_policy(invalid)
+
+
 @pytest.mark.parametrize(
     ("replacement", "message"),
     [
-        (("math: 200000", "math: 0.2"), "positive integer"),
+        (("stem: 200000", "stem: 0.2"), "positive integer"),
         (("prompt_count: 700000", "prompt_count: 700001"), "does not match"),
     ],
 )

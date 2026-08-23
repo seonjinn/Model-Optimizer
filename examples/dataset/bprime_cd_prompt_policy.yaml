@@ -7,37 +7,37 @@ exposure_tokens: [256000000, 1000000000]
 sequence_length: 4096
 full_context_maximum: 32768
 languages:
-  allowed: [en, ja]
+  allowed: [en, ja, es, fr, it]
   denied: [de]
 arms:
   B-prime:
     prompt_count: 700000
     cells:
-      math: 200000
-      code: 125000
-      stem: 125000
-      chat: 125000
-      multilingual: 125000
+      stem: 200000
+      japanese: 125000
+      spanish: 125000
+      french: 125000
+      italian: 125000
     lanes: {}
   C:
     prompt_count: 2000000
     cells:
-      math: 600000
-      code: 400000
-      stem: 200000
-      chat: 400000
+      swe-agentic-tool: 600000
+      math: 400000
+      code: 200000
+      stem-science: 400000
       multilingual: 300000
-      swe: 100000
+      instruction-chat: 100000
     lanes: {}
   D:
     prompt_count: 2000000
     cells:
-      math: 600000
-      code: 400000
-      stem: 200000
-      chat: 400000
+      swe-agentic-tool: 600000
+      math: 400000
+      code: 200000
+      stem-science: 400000
       multilingual: 300000
-      swe: 100000
+      instruction-chat: 100000
     lanes:
       agentless-swe: 200000
       interactive-swe-replay: 200000
