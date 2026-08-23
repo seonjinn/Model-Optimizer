@@ -239,6 +239,15 @@ def derive_ptv2_one_pass_corpus(
                 raise ExposureViewError("PTV2 selected conversation is invalid JSON") from error
             if not isinstance(canonical, dict) or not isinstance(canonical.get("messages"), list):
                 raise ExposureViewError("PTV2 selected conversation has no messages")
+            assistants = [
+                message
+                for message in canonical["messages"]
+                if isinstance(message, dict) and message.get("role") == "assistant"
+            ]
+            if not assistants or canonical_json(assistants[-1]).decode("utf-8") != response:
+                raise ExposureViewError(
+                    "PTV2 selected response is not the final assistant in its conversation"
+                )
             encoded = tokenizer.apply_chat_template(
                 canonical["messages"],
                 tools=canonical.get("tools") or None,

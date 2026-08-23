@@ -155,3 +155,12 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
 - `git diff --check`: PASS.
 - `pre-commit` and Pyright remain unavailable; no environment bootstrapping
   was performed.
+
+### Follow-up response-binding regression
+
+- RED: an authenticated SQLite row whose separately hashed response was not
+  the final assistant message in its canonical conversation was accepted by
+  the new tokenizer path.
+- GREEN: `test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation`
+  now passes after Task 7 verifies that exact final assistant payload before
+  applying the chat template and assistant mask.
