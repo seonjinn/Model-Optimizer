@@ -477,6 +477,9 @@ def test_staged_inventory_authenticates_declared_bytes_and_physical_row_order(
     assert rows[0].prompt_uuid == prompt_uuid(
         [{"role": "user", "content": "first"}], [{"type": "function", "function": {"name": "tool"}}]
     )
+    assert json.loads(rows[0].canonical_conversation)["tools"] == [
+        {"type": "function", "function": {"name": "tool"}}
+    ]
     staged_file.write_bytes(b"mutated payload")
     with pytest.raises(SourceManifestError, match="stale staged file"):
         tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))

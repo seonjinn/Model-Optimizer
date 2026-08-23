@@ -164,3 +164,65 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
 - GREEN: `test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation`
   now passes after Task 7 verifies that exact final assistant payload before
   applying the chat template and assistant mask.
+
+## Review round 3 corrective pass
+
+- Baseline receipt reconciliation now consumes the unique
+  `BaselineAudit.exclusion_prompt_ids`, while the independently ordered,
+  duplicate-permitting occurrence sequence remains authenticated by
+  `_verify_baseline_prefix()` and the baseline occurrence digest.
+- Staged canonical conversations now retain top-level `tools`; prompt UUID
+  construction, conversation hashing, and Task 7 chat templating therefore
+  consume the same tool-bearing prompt representation.
+- Added `select_authenticated_ptv2_study_views()`, the full paired production
+  entrypoint. It accepts Task 3 receipt paths and typed Task 5 roots only,
+  derives A history/complement and B directly from receipt-authenticated staged
+  Parquet streams, and recomputes/reconciles the complete complement-stream
+  identity while rows are consumed. The B-only path remains independent.
+- Task 7 creates the SQLite database as a private `O_EXCL|O_NOFOLLOW` partial,
+  closes/rolls back connections on every failure, fsyncs it, links it into its
+  final immutable name without replacement, and requires typed recovery for a
+  preserved partial. It now binds tokenizer, chat-template, and assistant-mask
+  identities from the actual tokenizer object.
+- One-pass receipts carry exact occurrence cursors `500224`, `1000448`,
+  `1300480`, and `2000000`, plus segment occurrences `1300000/700000`,
+  segment steps `2540/1368`, cumulative steps `2540/3908`, and terminal valid
+  counts `32/96`. `packed_sequence_lower_bound` replaces the former untrue
+  measured-packing claim. Runtime 64M and scientific 256M requests now
+  materialize exact mask-trimmed JSONL prefixes from the authenticated token
+  SQLite, with per-prefix receipts bound to the response/tokenizer/tokenized
+  roots.
+- One-pass validation reopens and authenticates both the SQLite file and its
+  receipt instead of trusting a caller-constructed dataclass.
+- Task 8 lineage is now directional: source manifest to selection source root,
+  then selection to response/tokenized/exposure/rejection, response root to
+  tokenized/exposure, tokenizer/template/mask to exposure, and tokenized
+  database root to exposure. A direct regression proves an upstream source
+  receipt need not contain downstream selection state while a mutated
+  tokenized-root edge fails closed.
+
+### Round 3 TDD evidence
+
+1. RED/GREEN: a baseline occurrence sequence with natural duplicate UUIDs
+   triggered `make_exclusion_receipt()`'s uniqueness guard when used as the
+   baseline exclusion receipt. The production pairing now uses the audit's
+   unique exclusion set and retains the separate ordered-prefix audit.
+2. RED/GREEN: a tool-bearing staged row lost its top-level tool schema before
+   Task 7 templating; the staged-row regression now asserts preserved tools in
+   canonical conversation data.
+3. RED/GREEN: a source receipt was previously required to contain the future
+   selection digest. The lineage regression now passes a genuine upstream-only
+   source receipt and fails after independently mutating the exposure's
+   tokenized root.
+4. RED/GREEN: the Task 7 response-binding test showed that a separately hashed
+   but non-final assistant response could be tokenized; it now fails closed.
+
+### Round 3 verification
+
+- Focused Task 9 suite: PASS, `65 passed` (336 pre-existing macOS pytest
+  temporary-directory cleanup warnings).
+- Ruff check and format check on all six Task 9 implementation/test files:
+  PASS.
+- `git diff --check`: PASS.
+- Pyright and the repository `pre-commit` command remain unavailable in the
+  local environment; no tool bootstrapping was performed.

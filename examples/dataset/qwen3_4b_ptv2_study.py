@@ -14,6 +14,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from hashlib import sha256
+from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
@@ -41,6 +42,7 @@ __all__ = [
     "load_ptv2_study_policy",
     "select_a_repair_view",
     "select_authenticated_b_balanced_view",
+    "select_authenticated_ptv2_study_views",
     "select_ptv2_b_balanced_view",
     "select_ptv2_study_views",
 ]
@@ -314,7 +316,7 @@ def select_ptv2_study_views(
             raise PTV2StudyError(
                 "paired study SourceInventory is not the approved staged PTV2 root"
             )
-        _validate_exclusion_receipt(baseline_receipt, "baseline", baseline.occurrence_prompt_ids)
+        _validate_exclusion_receipt(baseline_receipt, "baseline", baseline.exclusion_prompt_ids)
         _validate_exclusion_receipt(held_out_receipt, "held-out", exclusions.held_out)
         _require_digest(complement_selection_sha256, "A-repair complement selection")
         root = _selection_root(output_root)
@@ -462,6 +464,83 @@ def select_authenticated_b_balanced_view(
     )
 
 
+def select_authenticated_ptv2_study_views(
+    inventory_receipt: Path,
+    *,
+    policy: PTV2StudyPolicy,
+    baseline: BaselineAudit,
+    exclusions: ExclusionIndex,
+    baseline_receipt: ExclusionReceipt,
+    held_out_receipt: ExclusionReceipt,
+    complement_selection_sha256: str,
+    output_root: Path | None = None,
+) -> PTV2StudyBundle:
+    """Build paired A/B views from the authenticated Task 3 stream only.
+
+    This production path deliberately does not accept caller-provided row
+    iterables.  Its post-history stream is digested while it is physically
+    consumed, binding the stated A complement root to source identity, row,
+    conversation, response, cell, and language.
+    """
+    if policy.total_occurrences != 2_000_000:
+        raise PTV2StudyError("authenticated paired selection is only defined for full PTV2")
+    if not isinstance(exclusions, ExclusionIndex):
+        raise PTV2StudyError("authenticated paired selection requires an ExclusionIndex")
+    inventory = load_source_inventory(inventory_receipt)
+    if inventory.staged_root is None:
+        raise PTV2StudyError("authenticated paired selection requires staged SourceInventory")
+    _validate_exclusion_receipt(baseline_receipt, "baseline", baseline.exclusion_prompt_ids)
+    _validate_exclusion_receipt(held_out_receipt, "held-out", exclusions.held_out)
+    _require_digest(complement_selection_sha256, "A-repair complement selection")
+    source = iter_ptv2_staged_source_rows(inventory_receipt, policy=policy)
+
+    def complement() -> Iterator[PTV2StudySourceRow]:
+        digest = sha256()
+        for row in source:
+            digest.update(
+                canonical_json(
+                    [
+                        row.prompt_uuid,
+                        row.source_identity_sha256,
+                        row.source_row,
+                        row.cell,
+                        row.language,
+                        row.canonical_conversation,
+                        row.assistant_response,
+                    ]
+                )
+            )
+            digest.update(b"\n")
+            yield row
+        if digest.hexdigest() != complement_selection_sha256:
+            raise PTV2StudyError("A-repair complement stream does not match its selection root")
+
+    root = _selection_root(output_root)
+    a_repair = select_a_repair_view(
+        islice(source, policy.historical_occurrences),
+        complement(),
+        policy=policy,
+        baseline=baseline,
+        held_out_prompt_uuids=exclusions.held_out,
+        output_root=root,
+        source_inventory=inventory,
+        baseline_receipt=baseline_receipt,
+        held_out_receipt=held_out_receipt,
+        complement_selection_sha256=complement_selection_sha256,
+    )
+    b_balanced = select_authenticated_b_balanced_view(
+        inventory_receipt, policy=policy, exclusions=exclusions, output_root=root
+    )
+    return PTV2StudyBundle(
+        policy.policy_sha256,
+        inventory.manifest_sha256,
+        baseline_receipt.receipt_sha256,
+        held_out_receipt.receipt_sha256,
+        a_repair,
+        b_balanced,
+    )
+
+
 def select_a_repair_view(
     historical_rows: Iterable[PTV2StudySourceRow],
     repair_complement_rows: Iterable[PTV2StudySourceRow],
@@ -581,7 +660,6 @@ def iter_ptv2_staged_source_rows(
                 if not assistants:
                     raise PTV2StudyError("PTV2 row has no source-native assistant response")
                 response = canonical_json(assistants[-1]).decode("utf-8")
-                conversation = canonical_json({"messages": messages}).decode("utf-8")
                 tools = record.get("tools")
                 if isinstance(tools, str):
                     tools = json.loads(tools)
@@ -589,6 +667,9 @@ def iter_ptv2_staged_source_rows(
                     not isinstance(tools, list) or not all(isinstance(item, dict) for item in tools)
                 ):
                     raise PTV2StudyError("PTV2 tools must be a list of mappings")
+                conversation = canonical_json({"messages": messages, "tools": tools or []}).decode(
+                    "utf-8"
+                )
                 prompt_messages = [
                     item for item in messages if item.get("role") in {"system", "developer", "user"}
                 ]

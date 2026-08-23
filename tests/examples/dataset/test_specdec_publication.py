@@ -37,6 +37,48 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def test_ptv2_lineage_flows_from_source_to_selection_then_tokenization() -> None:
+    """A genuine upstream source receipt need not contain downstream selection state."""
+
+    def digest(character: str) -> str:
+        return character * 64
+
+    selection = {
+        "selection_sha256": digest("1"),
+        "source_inventory_sha256": digest("2"),
+        "baseline_receipt_sha256": digest("3"),
+        "held_out_receipt_sha256": digest("4"),
+    }
+    response = {"selection_sha256": digest("1"), "source_response_root_sha256": digest("5")}
+    tokenized = {
+        **response,
+        "database_sha256": digest("6"),
+        "tokenizer_sha256": digest("7"),
+        "chat_template_sha256": digest("8"),
+        "assistant_loss_target_sha256": digest("9"),
+    }
+    exposure = {
+        **response,
+        "tokenized_sha256": digest("6"),
+        "tokenizer_sha256": digest("7"),
+        "chat_template_sha256": digest("8"),
+        "assistant_loss_target_sha256": digest("9"),
+    }
+    payloads = {
+        "source": {"source_manifest_sha256": digest("2")},
+        "selection": selection,
+        "response": response,
+        "tokenized": tokenized,
+        "exposure": exposure,
+        "rejection": {"selection_sha256": digest("1")},
+    }
+
+    publication._reconcile_ptv2_role_lineage(payloads)
+    payloads["exposure"] = {**exposure, "tokenized_sha256": digest("a")}
+    with pytest.raises(publication.PublicationError, match="tokenized root"):
+        publication._reconcile_ptv2_role_lineage(payloads)
+
+
 def _receipt(root: Path, role: str, records: list[dict[str, Any]]) -> publication.InputArtifact:
     root.mkdir(parents=True, exist_ok=True)
     payload_path = root / f"{role}.jsonl"

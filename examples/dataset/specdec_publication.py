@@ -401,24 +401,47 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
 
 
 def _reconcile_ptv2_role_lineage(payloads: Mapping[str, Mapping[str, Any]]) -> None:
-    """Require every Task 9 role receipt to carry the same authenticated selection roots."""
+    """Reconcile Task 9 roots in their forward data-dependency direction."""
     selection = payloads["selection"]
-    expected = {
-        "selection_sha256": selection["selection_sha256"],
-        "source_inventory_sha256": selection["source_inventory_sha256"],
-        "baseline_receipt_sha256": selection["baseline_receipt_sha256"],
-        "held_out_receipt_sha256": selection["held_out_receipt_sha256"],
-    }
-    for role in REQUIRED_ROLES:
-        if role == "selection":
-            continue
+    source = payloads["source"]
+    if source.get("source_manifest_sha256") != selection["source_inventory_sha256"]:
+        raise PublicationError("PTV2 selection is not bound to the authenticated source inventory")
+    expected_selection = selection["selection_sha256"]
+
+    def identity(role: str) -> Mapping[str, Any]:
         payload = payloads[role]
-        identity = payload.get("identity")
-        source = identity if isinstance(identity, Mapping) else payload
-        for key, expected_digest in expected.items():
-            actual = source.get(key)
-            if actual != expected_digest:
-                raise PublicationError(f"PTV2 {role} receipt does not reconcile {key}")
+        value = payload.get("identity")
+        return value if isinstance(value, Mapping) else payload
+
+    response = identity("response")
+    tokenized = identity("tokenized")
+    exposure = identity("exposure")
+    rejection = identity("rejection")
+    for role, payload in (
+        ("response", response),
+        ("tokenized", tokenized),
+        ("exposure", exposure),
+        ("rejection", rejection),
+    ):
+        if payload.get("selection_sha256") != expected_selection:
+            raise PublicationError(f"PTV2 {role} receipt is not bound to selection")
+    response_root = response.get("source_response_root_sha256")
+    if not isinstance(response_root, str) or _SHA256.fullmatch(response_root) is None:
+        raise PublicationError("PTV2 response receipt has no source response root")
+    for role, payload in (("tokenized", tokenized), ("exposure", exposure)):
+        if payload.get("source_response_root_sha256") != response_root:
+            raise PublicationError(f"PTV2 {role} receipt does not reconcile response root")
+    for key in ("tokenizer_sha256", "chat_template_sha256", "assistant_loss_target_sha256"):
+        value = tokenized.get(key)
+        if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+            raise PublicationError(f"PTV2 tokenized receipt has no {key}")
+        if exposure.get(key) != value:
+            raise PublicationError(f"PTV2 exposure receipt does not reconcile {key}")
+    tokenized_root = tokenized.get("database_sha256")
+    if not isinstance(tokenized_root, str) or _SHA256.fullmatch(tokenized_root) is None:
+        raise PublicationError("PTV2 tokenized receipt has no database root")
+    if exposure.get("tokenized_sha256") != tokenized_root:
+        raise PublicationError("PTV2 exposure receipt does not reconcile tokenized root")
 
 
 def _validate_ptv2_selection_policy(

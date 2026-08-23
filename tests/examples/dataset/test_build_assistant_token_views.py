@@ -95,6 +95,8 @@ class _GenerationIdentity:
 
 class _Tokenizer:
     chat_template = CHAT_TEMPLATE
+    tokenizer_sha256 = TOKENIZER_SHA256
+    assistant_loss_target_sha256 = "2" * 64
 
     def apply_chat_template(self, messages, **kwargs):
         assert kwargs == {
@@ -257,7 +259,7 @@ def test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation(
     with pytest.raises(module.ExposureViewError, match="final assistant"):
         module.derive_ptv2_one_pass_corpus(
             view,
-            tokenizer_sha256="1" * 64,
+            tokenizer_sha256=TOKENIZER_SHA256,
             chat_template_sha256=CHAT_TEMPLATE_SHA256,
             assistant_loss_target_sha256="2" * 64,
             training_config_sha256="3" * 64,
