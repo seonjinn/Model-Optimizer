@@ -437,8 +437,13 @@ def materialize_parquet(
         schema = pa.schema(
             [
                 pa.field("prompt_id", pa.string(), nullable=False),
+                pa.field("prompt_uuid", pa.string()),
+                pa.field("arm", pa.string()),
                 pa.field("pool", pa.string(), nullable=False),
                 pa.field("category", pa.string(), nullable=False),
+                pa.field("domain", pa.string()),
+                pa.field("lane", pa.string()),
+                pa.field("language", pa.string()),
                 pa.field("context_bucket", pa.string(), nullable=False),
                 pa.field("assistant_tokens", pa.int64(), nullable=False),
                 pa.field("full_token_count", pa.int64()),
@@ -450,6 +455,9 @@ def materialize_parquet(
                 pa.field("source_file_path", pa.string()),
                 pa.field("source_file_sha256", pa.string()),
                 pa.field("source_row_index", pa.int64()),
+                pa.field("candidate_rank", pa.int64()),
+                pa.field("selection_index", pa.int64()),
+                pa.field("selection_status", pa.string()),
                 pa.field("response_source", pa.string()),
                 pa.field("tool_lane", pa.string()),
                 pa.field("tokenizer_sha256", pa.string(), nullable=False),
@@ -457,11 +465,14 @@ def materialize_parquet(
                 pa.field("loss_mask", pa.list_(pa.int8()), nullable=False),
                 pa.field("messages", pa.large_string()),
                 pa.field("tools", pa.large_string()),
+                pa.field("canonical_prompt", pa.large_string()),
             ]
         )
         normalized = []
         for row in selected:
             value = {field.name: row.get(field.name) for field in schema}
+            value["domain"] = row.get("domain", row.get("category"))
+            value["selection_status"] = row.get("selection_status", row.get("status"))
             value["full_token_count"] = row.get("full_token_count", len(row["input_ids"]))
             value["full_assistant_tokens"] = row.get(
                 "full_assistant_tokens", row["assistant_tokens"]
@@ -474,6 +485,11 @@ def materialize_parquet(
             value["tools"] = (
                 json.dumps(row["tools"], ensure_ascii=False, sort_keys=True)
                 if row.get("tools") is not None
+                else None
+            )
+            value["canonical_prompt"] = (
+                json.dumps(row["canonical_prompt"], ensure_ascii=False, sort_keys=True)
+                if row.get("canonical_prompt") is not None
                 else None
             )
             normalized.append(value)
