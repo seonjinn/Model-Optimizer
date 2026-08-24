@@ -66,6 +66,110 @@ def _tokenization_shards() -> list[dict[str, object]]:
     ]
 
 
+def _task8_execution() -> dict[str, object]:
+    quotient, remainder = divmod(2_000_000, 201)
+    start = 0
+    ranges = []
+    for index in range(201):
+        stop = start + quotient + int(index < remainder)
+        ranges.append(
+            {
+                "index": index,
+                "start": start,
+                "stop": stop,
+                "row_count": stop - start,
+                "spool_path": f"range-{index:03d}.sqlite3",
+                "spool_bytes": index + 1,
+                "spool_sha256": hashlib.sha256(str(index).encode()).hexdigest(),
+                "elapsed_seconds": 0.1,
+                "worker_pid": 1_000 + index,
+            }
+        )
+        start = stop
+    body: dict[str, object] = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "declared_range_count": 201,
+        "occurrence_count": 2_000_000,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": {
+            "ARROW_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+        },
+        "source_index_bytes": 123,
+        "source_index_sha256": "b" * 64,
+        "source_stage_elapsed_seconds": 0.2,
+        "started_at_ns": 1,
+        "finished_at_ns": 2,
+        "elapsed_seconds": 1.0,
+        "ranges": ranges,
+        "selection_sha256": "c" * 64,
+        "ordered_occurrences_sha256": "d" * 64,
+        "source_response_root_sha256": "e" * 64,
+        "tokenizer_sha256": "f" * 64,
+        "chat_template_sha256": "1" * 64,
+        "assistant_loss_target_sha256": "2" * 64,
+        "tokenized_sha256": "3" * 64,
+    }
+    body["receipt_sha256"] = hashlib.sha256(_canonical(body)[:-1]).hexdigest()
+    return body
+
+
+def test_task8_execution_receipt_is_declared_authenticated_and_semantically_bound(
+    tmp_path: Path,
+) -> None:
+    execution = _task8_execution()
+    execution_path = tmp_path / "EXECUTION_RECEIPT.json"
+    execution_path.write_bytes(_canonical(execution))
+    descriptor = {
+        "path": execution_path.name,
+        "bytes": execution_path.stat().st_size,
+        "sha256": hashlib.sha256(execution_path.read_bytes()).hexdigest(),
+    }
+    tokenized = {
+        "schema_version": 1,
+        "strategy": "B-balanced",
+        "occurrence_count": 2_000_000,
+        "assistant_tokens": 1,
+        "database_path": "records.sqlite3",
+        "database_bytes": 1,
+        "database_sha256": "3" * 64,
+        "selection_sha256": "c" * 64,
+        "ordered_occurrences_sha256": "d" * 64,
+        "source_response_root_sha256": "e" * 64,
+        "tokenizer_sha256": "f" * 64,
+        "chat_template_sha256": "1" * 64,
+        "assistant_loss_target_sha256": "2" * 64,
+        "source_index_bytes": 123,
+        "source_index_sha256": "b" * 64,
+        "execution_receipt": descriptor,
+    }
+
+    assert descriptor in publication._role_file_descriptors("tokenized", tokenized)
+    publication._validate_task8_execution_receipt(
+        tokenized,
+        [(execution_path.name, execution_path, execution_path.stat().st_size, descriptor["sha256"])],
+    )
+    with pytest.raises(publication.PublicationError, match="Task8 execution lineage"):
+        publication._validate_task8_execution_receipt(
+            tokenized | {"database_sha256": "4" * 64},
+            [
+                (
+                    execution_path.name,
+                    execution_path,
+                    execution_path.stat().st_size,
+                    descriptor["sha256"],
+                )
+            ],
+        )
+
+
 def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
     tmp_path: Path,
 ) -> None:

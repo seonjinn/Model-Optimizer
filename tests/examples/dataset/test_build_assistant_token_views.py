@@ -21,6 +21,7 @@ import json
 import sqlite3
 import sys
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -108,6 +109,11 @@ class _Tokenizer:
         }
         encoded = json.loads(messages[-1]["content"])
         return {"input_ids": encoded["ids"], "assistant_masks": encoded["mask"]}
+
+
+class _FailingTask8Tokenizer(_Tokenizer):
+    def apply_chat_template(self, messages, **kwargs):
+        raise ValueError("injected Task8 worker failure")
 
 
 def _record(
@@ -327,6 +333,179 @@ def test_ptv2_derivation_publishes_an_authenticated_token_bundle_on_apfs(tmp_pat
     assert corpus.assistant_tokens == 2
     assert Path(corpus.tokenized_path).is_file()
     assert Path(corpus.receipt_path).is_file()
+
+
+def test_ptv2_task8_one_vs_96_is_byte_identical(tmp_path: Path) -> None:
+    module = _load_module()
+    index = tmp_path / "selection-201.sqlite3"
+    connection = sqlite3.connect(index)
+    connection.executescript(
+        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
+        "canonical_conversation TEXT,assistant_response TEXT);"
+        "CREATE TABLE occurrences(strategy TEXT,ordinal INTEGER,prompt_uuid TEXT,"
+        "source_identity_sha256 TEXT,source_row INTEGER,cell TEXT,reuse_index INTEGER,"
+        "conversation_sha256 TEXT,assistant_response_sha256 TEXT);"
+    )
+    occurrence_digest = hashlib.sha256()
+    response_digest = hashlib.sha256()
+    for ordinal in range(201):
+        assistant = {
+            "role": "assistant",
+            "content": json.dumps({"ids": [ordinal + 1, 2], "mask": [0, 1]}),
+        }
+        conversation = _canonical(
+            {"messages": [{"role": "user", "content": str(ordinal)}, assistant], "tools": []}
+        ).decode()
+        response = _canonical(assistant).decode()
+        source_identity = hashlib.sha256(f"source-{ordinal}".encode()).hexdigest()
+        prompt = hashlib.sha256(f"prompt-{ordinal}".encode()).hexdigest()
+        conversation_sha = hashlib.sha256(conversation.encode()).hexdigest()
+        response_sha = hashlib.sha256(response.encode()).hexdigest()
+        occurrence = (
+            ordinal,
+            prompt,
+            source_identity,
+            ordinal,
+            "math",
+            0,
+            conversation_sha,
+            response_sha,
+        )
+        connection.execute(
+            "INSERT INTO source_rows VALUES(?,?,?,?)",
+            (source_identity, ordinal, conversation, response),
+        )
+        connection.execute(
+            "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)",
+            ("B-balanced", *occurrence),
+        )
+        occurrence_digest.update(_canonical(list(occurrence)) + b"\n")
+        response_digest.update(
+            _canonical([source_identity, ordinal, conversation_sha, response_sha]) + b"\n"
+        )
+    connection.commit()
+    connection.close()
+    view = SimpleNamespace(
+        strategy="B-balanced",
+        index_path=index,
+        occurrence_count=201,
+        ordered_occurrences_sha256=occurrence_digest.hexdigest(),
+        selection_sha256="c" * 64,
+        source_response_root_sha256=response_digest.hexdigest(),
+        unique_prompt_count=201,
+        natural_duplicate_count=0,
+        constructed_repeat_count=0,
+        trainer_epochs=1,
+    )
+    common = {
+        "tokenizer_sha256": TOKENIZER_SHA256,
+        "chat_template_sha256": CHAT_TEMPLATE_SHA256,
+        "assistant_loss_target_sha256": "2" * 64,
+        "training_config_sha256": "3" * 64,
+        "tokenizer": _Tokenizer(),
+        "milestone_occurrences": (201,),
+        "milestone_steps": (1,),
+    }
+    serial = module.derive_ptv2_one_pass_corpus(
+        view, output_root=tmp_path / "serial", **common
+    )
+    parallel = module.derive_ptv2_one_pass_corpus(
+        view,
+        output_root=tmp_path / "parallel",
+        work_root=tmp_path / "parallel-work",
+        workers=96,
+        source_commit="1" * 40,
+        **common,
+    )
+
+    assert Path(serial.tokenized_path).read_bytes() == Path(parallel.tokenized_path).read_bytes()
+    assert serial.tokenized_sha256 == parallel.tokenized_sha256
+    bundle = tmp_path / "parallel/b-balanced-tokenized"
+    execution_path = bundle / "EXECUTION_RECEIPT.json"
+    assert execution_path.is_file()
+    assert not (tmp_path / "parallel/b-balanced-tokenized.EXECUTION_RECEIPT.json").exists()
+    execution = json.loads(execution_path.read_bytes())
+    body = dict(execution)
+    claimed = body.pop("receipt_sha256")
+    assert claimed == hashlib.sha256(_canonical(body)).hexdigest()
+    assert execution["source_commit"] == "1" * 40
+    assert execution["selection_sha256"] == "c" * 64
+    assert execution["declared_range_count"] == 201
+    assert execution["effective_workers"] == 96
+    assert execution["source_index_bytes"] == index.stat().st_size
+    assert execution["source_index_sha256"] == hashlib.sha256(index.read_bytes()).hexdigest()
+    assert set(execution["thread_environment"].values()) == {"1"}
+    tokenized = json.loads((bundle / "TOKENIZED.json").read_bytes())
+    assert tokenized["execution_receipt"] == {
+        "path": "EXECUTION_RECEIPT.json",
+        "bytes": execution_path.stat().st_size,
+        "sha256": hashlib.sha256(execution_path.read_bytes()).hexdigest(),
+    }
+    assert list((tmp_path / "parallel-work").iterdir()) == []
+
+
+def test_ptv2_task8_exact_two_million_partition_is_201_source_order_ranges() -> None:
+    module = _load_module()
+
+    ranges = module._task8_ranges(2_000_000, 201)
+
+    assert len(ranges) == 201
+    assert ranges[0] == (0, 9_951)
+    assert ranges[49] == (487_599, 497_550)
+    assert ranges[50] == (497_550, 507_500)
+    assert ranges[-1] == (1_990_050, 2_000_000)
+    assert all(left[1] == right[0] for left, right in pairwise(ranges))
+    assert module.resolve_task8_worker_count(
+        96,
+        occurrence_count=2_000_000,
+        declared_ranges=201,
+        environ={"SLURM_CPUS_PER_TASK": "96"},
+    ) == (96, 96)
+
+
+def test_ptv2_task8_worker_failure_cleans_spools_and_publishes_nothing(tmp_path: Path) -> None:
+    module = _load_module()
+    index = tmp_path / "selection.sqlite3"
+    assistant = {"role": "assistant", "content": json.dumps({"ids": [1], "mask": [1]})}
+    conversation = _canonical(
+        {"messages": [{"role": "user", "content": "q"}, assistant], "tools": []}
+    ).decode()
+    response = _canonical(assistant).decode()
+    conversation_sha = hashlib.sha256(conversation.encode()).hexdigest()
+    response_sha = hashlib.sha256(response.encode()).hexdigest()
+    connection = sqlite3.connect(index)
+    connection.executescript(
+        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
+        "canonical_conversation TEXT,assistant_response TEXT);"
+        "CREATE TABLE occurrences(strategy TEXT,ordinal INTEGER,prompt_uuid TEXT,"
+        "source_identity_sha256 TEXT,source_row INTEGER,cell TEXT,reuse_index INTEGER,"
+        "conversation_sha256 TEXT,assistant_response_sha256 TEXT);"
+    )
+    connection.execute(
+        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 0, conversation, response)
+    )
+    connection.execute(
+        "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)",
+        ("B-balanced", 0, "a" * 64, "b" * 64, 0, "math", 0, conversation_sha, response_sha),
+    )
+    connection.commit()
+    connection.close()
+    work = tmp_path / "work"
+
+    with pytest.raises(ValueError, match="injected Task8 worker failure"):
+        module._pretokenize_task8(
+            index_path=index,
+            strategy="B-balanced",
+            occurrence_count=1,
+            sequence_length=4_096,
+            tokenizer=_FailingTask8Tokenizer(),
+            work_root=work,
+            workers=96,
+            source_commit="1" * 40,
+        )
+
+    assert list(work.iterdir()) == []
+    assert not (tmp_path / "b-balanced-tokenized").exists()
 
 
 def test_ptv2_token_bundle_publish_is_atomic_no_replace_and_apfs_safe(tmp_path: Path) -> None:

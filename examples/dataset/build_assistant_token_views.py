@@ -22,11 +22,15 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
+import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator, Mapping
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+from multiprocessing import get_context
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -174,6 +178,415 @@ class PTV2StudyExposureViews:
     scientific_artifacts: Mapping[str, str] = MappingProxyType({})
 
 
+_TASK8_TOKENIZER: Any | None = None
+
+
+@dataclass(frozen=True)
+class _Task8TokenRange:
+    index: int
+    start: int
+    stop: int
+    selection_index: Path
+    strategy: str
+    sequence_length: int
+    spool_path: Path
+
+
+@dataclass(frozen=True)
+class _Task8TokenResult:
+    index: int
+    start: int
+    stop: int
+    row_count: int
+    spool_path: Path
+    spool_bytes: int
+    spool_sha256: str
+    elapsed_seconds: float
+    worker_pid: int
+
+
+def resolve_task8_worker_count(
+    requested_workers: int,
+    *,
+    occurrence_count: int,
+    declared_ranges: int = 201,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[int, int]:
+    """Bound Task8 tokenization by allocation and deterministic ordinal ranges."""
+    if isinstance(requested_workers, bool) or requested_workers < 1:
+        raise ExposureViewError("Task8 workers must be a positive integer")
+    if occurrence_count < 1 or declared_ranges < 1 or declared_ranges > 201:
+        raise ExposureViewError("Task8 ordinal range contract is invalid")
+    environment = os.environ if environ is None else environ
+    try:
+        allocated = int(environment.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    except ValueError as error:
+        raise ExposureViewError("SLURM_CPUS_PER_TASK must be a positive integer") from error
+    if allocated < 1:
+        raise ExposureViewError("Task8 requires a positive CPU allocation")
+    return min(requested_workers, allocated, declared_ranges, occurrence_count, 96), allocated
+
+
+def _task8_ranges(count: int, declared_ranges: int) -> tuple[tuple[int, int], ...]:
+    ranges = min(count, declared_ranges)
+    quotient, remainder = divmod(count, ranges)
+    result = []
+    start = 0
+    for index in range(ranges):
+        size = quotient + int(index < remainder)
+        result.append((start, start + size))
+        start += size
+    if start != count or any(stop <= start for start, stop in result):
+        raise AssertionError("Task8 ordinal partition did not cover the exact selection")
+    return tuple(result)
+
+
+def _initialize_task8_worker() -> None:
+    for name in (
+        "ARROW_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[name] = "1"
+
+
+def _stage_task8_selection_index(source: Path, destination: Path) -> tuple[int, str]:
+    """Authenticate and copy the shared Task9 SQLite index exactly once node-locally."""
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = os.open(source, source_flags)
+    initial = os.fstat(source_descriptor)
+    if not stat.S_ISREG(initial.st_mode):
+        os.close(source_descriptor)
+        raise ExposureViewError("Task8 selection index is not a no-follow regular file")
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    destination_descriptor = os.open(destination, destination_flags, 0o600)
+    digest = sha256()
+    try:
+        with os.fdopen(os.dup(source_descriptor), "rb") as input_stream, os.fdopen(
+            destination_descriptor, "wb"
+        ) as output_stream:
+            for chunk in iter(lambda: input_stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+                output_stream.write(chunk)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        final = os.fstat(source_descriptor)
+        pathname = os.lstat(source)
+        if (
+            stat.S_ISLNK(pathname.st_mode)
+            or (pathname.st_dev, pathname.st_ino) != (final.st_dev, final.st_ino)
+            or (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns)
+            != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns)
+        ):
+            raise ExposureViewError("Task8 selection index changed during node-local staging")
+    except BaseException:
+        os.close(source_descriptor)
+        destination.unlink(missing_ok=True)
+        raise
+    os.close(source_descriptor)
+    return initial.st_size, digest.hexdigest()
+
+
+def _tokenize_ptv2_conversation(
+    conversation: str, response: str, sequence_length: int
+) -> tuple[list[int], list[int]]:
+    assert _TASK8_TOKENIZER is not None
+    try:
+        canonical = json.loads(conversation)
+    except json.JSONDecodeError as error:
+        raise ExposureViewError("PTV2 selected conversation is invalid JSON") from error
+    if not isinstance(canonical, dict) or not isinstance(canonical.get("messages"), list):
+        raise ExposureViewError("PTV2 selected conversation has no messages")
+    assistants = [
+        message
+        for message in canonical["messages"]
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    if not assistants or canonical_json(assistants[-1]).decode("utf-8") != response:
+        raise ExposureViewError("PTV2 selected response is not the final assistant in its conversation")
+    encoded = _TASK8_TOKENIZER.apply_chat_template(
+        canonical["messages"],
+        tools=canonical.get("tools") or None,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
+    )
+    input_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
+    loss_mask = encoded.get("assistant_masks") if isinstance(encoded, Mapping) else None
+    if loss_mask is None and isinstance(encoded, Mapping):
+        loss_mask = encoded.get("assistant_tokens_mask")
+    if (
+        not isinstance(input_ids, list)
+        or not input_ids
+        or not isinstance(loss_mask, list)
+        or len(input_ids) != len(loss_mask)
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in input_ids)
+        or any(value not in (0, 1) for value in loss_mask)
+    ):
+        raise ExposureViewError("PTV2 tokenizer did not return aligned IDs and assistant mask")
+    input_ids = input_ids[:sequence_length]
+    loss_mask = loss_mask[:sequence_length]
+    if sum(loss_mask) < 1:
+        raise ExposureViewError("PTV2 final training boundary has no assistant tokens")
+    return input_ids, loss_mask
+
+
+def _process_task8_range(task: _Task8TokenRange) -> _Task8TokenResult:
+    started = time.monotonic_ns()
+    observed = os.lstat(task.selection_index)
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
+        raise ExposureViewError("Task8 selection index is not a no-follow regular file")
+    source = sqlite3.connect(f"file:{task.selection_index}?mode=ro", uri=True)
+    output = sqlite3.connect(task.spool_path)
+    output.execute("PRAGMA synchronous=NORMAL")
+    output.execute(
+        "CREATE TABLE records(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+        "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,cell TEXT NOT NULL,"
+        "reuse_index INTEGER NOT NULL,conversation_sha256 TEXT NOT NULL,"
+        "assistant_response_sha256 TEXT NOT NULL,input_ids_json TEXT NOT NULL,"
+        "loss_mask_json TEXT NOT NULL,assistant_tokens INTEGER NOT NULL,serialized_tokens INTEGER NOT NULL)"
+    )
+    count = 0
+    try:
+        cursor = source.execute(
+            "SELECT occurrences.ordinal,occurrences.prompt_uuid,occurrences.source_identity_sha256,"
+            "occurrences.source_row,occurrences.cell,occurrences.reuse_index,"
+            "occurrences.conversation_sha256,occurrences.assistant_response_sha256,"
+            "source_rows.canonical_conversation,source_rows.assistant_response "
+            "FROM occurrences JOIN source_rows "
+            "ON occurrences.source_identity_sha256=source_rows.source_identity_sha256 "
+            "AND occurrences.source_row=source_rows.source_row "
+            "WHERE occurrences.strategy=? AND occurrences.ordinal>=? AND occurrences.ordinal<? "
+            "ORDER BY occurrences.ordinal",
+            (task.strategy, task.start, task.stop),
+        )
+        for row in cursor:
+            occurrence, conversation, response = row[:8], row[8], row[9]
+            if sha256(conversation.encode("utf-8")).hexdigest() != occurrence[6]:
+                raise ExposureViewError("PTV2 selected conversation hash mismatch")
+            if sha256(response.encode("utf-8")).hexdigest() != occurrence[7]:
+                raise ExposureViewError("PTV2 selected assistant response hash mismatch")
+            input_ids, loss_mask = _tokenize_ptv2_conversation(
+                conversation, response, task.sequence_length
+            )
+            output.execute(
+                "INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    *occurrence,
+                    canonical_json(input_ids).decode("utf-8"),
+                    canonical_json(loss_mask).decode("utf-8"),
+                    sum(loss_mask),
+                    len(input_ids),
+                ),
+            )
+            count += 1
+            if count % 10_000 == 0:
+                output.commit()
+        output.commit()
+    except BaseException:
+        output.close()
+        source.close()
+        task.spool_path.unlink(missing_ok=True)
+        raise
+    output.close()
+    source.close()
+    after = os.lstat(task.selection_index)
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (observed.st_dev, observed.st_ino, observed.st_size, observed.st_mtime_ns)
+    ):
+        task.spool_path.unlink(missing_ok=True)
+        raise ExposureViewError("Task8 selection index changed during tokenization")
+    if count != task.stop - task.start:
+        task.spool_path.unlink(missing_ok=True)
+        raise ExposureViewError("Task8 ordinal range is incomplete")
+    return _Task8TokenResult(
+        task.index,
+        task.start,
+        task.stop,
+        count,
+        task.spool_path,
+        task.spool_path.stat().st_size,
+        _sha256_file(task.spool_path),
+        round((time.monotonic_ns() - started) / 1_000_000_000, 6),
+        os.getpid(),
+    )
+
+
+class _Task8LookupTokenizer:
+    def __init__(self, tokenizer: Any, database: Path) -> None:
+        self.tokenizer_sha256 = tokenizer.tokenizer_sha256
+        self.chat_template = tokenizer.chat_template
+        self.assistant_loss_target_sha256 = tokenizer.assistant_loss_target_sha256
+        self._database = database
+        self._connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+
+    def apply_chat_template(self, messages: Any, **kwargs: Any) -> dict[str, list[int]]:
+        conversation = canonical_json(
+            {"messages": messages, "tools": kwargs.get("tools") or []}
+        ).decode("utf-8")
+        digest = sha256(conversation.encode("utf-8")).hexdigest()
+        row = self._connection.execute(
+            "SELECT input_ids_json,loss_mask_json FROM tokenized WHERE conversation_sha256=?",
+            (digest,),
+        ).fetchone()
+        if row is None:
+            raise ExposureViewError("Task8 parallel token lookup is incomplete")
+        return {"input_ids": json.loads(row[0]), "assistant_masks": json.loads(row[1])}
+
+    def close(self) -> None:
+        self._connection.close()
+
+
+def _pretokenize_task8(
+    *,
+    index_path: Path,
+    strategy: str,
+    occurrence_count: int,
+    sequence_length: int,
+    tokenizer: Any,
+    work_root: Path,
+    workers: int,
+    source_commit: str,
+) -> tuple[tempfile.TemporaryDirectory[str], _Task8LookupTokenizer, Mapping[str, Any]]:
+    effective, allocated = resolve_task8_worker_count(
+        workers, occurrence_count=occurrence_count
+    )
+    work_root.mkdir(parents=True, exist_ok=True)
+    resolved_work_root = work_root.resolve(strict=True)
+    if (
+        work_root.is_symlink()
+        or not work_root.is_dir()
+        or resolved_work_root.parts[:2] in {("/", "lustre"), ("/", "home")}
+    ):
+        raise ExposureViewError("Task8 work root must be a safe node-local directory")
+    started_wall_ns = time.time_ns()
+    started = time.monotonic_ns()
+    temporary = tempfile.TemporaryDirectory(prefix="task8-token-ranges-", dir=resolved_work_root)
+    root = Path(temporary.name)
+    staged_index = root / "selection-index.sqlite3"
+    stage_started = time.monotonic_ns()
+    try:
+        source_index_bytes, source_index_sha256 = _stage_task8_selection_index(
+            index_path, staged_index
+        )
+    except BaseException:
+        temporary.cleanup()
+        raise
+    source_stage_elapsed_seconds = round(
+        (time.monotonic_ns() - stage_started) / 1_000_000_000, 6
+    )
+    ranges = _task8_ranges(occurrence_count, 201)
+    tasks = tuple(
+        _Task8TokenRange(
+            index,
+            start,
+            stop,
+            staged_index,
+            strategy,
+            sequence_length,
+            root / f"range-{index:03d}.sqlite3",
+        )
+        for index, (start, stop) in enumerate(ranges)
+    )
+    global _TASK8_TOKENIZER
+    _TASK8_TOKENIZER = tokenizer
+    _initialize_task8_worker()
+    thread_environment = {
+        name: os.environ.get(name)
+        for name in (
+            "ARROW_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        )
+    }
+    if set(thread_environment.values()) != {"1"}:
+        raise ExposureViewError("Task8 thread caps did not reconcile")
+    try:
+        results: dict[int, _Task8TokenResult] = {}
+        with ProcessPoolExecutor(
+            max_workers=effective,
+            mp_context=get_context("fork"),
+            initializer=_initialize_task8_worker,
+        ) as executor:
+            futures = {executor.submit(_process_task8_range, task): task.index for task in tasks}
+            try:
+                for future in as_completed(futures):
+                    result = future.result()
+                    results[result.index] = result
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+        ordered = tuple(results[index] for index in range(len(tasks)))
+        database = root / "lookup.sqlite3"
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "CREATE TABLE tokenized(conversation_sha256 TEXT PRIMARY KEY,input_ids_json TEXT NOT NULL,"
+            "loss_mask_json TEXT NOT NULL) WITHOUT ROWID"
+        )
+        for result in ordered:
+            observed = os.lstat(result.spool_path)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_size != result.spool_bytes
+                or _sha256_file(result.spool_path) != result.spool_sha256
+            ):
+                raise ExposureViewError("Task8 token spool changed before deterministic merge")
+            with sqlite3.connect(result.spool_path) as shard:
+                for conversation_sha, input_ids, loss_mask in shard.execute(
+                    "SELECT conversation_sha256,input_ids_json,loss_mask_json "
+                    "FROM records ORDER BY ordinal"
+                ):
+                    previous = connection.execute(
+                        "SELECT input_ids_json,loss_mask_json FROM tokenized "
+                        "WHERE conversation_sha256=?",
+                        (conversation_sha,),
+                    ).fetchone()
+                    if previous is not None and previous != (input_ids, loss_mask):
+                        raise ExposureViewError("Task8 duplicate conversation tokenization diverged")
+                    connection.execute(
+                        "INSERT OR IGNORE INTO tokenized VALUES(?,?,?)",
+                        (conversation_sha, input_ids, loss_mask),
+                    )
+            connection.commit()
+        connection.close()
+        execution: dict[str, Any] = {
+            "schema_version": 1,
+            "source_commit": source_commit,
+            "declared_range_count": len(ranges),
+            "occurrence_count": occurrence_count,
+            "allocated_cpus": allocated,
+            "requested_workers": workers,
+            "effective_workers": effective,
+            "threads_per_worker": 1,
+            "thread_environment": thread_environment,
+            "source_index_bytes": source_index_bytes,
+            "source_index_sha256": source_index_sha256,
+            "source_stage_elapsed_seconds": source_stage_elapsed_seconds,
+            "started_at_ns": started_wall_ns,
+            "finished_at_ns": time.time_ns(),
+            "elapsed_seconds": round((time.monotonic_ns() - started) / 1_000_000_000, 6),
+            "ranges": [
+                {**asdict(result), "spool_path": result.spool_path.name} for result in ordered
+            ],
+        }
+        execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+        return temporary, _Task8LookupTokenizer(tokenizer, database), MappingProxyType(execution)
+    except BaseException:
+        temporary.cleanup()
+        raise
+    finally:
+        _TASK8_TOKENIZER = None
+
+
 def derive_ptv2_one_pass_corpus(
     view: Any,
     *,
@@ -183,7 +596,11 @@ def derive_ptv2_one_pass_corpus(
     training_config_sha256: str,
     tokenizer: Any,
     output_root: Path,
+    work_root: Path | None = None,
     sequence_length: int = 4_096,
+    workers: int = 1,
+    source_commit: str | None = None,
+    _parallel_execution: Mapping[str, Any] | None = None,
     milestone_occurrences: tuple[int, ...] = (500_224, 1_000_448, 1_300_000, 2_000_000),
     milestone_steps: tuple[int, ...] = (977, 1_954, 2_540, 3_908),
 ) -> PTV2OnePassCorpus:
@@ -209,7 +626,10 @@ def derive_ptv2_one_pass_corpus(
     if strategy not in {"A-repair", "B-balanced"}:
         raise ExposureViewError("PTV2 materialized view strategy is invalid")
     index_path = Path(getattr(view, "index_path", ""))
-    selection_sha256 = getattr(view, "selection_sha256", None)
+    raw_selection_sha256 = getattr(view, "selection_sha256", None)
+    if not isinstance(raw_selection_sha256, str):
+        raise ExposureViewError("PTV2 selection digest is missing")
+    selection_sha256 = raw_selection_sha256
     _require_digest("PTV2 selection", selection_sha256)
     if not index_path.is_file() or index_path.is_symlink():
         raise ExposureViewError("PTV2 selection SQLite index is missing or unsafe")
@@ -228,6 +648,41 @@ def derive_ptv2_one_pass_corpus(
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir():
         raise ExposureViewError("PTV2 tokenized output root is unsafe")
+    if workers > 1:
+        resolved_commit = source_commit or os.environ.get("SOURCE_COMMIT", "")
+        if re.fullmatch(r"[0-9a-f]{40}", resolved_commit) is None:
+            raise ExposureViewError("parallel Task8 processing requires an exact source commit")
+        if work_root is None:
+            raise ExposureViewError("parallel Task8 processing requires a node-local work root")
+        temporary, lookup, execution = _pretokenize_task8(
+            index_path=index_path,
+            strategy=strategy,
+            occurrence_count=int(getattr(view, "occurrence_count", 0)),
+            sequence_length=sequence_length,
+            tokenizer=tokenizer,
+            work_root=Path(work_root),
+            workers=workers,
+            source_commit=resolved_commit,
+        )
+        try:
+            corpus = derive_ptv2_one_pass_corpus(
+                view,
+                tokenizer_sha256=tokenizer_sha256,
+                chat_template_sha256=chat_template_sha256,
+                assistant_loss_target_sha256=assistant_loss_target_sha256,
+                training_config_sha256=training_config_sha256,
+                tokenizer=lookup,
+                output_root=output_root,
+                sequence_length=sequence_length,
+                workers=1,
+                _parallel_execution=execution,
+                milestone_occurrences=milestone_occurrences,
+                milestone_steps=milestone_steps,
+            )
+            return corpus
+        finally:
+            lookup.close()
+            temporary.cleanup()
     bundle_path = root / f"{strategy.lower()}-tokenized"
     temporary_bundle = _prepare_ptv2_tokenized_bundle(root, bundle_path)
     temporary_database = temporary_bundle / "records.sqlite3"
@@ -350,6 +805,33 @@ def derive_ptv2_one_pass_corpus(
         raise ExposureViewError("PTV2 selection multiplicity summary does not reconcile")
     _fsync_file(temporary_database)
     database_sha256 = _sha256_file(temporary_database)
+    execution_descriptor: dict[str, Any] | None = None
+    if _parallel_execution is not None:
+        execution_payload = dict(_parallel_execution)
+        execution_payload.pop("receipt_sha256", None)
+        execution_payload.update(
+            {
+                "selection_sha256": selection_sha256,
+                "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
+                "source_response_root_sha256": response_digest.hexdigest(),
+                "tokenizer_sha256": tokenizer_sha256,
+                "chat_template_sha256": chat_template_sha256,
+                "assistant_loss_target_sha256": assistant_loss_target_sha256,
+                "tokenized_sha256": database_sha256,
+            }
+        )
+        execution_payload["receipt_sha256"] = sha256(
+            canonical_json(execution_payload)
+        ).hexdigest()
+        execution_path = temporary_bundle / "EXECUTION_RECEIPT.json"
+        execution_bytes = canonical_json(execution_payload) + b"\n"
+        _write_exclusive(execution_path, execution_bytes)
+        _fsync_file(execution_path)
+        execution_descriptor = {
+            "path": execution_path.name,
+            "bytes": len(execution_bytes),
+            "sha256": sha256(execution_bytes).hexdigest(),
+        }
     receipt = {
         "schema_version": 1,
         "strategy": strategy,
@@ -378,6 +860,11 @@ def derive_ptv2_one_pass_corpus(
         "database_sha256": database_sha256,
         "database_bytes": temporary_database.stat().st_size,
     }
+    if execution_descriptor is not None:
+        receipt["execution_receipt"] = execution_descriptor
+        assert _parallel_execution is not None
+        receipt["source_index_bytes"] = _parallel_execution["source_index_bytes"]
+        receipt["source_index_sha256"] = _parallel_execution["source_index_sha256"]
     receipt_sha256 = sha256(canonical_json(receipt)).hexdigest()
     _write_exclusive(
         temporary_receipt, canonical_json(receipt | {"receipt_sha256": receipt_sha256}) + b"\n"
@@ -1959,7 +2446,7 @@ def _authenticate_tokenizer_root(
     if not template_path.is_file() or _sha256_file(template_path) != chat_template_sha256:
         raise ExposureViewError("trainer chat-template file digest mismatch")
     # Production must use the exact local snapshot just authenticated above.
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer  # pyright: ignore[reportMissingImports]
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(

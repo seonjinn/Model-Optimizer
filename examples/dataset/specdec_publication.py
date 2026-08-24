@@ -435,6 +435,13 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
             if "execution_receipt" in payload:
                 _validate_task9_execution_receipt(payload, files)
         if (
+            artifact.role == "tokenized"
+            and payload.get("schema_version") == 1
+            and payload.get("strategy") in {"A-repair", "B-balanced"}
+            and "execution_receipt" in payload
+        ):
+            _validate_task8_execution_receipt(payload, files)
+        if (
             artifact.role == "selection"
             and payload.get("schema_version") == 2
             and payload.get("selection_mode") == "B-prime-only"
@@ -475,6 +482,11 @@ def _reconcile_ptv2_role_lineage(payloads: Mapping[str, Mapping[str, Any]]) -> N
     ):
         if payload.get("selection_sha256") != expected_selection:
             raise PublicationError(f"PTV2 {role} receipt is not bound to selection")
+    if "execution_receipt" in tokenized and (
+        tokenized.get("source_index_sha256") != selection["index"].get("sha256")
+        or tokenized.get("source_index_bytes") != selection["index"].get("bytes")
+    ):
+        raise PublicationError("PTV2 Task8 source index does not reconcile Task9 selection")
     response_root = response.get("source_response_root_sha256")
     if not isinstance(response_root, str) or _SHA256.fullmatch(response_root) is None:
         raise PublicationError("PTV2 response receipt has no source response root")
@@ -959,6 +971,129 @@ def _parallel_shards_reconcile(value: object, *, include_spool_identity: bool) -
     return seen == set(range(201))
 
 
+def _validate_task8_execution_receipt(
+    tokenized: Mapping[str, Any], files: list[tuple[str, Path, int, str]]
+) -> None:
+    """Authenticate the exact 2M/201-range Task8 p96 execution lineage."""
+    descriptor = tokenized.get("execution_receipt")
+    if not isinstance(descriptor, dict):
+        raise PublicationError("Task8 execution receipt descriptor is malformed")
+    execution_file = next((item for item in files if item[0] == descriptor.get("path")), None)
+    if execution_file is None:
+        raise PublicationError("Task8 execution receipt was not authenticated")
+    execution = _canonical_document(execution_file[1].read_bytes(), "Task8 execution receipt")
+    expected_keys = {
+        "schema_version",
+        "source_commit",
+        "declared_range_count",
+        "occurrence_count",
+        "allocated_cpus",
+        "requested_workers",
+        "effective_workers",
+        "threads_per_worker",
+        "thread_environment",
+        "source_index_bytes",
+        "source_index_sha256",
+        "source_stage_elapsed_seconds",
+        "started_at_ns",
+        "finished_at_ns",
+        "elapsed_seconds",
+        "ranges",
+        "selection_sha256",
+        "ordered_occurrences_sha256",
+        "source_response_root_sha256",
+        "tokenizer_sha256",
+        "chat_template_sha256",
+        "assistant_loss_target_sha256",
+        "tokenized_sha256",
+        "receipt_sha256",
+    }
+    claimed = execution.get("receipt_sha256")
+    body = {key: value for key, value in execution.items() if key != "receipt_sha256"}
+    thread_environment = execution.get("thread_environment")
+    lineage = {
+        "source_index_sha256": tokenized.get("source_index_sha256"),
+        "selection_sha256": tokenized.get("selection_sha256"),
+        "ordered_occurrences_sha256": tokenized.get("ordered_occurrences_sha256"),
+        "source_response_root_sha256": tokenized.get("source_response_root_sha256"),
+        "tokenizer_sha256": tokenized.get("tokenizer_sha256"),
+        "chat_template_sha256": tokenized.get("chat_template_sha256"),
+        "assistant_loss_target_sha256": tokenized.get("assistant_loss_target_sha256"),
+        "tokenized_sha256": tokenized.get("database_sha256"),
+    }
+    started = execution.get("started_at_ns")
+    finished = execution.get("finished_at_ns")
+    if (
+        set(execution) != expected_keys
+        or claimed != _sha256_bytes(_identity_json(body))
+        or execution.get("schema_version") != 1
+        or not isinstance(execution.get("source_commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", execution["source_commit"]) is None
+        or execution.get("declared_range_count") != 201
+        or execution.get("occurrence_count") != 2_000_000
+        or execution.get("allocated_cpus") != 96
+        or execution.get("requested_workers") != 96
+        or execution.get("effective_workers") != 96
+        or execution.get("threads_per_worker") != 1
+        or not isinstance(thread_environment, dict)
+        or set(thread_environment) != _PARALLEL_THREAD_ENVIRONMENT
+        or set(thread_environment.values()) != {"1"}
+        or not _is_nonnegative_int(execution.get("source_index_bytes"))
+        or execution["source_index_bytes"] < 1
+        or not _is_nonnegative_number(execution.get("source_stage_elapsed_seconds"))
+        or not _is_nonnegative_number(execution.get("elapsed_seconds"))
+        or not isinstance(started, int)
+        or isinstance(started, bool)
+        or started < 0
+        or not isinstance(finished, int)
+        or isinstance(finished, bool)
+        or finished < 0
+        or finished < started
+        or not _is_nonnegative_int(tokenized.get("source_index_bytes"))
+        or execution.get("source_index_bytes") != tokenized.get("source_index_bytes")
+        or any(not _is_sha256(value) for value in lineage.values())
+        or any(execution.get(key) != value for key, value in lineage.items())
+    ):
+        raise PublicationError("Task8 execution lineage is invalid")
+    ranges = execution.get("ranges")
+    if not isinstance(ranges, list) or len(ranges) != 201:
+        raise PublicationError("Task8 execution range topology is invalid")
+    quotient, remainder = divmod(2_000_000, 201)
+    start = 0
+    range_keys = {
+        "index",
+        "start",
+        "stop",
+        "row_count",
+        "spool_path",
+        "spool_bytes",
+        "spool_sha256",
+        "elapsed_seconds",
+        "worker_pid",
+    }
+    for index, item in enumerate(ranges):
+        stop = start + quotient + int(index < remainder)
+        if (
+            not isinstance(item, dict)
+            or set(item) != range_keys
+            or item.get("index") != index
+            or item.get("start") != start
+            or item.get("stop") != stop
+            or item.get("row_count") != stop - start
+            or item.get("spool_path") != f"range-{index:03d}.sqlite3"
+            or not _is_nonnegative_int(item.get("spool_bytes"))
+            or item["spool_bytes"] < 1
+            or not _is_sha256(item.get("spool_sha256"))
+            or not _is_nonnegative_number(item.get("elapsed_seconds"))
+            or not _is_nonnegative_int(item.get("worker_pid"))
+            or item["worker_pid"] < 1
+        ):
+            raise PublicationError("Task8 execution range topology is invalid")
+        start = stop
+    if start != 2_000_000:
+        raise PublicationError("Task8 execution range topology is invalid")
+
+
 def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
     if role == "selection" and payload.get("schema_version") == 2:
         root_sha256 = payload.get("root_sha256")
@@ -1051,14 +1186,20 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
                 "chat_template_sha256",
                 "assistant_loss_target_sha256",
             }
+            if "execution_receipt" in payload:
+                required |= {"source_index_bytes", "source_index_sha256"}
             if not required.issubset(payload):
                 raise PublicationError("PTV2 tokenized receipt schema is incomplete")
+            execution = payload.get("execution_receipt")
+            if execution is not None and not isinstance(execution, dict):
+                raise PublicationError("Task8 execution receipt descriptor is malformed")
             return [
                 {
                     "path": payload["database_path"],
                     "bytes": payload["database_bytes"],
                     "sha256": payload["database_sha256"],
-                }
+                },
+                *([execution] if execution is not None else []),
             ]
         required = {
             "database_path",
