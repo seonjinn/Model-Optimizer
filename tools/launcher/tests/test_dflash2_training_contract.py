@@ -514,6 +514,23 @@ def test_dflash2_runtime_stager_inserts_and_verifies_the_receipt() -> None:
         assert required in script
 
 
+def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
+    """The CPU staging job proves both immutable bytes and an executable selector."""
+    script = (
+        Path(__file__).resolve().parents[1] / "common/specdec/build_dflash2_runtime.sbatch"
+    ).read_text()
+    for required in (
+        "b389ac29465b33f9e9c534df221ea3c129e9793f",
+        "--runtime-package",
+        "dflash2-vllm-runtime-receipt.json",
+        "verify_vllm_runtime",
+        "_score_edges",
+        "DFlash2Speculator",
+        "refusing to replace existing runtime output",
+    ):
+        assert required in script
+
+
 def test_shared_runner_enforces_and_consumes_the_dflash2_contract() -> None:
     """The manifest contract reaches runtime verification and the training recipe."""
     runner = (
