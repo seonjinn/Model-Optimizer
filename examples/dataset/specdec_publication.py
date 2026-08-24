@@ -54,6 +54,24 @@ REQUIRED_ROLES = ("source", "selection", "response", "tokenized", "exposure", "r
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _BUFFER_SIZE = 1024 * 1024
+_PTV2_SELECTION_IDENTITY_KEYS = frozenset(
+    {
+        "strategy",
+        "policy_sha256",
+        "occurrence_count",
+        "unique_prompt_count",
+        "cell_occurrence_counts",
+        "multilingual_occurrence_counts",
+        "repair_complement_counts",
+        "uuid_multiplicity_histogram",
+        "source_occurrence_multiplicity_histogram",
+        "ordered_occurrences_sha256",
+        "ordered_prompt_uuids_sha256",
+        "source_response_root_sha256",
+        "occurrence_multiplicity_sha256",
+        "trust_root_sha256",
+    }
+)
 _SCHEMA = pa.schema(
     [
         ("prompt_uuid", pa.string()),
@@ -463,13 +481,27 @@ def _validate_ptv2_selection_policy(
     if _sha256_bytes(_identity_json(decoded_policy)) != payload["policy_sha256"]:
         raise PublicationError("PTV2 semantic policy does not match policy_sha256")
     identity = payload["selection_identity"]
-    if not isinstance(identity, Mapping) or _sha256_bytes(_identity_json(identity)) != payload[
-        "selection_sha256"
-    ]:
+    if not isinstance(identity, Mapping) or set(identity) != _PTV2_SELECTION_IDENTITY_KEYS:
+        raise PublicationError("PTV2 selection identity does not have the exact schema")
+    if _sha256_bytes(_identity_json(identity)) != payload["selection_sha256"]:
         raise PublicationError("PTV2 selection identity does not match selection_sha256")
-    for key in ("strategy", "occurrence_count", "ordered_occurrences_sha256"):
-        if identity.get(key) != payload[key]:
-            raise PublicationError(f"PTV2 selection identity does not reconcile {key}")
+    trust_roots = payload["trust_roots"]
+    expected_trust_roots = {
+        "source_inventory_sha256": payload["source_inventory_sha256"],
+        "held_out_receipt_sha256": payload["held_out_receipt_sha256"],
+    }
+    if payload["strategy"] == "A-repair":
+        expected_trust_roots |= {
+            "baseline_receipt_sha256": payload["baseline_receipt_sha256"],
+            "complement_selection_sha256": trust_roots.get("complement_selection_sha256")
+            if isinstance(trust_roots, Mapping)
+            else None,
+        }
+    if not isinstance(trust_roots, Mapping) or dict(trust_roots) != expected_trust_roots:
+        raise PublicationError("PTV2 selection trust-root preimage is invalid")
+    for value in trust_roots.values():
+        if not isinstance(value, str) or _SHA256.fullmatch(value) is None or value == "0" * 64:
+            raise PublicationError("PTV2 selection trust-root preimage is invalid")
     index_file = next((item for item in files if item[0] == payload["index"]["path"]), None)
     if index_file is None:
         raise PublicationError("PTV2 selection index was not authenticated")
@@ -480,14 +512,23 @@ def _validate_ptv2_selection_policy(
             "SELECT occurrences.ordinal,occurrences.prompt_uuid,occurrences.source_identity_sha256,"
             "occurrences.source_row,occurrences.cell,occurrences.reuse_index,"
             "occurrences.conversation_sha256,occurrences.assistant_response_sha256,"
-            "source_rows.canonical_conversation,source_rows.assistant_response FROM occurrences "
+            "source_rows.canonical_conversation,source_rows.assistant_response,"
+            "source_rows.language FROM occurrences "
             "JOIN source_rows ON occurrences.source_identity_sha256=source_rows.source_identity_sha256 "
             "AND occurrences.source_row=source_rows.source_row WHERE occurrences.strategy=? "
             "ORDER BY occurrences.ordinal",
             (payload["strategy"],),
         )
         semantic = hashlib.sha256()
+        prompt_semantic = hashlib.sha256()
+        response_semantic = hashlib.sha256()
         count = 0
+        cell_counts: dict[str, int] = {}
+        language_counts: dict[str, int] = {}
+        repair_counts = dict.fromkeys(decoded_policy.get("repair", {}).get("complement", {}), 0)
+        historical_count = (
+            decoded_policy.get("repair", {}).get("historical", {}).get("occurrences", 0)
+        )
         for row in rows:
             occurrence = row[:8]
             if (
@@ -497,7 +538,56 @@ def _validate_ptv2_selection_policy(
                 raise PublicationError("PTV2 source-row conversation or response hash mismatch")
             semantic.update(_identity_json(list(occurrence)))
             semantic.update(b"\n")
+            prompt_semantic.update(_identity_json(occurrence[1]))
+            prompt_semantic.update(b"\n")
+            response_semantic.update(
+                _identity_json([occurrence[2], occurrence[3], occurrence[6], occurrence[7]])
+            )
+            response_semantic.update(b"\n")
+            cell = str(occurrence[4])
+            language = str(row[10])
+            cell_counts[cell] = cell_counts.get(cell, 0) + 1
+            if cell == "multilingual":
+                language_counts[language] = language_counts.get(language, 0) + 1
+            if payload["strategy"] == "A-repair" and occurrence[0] >= historical_count:
+                repair_key = "stem" if cell == "stem" else language
+                if repair_key in repair_counts:
+                    repair_counts[repair_key] += 1
             count += 1
+        unique_count = int(
+            connection.execute(
+                "SELECT count(DISTINCT prompt_uuid) FROM occurrences WHERE strategy=?",
+                (payload["strategy"],),
+            ).fetchone()[0]
+        )
+        multiplicity_semantic = hashlib.sha256()
+        for row in connection.execute(
+            "SELECT prompt_uuid,source_identity_sha256,source_row,count(*) FROM occurrences "
+            "WHERE strategy=? GROUP BY prompt_uuid,source_identity_sha256,source_row "
+            "ORDER BY prompt_uuid,source_identity_sha256,source_row",
+            (payload["strategy"],),
+        ):
+            multiplicity_semantic.update(_identity_json(list(row)))
+            multiplicity_semantic.update(b"\n")
+        uuid_histogram = {
+            int(multiplicity): int(row_count)
+            for multiplicity, row_count in connection.execute(
+                "SELECT multiplicity,count(*) FROM (SELECT prompt_uuid,count(*) AS multiplicity "
+                "FROM occurrences WHERE strategy=? GROUP BY prompt_uuid) "
+                "GROUP BY multiplicity ORDER BY multiplicity",
+                (payload["strategy"],),
+            )
+        }
+        source_histogram = {
+            int(multiplicity): int(row_count)
+            for multiplicity, row_count in connection.execute(
+                "SELECT multiplicity,count(*) FROM (SELECT prompt_uuid,source_identity_sha256,"
+                "source_row,count(*) AS multiplicity FROM occurrences WHERE strategy=? "
+                "GROUP BY prompt_uuid,source_identity_sha256,source_row) "
+                "GROUP BY multiplicity ORDER BY multiplicity",
+                (payload["strategy"],),
+            )
+        }
     except sqlite3.Error as error:
         raise PublicationError("PTV2 selection index semantics are invalid") from error
     finally:
@@ -508,6 +598,30 @@ def _validate_ptv2_selection_policy(
         or semantic.hexdigest() != payload["ordered_occurrences_sha256"]
     ):
         raise PublicationError("PTV2 selection index semantics do not match its receipt")
+    language_keys = decoded_policy.get("balanced", {}).get("multilingual_occurrences", {})
+    recomputed_identity = {
+        "strategy": payload["strategy"],
+        "policy_sha256": payload["policy_sha256"],
+        "occurrence_count": count,
+        "unique_prompt_count": unique_count,
+        "cell_occurrence_counts": {
+            cell: cell_counts.get(cell, 0)
+            for cell in ("math", "code", "stem", "chat", "multilingual")
+        },
+        "multilingual_occurrence_counts": {
+            language: language_counts.get(language, 0) for language in language_keys
+        },
+        "repair_complement_counts": repair_counts if payload["strategy"] == "A-repair" else {},
+        "uuid_multiplicity_histogram": uuid_histogram,
+        "source_occurrence_multiplicity_histogram": source_histogram,
+        "ordered_occurrences_sha256": semantic.hexdigest(),
+        "ordered_prompt_uuids_sha256": prompt_semantic.hexdigest(),
+        "source_response_root_sha256": response_semantic.hexdigest(),
+        "occurrence_multiplicity_sha256": multiplicity_semantic.hexdigest(),
+        "trust_root_sha256": _sha256_bytes(_identity_json(trust_roots)),
+    }
+    if _identity_json(recomputed_identity) != _identity_json(identity):
+        raise PublicationError("PTV2 selection identity does not match index semantics")
     shard_semantic = hashlib.sha256()
     shard_count = 0
     for _, path, _, _ in files:
@@ -556,6 +670,7 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "source_inventory_sha256",
             "baseline_receipt_sha256",
             "held_out_receipt_sha256",
+            "trust_roots",
             "strategy",
             "occurrence_count",
             "ordered_occurrences_sha256",
@@ -937,8 +1052,9 @@ def _copy_or_verify(source: Path, destination: Path, digest: str) -> None:
 def _payload_file_records(partial: Path) -> list[dict[str, Any]]:
     excluded = {"CORPUS_MANIFEST.json", "PUBLICATION.json"}
     records: list[dict[str, Any]] = []
-    for path in _regular_tree_files(partial):
-        relative = path.relative_to(partial).as_posix()
+    normalized_root = partial.resolve(strict=True)
+    for path in _regular_tree_files(normalized_root):
+        relative = path.relative_to(normalized_root).as_posix()
         if relative in excluded:
             continue
         records.append(

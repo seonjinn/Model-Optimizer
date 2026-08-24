@@ -946,6 +946,7 @@ def write_ptv2_selection_receipt(
     source_inventory_sha256: str,
     baseline_receipt_sha256: str,
     held_out_receipt_sha256: str,
+    complement_selection_sha256: str | None = None,
 ) -> Path:
     """Publish Task9's schema-v3 selection evidence with no synthetic row metadata.
 
@@ -970,6 +971,22 @@ def write_ptv2_selection_receipt(
     selection_sha256 = sha256(canonical_json(identity)).hexdigest()
     if selection_sha256 != view.selection_sha256:
         raise PTV2StudyError("selection view identity cannot be recomputed")
+    trust_roots = {
+        "source_inventory_sha256": source_inventory_sha256,
+        "held_out_receipt_sha256": held_out_receipt_sha256,
+    }
+    if view.strategy == "A-repair":
+        if complement_selection_sha256 is None:
+            raise PTV2StudyError("A-repair receipt requires complement selection digest")
+        _require_digest(complement_selection_sha256, "A-repair complement selection")
+        if complement_selection_sha256 == "0" * 64:
+            raise PTV2StudyError("A-repair complement selection digest must be nonzero")
+        trust_roots |= {
+            "baseline_receipt_sha256": baseline_receipt_sha256,
+            "complement_selection_sha256": complement_selection_sha256,
+        }
+    if sha256(canonical_json(trust_roots)).hexdigest() != view.trust_root_sha256:
+        raise PTV2StudyError("selection trust-root preimage does not match the selected view")
     output_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if output_root.is_symlink() or output_root.exists():
         raise FileExistsError(f"immutable Task9 selection receipt already exists: {output_root}")
@@ -992,18 +1009,21 @@ def write_ptv2_selection_receipt(
         try:
             with os.fdopen(descriptor, "wb") as stream:
                 for occurrence in iter_ptv2_study_occurrences(view):
-                    encoded = canonical_json(
-                        [
-                            occurrence.ordinal,
-                            occurrence.prompt_uuid,
-                            occurrence.source_identity_sha256,
-                            occurrence.source_row,
-                            occurrence.cell,
-                            occurrence.reuse_index,
-                            occurrence.conversation_sha256,
-                            occurrence.assistant_response_sha256,
-                        ]
-                    ) + b"\n"
+                    encoded = (
+                        canonical_json(
+                            [
+                                occurrence.ordinal,
+                                occurrence.prompt_uuid,
+                                occurrence.source_identity_sha256,
+                                occurrence.source_row,
+                                occurrence.cell,
+                                occurrence.reuse_index,
+                                occurrence.conversation_sha256,
+                                occurrence.assistant_response_sha256,
+                            ]
+                        )
+                        + b"\n"
+                    )
                     stream.write(encoded)
                     shard_digest.update(encoded)
                     rows += 1
@@ -1022,6 +1042,7 @@ def write_ptv2_selection_receipt(
             "source_inventory_sha256": source_inventory_sha256,
             "baseline_receipt_sha256": baseline_receipt_sha256,
             "held_out_receipt_sha256": held_out_receipt_sha256,
+            "trust_roots": trust_roots,
             "strategy": view.strategy,
             "occurrence_count": view.occurrence_count,
             "ordered_occurrences_sha256": view.ordered_occurrences_sha256,
@@ -1618,7 +1639,9 @@ def _selection_identity(view: PTV2StudyView, policy: PTV2StudyPolicy) -> dict[st
         "multilingual_occurrence_counts": dict(view.multilingual_occurrence_counts),
         "repair_complement_counts": dict(view.repair_complement_counts),
         "uuid_multiplicity_histogram": dict(view.uuid_multiplicity_histogram),
-        "source_occurrence_multiplicity_histogram": dict(view.source_occurrence_multiplicity_histogram),
+        "source_occurrence_multiplicity_histogram": dict(
+            view.source_occurrence_multiplicity_histogram
+        ),
         "ordered_occurrences_sha256": view.ordered_occurrences_sha256,
         "ordered_prompt_uuids_sha256": view.ordered_prompt_uuids_sha256,
         "source_response_root_sha256": view.source_response_root_sha256,

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import sys
 from dataclasses import replace
 from hashlib import sha256
@@ -37,6 +36,7 @@ try:
         write_ptv2_selection_receipt,
         write_task9_balanced_view_json,
     )
+    from select_bprime_cd_prompts import PromptView, SelectedPrompt, publish_prompt_view_bundle
     from specdec_corpus_contracts import canonical_json
     from specdec_identity import prompt_uuid
     from stage_ptv23_sources import (
@@ -403,9 +403,29 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
         _row("multilingual", 5, "multi"),
     )
     policy = _scaled_policy()
-    view = select_ptv2_b_balanced_view(rows, policy=policy, output_root=tmp_path / "index")
+    trust_roots = {
+        "source_inventory_sha256": "1" * 64,
+        "held_out_receipt_sha256": "3" * 64,
+    }
+    view = select_ptv2_b_balanced_view(
+        rows,
+        policy=policy,
+        output_root=tmp_path / "index",
+        trust_roots=trust_roots,
+    )
     policy_path = tmp_path / "policy.yaml"
     policy_path.write_bytes(POLICY.read_bytes())
+
+    with pytest.raises(PTV2StudyError, match="trust-root preimage"):
+        write_ptv2_selection_receipt(
+            tmp_path / "forged-receipt",
+            view,
+            policy=policy,
+            policy_path=policy_path,
+            source_inventory_sha256="9" * 64,
+            baseline_receipt_sha256="2" * 64,
+            held_out_receipt_sha256="3" * 64,
+        )
 
     receipt = write_ptv2_selection_receipt(
         tmp_path / "receipt",
@@ -419,6 +439,7 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
 
     payload = json.loads(receipt.read_bytes())
     assert payload["schema_version"] == 3
+    assert payload["trust_roots"] == trust_roots
     assert (
         payload["selection_sha256"]
         == sha256(canonical_json(payload["selection_identity"])).hexdigest()
@@ -627,90 +648,66 @@ def test_task5_published_complement_joins_the_task3_physical_row_stream(
     physical = next(iter_ptv2_staged_source_rows(inventory_receipt, policy=policy))
     inventory = load_source_inventory(inventory_receipt)
     source = inventory.sources[0]
-    selected = {
-        "prompt_uuid": physical.prompt_uuid,
-        "arm": "C",
-        "domain": "math",
-        "lane": "target-synth",
-        "language": "",
-        "context_bucket": "le4k",
-        "source_id": "fixture",
-        "source_family": "ptv2",
-        "source_repository_id": source.repository_id,
-        "source_configuration": source.configuration,
-        "source_split": source.split,
-        "source_revision": source.revision,
-        "source_file_sha256": source.files[0].sha256,
-        "source_manifest_sha256": inventory.manifest_sha256,
-        "source_file_path": source.files[0].path,
-        "source_row_index": physical.source_row,
-        "candidate_rank": 0,
-        "candidate_rank_sha256": "a" * 64,
-        "selection_index": 0,
-        "status": "primary",
-        "canonical_prompt": {"messages": [{"role": "user", "content": "first"}]},
-    }
-    root = tmp_path / "task5"
-    shards = root / "shards"
-    shards.mkdir(parents=True)
-    line = canonical_json(selected) + b"\n"
-    shard = shards / "rows-000001.jsonl"
-    shard.write_bytes(line)
-    index = root / "selection-index.sqlite3"
-    connection = sqlite3.connect(index)
-    connection.execute(
-        "CREATE TABLE rows(arm,status,selection_index,lane,prompt_uuid,shard_path,"
-        "byte_offset,byte_length,row_sha256,domain,language,candidate_rank)"
+    policy_sha256 = "1" * 64
+    seed = 20260822
+    rank_fields = (
+        policy_sha256,
+        str(seed),
+        "math",
+        "target-synth",
+        "",
+        "le4k",
+        "fixture",
+        source.revision,
+        source.files[0].sha256,
+        inventory.manifest_sha256,
+        source.files[0].path,
+        str(physical.source_row),
+        physical.prompt_uuid,
     )
-    connection.execute(
-        "INSERT INTO rows VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            "C",
-            "primary",
-            0,
-            "target-synth",
-            physical.prompt_uuid,
-            shard.relative_to(root).as_posix(),
-            0,
-            len(line),
-            sha256(line).hexdigest(),
-            "math",
-            "",
-            0,
-        ),
+    selected = SelectedPrompt(
+        physical.prompt_uuid,
+        "C",
+        "math",
+        "target-synth",
+        "",
+        "le4k",
+        "fixture",
+        "ptv2",
+        source.repository_id,
+        source.configuration,
+        source.split,
+        source.revision,
+        source.files[0].sha256,
+        inventory.manifest_sha256,
+        source.files[0].path,
+        physical.source_row,
+        0,
+        sha256("\0".join(rank_fields).encode()).hexdigest(),
+        0,
+        "primary",
+        canonical_json({"messages": [{"role": "user", "content": "first"}]}).decode(),
     )
-    connection.commit()
-    connection.close()
-    manifest = {
-        "schema_version": 2,
-        "selection_sha256": "b" * 64,
-        "paired_cd_sha256": "c" * 64,
-        "row_count": 1,
-        "shards": [
-            {
-                "path": shard.relative_to(root).as_posix(),
-                "row_count": 1,
-                "byte_count": len(line),
-                "sha256": sha256(line).hexdigest(),
-            }
-        ],
-        "index": {"path": index.name, "sha256": sha256(index.read_bytes()).hexdigest()},
-        "arms": {
-            "C": {
-                "primary_count": 1,
-                "reserve_count": 0,
-                "cell_counts": {"math": 1},
-                "lane_counts": {"target-synth": 1},
-                "bucket_floors": {},
-                "non_agentic_bucket_floors": {},
-                "lane_bucket_floors": {},
-                "count_proof_sha256": "d" * 64,
-            }
-        },
-    }
-    manifest["root_sha256"] = sha256(canonical_json(manifest)).hexdigest()
-    manifest_path = root / "SELECTION_MANIFEST.json"
-    manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+    b_prime = PromptView("B-prime", (), (), {}, {}, {}, {}, {}, "d" * 64)
+    d_view = PromptView("D", (), (), {}, {}, {}, {}, {}, "d" * 64)
+    bundle = SimpleNamespace(
+        B_prime=b_prime,
+        C=PromptView("C", (selected,), (), {"math": 1}, {"target-synth": 1}, {}, {}, {}, "d" * 64),
+        D=d_view,
+        policy_sha256=policy_sha256,
+        seed=seed,
+        source_inventory_sha256=inventory.manifest_sha256,
+        baseline_receipt_sha256="2" * 64,
+        held_out_receipt_sha256="3" * 64,
+        ptv2_revision=source.revision,
+        ptv2_allowlist_sha256="4" * 64,
+        reserve_numerator=1,
+        reserve_denominator=10,
+        paired_cd_sha256="5" * 64,
+        selection_sha256="6" * 64,
+    )
+    published = publish_prompt_view_bundle(bundle, tmp_path / "task5", rows_per_shard=1)
+    manifest_path = published.manifest_path
     view = study_module.load_prompt_view(
         manifest_path,
         expected_manifest_sha256=sha256(manifest_path.read_bytes()).hexdigest(),

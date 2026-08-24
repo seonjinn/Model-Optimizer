@@ -22,6 +22,7 @@ import importlib
 import json
 import sqlite3
 import sys
+import tempfile
 import tracemalloc
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,17 @@ def _bundle(root: Path, *, count: int = 5) -> publication.CorpusBundle:
     )
 
 
+def test_publish_bundle_normalizes_apfs_var_alias() -> None:
+    """Resolved descendants remain relative to an unresolved macOS /var publication root."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        bundle = _bundle(root / "inputs", count=1)
+
+        receipt = publication.publish_bundle(bundle, root / "published", "apfs-alias")
+
+        assert receipt.published_path == str(root / "published")
+
+
 def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards(
     tmp_path: Path,
 ) -> None:
@@ -149,8 +161,8 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         "assistant_response_sha256 TEXT,strategy TEXT)"
     )
     connection.execute(
-        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
-        "canonical_conversation TEXT,assistant_response TEXT)"
+        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,cell TEXT,"
+        "language TEXT,canonical_conversation TEXT,assistant_response TEXT)"
     )
     conversation = "conversation"
     response = "response"
@@ -165,7 +177,8 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         hashlib.sha256(response.encode()).hexdigest(),
     )
     connection.execute(
-        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 7, conversation, response)
+        "INSERT INTO source_rows VALUES(?,?,?,?,?,?)",
+        ("b" * 64, 7, "math", "", conversation, response),
     )
     connection.execute(
         "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", (*occurrence, "B-balanced")
@@ -184,14 +197,43 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
 
+    trust_roots = {
+        "source_inventory_sha256": "3" * 64,
+        "held_out_receipt_sha256": "5" * 64,
+    }
     selection_identity = {
         "strategy": "B-balanced",
+        "policy_sha256": hashlib.sha256(
+            publication._identity_json({"seed": 20260822, "strategy": "B-balanced"})
+        ).hexdigest(),
         "occurrence_count": 1,
+        "unique_prompt_count": 1,
+        "cell_occurrence_counts": {
+            "math": 1,
+            "code": 0,
+            "stem": 0,
+            "chat": 0,
+            "multilingual": 0,
+        },
+        "multilingual_occurrence_counts": {},
+        "repair_complement_counts": {},
+        "uuid_multiplicity_histogram": {1: 1},
+        "source_occurrence_multiplicity_histogram": {1: 1},
         "ordered_occurrences_sha256": ordered,
+        "ordered_prompt_uuids_sha256": hashlib.sha256(_canonical("a" * 64)).hexdigest(),
+        "source_response_root_sha256": hashlib.sha256(
+            _canonical(["b" * 64, 7, occurrence[6], occurrence[7]])
+        ).hexdigest(),
+        "occurrence_multiplicity_sha256": hashlib.sha256(
+            _canonical(["a" * 64, "b" * 64, 7, 1])
+        ).hexdigest(),
+        "trust_root_sha256": hashlib.sha256(publication._identity_json(trust_roots)).hexdigest(),
     }
     payload = {
         "schema_version": 3,
-        "selection_sha256": hashlib.sha256(publication._identity_json(selection_identity)).hexdigest(),
+        "selection_sha256": hashlib.sha256(
+            publication._identity_json(selection_identity)
+        ).hexdigest(),
         "selection_identity": selection_identity,
         "policy_sha256": hashlib.sha256(
             publication._identity_json({"seed": 20260822, "strategy": "B-balanced"})
@@ -200,6 +242,7 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         "source_inventory_sha256": "3" * 64,
         "baseline_receipt_sha256": "4" * 64,
         "held_out_receipt_sha256": "5" * 64,
+        "trust_roots": trust_roots,
         "strategy": "B-balanced",
         "occurrence_count": 1,
         "ordered_occurrences_sha256": ordered,
@@ -223,6 +266,57 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
             (policy.name, policy, policy.stat().st_size, descriptor(policy)["sha256"]),
         ],
     )
+
+    incomplete = dict(payload)
+    incomplete_identity = dict(selection_identity)
+    incomplete_identity.pop("unique_prompt_count")
+    incomplete["selection_identity"] = incomplete_identity
+    incomplete["selection_sha256"] = hashlib.sha256(
+        publication._identity_json(incomplete_identity)
+    ).hexdigest()
+    with pytest.raises(publication.PublicationError, match="exact schema"):
+        publication._validate_ptv2_selection_policy(
+            incomplete,
+            [
+                (shard.name, shard, shard.stat().st_size, descriptor(shard)["sha256"]),
+                (index.name, index, index.stat().st_size, descriptor(index)["sha256"]),
+                (policy.name, policy, policy.stat().st_size, descriptor(policy)["sha256"]),
+            ],
+        )
+
+    forged_values = {
+        "strategy": "A-repair",
+        "policy_sha256": "9" * 64,
+        "occurrence_count": 2,
+        "unique_prompt_count": 2,
+        "cell_occurrence_counts": {"math": 2},
+        "multilingual_occurrence_counts": {"de": 1},
+        "repair_complement_counts": {"stem": 1},
+        "uuid_multiplicity_histogram": {2: 1},
+        "source_occurrence_multiplicity_histogram": {2: 1},
+        "ordered_occurrences_sha256": "9" * 64,
+        "ordered_prompt_uuids_sha256": "9" * 64,
+        "source_response_root_sha256": "9" * 64,
+        "occurrence_multiplicity_sha256": "9" * 64,
+        "trust_root_sha256": "9" * 64,
+    }
+    for field, forged_value in forged_values.items():
+        forged = dict(payload)
+        forged_identity = dict(selection_identity)
+        forged_identity[field] = forged_value
+        forged["selection_identity"] = forged_identity
+        forged["selection_sha256"] = hashlib.sha256(
+            publication._identity_json(forged_identity)
+        ).hexdigest()
+        with pytest.raises(publication.PublicationError, match="index semantics"):
+            publication._validate_ptv2_selection_policy(
+                forged,
+                [
+                    (shard.name, shard, shard.stat().st_size, descriptor(shard)["sha256"]),
+                    (index.name, index, index.stat().st_size, descriptor(index)["sha256"]),
+                    (policy.name, policy, policy.stat().st_size, descriptor(policy)["sha256"]),
+                ],
+            )
 
     connection = sqlite3.connect(index)
     connection.execute("UPDATE occurrences SET source_row=8")
@@ -327,8 +421,8 @@ def test_ptv2_schema_v3_receipts_publish_as_a_complete_bundle(tmp_path: Path) ->
         "assistant_response_sha256 TEXT,strategy TEXT)"
     )
     connection.execute(
-        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
-        "canonical_conversation TEXT,assistant_response TEXT)"
+        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,cell TEXT,"
+        "language TEXT,canonical_conversation TEXT,assistant_response TEXT)"
     )
     conversation = "conversation"
     response = "response"
@@ -343,7 +437,8 @@ def test_ptv2_schema_v3_receipts_publish_as_a_complete_bundle(tmp_path: Path) ->
         digest(response.encode()),
     )
     connection.execute(
-        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 0, conversation, response)
+        "INSERT INTO source_rows VALUES(?,?,?,?,?,?)",
+        ("b" * 64, 0, "math", "", conversation, response),
     )
     connection.execute(
         "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", (*occurrence, "B-balanced")
@@ -363,20 +458,45 @@ def test_ptv2_schema_v3_receipts_publish_as_a_complete_bundle(tmp_path: Path) ->
     ordered = digest(
         json.dumps(list(occurrence), sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
+    policy_sha = digest(publication._identity_json({"seed": 1, "strategy": "B-balanced"}))
+    trust_roots = {
+        "source_inventory_sha256": source_root_sha,
+        "held_out_receipt_sha256": "4" * 64,
+    }
     selection_identity = {
         "strategy": "B-balanced",
+        "policy_sha256": policy_sha,
         "occurrence_count": 1,
+        "unique_prompt_count": 1,
+        "cell_occurrence_counts": {
+            "math": 1,
+            "code": 0,
+            "stem": 0,
+            "chat": 0,
+            "multilingual": 0,
+        },
+        "multilingual_occurrence_counts": {},
+        "repair_complement_counts": {},
+        "uuid_multiplicity_histogram": {1: 1},
+        "source_occurrence_multiplicity_histogram": {1: 1},
         "ordered_occurrences_sha256": ordered,
+        "ordered_prompt_uuids_sha256": digest(_canonical("a" * 64)),
+        "source_response_root_sha256": digest(
+            _canonical(["b" * 64, 0, occurrence[6], occurrence[7]])
+        ),
+        "occurrence_multiplicity_sha256": digest(_canonical(["a" * 64, "b" * 64, 0, 1])),
+        "trust_root_sha256": digest(publication._identity_json(trust_roots)),
     }
     selection_body = {
         "schema_version": 3,
         "selection_sha256": digest(publication._identity_json(selection_identity)),
         "selection_identity": selection_identity,
-        "policy_sha256": digest(publication._identity_json({"seed": 1, "strategy": "B-balanced"})),
+        "policy_sha256": policy_sha,
         "policy_file_sha256": digest(policy.read_bytes()),
         "source_inventory_sha256": source_root_sha,
         "baseline_receipt_sha256": "3" * 64,
         "held_out_receipt_sha256": "4" * 64,
+        "trust_roots": trust_roots,
         "strategy": "B-balanced",
         "occurrence_count": 1,
         "ordered_occurrences_sha256": ordered,
