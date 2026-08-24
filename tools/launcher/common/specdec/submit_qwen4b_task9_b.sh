@@ -64,11 +64,11 @@ SOURCE_INVENTORY="$(python3 -c 'from pathlib import Path; import sys; print(Path
 POLICY="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$POLICY")"
 HELD_OUT_UUIDS="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$HELD_OUT_UUIDS")"
 RECEIPT_ROOT="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=False))' "$RECEIPT_ROOT")"
-SOURCE_INVENTORY_SHA256="$(PYTHONPATH="$REPO_ROOT/examples/dataset${PYTHONPATH:+:$PYTHONPATH}" python3 - "$SOURCE_INVENTORY" <<'PY'
+SOURCE_INVENTORY_SHA256="$(python3 - "$SOURCE_INVENTORY" <<'PY'
+import json
 import sys
 from pathlib import Path
-from stage_ptv23_sources import load_source_inventory
-print(load_source_inventory(Path(sys.argv[1])).manifest_sha256)
+print(json.loads(Path(sys.argv[1]).read_bytes())["source_manifest_sha256"])
 PY
 )"
 POLICY_FILE_SHA256="$(sha256sum "$POLICY" | cut -d' ' -f1)"

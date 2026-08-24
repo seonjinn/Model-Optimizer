@@ -57,13 +57,12 @@ readarray -t identities < <(
     PYTHONPATH="$REPO_ROOT/examples/dataset${PYTHONPATH:+:$PYTHONPATH}" python3 - \
         "$SOURCE_INVENTORY" "$POLICY" "$HELD_OUT_UUIDS" <<'PY'
 from hashlib import sha256
+import json
 from pathlib import Path
 import sys
 
-from stage_ptv23_sources import load_source_inventory
-
 inventory, policy, held_out = map(Path, sys.argv[1:])
-print(load_source_inventory(inventory).manifest_sha256)
+print(json.loads(inventory.read_bytes())["source_manifest_sha256"])
 print(sha256(policy.read_bytes()).hexdigest())
 print(sha256(held_out.read_bytes()).hexdigest())
 PY
