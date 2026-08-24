@@ -784,8 +784,6 @@ def test_dflash2_runtime_stager_inserts_and_verifies_the_receipt() -> None:
         'SOURCE_FOR_ARCHIVE="$prepared_runtime"',
     ):
         assert required in script
-
-
 def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
     """The CPU staging job proves both immutable bytes and an executable selector."""
     script = (
@@ -814,6 +812,9 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "refusing to replace existing runtime output",
     ):
         assert required in script
+    assert script.index('git -C "$VLLM_CHECKOUT" archive HEAD') < script.index(
+        "srun --nodes=1"
+    )
 
 
 def test_dflash2_artifact_receipt_builder_creates_scratch_before_pyxis() -> None:

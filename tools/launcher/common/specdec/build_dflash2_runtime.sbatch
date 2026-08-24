@@ -34,8 +34,9 @@ work_root="${SCRATCH_ROOT%/}/${SLURM_JOB_ID:?SLURM_JOB_ID is required}/dflash2-r
 prepared="$work_root/runtime"
 build_source="$work_root/vllm-source"
 build_directory="$work_root/vllm-build"
-mkdir -p "$prepared" "$(dirname "$OUTPUT_ARCHIVE")"
+mkdir -p "$prepared" "$build_source" "$build_directory" "$(dirname "$OUTPUT_ARCHIVE")"
 tar --extract --file="$BASE_RUNTIME" --directory="$prepared"
+git -C "$VLLM_CHECKOUT" archive HEAD | tar -x -C "$build_source"
 
 mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${FLASHMLA_CHECKOUT}:${FLASHMLA_CHECKOUT}:ro,${LAUNCHER_ROOT}:${LAUNCHER_ROOT}:ro"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
@@ -74,8 +75,6 @@ while IFS= read -r -d '' extension; do
     mkdir -p "$runtime_package/$(dirname "$relative")"
     cp -a "$extension" "$runtime_package/$relative"
 done < <(find "$system_package" -type f \( -name '*.so' -o -name '_version.py' \) -print0)
-mkdir -p "$build_source" "$build_directory"
-git -C "$checkout" archive HEAD | tar -x -C "$build_source"
 TORCH_CUDA_ARCH_LIST=10.0a FLASH_MLA_SRC_DIR="$flashmla_checkout" \
     cmake -S "$build_source" -B "$build_directory" \
     -G Ninja -DVLLM_TARGET_DEVICE=cuda -DVLLM_PYTHON_EXECUTABLE="$prepared/bin/python" \
