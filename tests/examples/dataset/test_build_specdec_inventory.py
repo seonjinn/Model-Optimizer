@@ -85,7 +85,7 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         files=(),
     )
     files = []
-    for index in range(2):
+    for index in range(201):
         path = tmp_path / f"shard-{index}.jsonl"
         rows = [
             {
@@ -127,8 +127,8 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         assert module.candidate_inventory_bytes(serial) == module.candidate_inventory_bytes(parallel)
         assert serial.inventory_sha256 == parallel.inventory_sha256
         assert parallel.execution_receipt is not None
-        assert parallel.execution_receipt["effective_workers"] == 2
-        assert parallel.execution_receipt["declared_shard_count"] == 2
+        assert parallel.execution_receipt["effective_workers"] == 96
+        assert parallel.execution_receipt["declared_shard_count"] == 201
     finally:
         serial.close()
         parallel.close()
