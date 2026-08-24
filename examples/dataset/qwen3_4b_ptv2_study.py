@@ -237,24 +237,123 @@ class _AuthenticatedPTV2SourceRows:
         storage_path: Path,
         count: int,
         execution_receipt: Mapping[str, Any] | None = None,
+        tasks: tuple[_PTV2ShardTask, ...] = (),
+        policy: PTV2StudyPolicy | None = None,
     ) -> None:
         self._temporary = temporary
         self.storage_path = storage_path
         self.count = count
         self.execution_receipt = execution_receipt
+        self._tasks = tasks
+        self._policy = policy
         self._closed = False
 
     def __iter__(self) -> Iterator[PTV2StudySourceRow]:
         if self._closed:
             raise PTV2StudyError("authenticated PTV2 source spool is closed")
+        if not self._tasks:
+            raise PTV2StudyError("authenticated PTV2 source has no staged physical shards")
         with sqlite3.connect(self.storage_path) as connection:
-            cursor = connection.execute(
-                "SELECT prompt_uuid,source_identity_sha256,source_row,cell,"
-                "canonical_conversation,assistant_response,language "
-                "FROM authenticated_rows ORDER BY ordinal"
+            expected = iter(
+                connection.execute(
+                    "SELECT prompt_uuid,source_identity_sha256,source_row,cell,language,"
+                    "conversation_sha256,assistant_response_sha256 FROM authenticated_rows "
+                    "ORDER BY ordinal"
+                )
             )
-            for record in cursor:
-                yield PTV2StudySourceRow(*record)
+            observed = 0
+            for task in self._tasks:
+                for row in _iter_local_ptv2_shard_rows(task):
+                    metadata = next(expected, None)
+                    if metadata != _source_row_metadata(row):
+                        raise PTV2StudyError("node-local PTV2 row changed after authentication")
+                    observed += 1
+                    yield row
+            if observed != self.count or next(expected, None) is not None:
+                raise PTV2StudyError("authenticated PTV2 compact row count changed")
+
+    def materialize_selected(self, connection: sqlite3.Connection) -> None:
+        """Rejoin only selected payloads from authenticated node-local Parquet shards."""
+        if self._closed or not self._tasks:
+            raise PTV2StudyError("authenticated PTV2 source spool is closed")
+        connection.executescript(
+            "CREATE TEMP TABLE selected_sources("
+            "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,"
+            "PRIMARY KEY(source_identity_sha256,source_row)) WITHOUT ROWID;"
+            "INSERT INTO selected_sources SELECT DISTINCT source_identity_sha256,source_row "
+            "FROM occurrences;"
+        )
+        for task in self._tasks:
+            identity = _source_identity(task.source, task.source_file)
+            wanted = iter(
+                connection.execute(
+                    "SELECT candidates.source_ordinal,candidates.prompt_uuid,candidates.source_row,"
+                    "candidates.cell,candidates.language,candidates.conversation_sha256,"
+                    "candidates.assistant_response_sha256,candidates.rank FROM candidate_rows "
+                    "AS candidates JOIN selected_sources AS selected ON "
+                    "selected.source_identity_sha256=candidates.source_identity_sha256 AND "
+                    "selected.source_row=candidates.source_row "
+                    "WHERE candidates.source_identity_sha256=? ORDER BY candidates.source_row",
+                    (identity,),
+                )
+            )
+            selected = next(wanted, None)
+            if selected is None:
+                continue
+            for row in _iter_local_ptv2_shard_rows(task):
+                if row.source_row != selected[2]:
+                    continue
+                metadata = _source_row_metadata(row)
+                rank = _source_row_rank(row, self._require_policy())
+                if (
+                    metadata
+                    != (
+                        selected[1],
+                        identity,
+                        selected[2],
+                        selected[3],
+                        selected[4],
+                        selected[5],
+                        selected[6],
+                    )
+                    or rank != selected[7]
+                ):
+                    raise PTV2StudyError("selected PTV2 physical rejoin identity changed")
+                connection.execute(
+                    "INSERT INTO source_rows VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        selected[0],
+                        row.prompt_uuid,
+                        row.source_identity_sha256,
+                        row.source_row,
+                        row.cell,
+                        row.language,
+                        row.canonical_conversation,
+                        row.assistant_response,
+                        selected[5],
+                        selected[6],
+                        selected[7],
+                    ),
+                )
+                selected = next(wanted, None)
+                if selected is None:
+                    break
+            if selected is not None:
+                raise PTV2StudyError("selected PTV2 row is absent from its authenticated shard")
+        selected_count = int(
+            connection.execute("SELECT count(*) FROM selected_sources").fetchone()[0]
+        )
+        materialized_count = int(
+            connection.execute("SELECT count(*) FROM source_rows").fetchone()[0]
+        )
+        if materialized_count != selected_count:
+            raise PTV2StudyError("selected PTV2 physical rejoin count does not reconcile")
+        connection.execute("DROP TABLE selected_sources")
+
+    def _require_policy(self) -> PTV2StudyPolicy:
+        if self._policy is None:
+            raise PTV2StudyError("authenticated PTV2 source policy is missing")
+        return self._policy
 
     def close(self) -> None:
         if not self._closed:
@@ -560,9 +659,21 @@ def select_ptv2_b_balanced_view(
     connection = sqlite3.connect(temporary_index)
     try:
         _create_schema(connection)
-        _spool_source_rows(connection, source_rows, policy)
-        capacities = _capacity_counts(connection)
-        _insert_b_balanced(connection, policy)
+        if isinstance(source_rows, _AuthenticatedPTV2SourceRows):
+            _spool_compact_candidates(connection, source_rows)
+            capacities = _capacity_counts(connection, table="candidate_rows")
+            _insert_b_balanced(connection, policy, table="candidate_rows")
+            source_rows.materialize_selected(connection)
+            connection.commit()
+            connection.executescript(
+                "DROP INDEX candidate_rows_cell_rank; DROP TABLE candidate_rows;"
+            )
+            connection.commit()
+            connection.execute("VACUUM")
+        else:
+            _spool_source_rows(connection, source_rows, policy)
+            capacities = _capacity_counts(connection)
+            _insert_b_balanced(connection, policy)
         connection.commit()
         view = _build_view(
             connection, "B-balanced", policy, index_path, held_out, capacities, trust_roots
@@ -899,6 +1010,7 @@ class _PTV2ShardTask:
     path: Path
     staged_path: Path
     spool_path: Path
+    policy_sha256: str
 
 
 @dataclass(frozen=True)
@@ -944,43 +1056,70 @@ def _initialize_ptv2_worker() -> None:
         os.environ[name] = "1"
 
 
-def _process_ptv2_shard(task: _PTV2ShardTask) -> _PTV2ShardResult:
-    started = time.monotonic_ns()
+def _source_identity(source: SourceIdentity, source_file: SourceFile) -> str:
+    return sha256(
+        canonical_json(
+            [
+                source.repository_id,
+                source.configuration,
+                source.split,
+                source.revision,
+                source_file.path,
+            ]
+        )
+    ).hexdigest()
+
+
+def _source_row_metadata(row: PTV2StudySourceRow) -> tuple[str, str, int, str, str, str, str]:
+    return (
+        row.prompt_uuid,
+        row.source_identity_sha256,
+        row.source_row,
+        row.cell,
+        row.language,
+        sha256(row.canonical_conversation.encode("utf-8")).hexdigest(),
+        sha256(row.assistant_response.encode("utf-8")).hexdigest(),
+    )
+
+
+def _source_row_rank(row: PTV2StudySourceRow, policy: PTV2StudyPolicy) -> str:
+    return _source_row_rank_sha256(row, policy.policy_sha256)
+
+
+def _source_row_rank_sha256(row: PTV2StudySourceRow, policy_sha256: str) -> str:
+    return sha256(
+        (
+            policy_sha256
+            + row.cell
+            + row.source_identity_sha256
+            + str(row.source_row)
+            + row.prompt_uuid
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _iter_local_ptv2_shard_rows(task: _PTV2ShardTask) -> Iterator[PTV2StudySourceRow]:
     try:
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
     except ImportError as error:
         raise PTV2StudyError("pyarrow is required to read staged PTV2 rows") from error
-    _stage_authenticated_source_once(task.path, task.staged_path, task.source_file)
-    initial_stat = os.lstat(task.staged_path)
-    connection = sqlite3.connect(task.spool_path)
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute(
-        "CREATE TABLE authenticated_rows(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
-        "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,cell TEXT NOT NULL,"
-        "canonical_conversation TEXT NOT NULL,assistant_response TEXT NOT NULL,language TEXT NOT NULL)"
-    )
-    identity = sha256(
-        canonical_json(
-            [
-                task.source.repository_id,
-                task.source.configuration,
-                task.source.split,
-                task.source.revision,
-                task.source_file.path,
-            ]
-        )
-    ).hexdigest()
-    cell, language = _normalize_source_cell(task.source.cell)
-    row_count = 0
     try:
-        with task.staged_path.open("rb") as stream:
+        descriptor, initial_stat = _open_verified_source_fd(task.staged_path, task.source_file)
+    except (OSError, ValueError) as error:
+        raise PTV2StudyError("node-local staged PTV2 shard identity is invalid") from error
+    identity = _source_identity(task.source, task.source_file)
+    cell, language = _normalize_source_cell(task.source.cell)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb") as stream:
             parquet = pq.ParquetFile(stream)
             names = set(parquet.schema_arrow.names)
             if "messages" not in names:
                 raise PTV2StudyError(f"PTV2 shard has no messages column: {task.path}")
             columns = ["messages"] + (["tools"] if "tools" in names else [])
+            source_row = 0
             for batch in parquet.iter_batches(columns=columns, batch_size=8192):
-                for record in batch.to_pylist():
+                for offset, record in enumerate(batch.to_pylist()):
                     messages = record["messages"]
                     if isinstance(messages, str):
                         messages = json.loads(messages)
@@ -989,48 +1128,71 @@ def _process_ptv2_shard(task: _PTV2ShardTask) -> _PTV2ShardResult:
                     ):
                         raise PTV2StudyError("PTV2 messages must be a list of mappings")
                     if not messages or messages[-1].get("role") != "assistant":
-                        raise PTV2StudyError("PTV2 row has no terminal source-native assistant response")
-                    response = canonical_json(messages[-1]).decode("utf-8")
+                        raise PTV2StudyError(
+                            "PTV2 row has no terminal source-native assistant response"
+                        )
                     tools = record.get("tools")
                     if isinstance(tools, str):
                         tools = json.loads(tools)
                     if tools is not None and (
-                        not isinstance(tools, list) or not all(isinstance(item, dict) for item in tools)
+                        not isinstance(tools, list)
+                        or not all(isinstance(item, dict) for item in tools)
                     ):
                         raise PTV2StudyError("PTV2 tools must be a list of mappings")
-                    conversation = canonical_json({"messages": messages, "tools": tools or []}).decode(
-                        "utf-8"
-                    )
                     prompt_messages = messages[:-1]
                     if not any(
                         item.get("role") in {"system", "developer", "user"}
                         for item in prompt_messages
                     ):
                         raise PTV2StudyError("PTV2 row has no prompt-bearing message")
-                    connection.execute(
-                        "INSERT INTO authenticated_rows VALUES(?,?,?,?,?,?,?,?)",
-                        (
-                            row_count,
-                            prompt_uuid(prompt_messages, tools),
-                            identity,
-                            row_count,
-                            cell,
-                            conversation,
-                            response,
-                            language,
+                    yield PTV2StudySourceRow(
+                        prompt_uuid(prompt_messages, tools),
+                        identity,
+                        source_row + offset,
+                        cell,
+                        canonical_json({"messages": messages, "tools": tools or []}).decode(
+                            "utf-8"
                         ),
+                        canonical_json(messages[-1]).decode("utf-8"),
+                        language,
                     )
-                    row_count += 1
-                    if row_count % 10_000 == 0:
-                        connection.commit()
+                source_row += batch.num_rows
+        try:
+            _verify_source_fd_stable(descriptor, initial_stat, task.staged_path, task.source_file)
+        except ValueError as error:
+            raise PTV2StudyError(
+                "node-local staged PTV2 shard changed during processing"
+            ) from error
+    finally:
+        os.close(descriptor)
+
+
+def _process_ptv2_shard(task: _PTV2ShardTask) -> _PTV2ShardResult:
+    started = time.monotonic_ns()
+    _stage_authenticated_source_once(task.path, task.staged_path, task.source_file)
+    connection = sqlite3.connect(task.spool_path)
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute(
+        "CREATE TABLE authenticated_rows(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+        "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,cell TEXT NOT NULL,"
+        "language TEXT NOT NULL,conversation_sha256 TEXT NOT NULL,"
+        "assistant_response_sha256 TEXT NOT NULL,rank TEXT NOT NULL)"
+    )
+    row_count = 0
+    try:
+        for row in _iter_local_ptv2_shard_rows(task):
+            connection.execute(
+                "INSERT INTO authenticated_rows VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    row_count,
+                    *_source_row_metadata(row),
+                    _source_row_rank_sha256(row, task.policy_sha256),
+                ),
+            )
+            row_count += 1
+            if row_count % 10_000 == 0:
+                connection.commit()
         connection.commit()
-        final_stat = os.lstat(task.staged_path)
-        if (
-            (final_stat.st_dev, final_stat.st_ino, final_stat.st_size, final_stat.st_mtime_ns)
-            != (initial_stat.st_dev, initial_stat.st_ino, initial_stat.st_size, initial_stat.st_mtime_ns)
-            or _sha256_file(task.staged_path) != task.source_file.sha256
-        ):
-            raise PTV2StudyError("node-local staged PTV2 shard changed during processing")
     except BaseException:
         connection.close()
         task.spool_path.unlink(missing_ok=True)
@@ -1056,59 +1218,16 @@ def _spool_authenticated_ptv2_source_rows(
     source_commit: str | None = None,
 ) -> _AuthenticatedPTV2SourceRows:
     """Fully authenticate the physical stream before exposing any replayable row."""
-    if workers > 1:
-        resolved_commit = source_commit or os.environ.get("SOURCE_COMMIT", "")
-        if _REVISION.fullmatch(resolved_commit) is None:
-            raise PTV2StudyError("parallel Task9 processing requires an exact source commit")
-        return _spool_authenticated_ptv2_source_rows_parallel(
-            inventory_path,
-            policy=policy,
-            storage_dir=storage_dir,
-            workers=workers,
-            source_commit=resolved_commit,
-        )
-    if storage_dir is not None:
-        storage_dir.mkdir(parents=True, exist_ok=True)
-    temporary = tempfile.TemporaryDirectory(prefix="ptv2-authenticated-", dir=storage_dir)
-    storage_path = Path(temporary.name) / "source-rows.sqlite3"
-    connection = sqlite3.connect(storage_path)
-    try:
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute(
-            "CREATE TABLE authenticated_rows("
-            "ordinal INTEGER PRIMARY KEY,"
-            "prompt_uuid TEXT NOT NULL,"
-            "source_identity_sha256 TEXT NOT NULL,"
-            "source_row INTEGER NOT NULL,"
-            "cell TEXT NOT NULL,"
-            "canonical_conversation TEXT NOT NULL,"
-            "assistant_response TEXT NOT NULL,"
-            "language TEXT NOT NULL)"
-        )
-        count = 0
-        for count, row in enumerate(
-            iter_ptv2_staged_source_rows(inventory_path, policy=policy), start=1
-        ):
-            connection.execute(
-                "INSERT INTO authenticated_rows VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    count - 1,
-                    row.prompt_uuid,
-                    row.source_identity_sha256,
-                    row.source_row,
-                    row.cell,
-                    row.canonical_conversation,
-                    row.assistant_response,
-                    row.language,
-                ),
-            )
-        connection.commit()
-    except BaseException:
-        connection.close()
-        temporary.cleanup()
-        raise
-    connection.close()
-    return _AuthenticatedPTV2SourceRows(temporary, storage_path, count)
+    resolved_commit = source_commit or os.environ.get("SOURCE_COMMIT", "")
+    if workers > 1 and _REVISION.fullmatch(resolved_commit) is None:
+        raise PTV2StudyError("parallel Task9 processing requires an exact source commit")
+    return _spool_authenticated_ptv2_source_rows_parallel(
+        inventory_path,
+        policy=policy,
+        storage_dir=storage_dir,
+        workers=workers,
+        source_commit=resolved_commit,
+    )
 
 
 def _spool_authenticated_ptv2_source_rows_parallel(
@@ -1122,7 +1241,8 @@ def _spool_authenticated_ptv2_source_rows_parallel(
     inventory = load_source_inventory(inventory_path)
     if inventory.staged_root is None:
         raise PTV2StudyError("Task9 requires an authenticated staged SourceInventory")
-    validate_approved_ptv2_topology(inventory)
+    if policy.ptv2_revision == APPROVED_PTV2_REVISION:
+        validate_approved_ptv2_topology(inventory)
     if any(source.revision != policy.ptv2_revision for source in inventory.sources):
         raise PTV2StudyError("SourceInventory revision does not match the study policy")
     sources_root = inventory.staged_root / "sources"
@@ -1140,9 +1260,12 @@ def _spool_authenticated_ptv2_source_rows_parallel(
         sources_root, tuple(path for _source, _descriptor, path in declared)
     ):
         raise PTV2StudyError("staged PTV2 physical shard set does not match its receipt")
-    effective_workers, allocated_cpus = resolve_ptv2_worker_count(
-        workers, declared_shards=len(declared)
-    )
+    if workers > 1:
+        effective_workers, allocated_cpus = resolve_ptv2_worker_count(
+            workers, declared_shards=len(declared)
+        )
+    else:
+        effective_workers, allocated_cpus = 1, 1
     _initialize_ptv2_worker()
     thread_environment = {
         name: os.environ.get(name)
@@ -1173,6 +1296,7 @@ def _spool_authenticated_ptv2_source_rows_parallel(
             path,
             stage_root / f"shard-{index:03d}{path.suffix}",
             spool_root / f"shard-{index:03d}.sqlite3",
+            policy.policy_sha256,
         )
         for index, (source, descriptor, path) in enumerate(declared)
     )
@@ -1183,24 +1307,29 @@ def _spool_authenticated_ptv2_source_rows_parallel(
     connection.execute(
         "CREATE TABLE authenticated_rows(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
         "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,cell TEXT NOT NULL,"
-        "canonical_conversation TEXT NOT NULL,assistant_response TEXT NOT NULL,language TEXT NOT NULL)"
+        "language TEXT NOT NULL,conversation_sha256 TEXT NOT NULL,"
+        "assistant_response_sha256 TEXT NOT NULL,rank TEXT NOT NULL)"
     )
     try:
         results: dict[int, _PTV2ShardResult] = {}
-        with ProcessPoolExecutor(
-            max_workers=effective_workers,
-            mp_context=get_context("fork"),
-            initializer=_initialize_ptv2_worker,
-        ) as executor:
-            futures = {executor.submit(_process_ptv2_shard, task): task.index for task in tasks}
-            try:
-                for future in as_completed(futures):
-                    result = future.result()
-                    results[result.index] = result
-            except BaseException:
-                for future in futures:
-                    future.cancel()
-                raise
+        if effective_workers == 1:
+            for task in tasks:
+                results[task.index] = _process_ptv2_shard(task)
+        else:
+            with ProcessPoolExecutor(
+                max_workers=effective_workers,
+                mp_context=get_context("fork"),
+                initializer=_initialize_ptv2_worker,
+            ) as executor:
+                futures = {executor.submit(_process_ptv2_shard, task): task.index for task in tasks}
+                try:
+                    for future in as_completed(futures):
+                        result = future.result()
+                        results[result.index] = result
+                except BaseException:
+                    for future in futures:
+                        future.cancel()
+                    raise
         ordered_results = tuple(results[index] for index in range(len(tasks)))
         if _staged_tree_snapshot(sources_root) != initial_tree:
             raise PTV2StudyError("staged PTV2 source tree changed during authentication")
@@ -1215,12 +1344,12 @@ def _spool_authenticated_ptv2_source_rows_parallel(
                 raise PTV2StudyError("Task9 shard spool changed before deterministic merge")
             with sqlite3.connect(result.spool_path) as shard:
                 for row in shard.execute(
-                    "SELECT prompt_uuid,source_identity_sha256,source_row,cell,"
-                    "canonical_conversation,assistant_response,language "
+                    "SELECT prompt_uuid,source_identity_sha256,source_row,cell,language,"
+                    "conversation_sha256,assistant_response_sha256,rank "
                     "FROM authenticated_rows ORDER BY ordinal"
                 ):
                     connection.execute(
-                        "INSERT INTO authenticated_rows VALUES(?,?,?,?,?,?,?,?)",
+                        "INSERT INTO authenticated_rows VALUES(?,?,?,?,?,?,?,?,?)",
                         (ordinal, *row),
                     )
                     ordinal += 1
@@ -1228,32 +1357,39 @@ def _spool_authenticated_ptv2_source_rows_parallel(
                         connection.commit()
         connection.commit()
         connection.close()
-        execution: dict[str, Any] = {
-            "schema_version": 1,
-            "source_commit": source_commit,
-            "source_inventory_sha256": inventory.manifest_sha256,
-            "declared_shard_count": len(tasks),
-            "allocated_cpus": allocated_cpus,
-            "requested_workers": workers,
-            "effective_workers": effective_workers,
-            "threads_per_worker": 1,
-            "thread_environment": thread_environment,
-            "started_at_ns": started_wall_ns,
-            "finished_at_ns": time.time_ns(),
-            "elapsed_seconds": round(
-                (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000, 6
-            ),
-            "shards": [
-                {
-                    **asdict(result),
-                    "spool_path": result.spool_path.name,
-                }
-                for result in ordered_results
-            ],
-        }
-        execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+        execution: dict[str, Any] | None = None
+        if workers > 1:
+            execution = {
+                "schema_version": 1,
+                "source_commit": source_commit,
+                "source_inventory_sha256": inventory.manifest_sha256,
+                "declared_shard_count": len(tasks),
+                "allocated_cpus": allocated_cpus,
+                "requested_workers": workers,
+                "effective_workers": effective_workers,
+                "threads_per_worker": 1,
+                "thread_environment": thread_environment,
+                "started_at_ns": started_wall_ns,
+                "finished_at_ns": time.time_ns(),
+                "elapsed_seconds": round(
+                    (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000, 6
+                ),
+                "shards": [
+                    {
+                        **asdict(result),
+                        "spool_path": result.spool_path.name,
+                    }
+                    for result in ordered_results
+                ],
+            }
+            execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
         return _AuthenticatedPTV2SourceRows(
-            temporary, storage_path, ordinal, MappingProxyType(execution)
+            temporary,
+            storage_path,
+            ordinal,
+            MappingProxyType(execution) if execution is not None else None,
+            tasks,
+            policy,
         )
     except BaseException:
         connection.close()
@@ -1391,9 +1527,7 @@ def _authenticate_task5_bprime(
     if declared_root != sha256(canonical_json(root_record)).hexdigest():
         raise PTV2StudyError("Task 5 selection root identity does not reconcile")
     try:
-        execution_identity = validate_task5_execution_receipt(
-            manifest, manifest_path.parent
-        )
+        execution_identity = validate_task5_execution_receipt(manifest, manifest_path.parent)
     except PublicationError as error:
         raise PTV2StudyError("Task 5 execution receipt does not authenticate") from error
     if execution_identity.source_manifest_sha256 != source_manifest_sha256:
@@ -2139,10 +2273,41 @@ def _validate_source_row(row: PTV2StudySourceRow) -> None:
         raise PTV2StudyError("source-native assistant response is required")
 
 
-def _capacity_counts(connection: sqlite3.Connection) -> Mapping[str, int]:
+def _spool_compact_candidates(
+    connection: sqlite3.Connection, source: _AuthenticatedPTV2SourceRows
+) -> None:
+    connection.executescript(
+        "CREATE TABLE candidate_rows("
+        "source_ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+        "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,"
+        "cell TEXT NOT NULL,language TEXT NOT NULL,conversation_sha256 TEXT NOT NULL,"
+        "assistant_response_sha256 TEXT NOT NULL,rank TEXT NOT NULL);"
+        "CREATE INDEX candidate_rows_cell_rank ON candidate_rows("
+        "cell,language,rank,source_identity_sha256,source_row,prompt_uuid);"
+    )
+    connection.execute("ATTACH DATABASE ? AS authenticated", (str(source.storage_path),))
+    try:
+        connection.execute(
+            "INSERT INTO candidate_rows SELECT ordinal,prompt_uuid,source_identity_sha256,"
+            "source_row,cell,language,conversation_sha256,assistant_response_sha256,rank "
+            "FROM authenticated.authenticated_rows ORDER BY ordinal"
+        )
+    finally:
+        connection.commit()
+        connection.execute("DETACH DATABASE authenticated")
+    count = int(connection.execute("SELECT count(*) FROM candidate_rows").fetchone()[0])
+    if count == 0 or count != source.count:
+        raise PTV2StudyError("authenticated compact source inventory count changed")
+
+
+def _capacity_counts(
+    connection: sqlite3.Connection,
+    *,
+    table: Literal["source_rows", "candidate_rows"] = "source_rows",
+) -> Mapping[str, int]:
     counts = {
         str(cell): int(count)
-        for cell, count in connection.execute("SELECT cell,count(*) FROM source_rows GROUP BY cell")
+        for cell, count in connection.execute(f"SELECT cell,count(*) FROM {table} GROUP BY cell")
     }
     return MappingProxyType({cell: counts.get(cell, 0) for cell in _CELLS})
 
@@ -2238,19 +2403,26 @@ def _insert_a_repair_complement(
         )
 
 
-def _insert_b_balanced(connection: sqlite3.Connection, policy: PTV2StudyPolicy) -> None:
+def _insert_b_balanced(
+    connection: sqlite3.Connection,
+    policy: PTV2StudyPolicy,
+    *,
+    table: Literal["source_rows", "candidate_rows"] = "source_rows",
+) -> None:
     ordinal = 0
     for cell in _CELLS:
         quota = policy.balanced_occurrences[cell]
         if cell != "multilingual" or policy.total_occurrences != 2_000_000:
-            ordinal = _insert_b_cell(connection, cell, quota, ordinal)
+            ordinal = _insert_b_cell(connection, cell, quota, ordinal, table=table)
             continue
         if sum(policy.multilingual_occurrences.values()) != quota:
             raise PTV2StudyError(
                 "multilingual language quotas must equal the B-balanced 200K allocation"
             )
         for language, language_quota in policy.multilingual_occurrences.items():
-            ordinal = _insert_b_cell(connection, cell, language_quota, ordinal, language=language)
+            ordinal = _insert_b_cell(
+                connection, cell, language_quota, ordinal, language=language, table=table
+            )
     if ordinal != sum(policy.balanced_occurrences.values()):
         raise AssertionError("B-balanced occurrence arithmetic does not reconcile")
 
@@ -2262,13 +2434,14 @@ def _insert_b_cell(
     ordinal: int,
     *,
     language: str | None = None,
+    table: Literal["source_rows", "candidate_rows"] = "source_rows",
 ) -> int:
     """Append one independently ranked source cell using deterministic round-robin cycling."""
     predicate = "cell=?" if language is None else "cell=? AND language=?"
     parameters: tuple[str, ...] = (cell,) if language is None else (cell, language)
     capacity = int(
         connection.execute(
-            f"SELECT count(*) FROM source_rows WHERE {predicate}", parameters
+            f"SELECT count(*) FROM {table} WHERE {predicate}", parameters
         ).fetchone()[0]
     )
     label = cell if language is None else f"{cell}:{language}"
@@ -2279,7 +2452,7 @@ def _insert_b_cell(
         limit = capacity if reuse_index < base else remainder
         cursor = connection.execute(
             "SELECT prompt_uuid,source_identity_sha256,source_row,cell,conversation_sha256,"
-            f"assistant_response_sha256 FROM source_rows WHERE {predicate} "
+            f"assistant_response_sha256 FROM {table} WHERE {predicate} "
             "ORDER BY rank,source_identity_sha256,source_row,prompt_uuid LIMIT ?",
             (*parameters, limit),
         )

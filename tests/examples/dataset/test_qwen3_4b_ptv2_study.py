@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from dataclasses import replace
 from hashlib import sha256
@@ -54,7 +55,7 @@ try:
         select_bprime_prompt_view,
     )
     from specdec_corpus_contracts import canonical_json
-    from specdec_identity import prompt_uuid
+    from specdec_identity import ExclusionIndex, prompt_uuid
     from stage_ptv23_sources import (
         SourceFile,
         SourceIdentity,
@@ -102,9 +103,9 @@ def test_task9_worker_count_is_bounded_by_allocation_and_exact_shards() -> None:
 
 
 def test_task9_runner_requires_the_atomically_published_execution_receipt() -> None:
-    runner = (
-        ROOT / "tools/launcher/common/specdec/run_qwen4b_task9_b.sbatch"
-    ).read_text(encoding="utf-8")
+    runner = (ROOT / "tools/launcher/common/specdec/run_qwen4b_task9_b.sbatch").read_text(
+        encoding="utf-8"
+    )
 
     assert '"$RECEIPT_ROOT/EXECUTION_RECEIPT.json"' in runner
     assert '"$RECEIPT_ROOT.EXECUTION_RECEIPT.json"' not in runner
@@ -324,42 +325,79 @@ def _write_exact_ptv2_inventory(
 def test_task9_exact_201_shard_serial_and_p96_are_byte_and_semantically_identical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The production 201-shard process path preserves the serial source-order contract."""
+    """Compact serial and p96 selection preserve exact source order and output bytes."""
     inventory_receipt, _ = _write_exact_ptv2_inventory(tmp_path)
     policy = _scaled_policy()
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "96")
-    with (
-        study_module._spool_authenticated_ptv2_source_rows(
-            inventory_receipt,
-            policy=policy,
-            storage_dir=tmp_path / "serial-spool",
-        ) as serial,
-        study_module._spool_authenticated_ptv2_source_rows(
-            inventory_receipt,
-            policy=policy,
-            storage_dir=tmp_path / "p96-spool",
-            workers=96,
-            source_commit="1" * 40,
-        ) as parallel,
-    ):
-        serial_rows = tuple(serial)
-        parallel_rows = tuple(parallel)
-        assert parallel.execution_receipt is not None
-        assert parallel.execution_receipt["effective_workers"] == 96
-        assert parallel.execution_receipt["allocated_cpus"] == 96
-        assert set(parallel.execution_receipt["thread_environment"].values()) == {"1"}
-        assert canonical_json([row.__dict__ for row in parallel_rows]) == canonical_json(
-            [row.__dict__ for row in serial_rows]
-        )
+    serial_view = select_authenticated_b_balanced_view(
+        inventory_receipt,
+        policy=policy,
+        exclusions=ExclusionIndex(held_out=set()),
+        output_root=tmp_path / "serial-selection",
+    )
+    parallel_view = select_authenticated_b_balanced_view(
+        inventory_receipt,
+        policy=policy,
+        exclusions=ExclusionIndex(held_out=set()),
+        output_root=tmp_path / "p96-selection",
+        workers=96,
+        source_commit="1" * 40,
+    )
 
-        serial_view = select_ptv2_b_balanced_view(
-            serial_rows, policy=policy, output_root=tmp_path / "serial-selection"
+    assert parallel_view.execution_receipt is not None
+    assert parallel_view.execution_receipt["effective_workers"] == 96
+    assert parallel_view.execution_receipt["allocated_cpus"] == 96
+    assert set(parallel_view.execution_receipt["thread_environment"].values()) == {"1"}
+    assert parallel_view.selection_sha256 == serial_view.selection_sha256
+    assert parallel_view.index_path.read_bytes() == serial_view.index_path.read_bytes()
+    with sqlite3.connect(parallel_view.index_path) as connection:
+        selected_sources = connection.execute("SELECT count(*) FROM source_rows").fetchone()[0]
+        distinct_sources = connection.execute(
+            "SELECT count(*) FROM (SELECT DISTINCT source_identity_sha256,source_row "
+            "FROM occurrences)"
+        ).fetchone()[0]
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        }
+    assert selected_sources == distinct_sources
+    assert "candidate_rows" not in tables
+
+
+def test_task9_authenticated_spool_size_is_independent_of_source_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Candidate authentication stores compact identities rather than conversation payloads."""
+    huge = "x" * (4 * 1024 * 1024)
+    receipt, _ = _write_authenticated_staged_parquet(
+        tmp_path,
+        messages_override=[
+            [
+                {"role": "user", "content": huge},
+                {"role": "assistant", "content": huge},
+            ]
+        ],
+    )
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+
+    with study_module._spool_authenticated_ptv2_source_rows(
+        receipt,
+        policy=_fixture_policy(),
+        storage_dir=tmp_path / "compact-spool",
+    ) as source:
+        sqlite_bytes = sum(
+            path.stat().st_size for path in Path(source._temporary.name).rglob("*.sqlite3")
         )
-        parallel_view = select_ptv2_b_balanced_view(
-            parallel_rows, policy=policy, output_root=tmp_path / "p96-selection"
-        )
-        assert parallel_view.selection_sha256 == serial_view.selection_sha256
-        assert parallel_view.index_path.read_bytes() == serial_view.index_path.read_bytes()
+        with sqlite3.connect(source.storage_path) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(authenticated_rows)")
+            }
+
+    assert "canonical_conversation" not in columns
+    assert "assistant_response" not in columns
+    assert sqlite_bytes < 1024 * 1024
 
 
 def _genuine_scaled_task5_bundle(
