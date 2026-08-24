@@ -25,6 +25,7 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import stat
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -461,6 +462,32 @@ def _validate_ptv2_selection_policy(
         raise PublicationError("PTV2 semantic policy must be a mapping")
     if _sha256_bytes(_identity_json(decoded_policy)) != payload["policy_sha256"]:
         raise PublicationError("PTV2 semantic policy does not match policy_sha256")
+    index_file = next((item for item in files if item[0] == payload["index"]["path"]), None)
+    if index_file is None:
+        raise PublicationError("PTV2 selection index was not authenticated")
+    try:
+        connection = sqlite3.connect(f"file:{index_file[1]}?mode=ro", uri=True)
+        rows = connection.execute(
+            "SELECT ordinal,prompt_uuid,source_identity_sha256,source_row,cell,reuse_index,"
+            "conversation_sha256,assistant_response_sha256 FROM occurrences "
+            "WHERE strategy=? ORDER BY ordinal",
+            (payload["strategy"],),
+        )
+        semantic = hashlib.sha256()
+        count = 0
+        for row in rows:
+            semantic.update(_identity_json(list(row)))
+            semantic.update(b"\n")
+            count += 1
+    except sqlite3.Error as error:
+        raise PublicationError("PTV2 selection index semantics are invalid") from error
+    finally:
+        connection.close()
+    if (
+        count != payload["occurrence_count"]
+        or semantic.hexdigest() != payload["ordered_occurrences_sha256"]
+    ):
+        raise PublicationError("PTV2 selection index semantics do not match its receipt")
 
 
 def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -486,6 +513,9 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "source_inventory_sha256",
             "baseline_receipt_sha256",
             "held_out_receipt_sha256",
+            "strategy",
+            "occurrence_count",
+            "ordered_occurrences_sha256",
             "policy",
             "index",
             "shards",
@@ -510,6 +540,7 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "source_inventory_sha256",
             "baseline_receipt_sha256",
             "held_out_receipt_sha256",
+            "ordered_occurrences_sha256",
         ):
             value = payload[key]
             if not isinstance(value, str) or _SHA256.fullmatch(value) is None:

@@ -269,6 +269,17 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
 - Direct macOS probes: token bundle no-replace publication and typed partial
   recovery both pass (`2 passed`).
 - PTV token/exposure receipts now carry the selection root and Task 8 accepts
-  their role-specific declared database/records descriptors; the full genuine
-  schema-v3 `publish_bundle()` integration remains to be completed before
-  submission authorization.
+  their role-specific declared database/records descriptors.
+
+### C6 selection-semantic probe
+
+- Schema-v3 selection receipts now carry strategy, occurrence count, and the
+  ordered-occurrence root. Publication reopens the authenticated SQLite index,
+  streams the exact occurrence semantic projection, and rejects a forged row
+  even when the receipt's declared file descriptor is otherwise presented to
+  the semantic adapter. The direct GREEN probe passes along with the policy
+  byte/digest mutation probe.
+- Genuine Task3 source, Task9 selection index/shard/policy, source-response,
+  tokenized, exposure, and rejection receipts now pass an end-to-end
+  `publish_bundle()` schema-v3 integration probe. This confirms the actual
+  Task9 tokenized/exposure receipt shapes are accepted by the Task8 adapter.

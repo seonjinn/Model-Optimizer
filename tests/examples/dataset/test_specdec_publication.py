@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import sqlite3
 import sys
 import tracemalloc
 from pathlib import Path
@@ -141,8 +142,22 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
     index = tmp_path / "ptv2-study-index.sqlite3"
     shard = tmp_path / "a-prefix.jsonl"
     policy.write_bytes(b"seed: 20260822\nstrategy: B-balanced\n")
-    index.write_bytes(b"sqlite\n")
-    shard.write_bytes(b"occurrence\n")
+    connection = sqlite3.connect(index)
+    connection.execute(
+        "CREATE TABLE occurrences(ordinal INTEGER,prompt_uuid TEXT,source_identity_sha256 TEXT,"
+        "source_row INTEGER,cell TEXT,reuse_index INTEGER,conversation_sha256 TEXT,"
+        "assistant_response_sha256 TEXT,strategy TEXT)"
+    )
+    occurrence = (0, "a" * 64, "b" * 64, 7, "math", 0, "c" * 64, "d" * 64)
+    connection.execute(
+        "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", (*occurrence, "B-balanced")
+    )
+    connection.commit()
+    connection.close()
+    shard.write_bytes(_canonical(list(occurrence)))
+    ordered = hashlib.sha256(
+        json.dumps(list(occurrence), sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    ).hexdigest()
 
     def descriptor(path: Path) -> dict[str, Any]:
         return {
@@ -161,6 +176,9 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         "source_inventory_sha256": "3" * 64,
         "baseline_receipt_sha256": "4" * 64,
         "held_out_receipt_sha256": "5" * 64,
+        "strategy": "B-balanced",
+        "occurrence_count": 1,
+        "ordered_occurrences_sha256": ordered,
         "policy": descriptor(policy),
         "index": descriptor(index),
         "shards": [descriptor(shard)],
@@ -180,6 +198,24 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
             (policy.name, policy, policy.stat().st_size, descriptor(policy)["sha256"]),
         ],
     )
+
+    connection = sqlite3.connect(index)
+    connection.execute("UPDATE occurrences SET source_row=8")
+    connection.commit()
+    connection.close()
+    with pytest.raises(publication.PublicationError, match="index semantics"):
+        publication._validate_ptv2_selection_policy(
+            payload,
+            [
+                (shard.name, shard, shard.stat().st_size, descriptor(shard)["sha256"]),
+                (index.name, index, index.stat().st_size, descriptor(index)["sha256"]),
+                (policy.name, policy, policy.stat().st_size, descriptor(policy)["sha256"]),
+            ],
+        )
+    connection = sqlite3.connect(index)
+    connection.execute("UPDATE occurrences SET source_row=7")
+    connection.commit()
+    connection.close()
 
     semantic_mismatch = dict(payload)
     semantic_mismatch["policy_sha256"] = "0" * 64
@@ -208,6 +244,174 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
     ).hexdigest()
     with pytest.raises(publication.PublicationError, match="schema is incomplete"):
         publication._role_file_descriptors("selection", malformed)
+
+
+def test_ptv2_schema_v3_receipts_publish_as_a_complete_bundle(tmp_path: Path) -> None:
+    """Task 8 accepts genuine Task 9-shaped source, selection, token, and exposure roots."""
+    base = _bundle(tmp_path / "base")
+
+    def digest(value: bytes) -> str:
+        return hashlib.sha256(value).hexdigest()
+
+    def artifact(root: Path, role: str, payload: dict[str, Any]) -> publication.InputArtifact:
+        path = root / f"{role}.json"
+        path.write_bytes(_canonical(payload))
+        return publication.InputArtifact(role, path, digest(path.read_bytes()))
+
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_file = source_root / "source.jsonl"
+    source_file.write_bytes(b"{}\n")
+    source_root_sha = "1" * 64
+    source = artifact(
+        source_root,
+        "source",
+        {
+            "schema_version": 1,
+            "name": "ptv2",
+            "source_manifest_sha256": source_root_sha,
+            "complete": True,
+            "raw_counts": {"math": 1},
+            "files": [
+                {
+                    "repository_id": "owner/repo",
+                    "configuration": "default",
+                    "split": "math",
+                    "revision": "a" * 40,
+                    "license_expression": "Apache-2.0",
+                    "approved_use": True,
+                    "cell": "math",
+                    "lane": "target-synthesis",
+                    "source_path": source_file.name,
+                    "staged_path": source_file.name,
+                    "bytes": source_file.stat().st_size,
+                    "sha256": digest(source_file.read_bytes()),
+                }
+            ],
+        },
+    )
+    selection_root = tmp_path / "selection"
+    selection_root.mkdir()
+    policy = selection_root / "policy.yaml"
+    policy.write_bytes(b"seed: 1\nstrategy: B-balanced\n")
+    index = selection_root / "selection.sqlite3"
+    connection = sqlite3.connect(index)
+    connection.execute(
+        "CREATE TABLE occurrences(ordinal INTEGER,prompt_uuid TEXT,source_identity_sha256 TEXT,"
+        "source_row INTEGER,cell TEXT,reuse_index INTEGER,conversation_sha256 TEXT,"
+        "assistant_response_sha256 TEXT,strategy TEXT)"
+    )
+    occurrence = (0, "a" * 64, "b" * 64, 0, "math", 0, "c" * 64, "d" * 64)
+    connection.execute(
+        "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", (*occurrence, "B-balanced")
+    )
+    connection.commit()
+    connection.close()
+    shard = selection_root / "occurrences.jsonl"
+    shard.write_bytes(_canonical(list(occurrence)))
+
+    def descriptor(path: Path) -> dict[str, Any]:
+        return {
+            "path": path.name,
+            "bytes": path.stat().st_size,
+            "sha256": digest(path.read_bytes()),
+        }
+
+    ordered = digest(
+        json.dumps(list(occurrence), sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    )
+    selection_body = {
+        "schema_version": 3,
+        "selection_sha256": "2" * 64,
+        "policy_sha256": digest(publication._identity_json({"seed": 1, "strategy": "B-balanced"})),
+        "policy_file_sha256": digest(policy.read_bytes()),
+        "source_inventory_sha256": source_root_sha,
+        "baseline_receipt_sha256": "3" * 64,
+        "held_out_receipt_sha256": "4" * 64,
+        "strategy": "B-balanced",
+        "occurrence_count": 1,
+        "ordered_occurrences_sha256": ordered,
+        "policy": descriptor(policy),
+        "index": descriptor(index),
+        "shards": [descriptor(shard)],
+    }
+    selection_body["root_sha256"] = digest(publication._identity_json(selection_body))
+    selection = artifact(selection_root, "selection", selection_body)
+    response_root = "5" * 64
+    response = _receipt(tmp_path / "response", "response", _rows(1))
+    response_payload = {
+        key: value
+        for key, value in json.loads(response.receipt_path.read_bytes()).items()
+        if key != "receipt_sha256"
+    } | {
+        "selection_sha256": selection_body["selection_sha256"],
+        "source_response_root_sha256": response_root,
+    }
+    response = artifact(response.receipt_path.parent, "response", response_payload)
+    token_root = tmp_path / "token"
+    token_root.mkdir()
+    database = token_root / "records.sqlite3"
+    database.write_bytes(b"sqlite")
+    tokenized = artifact(
+        token_root,
+        "tokenized",
+        {
+            "schema_version": 1,
+            "strategy": "B-balanced",
+            "occurrence_count": 1,
+            "assistant_tokens": 1,
+            "database_path": database.name,
+            "database_bytes": database.stat().st_size,
+            "database_sha256": digest(database.read_bytes()),
+            "selection_sha256": selection_body["selection_sha256"],
+            "source_response_root_sha256": response_root,
+            "tokenizer_sha256": "6" * 64,
+            "chat_template_sha256": "7" * 64,
+            "assistant_loss_target_sha256": "8" * 64,
+        },
+    )
+    exposure_root = tmp_path / "exposure"
+    exposure_root.mkdir()
+    records = exposure_root / "records.jsonl"
+    records.write_bytes(_canonical(_rows(1)[0]))
+    exposure = artifact(
+        exposure_root,
+        "exposure",
+        {
+            "schema_version": 1,
+            "strategy": "B-balanced",
+            "target_assistant_tokens": 1,
+            "records_path": records.name,
+            "records_bytes": records.stat().st_size,
+            "records_sha256": digest(records.read_bytes()),
+            "row_count": 1,
+            "tokenized_sha256": digest(database.read_bytes()),
+            "selection_sha256": selection_body["selection_sha256"],
+            "source_response_root_sha256": response_root,
+            "tokenizer_sha256": "6" * 64,
+            "chat_template_sha256": "7" * 64,
+            "assistant_loss_target_sha256": "8" * 64,
+        },
+    )
+    rejection = _receipt(tmp_path / "rejection", "rejection", _rows(1))
+    rejection_payload = {
+        key: value
+        for key, value in json.loads(rejection.receipt_path.read_bytes()).items()
+        if key != "receipt_sha256"
+    } | {"selection_sha256": selection_body["selection_sha256"]}
+    rejection = artifact(rejection.receipt_path.parent, "rejection", rejection_payload)
+    bundle = publication.CorpusBundle(
+        artifacts=(source, selection, response, tokenized, exposure, rejection),
+        rows=base.rows,
+        prompt_count=base.prompt_count,
+        assistant_token_count=base.assistant_token_count,
+        quarantine_count=base.quarantine_count,
+        selection_manifest_sha256=selection.receipt_sha256,
+        artifact_source_commit="a" * 40,
+    )
+
+    published = publication.publish_bundle(bundle, tmp_path / "published", "ptv2-v3")
+    assert Path(published.published_path).is_dir()
 
 
 @pytest.mark.parametrize(
