@@ -12,17 +12,27 @@ set -euo pipefail
 
 required=(A_CANARY_MANIFEST A_CANARY_CHECKPOINT A_CANARY_EXPORT A_CANARY_GPU_EVIDENCE
     A_CANARY_EVALUATION_RECEIPT A_CANARY_AUTHORIZATION A_CANARY_EVAL_OUTPUT
-    LAUNCHER_ROOT REPO_ROOT TARGET_PATH MODELOPT_RUNTIME)
+    A_CANARY_SUPERVISOR_COMPLETION A_CANARY_OUTPUT_ROOT LAUNCHER_ROOT REPO_ROOT
+    MODELOPT_RUNTIME WANDB_NETRC_PATH WANDB_DIR WANDB_CACHE_DIR WANDB_CONFIG_DIR
+    WANDB_ARTIFACT_DIR)
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ && "${SLURM_NNODES:-}" == 16 ]] || exit 2
 for output in "$A_CANARY_CHECKPOINT" "$A_CANARY_EXPORT" "$A_CANARY_GPU_EVIDENCE" \
-    "$A_CANARY_EVALUATION_RECEIPT" "$A_CANARY_AUTHORIZATION" "$A_CANARY_EVAL_OUTPUT"; do
+    "$A_CANARY_EVALUATION_RECEIPT" "$A_CANARY_AUTHORIZATION" \
+    "$A_CANARY_SUPERVISOR_COMPLETION" "$A_CANARY_EVAL_OUTPUT"; do
     [[ ! -e "$output" && ! -L "$output" ]] || {
         echo "A canary output already exists: $output" >&2
         exit 2
     }
+done
+[[ ! -e "$A_CANARY_OUTPUT_ROOT" && ! -L "$A_CANARY_OUTPUT_ROOT" ]] || exit 2
+mkdir "$A_CANARY_OUTPUT_ROOT"
+for output in "$A_CANARY_CHECKPOINT" "$A_CANARY_EXPORT" "$A_CANARY_GPU_EVIDENCE" \
+    "$A_CANARY_EVALUATION_RECEIPT" "$A_CANARY_AUTHORIZATION" \
+    "$A_CANARY_SUPERVISOR_COMPLETION" "$A_CANARY_EVAL_OUTPUT"; do
+    [[ "$output" == "$A_CANARY_OUTPUT_ROOT"/* ]] || exit 2
 done
 readonly SUPERVISOR="$LAUNCHER_ROOT/common/eagle3/train_eagle_streaming.sh"
 readonly DFLASH_CONFIG="$REPO_ROOT/modelopt_recipes/general/speculative_decoding/dflash.yaml"
@@ -33,11 +43,17 @@ runtime_env="$({ PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 
 import shlex
 import sys
 from pathlib import Path
-from common.specdec.qwen4b_a_canary_manifest import load_a_canary_manifest, validate_bound_artifacts
+from common.specdec.qwen4b_a_canary_manifest import (
+    load_a_canary_manifest,
+    validate_bound_artifacts,
+    validate_runtime_mounts,
+)
 manifest = load_a_canary_manifest(Path(sys.argv[1]))
 validate_bound_artifacts(manifest, repository_root=Path(sys.argv[2]))
+validate_runtime_mounts(manifest.runtime, repository_root=Path(sys.argv[2]))
 values = {
     "A_CANARY_OUTPUT": manifest.builder_output_path,
+    "HF_MODEL_CKPT": manifest.runtime.target_path,
     "WANDB_PROJECT": manifest.runtime.wandb_project,
     "WANDB_RUN_ID": f"q4a-repair-{manifest.runtime.source_commit[:12]}",
 }
@@ -46,11 +62,13 @@ for key, value in values.items():
 PY
 } )"
 eval "$runtime_env"
-export A_CANARY_OUTPUT WANDB_PROJECT WANDB_RUN_ID
-export HF_MODEL_CKPT="$TARGET_PATH" SERVE_NODES=8 SERVE_TP=1 SERVE_REPLICAS_PER_NODE=4
+export A_CANARY_OUTPUT WANDB_PROJECT WANDB_RUN_ID HF_MODEL_CKPT
+export SERVE_NODES=8 SERVE_TP=1 SERVE_REPLICAS_PER_NODE=4
 export EAGLE_CAPTURE_IDS='[2,18,33,36]' EXPORT_PATH="$A_CANARY_EXPORT"
 export SERVE_READY_TIMEOUT=1800 SERVE_BLOCK_SIZE=32 SERVE_MAX_MODEL_LEN=32768
 export SERVE_MAX_NUM_SEQS=16 HS_POOL_SLOTS=32
+[[ "$WANDB_NETRC_PATH" == "/run/secrets/wandb.netrc" ]] || exit 2
+readonly WANDB_NETRC_PATH="/run/secrets/wandb.netrc"
 WANDB_API_KEY="$(python3 - <<'PY'
 import netrc
 credentials = netrc.netrc('/run/secrets/wandb.netrc').authenticators('api.wandb.ai')
@@ -60,6 +78,8 @@ print(credentials[2])
 PY
 )"
 export WANDB_API_KEY
+supervisor_started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+readonly supervisor_started_at
 
 gpu_log_root="$(dirname "$A_CANARY_GPU_EVIDENCE")/pmon"
 mkdir -p "$gpu_log_root" "$A_CANARY_EVAL_OUTPUT"
@@ -114,11 +134,31 @@ PY
 export A_CANARY_EXPORT A_CANARY_EVALUATION_RECEIPT A_CANARY_EVAL_OUTPUT LAUNCHER_ROOT
 srun --overlap --nodes=1 --ntasks=1 --gpus=4 --cpus-per-task=72 \
     --kill-on-bad-exit=1 bash "$EVALUATOR"
+supervisor_finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+readonly supervisor_finished_at
+
+PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    "$A_CANARY_MANIFEST" "$A_CANARY_SUPERVISOR_COMPLETION" "$SLURM_JOB_ID" \
+    "$A_CANARY_CHECKPOINT/checkpoint-200" "$A_CANARY_EXPORT" \
+    "$A_CANARY_EVALUATION_RECEIPT" "$supervisor_started_at" "$supervisor_finished_at" <<'PY'
+import sys
+from pathlib import Path
+from common.specdec.qwen4b_a_canary_manifest import (
+    load_a_canary_manifest,
+    publish_a_supervisor_completion,
+)
+publish_a_supervisor_completion(
+    Path(sys.argv[2]), load_a_canary_manifest(Path(sys.argv[1])), job_id=sys.argv[3],
+    checkpoint_path=Path(sys.argv[4]), export_path=Path(sys.argv[5]),
+    evaluation_receipt_path=Path(sys.argv[6]), started_at=sys.argv[7], finished_at=sys.argv[8],
+)
+PY
 
 PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$A_CANARY_MANIFEST" "$A_CANARY_AUTHORIZATION" "$SLURM_JOB_ID" \
     "$A_CANARY_CHECKPOINT/checkpoint-200" "$A_CANARY_EXPORT" \
-    "$A_CANARY_GPU_EVIDENCE" "$A_CANARY_EVALUATION_RECEIPT" <<'PY'
+    "$A_CANARY_GPU_EVIDENCE" "$A_CANARY_EVALUATION_RECEIPT" \
+    "$A_CANARY_SUPERVISOR_COMPLETION" "$REPO_ROOT" <<'PY'
 import sys
 from pathlib import Path
 from common.specdec.qwen4b_a_canary_manifest import load_a_canary_manifest, publish_a_authorization
@@ -126,5 +166,7 @@ publish_a_authorization(
     Path(sys.argv[2]), load_a_canary_manifest(Path(sys.argv[1])), job_id=sys.argv[3],
     checkpoint_path=Path(sys.argv[4]), export_path=Path(sys.argv[5]),
     gpu_evidence_path=Path(sys.argv[6]), evaluation_receipt_path=Path(sys.argv[7]),
+    supervisor_completion_path=Path(sys.argv[8]), manifest_path=Path(sys.argv[1]),
+    repository_root=Path(sys.argv[9]),
 )
 PY

@@ -12,6 +12,7 @@ import os
 import re
 import stat
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -79,9 +80,18 @@ class ACanaryRuntimeIdentity:
 
     source_commit: str
     target_revision: str
+    target_path: str
+    target_snapshot_sha256: str
+    target_config_sha256: str
     tokenizer_sha256: str
     chat_template_sha256: str
+    container_path: str
     container_sha256: str
+    wandb_netrc_sha256: str
+    wandb_dir: str
+    wandb_cache_dir: str
+    wandb_config_dir: str
+    wandb_artifact_dir: str
     producer_module_path: str
     producer_module_sha256: str
     runner_path: str
@@ -92,6 +102,10 @@ class ACanaryRuntimeIdentity:
     recipe_sha256: str
     evaluator_path: str
     evaluator_sha256: str
+    exporter_path: str
+    exporter_sha256: str
+    train_script_path: str
+    train_script_sha256: str
     target_model_id: str = "Qwen/Qwen3-4B"
     method: str = "dflash"
     block_size: int = 8
@@ -107,14 +121,19 @@ class ACanaryRuntimeIdentity:
         ):
             raise ValueError("A runtime commits must be exact")
         digests = (
+            self.target_snapshot_sha256,
+            self.target_config_sha256,
             self.tokenizer_sha256,
             self.chat_template_sha256,
             self.container_sha256,
+            self.wandb_netrc_sha256,
             self.producer_module_sha256,
             self.runner_sha256,
             self.supervisor_sha256,
             self.recipe_sha256,
             self.evaluator_sha256,
+            self.exporter_sha256,
+            self.train_script_sha256,
         )
         if any(_SHA256.fullmatch(value) is None for value in digests):
             raise ValueError("A runtime digests must be exact")
@@ -128,6 +147,18 @@ class ACanaryRuntimeIdentity:
             raise ValueError("A runtime identity is not the authorized comparison")
         if self.wandb_project != "sna-qwen3-4b-dataset-study":
             raise ValueError("A runtime must use the shared Qwen3-4B study project")
+        absolute_paths = (
+            self.target_path,
+            self.container_path,
+            self.wandb_dir,
+            self.wandb_cache_dir,
+            self.wandb_config_dir,
+            self.wandb_artifact_dir,
+        )
+        if any(not Path(value).is_absolute() for value in absolute_paths):
+            raise ValueError("A runtime host paths must be absolute")
+        if len(set(absolute_paths)) != len(absolute_paths):
+            raise ValueError("A runtime host paths must be distinct")
 
 
 @dataclass(frozen=True)
@@ -203,11 +234,18 @@ def validate_bound_artifacts(manifest: ACanaryManifest, *, repository_root: Path
         (manifest.runtime.supervisor_path, manifest.runtime.supervisor_sha256),
         (manifest.runtime.recipe_path, manifest.runtime.recipe_sha256),
         (manifest.runtime.evaluator_path, manifest.runtime.evaluator_sha256),
+        (manifest.runtime.exporter_path, manifest.runtime.exporter_sha256),
+        (manifest.runtime.train_script_path, manifest.runtime.train_script_sha256),
     )
     for relative, digest in runtime_files:
         path = repository_root / relative
         if hashlib.sha256(_stable_file_bytes(path)).hexdigest() != digest:
             raise ValueError("A runtime source identity mismatch")
+    snapshot_target_identity(
+        Path(manifest.runtime.target_path),
+        container_path=Path(manifest.runtime.container_path),
+        expected=manifest.runtime,
+    )
     for path_value, digest in (
         (manifest.task9_a_selection_path, manifest.task9_a_selection_sha256),
         (manifest.task8_publication_path, manifest.task8_publication_sha256),
@@ -239,6 +277,8 @@ def validate_bound_artifacts(manifest: ACanaryManifest, *, repository_root: Path
         or builder.get("source_task8_publication_sha256") != manifest.task8_publication_sha256
         or builder.get("output_sha256") != manifest.builder_output_sha256
         or builder.get("occurrence_count") != 102_400
+        or builder.get("tokenizer_sha256") != manifest.runtime.tokenizer_sha256
+        or builder.get("chat_template_sha256") != manifest.runtime.chat_template_sha256
     ):
         raise ValueError("A builder lineage mismatch")
 
@@ -254,16 +294,286 @@ def last_finite_training_loss(state: object, *, expected_step: int) -> float:
         float(entry["loss"])
         for entry in history
         if isinstance(entry, dict)
+        and entry.get("step") == expected_step
         and isinstance(entry.get("loss"), (int, float))
         and not isinstance(entry.get("loss"), bool)
         and math.isfinite(float(entry["loss"]))
     ]
     if not candidates:
-        raise ValueError("trainer state lacks finite training loss")
+        raise ValueError(f"trainer state lacks finite training loss at step {expected_step}")
     return candidates[-1]
 
 
-def validate_evaluator_receipt(path: Path, *, job_id: str, export_sha256: str) -> dict[str, Any]:
+def snapshot_target_identity(
+    target_path: Path,
+    *,
+    container_path: Path,
+    target_revision: str | None = None,
+    expected: ACanaryRuntimeIdentity | None = None,
+) -> dict[str, str]:
+    """Hash the exact local Qwen3-4B snapshot, tokenizer, template, and container bytes."""
+    if not target_path.is_absolute() or not container_path.is_absolute():
+        raise ValueError("target and container paths must be absolute")
+    config_path = target_path / "config.json"
+    tokenizer_config_path = target_path / "tokenizer_config.json"
+    config_raw = _stable_file_bytes(config_path)
+    tokenizer_config_raw = _stable_file_bytes(tokenizer_config_path)
+    try:
+        config = json.loads(config_raw)
+        tokenizer_config = json.loads(tokenizer_config_raw)
+    except json.JSONDecodeError as error:
+        raise ValueError("target snapshot JSON is invalid") from error
+    exact_dims = {
+        "model_type": "qwen3",
+        "hidden_size": 2560,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "intermediate_size": 9728,
+        "vocab_size": 151936,
+    }
+    if not isinstance(config, dict) or any(config.get(key) != value for key, value in exact_dims.items()):
+        raise ValueError("target snapshot is not the exact Qwen3-4B configuration")
+    revision = expected.target_revision if expected is not None else target_revision
+    if revision is not None:
+        if _COMMIT.fullmatch(revision) is None:
+            raise ValueError("target revision must be exact")
+        snapshot_revision = target_path.resolve().name
+        if snapshot_revision != revision:
+            raise ValueError("target snapshot revision mismatch")
+    if not isinstance(tokenizer_config, dict):
+        raise ValueError("target snapshot tokenizer configuration is invalid")
+    template_raw = _stable_file_bytes(target_path / "chat_template.jinja")
+    tokenizer_names = {
+        "chat_template.jinja",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "vocab.txt",
+        "tokenizer.model",
+        "merges.txt",
+    }
+    tokenizer_files = sorted(
+        path for path in target_path.iterdir() if path.is_file() and path.name in tokenizer_names
+    )
+    if not tokenizer_files or not any(path.name == "tokenizer.json" for path in tokenizer_files):
+        raise ValueError("target snapshot has no complete tokenizer bytes")
+    tokenizer_digest = hashlib.sha256()
+    for artifact in tokenizer_files:
+        tokenizer_digest.update(artifact.name.encode())
+        tokenizer_digest.update(b"\0")
+        tokenizer_digest.update(bytes.fromhex(hashlib.sha256(_stable_file_bytes(artifact)).hexdigest()))
+    actual = {
+        "target_snapshot_sha256": _directory_sha256(target_path),
+        "target_config_sha256": hashlib.sha256(config_raw).hexdigest(),
+        "tokenizer_sha256": tokenizer_digest.hexdigest(),
+        "chat_template_sha256": hashlib.sha256(template_raw).hexdigest(),
+        "container_sha256": hashlib.sha256(_stable_file_bytes(container_path)).hexdigest(),
+    }
+    if expected is not None and any(getattr(expected, key) != value for key, value in actual.items()):
+        raise ValueError("target snapshot or container identity mismatch")
+    return actual
+
+
+def validate_runtime_mounts(
+    runtime: ACanaryRuntimeIdentity,
+    *,
+    repository_root: Path,
+    environ: dict[str, str] | None = None,
+) -> None:
+    """Fail unless W&B secret and durable state mounts match the signed manifest."""
+    environment = os.environ if environ is None else environ
+    netrc_path = Path(environment.get("WANDB_NETRC_PATH", ""))
+    if netrc_path != Path("/run/secrets/wandb.netrc"):
+        raise ValueError("W&B netrc must be mounted at the pinned secret path")
+    if hashlib.sha256(_stable_file_bytes(netrc_path)).hexdigest() != runtime.wandb_netrc_sha256:
+        raise ValueError("W&B netrc identity mismatch")
+    if not _path_on_read_only_mount(netrc_path):
+        raise ValueError("W&B netrc mount must be read-only")
+    expected_dirs = {
+        "WANDB_DIR": runtime.wandb_dir,
+        "WANDB_CACHE_DIR": runtime.wandb_cache_dir,
+        "WANDB_CONFIG_DIR": runtime.wandb_config_dir,
+        "WANDB_ARTIFACT_DIR": runtime.wandb_artifact_dir,
+    }
+    repo = repository_root.resolve()
+    for name, expected_path in expected_dirs.items():
+        path = Path(environment.get(name, ""))
+        if path != Path(expected_path) or not path.is_absolute() or not path.is_dir():
+            raise ValueError(f"{name} durable mount mismatch")
+        try:
+            path.resolve().relative_to(repo)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"{name} must be outside the repository")
+        probe = path / f".qwen4b-a-mount-probe-{os.getpid()}"
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        probe.unlink()
+
+
+def _path_on_read_only_mount(path: Path) -> bool:
+    """Return whether Linux mountinfo resolves the path to a read-only mount."""
+    mountinfo = Path("/proc/self/mountinfo")
+    if not mountinfo.is_file():
+        return False
+    resolved = path.resolve(strict=True)
+    candidates: list[tuple[int, bool]] = []
+    for line in mountinfo.read_text().splitlines():
+        fields = line.split()
+        if len(fields) < 6:
+            continue
+        mount_point = Path(
+            fields[4]
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+        )
+        try:
+            resolved.relative_to(mount_point)
+        except ValueError:
+            continue
+        candidates.append((len(mount_point.parts), "ro" in fields[5].split(",")))
+    return max(candidates, default=(0, False))[1]
+
+
+def publish_a_supervisor_completion(
+    path: Path,
+    manifest: ACanaryManifest,
+    *,
+    job_id: str,
+    checkpoint_path: Path,
+    export_path: Path,
+    evaluation_receipt_path: Path,
+    started_at: str,
+    finished_at: str,
+) -> None:
+    """Issue current-job proof that the canonical supervisor exported and reloaded step 200."""
+    if not job_id.isdigit():
+        raise ValueError("A supervisor completion requires a numeric Slurm job ID")
+    state = json.loads(_stable_file_bytes(checkpoint_path / "trainer_state.json"))
+    loss = last_finite_training_loss(state, expected_step=manifest.topology.max_steps)
+    checkpoint_sha = _directory_sha256(checkpoint_path)
+    export_sha = _directory_sha256(export_path)
+    evaluation_raw = _stable_file_bytes(evaluation_receipt_path)
+    validate_evaluator_receipt(
+        evaluation_receipt_path,
+        job_id=job_id,
+        export_sha256=export_sha,
+        manifest=manifest,
+        checkpoint_path=checkpoint_path,
+    )
+    _validate_job_times(started_at, finished_at)
+    body: dict[str, Any] = {
+        "schema_version": 1,
+        "producer": "qwen4b-a-canonical-supervisor-completion-v1",
+        "status": "completed",
+        "slurm_job_id": job_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "source_commit": manifest.runtime.source_commit,
+        "supervisor_path": manifest.runtime.supervisor_path,
+        "supervisor_sha256": manifest.runtime.supervisor_sha256,
+        "recipe_path": manifest.runtime.recipe_path,
+        "recipe_sha256": manifest.runtime.recipe_sha256,
+        "runner_sha256": manifest.runtime.runner_sha256,
+        "exporter_path": manifest.runtime.exporter_path,
+        "exporter_sha256": manifest.runtime.exporter_sha256,
+        "train_script_path": manifest.runtime.train_script_path,
+        "train_script_sha256": manifest.runtime.train_script_sha256,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha,
+        "checkpoint_step": manifest.topology.max_steps,
+        "last_finite_loss": loss,
+        "export_path": str(export_path),
+        "export_sha256": export_sha,
+        "checkpoint_reloaded_by_exporter": True,
+        "evaluation_receipt_path": str(evaluation_receipt_path),
+        "evaluation_receipt_sha256": hashlib.sha256(evaluation_raw).hexdigest(),
+    }
+    body["receipt_sha256"] = _sha256_json(body)
+    atomic_publish_bytes(path, (_canonical_json(body) + "\n").encode(), job_id=job_id)
+
+
+def validate_supervisor_completion(
+    path: Path,
+    *,
+    manifest: ACanaryManifest,
+    job_id: str,
+    checkpoint_path: Path,
+    export_path: Path,
+    evaluation_receipt_path: Path,
+) -> dict[str, Any]:
+    """Rehash and validate canonical supervisor/export/reload completion evidence."""
+    body = json.loads(_stable_file_bytes(path))
+    if not isinstance(body, dict):
+        raise ValueError("A supervisor completion receipt is invalid")
+    claim = body.pop("receipt_sha256", None)
+    state = json.loads(_stable_file_bytes(checkpoint_path / "trainer_state.json"))
+    loss = last_finite_training_loss(state, expected_step=manifest.topology.max_steps)
+    expected = {
+        "producer": "qwen4b-a-canonical-supervisor-completion-v1",
+        "status": "completed",
+        "slurm_job_id": job_id,
+        "source_commit": manifest.runtime.source_commit,
+        "supervisor_path": manifest.runtime.supervisor_path,
+        "supervisor_sha256": manifest.runtime.supervisor_sha256,
+        "recipe_path": manifest.runtime.recipe_path,
+        "recipe_sha256": manifest.runtime.recipe_sha256,
+        "runner_sha256": manifest.runtime.runner_sha256,
+        "exporter_path": manifest.runtime.exporter_path,
+        "exporter_sha256": manifest.runtime.exporter_sha256,
+        "train_script_path": manifest.runtime.train_script_path,
+        "train_script_sha256": manifest.runtime.train_script_sha256,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_sha256": _directory_sha256(checkpoint_path),
+        "checkpoint_step": manifest.topology.max_steps,
+        "last_finite_loss": loss,
+        "export_path": str(export_path),
+        "export_sha256": _directory_sha256(export_path),
+        "checkpoint_reloaded_by_exporter": True,
+        "evaluation_receipt_path": str(evaluation_receipt_path),
+        "evaluation_receipt_sha256": hashlib.sha256(_stable_file_bytes(evaluation_receipt_path)).hexdigest(),
+    }
+    started_at, finished_at = body.get("started_at"), body.get("finished_at")
+    if not isinstance(started_at, str) or not isinstance(finished_at, str):
+        raise ValueError("A supervisor completion timing is missing")
+    _validate_job_times(started_at, finished_at)
+    if claim != _sha256_json(body) or any(body.get(key) != value for key, value in expected.items()):
+        raise ValueError("A supervisor completion receipt mismatch")
+    validate_evaluator_receipt(
+        evaluation_receipt_path,
+        job_id=job_id,
+        export_sha256=expected["export_sha256"],
+        manifest=manifest,
+        checkpoint_path=checkpoint_path,
+    )
+    return body
+
+
+def _validate_job_times(started_at: str, finished_at: str) -> None:
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        finished = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("A supervisor completion timing is invalid") from error
+    if started.tzinfo is None or finished.tzinfo is None or finished < started:
+        raise ValueError("A supervisor completion timing is invalid")
+
+
+def validate_evaluator_receipt(
+    path: Path,
+    *,
+    job_id: str,
+    export_sha256: str,
+    manifest: ACanaryManifest | None = None,
+    checkpoint_path: Path | None = None,
+) -> dict[str, Any]:
     """Require a self-hashed, current-job evaluator with real completed requests."""
     raw = _stable_file_bytes(path)
     body = json.loads(raw)
@@ -281,6 +591,20 @@ def validate_evaluator_receipt(path: Path, *, job_id: str, export_sha256: str) -
         or body["completed_requests"] <= 0
     ):
         raise ValueError("A evaluator lacks completed requests or current-job identity")
+    if manifest is not None:
+        exporter_evidence = {
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": (
+                None if checkpoint_path is None else _directory_sha256(checkpoint_path)
+            ),
+            "exporter_path": manifest.runtime.exporter_path,
+            "exporter_sha256": manifest.runtime.exporter_sha256,
+            "checkpoint_reloaded_by_exporter": True,
+        }
+        if checkpoint_path is None or any(
+            body.get(key) != value for key, value in exporter_evidence.items()
+        ):
+            raise ValueError("A evaluator exporter/reload evidence mismatch")
     if (
         not isinstance(metrics, dict)
         or not metrics
@@ -304,16 +628,52 @@ def publish_a_authorization(
     export_path: Path,
     gpu_evidence_path: Path,
     evaluation_receipt_path: Path,
+    supervisor_completion_path: Path,
+    manifest_path: Path,
+    repository_root: Path,
 ) -> None:
     """Publish the only receipt allowed to authorize the B-balanced canary."""
     if not job_id.isdigit():
         raise ValueError("A authorization requires a numeric Slurm job ID")
+    if os.environ.get("SLURM_JOB_ID") != job_id or os.environ.get("SLURM_NNODES") != "16":
+        raise ValueError("A authorization requires the current 16-node Slurm context")
+    slurm_account = os.environ.get("SLURM_JOB_ACCOUNT")
+    slurm_job_name = os.environ.get("SLURM_JOB_NAME")
+    slurm_job_comment = os.environ.get("A_CANARY_JOB_COMMENT")
+    slurm_output_path = os.environ.get("A_CANARY_SLURM_OUTPUT")
+    if (
+        slurm_account not in {"nemotron_sw_post", "nemotron_n4_post"}
+        or slurm_job_name != "q4b-a-repair-canary"
+        or not slurm_job_comment
+        or not slurm_output_path
+        or not Path(slurm_output_path).is_absolute()
+    ):
+        raise ValueError("A authorization Slurm identity is invalid")
+    manifest_raw = _stable_file_bytes(manifest_path)
+    if load_a_canary_manifest(manifest_path) != manifest:
+        raise ValueError("A authorization manifest object mismatch")
+    validate_bound_artifacts(manifest, repository_root=repository_root)
     trainer_state = json.loads(_stable_file_bytes(checkpoint_path / "trainer_state.json"))
     finite_loss = last_finite_training_loss(trainer_state, expected_step=200)
     checkpoint_sha = _directory_sha256(checkpoint_path)
     export_sha = _directory_sha256(export_path)
     evaluation_raw = _stable_file_bytes(evaluation_receipt_path)
-    validate_evaluator_receipt(evaluation_receipt_path, job_id=job_id, export_sha256=export_sha)
+    validate_evaluator_receipt(
+        evaluation_receipt_path,
+        job_id=job_id,
+        export_sha256=export_sha,
+        manifest=manifest,
+        checkpoint_path=checkpoint_path,
+    )
+    completion_raw = _stable_file_bytes(supervisor_completion_path)
+    completion = validate_supervisor_completion(
+        supervisor_completion_path,
+        manifest=manifest,
+        job_id=job_id,
+        checkpoint_path=checkpoint_path,
+        export_path=export_path,
+        evaluation_receipt_path=evaluation_receipt_path,
+    )
     gpu_raw = _stable_file_bytes(gpu_evidence_path)
     gpu = json.loads(gpu_raw)
     if (
@@ -343,11 +703,17 @@ def publish_a_authorization(
         "global_batch_size": manifest.topology.global_batch_size,
         "max_steps": manifest.topology.max_steps,
         "scientific_training_authorized": False,
-        "checkpoint_reloaded": True,
+        "checkpoint_reloaded": completion["checkpoint_reloaded_by_exporter"],
         "drafter_exported": True,
         "all_gpus_active": True,
         "finite_loss": finite_loss,
         "slurm_job_id": job_id,
+        "slurm_account": slurm_account,
+        "slurm_job_name": slurm_job_name,
+        "slurm_job_comment": slurm_job_comment,
+        "slurm_output_path": slurm_output_path,
+        "started_at": completion["started_at"],
+        "finished_at": completion["finished_at"],
         "task9_a_selection_path": manifest.task9_a_selection_path,
         "task9_a_selection_sha256": manifest.task9_a_selection_sha256,
         "task8_publication_path": manifest.task8_publication_path,
@@ -360,6 +726,23 @@ def publish_a_authorization(
         "producer_module_sha256": runtime.producer_module_sha256,
         "runner_path": runtime.runner_path,
         "runner_sha256": runtime.runner_sha256,
+        "supervisor_path": runtime.supervisor_path,
+        "supervisor_sha256": runtime.supervisor_sha256,
+        "recipe_path": runtime.recipe_path,
+        "recipe_sha256": runtime.recipe_sha256,
+        "evaluator_path": runtime.evaluator_path,
+        "evaluator_sha256": runtime.evaluator_sha256,
+        "exporter_path": runtime.exporter_path,
+        "exporter_sha256": runtime.exporter_sha256,
+        "train_script_path": runtime.train_script_path,
+        "train_script_sha256": runtime.train_script_sha256,
+        "target_path": runtime.target_path,
+        "target_snapshot_sha256": runtime.target_snapshot_sha256,
+        "target_config_sha256": runtime.target_config_sha256,
+        "container_path": runtime.container_path,
+        "wandb_netrc_sha256": runtime.wandb_netrc_sha256,
+        "a_manifest_path": str(manifest_path),
+        "a_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
         "checkpoint_path": str(checkpoint_path),
         "checkpoint_sha256": checkpoint_sha,
         "export_path": str(export_path),
@@ -368,6 +751,8 @@ def publish_a_authorization(
         "gpu_evidence_sha256": hashlib.sha256(gpu_raw).hexdigest(),
         "evaluation_receipt_path": str(evaluation_receipt_path),
         "evaluation_receipt_sha256": hashlib.sha256(evaluation_raw).hexdigest(),
+        "supervisor_completion_path": str(supervisor_completion_path),
+        "supervisor_completion_sha256": hashlib.sha256(completion_raw).hexdigest(),
     }
     payload["receipt_sha256"] = _sha256_json(payload)
     atomic_publish_bytes(path, (_canonical_json(payload) + "\n").encode(), job_id=job_id)
