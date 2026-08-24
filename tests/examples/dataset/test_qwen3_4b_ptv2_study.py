@@ -1438,6 +1438,62 @@ def test_authenticated_source_spool_finishes_post_auth_before_prefix_consumption
         )
 
 
+def test_authenticated_source_spool_bounds_arrow_batch_rows_for_p96_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pq = pytest.importorskip("pyarrow.parquet")
+    receipt, _ = _write_authenticated_staged_parquet(tmp_path)
+    real_parquet_file = pq.ParquetFile
+    observed_batch_sizes: list[int] = []
+
+    class _ObservedParquetFile:
+        def __init__(self, source):
+            self._inner = real_parquet_file(source)
+
+        @property
+        def schema_arrow(self):
+            return self._inner.schema_arrow
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def iter_batches(self, *args, **kwargs):
+            observed_batch_sizes.append(kwargs["batch_size"])
+            yield from self._inner.iter_batches(*args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", _ObservedParquetFile)
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+
+    source = study_module._spool_authenticated_ptv2_source_rows(
+        receipt,
+        policy=_fixture_policy(),
+        storage_dir=tmp_path / "bounded-spool",
+    )
+    source.close()
+
+    assert observed_batch_sizes == [512]
+
+
+def test_authenticated_source_spool_is_byte_identical_across_arrow_batch_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("pyarrow.parquet")
+    receipt, _ = _write_authenticated_staged_parquet(tmp_path)
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+
+    outputs: list[bytes] = []
+    for batch_rows in (1, 512):
+        monkeypatch.setattr(study_module, "_PTV2_PARQUET_BATCH_ROWS", batch_rows)
+        with study_module._spool_authenticated_ptv2_source_rows(
+            receipt,
+            policy=_fixture_policy(),
+            storage_dir=tmp_path / f"spool-{batch_rows}",
+        ) as source:
+            outputs.append(source.storage_path.read_bytes())
+
+    assert outputs[0] == outputs[1]
+
+
 def test_staged_inventory_rejects_undeclared_orphan_parquet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

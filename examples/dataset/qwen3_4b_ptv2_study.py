@@ -102,6 +102,7 @@ _SEGMENT_STEPS = (2_540, 1_368)
 _CUMULATIVE_STEPS = (2_540, 3_908)
 _SEGMENT_FINAL_VALID = (32, 96)
 _DECLARED_PTV2_PARQUET_SHARDS = 201
+_PTV2_PARQUET_BATCH_ROWS = 512
 _ROOT_KEYS = frozenset(
     {
         "schema_version",
@@ -1251,7 +1252,7 @@ def _iter_local_ptv2_shard_rows(task: _PTV2ShardTask) -> Iterator[PTV2StudySourc
                 raise PTV2StudyError(f"PTV2 shard has no messages column: {task.path}")
             columns = ["messages"] + (["tools"] if "tools" in names else [])
             source_row = 0
-            for batch in parquet.iter_batches(columns=columns, batch_size=8192):
+            for batch in parquet.iter_batches(columns=columns, batch_size=_PTV2_PARQUET_BATCH_ROWS):
                 for offset, record in enumerate(batch.to_pylist()):
                     messages = record["messages"]
                     if isinstance(messages, str):
