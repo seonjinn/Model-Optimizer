@@ -203,14 +203,41 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
     runtime = tmp_path / "runtime/vllm"
     runtime.parent.mkdir()
     __import__("shutil").copytree(package, runtime)
-    (runtime / "_C.abi3.so").write_bytes(b"arm64-extension")
+    (runtime / "_flashmla_C.abi3.so").write_bytes(b"compiled-from-flashmla-a8f-core")
+    (runtime / "_flashmla_extension_C.abi3.so").write_bytes(
+        b"compiled-from-flashmla-a8f-extension"
+    )
     generated = runtime / "third_party/flashmla/flash_mla_interface.py"
     generated.parent.mkdir(parents=True)
     generated.write_text(
         "import torch\nimport vllm._flashmla_C\n"
         "flash_mla_cuda = torch.ops._flashmla_C\n"
     )
-    receipt = tmp_path / "vllm-runtime-v3.json"
+    base_runtime = tmp_path / "base-runtime.tar.zst"
+    base_runtime.write_bytes(b"immutable-base-runtime")
+    image = tmp_path / "vllm.sqsh"
+    image.write_bytes(b"immutable-container")
+    builder = tmp_path / "build_dflash2_runtime.sbatch"
+    builder.write_text("#!/usr/bin/env bash\ncmake --build exact-inputs\n")
+    configure_log = tmp_path / "dflash2-flashmla-cmake-configure.log"
+    configure_log.write_text(
+        "-- CUDA target architectures: 10.0a\n"
+        "-- FlashMLA CUDA architectures: 10.0f\n"
+    )
+    build_manifest = tmp_path / "dflash2-flashmla-build-manifest.json"
+    runtime_contract.write_flashmla_build_manifest(
+        build_manifest,
+        runtime,
+        package,
+        flashmla,
+        base_runtime,
+        image,
+        builder,
+        configure_log,
+        expected,
+        flashmla_commit,
+    )
+    receipt = tmp_path / "vllm-runtime-v4.json"
     receipt_sha = write_vllm_runtime_receipt(
         receipt,
         package,
@@ -219,6 +246,7 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
         runtime_package_path=runtime,
         flashmla_package_path=flashmla,
         flashmla_expected_commit=flashmla_commit,
+        flashmla_build_manifest_path=build_manifest,
     )
 
     assert (
@@ -233,11 +261,15 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
         == expected
     )
     body = json.loads(receipt.read_text())
-    assert body["schema_version"] == 3
+    assert body["schema_version"] == 4
     assert body["flashmla_commit"] == flashmla_commit
     assert body["flashmla_generated_interface"]["path"] == (
         "third_party/flashmla/flash_mla_interface.py"
     )
+    assert {item["path"] for item in body["flashmla_extension_binaries"]} == {
+        "_flashmla_C.abi3.so",
+        "_flashmla_extension_C.abi3.so",
+    }
     (runtime / "runtime.py").write_text("SUPPORTED = False\n")
     with pytest.raises(ValueError, match="runtime file bytes"):
         verify_vllm_runtime(
@@ -276,6 +308,41 @@ def test_vllm_receipt_rejects_mutated_flashmla_build_recipe(tmp_path: Path) -> N
             runtime_package_path=runtime,
             flashmla_package_path=flashmla,
             flashmla_expected_commit=flashmla_commit,
+        )
+
+
+def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) -> None:
+    """A source-build receipt requires both exact vLLM FlashMLA extension outputs."""
+    package, _, expected = _vllm_checkout(tmp_path)
+    flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
+    runtime = tmp_path / "runtime/vllm"
+    runtime.mkdir(parents=True)
+    (runtime / "_flashmla_C.abi3.so").write_bytes(b"only-one-extension")
+    inputs = []
+    for name in (
+        "base-runtime.tar.zst",
+        "vllm.sqsh",
+        "builder.sbatch",
+        "flashmla-cmake-configure.log",
+    ):
+        item = tmp_path / name
+        item.write_text(
+            "-- CUDA target architectures: 10.0a\n"
+            "-- FlashMLA CUDA architectures: 10.0f\n"
+            if name.endswith(".log")
+            else name
+        )
+        inputs.append(item)
+
+    with pytest.raises(ValueError, match="exact FlashMLA extension pair"):
+        runtime_contract.write_flashmla_build_manifest(
+            tmp_path / "build-manifest.json",
+            runtime,
+            package,
+            flashmla,
+            *inputs,
+            expected,
+            flashmla_commit,
         )
 
 
@@ -731,8 +798,19 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "verify_vllm_runtime",
         "_score_edges",
         "DFlash2Speculator",
-        "flash_mla_interface.py",
+        "flash_mla_interface",
         "vllm.v1.attention.ops.flashmla",
+        "import vllm._flashmla_C",
+        "import vllm._flashmla_extension_C",
+        "_is_flashmla_available() == (True, None)",
+        "FLASH_MLA_SRC_DIR",
+        "TORCH_CUDA_ARCH_LIST=10.0a",
+        "CUDA target architectures",
+        "FlashMLA CUDA architectures",
+        "cmake --build",
+        "--component _flashmla_C",
+        "--component _flashmla_extension_C",
+        "flashmla-build-manifest",
         "refusing to replace existing runtime output",
     ):
         assert required in script

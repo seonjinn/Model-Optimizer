@@ -32,21 +32,23 @@ FLASHMLA_COMMIT=a8f794d1251cbfd88a5011445dd5582289c727e4
 
 work_root="${SCRATCH_ROOT%/}/${SLURM_JOB_ID:?SLURM_JOB_ID is required}/dflash2-runtime"
 prepared="$work_root/runtime"
+build_source="$work_root/vllm-source"
+build_directory="$work_root/vllm-build"
 mkdir -p "$prepared" "$(dirname "$OUTPUT_ARCHIVE")"
 tar --extract --file="$BASE_RUNTIME" --directory="$prepared"
 
 mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${FLASHMLA_CHECKOUT}:${FLASHMLA_CHECKOUT}:ro,${LAUNCHER_ROOT}:${LAUNCHER_ROOT}:ro"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
-    bash -s -- "$prepared" "$VLLM_CHECKOUT" "$FLASHMLA_CHECKOUT" "$LAUNCHER_ROOT" \
-    "$EXPECTED_COMMIT" "$REQUIRED_COMMIT" <<'INNER'
+    bash -s -- "$prepared" "$VLLM_CHECKOUT" "$FLASHMLA_CHECKOUT" "$build_source" \
+    "$build_directory" <<'INNER'
 set -euo pipefail
 prepared="$1"
 checkout="$2"
 flashmla_checkout="$3"
-launcher="$4"
-expected="$5"
-required="$6"
+build_source="$4"
+build_directory="$5"
+configure_log="$prepared/dflash2-flashmla-cmake-configure.log"
 
 system_package="$($prepared/bin/python - <<'PY'
 from pathlib import Path
@@ -62,35 +64,49 @@ PY
 runtime_package="$site_package/vllm"
 printf '%s\n' "$runtime_package" >"$prepared/dflash2-vllm-runtime-package.path"
 mkdir -p "$runtime_package"
+rm -f "$runtime_package"/_flashmla_C*.so "$runtime_package"/_flashmla_extension_C*.so
 cp -a "$checkout/vllm/." "$runtime_package/"
 while IFS= read -r -d '' extension; do
     relative="${extension#"$system_package/"}"
+    case "$relative" in
+        _flashmla_C*.so|_flashmla_extension_C*.so) continue ;;
+    esac
     mkdir -p "$runtime_package/$(dirname "$relative")"
     cp -a "$extension" "$runtime_package/$relative"
 done < <(find "$system_package" -type f \( -name '*.so' -o -name '_version.py' \) -print0)
-"$prepared/bin/python" - "$flashmla_checkout" "$runtime_package" <<'PY'
-import sys
-from pathlib import Path
-
-source = Path(sys.argv[1]) / "flash_mla/flash_mla_interface.py"
-output = Path(sys.argv[2]) / "third_party/flashmla/flash_mla_interface.py"
-needle = "flash_mla_cuda = torch.ops._flashmla_C"
-raw = source.read_text()
-if raw.count(needle) != 1:
-    raise SystemExit("FlashMLA interface cannot be transformed deterministically")
-output.parent.mkdir(parents=True, exist_ok=True)
-output.write_text(raw.replace(needle, f"import vllm._flashmla_C\n{needle}"))
-PY
+mkdir -p "$build_source" "$build_directory"
+git -C "$checkout" archive HEAD | tar -x -C "$build_source"
+TORCH_CUDA_ARCH_LIST=10.0a FLASH_MLA_SRC_DIR="$flashmla_checkout" \
+    cmake -S "$build_source" -B "$build_directory" \
+    -G Ninja -DVLLM_TARGET_DEVICE=cuda -DVLLM_PYTHON_EXECUTABLE="$prepared/bin/python" \
+    -DCMAKE_INSTALL_PREFIX="$site_package" -DCMAKE_BUILD_TYPE=Release \
+    -DNVCC_THREADS=8 2>&1 | tee "$configure_log"
+grep -Eq 'CUDA target architectures:.*10\.0[af]' "$configure_log"
+grep -Eq 'FlashMLA CUDA architectures:.*10\.0[af]' "$configure_log"
+FLASH_MLA_SRC_DIR="$flashmla_checkout" cmake --build "$build_directory" \
+    --target _flashmla_C _flashmla_extension_C --parallel 16
+cmake --install "$build_directory" --component _flashmla_C
+cmake --install "$build_directory" --component _flashmla_extension_C
 INNER
 
 runtime_package="$(<"$prepared/dflash2-vllm-runtime-package.path")"
+build_manifest="$prepared/dflash2-flashmla-build-manifest.json"
+PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
+    "$LAUNCHER_ROOT/tools/launcher/common/specdec/dflash2_runtime_contract.py" \
+    flashmla-build-manifest --output "$build_manifest" --runtime-package "$runtime_package" \
+    --vllm-package "$VLLM_CHECKOUT/vllm" --flashmla-package "$FLASHMLA_CHECKOUT/flash_mla" \
+    --base-runtime "$BASE_RUNTIME" --image "$IMAGE" --builder "${BASH_SOURCE[0]}" \
+    --configure-log "$prepared/dflash2-flashmla-cmake-configure.log" \
+    --vllm-commit "$EXPECTED_COMMIT" --flashmla-commit "$FLASHMLA_COMMIT" \
+    >"$prepared/dflash2-flashmla-build-manifest.sha256"
 receipt="$prepared/dflash2-vllm-runtime-receipt.json"
 PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
     "$LAUNCHER_ROOT/tools/launcher/common/specdec/dflash2_runtime_contract.py" vllm-receipt \
     --package "$VLLM_CHECKOUT/vllm" --runtime-package "$runtime_package" --output "$receipt" \
     --expected-commit "$EXPECTED_COMMIT" --required-ancestor "$REQUIRED_COMMIT" \
     --flashmla-package "$FLASHMLA_CHECKOUT/flash_mla" \
-    --flashmla-expected-commit "$FLASHMLA_COMMIT" >"$prepared/dflash2-vllm-runtime-receipt.sha256"
+    --flashmla-expected-commit "$FLASHMLA_COMMIT" --flashmla-build-manifest "$build_manifest" \
+    >"$prepared/dflash2-vllm-runtime-receipt.sha256"
 receipt_sha="$(<"$prepared/dflash2-vllm-runtime-receipt.sha256")"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
@@ -114,7 +130,10 @@ from tools.launcher.common.specdec.dflash2_runtime_contract import verify_vllm_r
 verify_vllm_runtime(Path(sys.argv[1]), Path(sys.argv[2]), *sys.argv[3:])
 from vllm.model_executor.models.qwen3_dflash2 import _score_edges
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
-from vllm.v1.attention.ops.flashmla import is_flashmla_dense_supported
+import vllm._flashmla_C
+import vllm._flashmla_extension_C
+from vllm.third_party.flashmla import flash_mla_interface
+from vllm.v1.attention.ops.flashmla import _is_flashmla_available
 
 scores = _score_edges(
     torch.ones(8, 4), torch.ones(8, 4), torch.tensor([[[1, 2], [3, 4]]]),
@@ -122,7 +141,8 @@ scores = _score_edges(
 )
 assert scores.shape == (1, 2, 2, 2)
 assert DFlash2Speculator.__name__ == "DFlash2Speculator"
-assert callable(is_flashmla_dense_supported)
+assert flash_mla_interface.flash_mla_cuda is torch.ops._flashmla_C
+assert _is_flashmla_available() == (True, None)
 PY
 INNER
 

@@ -24,6 +24,9 @@ _FLASHMLA_REQUIRED_COMMIT = "a8f794d1251cbfd88a5011445dd5582289c727e4"
 _FLASHMLA_SOURCE_INTERFACE = "flash_mla/flash_mla_interface.py"
 _FLASHMLA_RUNTIME_INTERFACE = "third_party/flashmla/flash_mla_interface.py"
 _FLASHMLA_VLLM_RECIPE = "cmake/external_projects/flashmla.cmake"
+_FLASHMLA_BUILD_MANIFEST = "dflash2-flashmla-build-manifest.json"
+_FLASHMLA_CONFIGURE_LOG = "dflash2-flashmla-cmake-configure.log"
+_FLASHMLA_EXTENSION_STEMS = ("_flashmla_C", "_flashmla_extension_C")
 _DFLASH2_FEATURE_PATHS = (
     "modelopt/torch/export/plugins/hf_spec_export.py",
     "modelopt/torch/speculative/config.py",
@@ -59,6 +62,38 @@ def _canonical(value: object) -> str:
 
 def _sha_json(value: object) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
+
+
+def _file_descriptor(path: Path, name: str) -> dict[str, Any]:
+    handle = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = hashlib.sha256()
+    total = 0
+    with os.fdopen(handle, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        while chunk := stream.read(16 * 1024 * 1024):
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(stream.fileno())
+    if not stat.S_ISREG(before.st_mode) or (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError(f"artifact is not an inode-stable regular file: {path}")
+    return {"path": name, "bytes": total, "sha256": digest.hexdigest()}
+
+
+def _valid_file_descriptor(value: object, expected_path: str | None = None) -> bool:
+    return bool(
+        isinstance(value, dict)
+        and set(value) == {"path", "bytes", "sha256"}
+        and isinstance(value.get("path"), str)
+        and (expected_path is None or value.get("path") == expected_path)
+        and isinstance(value.get("bytes"), int)
+        and value["bytes"] >= 0
+        and _FULL_SHA256.fullmatch(str(value.get("sha256", "")))
+    )
 
 
 def artifact_tree_sha256(path: Path) -> str:
@@ -454,6 +489,83 @@ def _runtime_files(package: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _flashmla_extension_descriptors(runtime_package: Path) -> list[dict[str, Any]]:
+    extensions: list[Path] = []
+    for stem in _FLASHMLA_EXTENSION_STEMS:
+        matches = sorted(runtime_package.glob(f"{stem}*.so"))
+        if len(matches) != 1:
+            raise ValueError("runtime must contain the exact FlashMLA extension pair")
+        extensions.extend(matches)
+    return [_file_descriptor(item, item.name) for item in extensions]
+
+
+def write_flashmla_build_manifest(
+    path: Path,
+    runtime_package_path: Path,
+    vllm_package_path: Path,
+    flashmla_package_path: Path,
+    base_runtime_path: Path,
+    image_path: Path,
+    builder_path: Path,
+    configure_log_path: Path,
+    vllm_commit: str,
+    flashmla_commit: str,
+) -> str:
+    """Bind exact source-build inputs to both installed FlashMLA extensions."""
+    vllm_package = _verified_checkout(vllm_package_path, vllm_commit, vllm_commit)
+    flashmla_package = _verified_checkout(
+        flashmla_package_path,
+        flashmla_commit,
+        flashmla_commit,
+    )
+    recipe = _verified_commit_file(
+        vllm_package.parent,
+        _FLASHMLA_VLLM_RECIPE,
+        vllm_commit,
+        "vLLM FlashMLA build recipe",
+    )
+    flashmla_repository = flashmla_package.parent
+    submodules = _git(flashmla_repository, "submodule", "status", "--recursive")
+    submodule_lines = [line for line in submodules.stdout.splitlines() if line]
+    if submodules.returncode or any(line[0] != " " for line in submodule_lines):
+        raise ValueError("FlashMLA build requires initialized exact submodules")
+    runtime_package = runtime_package_path.resolve(strict=True)
+    configure_log = configure_log_path.resolve(strict=True)
+    configure_text = _stable_bytes(configure_log).decode("utf-8")
+    if not (
+        re.search(r"CUDA target architectures:.*10\.0[af]", configure_text)
+        and re.search(r"FlashMLA CUDA architectures:.*10\.0[af]", configure_text)
+    ):
+        raise ValueError("FlashMLA CMake configure did not enable Blackwell architectures")
+    body: dict[str, Any] = {
+        "schema_version": 1,
+        "producer": "dflash2-flashmla-source-build-v1",
+        "vllm_commit": vllm_commit,
+        "flashmla_commit": flashmla_commit,
+        "vllm_build_recipe": _file_descriptor(recipe, _FLASHMLA_VLLM_RECIPE),
+        "flashmla_source_interface": _file_descriptor(
+            flashmla_package.parent / _FLASHMLA_SOURCE_INTERFACE,
+            _FLASHMLA_SOURCE_INTERFACE,
+        ),
+        "flashmla_submodules": submodule_lines,
+        "base_runtime": _file_descriptor(
+            base_runtime_path.resolve(strict=True), str(base_runtime_path.resolve(strict=True))
+        ),
+        "container_image": _file_descriptor(
+            image_path.resolve(strict=True), str(image_path.resolve(strict=True))
+        ),
+        "builder": _file_descriptor(builder_path.resolve(strict=True), str(builder_path.resolve(strict=True))),
+        "configure_log": _file_descriptor(configure_log, _FLASHMLA_CONFIGURE_LOG),
+        "cmake_targets": list(_FLASHMLA_EXTENSION_STEMS),
+        "extension_binaries": _flashmla_extension_descriptors(runtime_package),
+    }
+    body["receipt_sha256"] = _sha_json(body)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(_canonical(body) + "\n")
+    return hashlib.sha256(_stable_bytes(path)).hexdigest()
+
+
 def write_vllm_runtime_receipt(
     path: Path,
     package_path: Path,
@@ -463,6 +575,7 @@ def write_vllm_runtime_receipt(
     runtime_package_path: Path | None = None,
     flashmla_package_path: Path | None = None,
     flashmla_expected_commit: str = _FLASHMLA_REQUIRED_COMMIT,
+    flashmla_build_manifest_path: Path | None = None,
 ) -> str:
     """Bind clean PR source plus the complete installed runtime file set."""
     source_package = _verified_checkout(package_path, expected_commit, required_ancestor)
@@ -485,7 +598,7 @@ def write_vllm_runtime_receipt(
         "runtime_files_sha256": _sha_json(runtime_files),
     }
     if runtime_package_path is None:
-        if flashmla_package_path is not None:
+        if flashmla_package_path is not None or flashmla_build_manifest_path is not None:
             raise ValueError("source-only vLLM receipts cannot claim FlashMLA runtime provenance")
         body.update(
             schema_version=2,
@@ -518,20 +631,55 @@ def write_vllm_runtime_receipt(
             expected_commit,
             "vLLM FlashMLA build recipe",
         )
-
-        def descriptor(path: Path, relative: str) -> dict[str, Any]:
-            raw = _stable_bytes(path)
-            return {"path": relative, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        if flashmla_build_manifest_path is None:
+            raise ValueError("staged vLLM runtime requires a FlashMLA source-build manifest")
+        build_manifest_path = flashmla_build_manifest_path.resolve(strict=True)
+        build_manifest_raw = _stable_bytes(build_manifest_path)
+        build_manifest = json.loads(build_manifest_raw)
+        build_claim = (
+            build_manifest.pop("receipt_sha256", None)
+            if isinstance(build_manifest, dict)
+            else None
+        )
+        extension_binaries = _flashmla_extension_descriptors(runtime_package)
+        if (
+            build_claim != _sha_json(build_manifest)
+            or build_manifest.get("schema_version") != 1
+            or build_manifest.get("producer") != "dflash2-flashmla-source-build-v1"
+            or build_manifest.get("vllm_commit") != expected_commit
+            or build_manifest.get("flashmla_commit") != flashmla_expected_commit
+            or build_manifest.get("vllm_build_recipe")
+            != _file_descriptor(recipe, _FLASHMLA_VLLM_RECIPE)
+            or build_manifest.get("flashmla_source_interface")
+            != _file_descriptor(source_interface, _FLASHMLA_SOURCE_INTERFACE)
+            or build_manifest.get("cmake_targets") != list(_FLASHMLA_EXTENSION_STEMS)
+            or build_manifest.get("extension_binaries") != extension_binaries
+            or any(
+                not _valid_file_descriptor(build_manifest.get(name))
+                for name in ("base_runtime", "container_image", "builder")
+            )
+            or not _valid_file_descriptor(
+                build_manifest.get("configure_log"), _FLASHMLA_CONFIGURE_LOG
+            )
+            or not isinstance(build_manifest.get("flashmla_submodules"), list)
+        ):
+            raise ValueError("FlashMLA source-build manifest identity mismatch")
 
         body.update(
-            schema_version=3,
-            producer="dflash2-vllm-runtime-receipt-v3",
+            schema_version=4,
+            producer="dflash2-vllm-runtime-receipt-v4",
             flashmla_commit=flashmla_expected_commit,
-            flashmla_source_interface=descriptor(source_interface, _FLASHMLA_SOURCE_INTERFACE),
-            flashmla_generated_interface=descriptor(
+            flashmla_source_interface=_file_descriptor(
+                source_interface, _FLASHMLA_SOURCE_INTERFACE
+            ),
+            flashmla_generated_interface=_file_descriptor(
                 generated_interface, _FLASHMLA_RUNTIME_INTERFACE
             ),
-            flashmla_vllm_build_recipe=descriptor(recipe, _FLASHMLA_VLLM_RECIPE),
+            flashmla_vllm_build_recipe=_file_descriptor(recipe, _FLASHMLA_VLLM_RECIPE),
+            flashmla_build_manifest=_file_descriptor(
+                build_manifest_path, _FLASHMLA_BUILD_MANIFEST
+            ),
+            flashmla_extension_binaries=extension_binaries,
         )
     body["receipt_sha256"] = _sha_json(body)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,7 +713,7 @@ def verify_vllm_runtime(
     producer = body.get("producer") if isinstance(body, dict) else None
     if (
         claim != _sha_json(body)
-        or schema_version not in {2, 3}
+        or schema_version not in {2, 4}
         or producer != f"dflash2-vllm-runtime-receipt-v{schema_version}"
         or body.get("vllm_commit") != expected_commit
         or body.get("required_pr52816_commit") != required_ancestor
@@ -587,7 +735,7 @@ def verify_vllm_runtime(
         raise ValueError("vLLM runtime source provenance mismatch")
     if schema_version == 2:
         if files != source_files:
-            raise ValueError("staged vLLM runtime requires FlashMLA provenance receipt v3")
+            raise ValueError("staged vLLM runtime requires FlashMLA provenance receipt v4")
     else:
         flashmla_fields = (
             ("flashmla_source_interface", _FLASHMLA_SOURCE_INTERFACE),
@@ -599,17 +747,66 @@ def verify_vllm_runtime(
         for name, expected_path in flashmla_fields:
             descriptor = body.get(name)
             if (
-                not isinstance(descriptor, dict)
-                or set(descriptor) != {"path", "bytes", "sha256"}
-                or descriptor.get("path") != expected_path
-                or not isinstance(descriptor.get("bytes"), int)
-                or not _FULL_SHA256.fullmatch(str(descriptor.get("sha256", "")))
+                not _valid_file_descriptor(descriptor, expected_path)
             ):
                 raise ValueError("FlashMLA runtime provenance descriptor mismatch")
         if runtime_by_path.get(_FLASHMLA_RUNTIME_INTERFACE) != body.get(
             "flashmla_generated_interface"
         ):
             raise ValueError("FlashMLA generated interface is not bound to runtime bytes")
+        build_descriptor = body.get("flashmla_build_manifest")
+        extension_binaries = body.get("flashmla_extension_binaries")
+        if (
+            not _valid_file_descriptor(build_descriptor, _FLASHMLA_BUILD_MANIFEST)
+            or not isinstance(extension_binaries, list)
+            or len(extension_binaries) != len(_FLASHMLA_EXTENSION_STEMS)
+            or any(not _valid_file_descriptor(item) for item in extension_binaries)
+        ):
+            raise ValueError("FlashMLA source-build provenance is invalid")
+        build_path = receipt_path.parent / _FLASHMLA_BUILD_MANIFEST
+        build_raw = _stable_bytes(build_path)
+        if (
+            len(build_raw) != build_descriptor.get("bytes")
+            or hashlib.sha256(build_raw).hexdigest() != build_descriptor.get("sha256")
+        ):
+            raise ValueError("FlashMLA source-build manifest bytes mismatch")
+        build_manifest = json.loads(build_raw)
+        build_claim = (
+            build_manifest.pop("receipt_sha256", None)
+            if isinstance(build_manifest, dict)
+            else None
+        )
+        if (
+            build_claim != _sha_json(build_manifest)
+            or build_manifest.get("schema_version") != 1
+            or build_manifest.get("producer") != "dflash2-flashmla-source-build-v1"
+            or build_manifest.get("vllm_commit") != expected_commit
+            or build_manifest.get("flashmla_commit") != expected_flashmla_commit
+            or build_manifest.get("cmake_targets") != list(_FLASHMLA_EXTENSION_STEMS)
+            or build_manifest.get("extension_binaries") != extension_binaries
+            or any(
+                not _valid_file_descriptor(build_manifest.get(name))
+                for name in ("base_runtime", "container_image", "builder")
+            )
+            or not _valid_file_descriptor(
+                build_manifest.get("configure_log"), _FLASHMLA_CONFIGURE_LOG
+            )
+            or not isinstance(build_manifest.get("flashmla_submodules"), list)
+        ):
+            raise ValueError("FlashMLA source-build manifest identity mismatch")
+        configure_descriptor = build_manifest["configure_log"]
+        configure_raw = _stable_bytes(receipt_path.parent / _FLASHMLA_CONFIGURE_LOG)
+        configure_text = configure_raw.decode("utf-8")
+        if (
+            len(configure_raw) != configure_descriptor["bytes"]
+            or hashlib.sha256(configure_raw).hexdigest() != configure_descriptor["sha256"]
+            or not re.search(r"CUDA target architectures:.*10\.0[af]", configure_text)
+            or not re.search(r"FlashMLA CUDA architectures:.*10\.0[af]", configure_text)
+        ):
+            raise ValueError("FlashMLA CMake configure evidence mismatch")
+        for descriptor in extension_binaries:
+            if runtime_by_path.get(descriptor.get("path")) != descriptor:
+                raise ValueError("FlashMLA extension binary is not bound to runtime bytes")
     declared_paths = set(runtime_by_path)
     runtime_paths = {descriptor["path"] for descriptor in _runtime_files(package)}
     if declared_paths != runtime_paths:
@@ -638,6 +835,18 @@ def main() -> None:
     vllm.add_argument("--required-ancestor", required=True)
     vllm.add_argument("--flashmla-package", type=Path)
     vllm.add_argument("--flashmla-expected-commit", default=_FLASHMLA_REQUIRED_COMMIT)
+    vllm.add_argument("--flashmla-build-manifest", type=Path)
+    flashmla_build = subparsers.add_parser("flashmla-build-manifest")
+    flashmla_build.add_argument("--output", type=Path, required=True)
+    flashmla_build.add_argument("--runtime-package", type=Path, required=True)
+    flashmla_build.add_argument("--vllm-package", type=Path, required=True)
+    flashmla_build.add_argument("--flashmla-package", type=Path, required=True)
+    flashmla_build.add_argument("--base-runtime", type=Path, required=True)
+    flashmla_build.add_argument("--image", type=Path, required=True)
+    flashmla_build.add_argument("--builder", type=Path, required=True)
+    flashmla_build.add_argument("--configure-log", type=Path, required=True)
+    flashmla_build.add_argument("--vllm-commit", required=True)
+    flashmla_build.add_argument("--flashmla-commit", required=True)
     artifact = subparsers.add_parser("artifact-receipt")
     artifact.add_argument("--artifact", type=Path, required=True)
     artifact.add_argument("--output", type=Path, required=True)
@@ -657,6 +866,20 @@ def main() -> None:
             runtime_package_path=args.runtime_package,
             flashmla_package_path=args.flashmla_package,
             flashmla_expected_commit=args.flashmla_expected_commit,
+            flashmla_build_manifest_path=args.flashmla_build_manifest,
+        )
+    elif args.command == "flashmla-build-manifest":
+        receipt_sha256 = write_flashmla_build_manifest(
+            args.output,
+            args.runtime_package,
+            args.vllm_package,
+            args.flashmla_package,
+            args.base_runtime,
+            args.image,
+            args.builder,
+            args.configure_log,
+            args.vllm_commit,
+            args.flashmla_commit,
         )
     elif args.command == "artifact-receipt":
         receipt_sha256 = write_artifact_receipt(
