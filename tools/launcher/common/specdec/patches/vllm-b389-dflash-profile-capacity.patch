@@ -1,41 +1,22 @@
-diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index 92837afd6..0461ead8d 100644
---- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-+++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-@@ -365,22 +365,30 @@ class DFlashSpeculator(DraftModelSpeculator):
-             # Memory profiling path: block_tables / kv_cache_config are not initialized.
-             # Since DFlash needs to build its own attention metadata, we must skip the
-             # preparation in this path and run a minimal forward pass.
-+            profile_num_reqs = min(
-+                num_reqs,
-+                self.max_num_tokens // self.num_query_per_req,
-+            )
-+            if profile_num_reqs <= 0:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 93a8af4f0..d7bcf11bb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -667,6 +667,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_tokens = max(num_tokens, self.decode_query_len)
+             num_reqs = num_tokens // self.decode_query_len
+             assert num_tokens % self.decode_query_len == 0
++
++        if (
++            is_profile
++            and self.speculative_config is not None
++            and self.speculative_config.use_dflash()
++        ):
++            max_profile_reqs = self.max_num_tokens // self.decode_query_len
++            if max_profile_reqs <= 0:
 +                raise ValueError("DFlash query width exceeds the profile token capacity")
-+            profile_num_query_tokens = profile_num_reqs * self.num_query_per_req
++            num_reqs = min(num_reqs, max_profile_reqs)
 +
-             self.model.precompute_and_store_context_kv(
-                 self.hidden_states[:num_target_tokens],
-                 self.context_positions[:num_target_tokens],
-             )
-             # DFlash processes all speculative tokens in one forward pass,
--            # so the real token count is num_query_tokens.
--            self._prepare_eplb_forward(num_query_tokens)
-+            # bounded by the fixed query-buffer capacity during profiling.
-+            self._prepare_eplb_forward(profile_num_query_tokens)
-             self._generate_draft(
--                num_reqs,
--                num_query_tokens,
-+                num_reqs=profile_num_reqs,
-+                num_tokens_padded=profile_num_query_tokens,
-                 attn_metadata=None,
-                 slot_mappings=None,
-                 num_tokens_across_dp=num_tokens_across_dp,
-                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
-             )
--            return self.draft_tokens[:num_reqs]
-+            return self.draft_tokens[:profile_num_reqs]
--
-+
-         # The query slot mapping is written into the shared BlockTables slot_mappings.
-         # That buffer's address is what the captured CUDA graph reads from at replay.
+         # Distribute the remainder evenly so no dummy request exceeds
+         # ceil(num_tokens / num_reqs) <= max_model_len tokens.
+         num_tokens_per_request = [

@@ -30,8 +30,8 @@ _FLASHMLA_EXTENSION_STEMS = ("_flashmla_C", "_flashmla_extension_C")
 _VLLM_CUTLASS_REVISION = "v4.4.2"
 _VLLM_PROFILE_PATCH_NAME = "dflash2-vllm-profile-capacity-patch.diff"
 _VLLM_PROFILE_PATCH_BASE_NAME = "dflash2-vllm-profile-capacity-base.py"
-_VLLM_PROFILE_PATCH_TARGET = "v1/worker/gpu/spec_decode/dflash/speculator.py"
-_VLLM_PROFILE_PATCH_SHA256 = "915b27e8c526589f2cee9e114df242b67c67ff98df9afdaf2c9c3fc93c6cdd1f"
+_VLLM_PROFILE_PATCH_TARGET = "v1/worker/gpu/model_runner.py"
+_VLLM_PROFILE_PATCH_SHA256 = "540fbb17ff1b1f388435c924b73a56c997b88642608e1fa466e8874dd6e59212"
 _DFLASH2_FEATURE_PATHS = (
     "modelopt/torch/export/plugins/hf_spec_export.py",
     "modelopt/torch/speculative/config.py",

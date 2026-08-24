@@ -27,7 +27,7 @@ REQUIRED_COMMIT=b389ac29465b33f9e9c534df221ea3c129e9793f
 FLASHMLA_COMMIT=a8f794d1251cbfd88a5011445dd5582289c727e4
 VLLM_CUTLASS_COMMIT=da5e086dab31d63815acafdac9a9c5893b1c69e2
 PROFILE_PATCH="$LAUNCHER_ROOT/tools/launcher/common/specdec/patches/vllm-b389-dflash-profile-capacity.patch"
-PROFILE_PATCH_SHA256=915b27e8c526589f2cee9e114df242b67c67ff98df9afdaf2c9c3fc93c6cdd1f
+PROFILE_PATCH_SHA256=540fbb17ff1b1f388435c924b73a56c997b88642608e1fa466e8874dd6e59212
 
 [[ -f "$BASE_RUNTIME" && -f "$IMAGE" && -f "$PROFILE_PATCH" && -d "$VLLM_CHECKOUT/vllm" && -d "$FLASHMLA_CHECKOUT/flash_mla" && -d "$VLLM_CUTLASS_CHECKOUT/include/cutlass" ]] || exit 2
 [[ "$(sha256sum "$PROFILE_PATCH" | cut -d' ' -f1)" == "$PROFILE_PATCH_SHA256" ]]
@@ -51,7 +51,7 @@ vllm_cutlass_archive="$work_root/vllm-cutlass-source.tar"
 mkdir -p "$prepared" "$build_source" "$build_directory" "$(dirname "$OUTPUT_ARCHIVE")"
 tar --extract --file="$BASE_RUNTIME" --directory="$prepared"
 git -C "$VLLM_CHECKOUT" archive HEAD | tar -x -C "$build_source"
-cp "$VLLM_CHECKOUT/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py" \
+cp "$VLLM_CHECKOUT/vllm/v1/worker/gpu/model_runner.py" \
     "$prepared/dflash2-vllm-profile-capacity-base.py"
 git -C "$build_source" apply --check "$PROFILE_PATCH"
 git -C "$build_source" apply "$PROFILE_PATCH"

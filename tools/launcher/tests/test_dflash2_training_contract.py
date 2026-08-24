@@ -106,6 +106,16 @@ def _vllm_checkout(tmp_path: Path) -> tuple[Path, str, str]:
         "        # The query slot mapping is written into the shared BlockTables slot_mappings.\n"
         "        # That buffer's address is what the captured CUDA graph reads from at replay.\n"
     )
+    model_runner = package / "v1/worker/gpu/model_runner.py"
+    model_runner.write_text(
+        "".join(f"# pinned b389 line {line}\n" for line in range(1, 667))
+        + "            num_tokens = max(num_tokens, self.decode_query_len)\n"
+        "            num_reqs = num_tokens // self.decode_query_len\n"
+        "            assert num_tokens % self.decode_query_len == 0\n"
+        "        # Distribute the remainder evenly so no dummy request exceeds\n"
+        "        # ceil(num_tokens / num_reqs) <= max_model_len tokens.\n"
+        "        num_tokens_per_request = [\n"
+    )
     recipe = repo / "cmake/external_projects/flashmla.cmake"
     recipe.parent.mkdir(parents=True)
     recipe.write_text("GIT_TAG test-flashmla\n")
@@ -345,7 +355,7 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(
     base_path = patched_root / "dflash2-vllm-profile-capacity-base.py"
     __import__("shutil").copy2(patch_source, patch_path)
     __import__("shutil").copy2(
-        package / "v1/worker/gpu/spec_decode/dflash/speculator.py",
+        package / "v1/worker/gpu/model_runner.py",
         base_path,
     )
     subprocess.run(
@@ -391,7 +401,11 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(
         )
         == expected
     )
-    patched_file = patched_runtime / "v1/worker/gpu/spec_decode/dflash/speculator.py"
+    child_speculator = patched_runtime / "v1/worker/gpu/spec_decode/dflash/speculator.py"
+    assert child_speculator.read_bytes() == (
+        package / "v1/worker/gpu/spec_decode/dflash/speculator.py"
+    ).read_bytes()
+    patched_file = patched_runtime / "v1/worker/gpu/model_runner.py"
     patched_file.write_text(patched_file.read_text() + "# forged\n")
     with pytest.raises(ValueError, match="profile patch output mismatch"):
         verify_vllm_runtime(
@@ -1168,8 +1182,8 @@ def test_dflash2_serve_gate_has_a_bounded_selector_diagnostic_mode() -> None:
         assert required in script
 
 
-def test_pinned_vllm_patch_caps_only_the_dflash_profile_query_expansion() -> None:
-    """B8 profiling must fit 1024 dummy requests into the 4096-token buffer."""
+def test_pinned_vllm_patch_caps_dflash_profile_request_capacity() -> None:
+    """Both DFlash profile modes must fit B8 queries into the 4096-token buffer."""
     patch_path = (
         Path(__file__).resolve().parents[1]
         / "common/specdec/patches/vllm-b389-dflash-profile-capacity.patch"
@@ -1179,14 +1193,19 @@ def test_pinned_vllm_patch_caps_only_the_dflash_profile_query_expansion() -> Non
         Path(__file__).resolve().parents[1]
         / "common/specdec/build_dflash2_runtime.sbatch"
     ).read_text()
-    assert "Memory profiling path" in patch
-    assert "profile_num_reqs = min(" in patch
-    assert "self.max_num_tokens // self.num_query_per_req" in patch
-    assert "num_reqs=profile_num_reqs" in patch
-    assert "num_tokens_padded=profile_num_query_tokens" in patch
-    assert "return self.draft_tokens[:profile_num_reqs]" in patch
-    assert min(1024, 4096 // 8) == 512
-    assert min(1, 8 // 8) == 1
+    assert "a/vllm/v1/worker/gpu/model_runner.py" in patch
+    assert "is_profile" in patch
+    assert "self.speculative_config.use_dflash()" in patch
+    assert "self.max_num_tokens // self.decode_query_len" in patch
+    assert "max_profile_reqs <= 0" in patch
+    assert "DFlash query width exceeds the profile token capacity" in patch
+    assert "uniform_decode = True" not in patch
+    assert "dflash/speculator.py" not in patch
+    profile_reqs = {skip_attn: min(1024, 4096 // 8) for skip_attn in (True, False)}
+    assert profile_reqs == {True: 512, False: 512}
+    assert min(16, 4096 // 8) == 16
+    assert min(1024, 4097 // 8) == 512
+    assert 7 // 8 == 0
     assert 'git -C "$build_source" apply --check "$PROFILE_PATCH"' in builder
     assert 'git -C "$build_source" apply "$PROFILE_PATCH"' in builder
     assert 'cp -a "$build_source/vllm/." "$runtime_package/"' in builder
