@@ -314,6 +314,37 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
             required,
             expected_flashmla_commit=flashmla_commit,
         )
+    (runtime / "runtime.py").write_text((package / "runtime.py").read_text())
+
+    build_body = json.loads(build_manifest.read_text())
+    build_body.pop("receipt_sha256")
+    build_body.pop("focused_vllm_cmake")
+    build_body["receipt_sha256"] = hashlib.sha256(
+        json.dumps(build_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    build_manifest.write_text(
+        json.dumps(build_body, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    body["flashmla_build_manifest"] = {
+        "path": "dflash2-flashmla-build-manifest.json",
+        "bytes": build_manifest.stat().st_size,
+        "sha256": hashlib.sha256(build_manifest.read_bytes()).hexdigest(),
+    }
+    body.pop("receipt_sha256")
+    body["receipt_sha256"] = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
+    forged_receipt_sha = hashlib.sha256(receipt.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="source-build manifest identity"):
+        verify_vllm_runtime(
+            runtime,
+            receipt,
+            forged_receipt_sha,
+            expected,
+            required,
+            expected_flashmla_commit=flashmla_commit,
+        )
 
 
 def test_vllm_receipt_rejects_mutated_flashmla_build_recipe(tmp_path: Path) -> None:
@@ -411,7 +442,7 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
         "cmake_path=/scratch/job/runtime/bin/cmake\n"
         "cmake version 3.31.6\n"
         "ninja_path=/scratch/job/runtime/bin/ninja\n"
-        "1.13.0\n"
+        "1.13.0.git.kitware.jobserver-pipe-1\n"
         "-- CUDA target architectures: 10.0a\n"
         "-- FlashMLA CUDA architectures: 10.0f\n"
         "-- The VLLM_CUTLASS_SRC_DIR is set, using /scratch/vllm-cutlass-source\n"
@@ -437,6 +468,9 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
     assert hashlib.sha256(receipt.read_bytes()).hexdigest() == receipt_sha
     assert body["producer"] == "dflash2-flashmla-configure-preflight-v1"
     assert body["slurm_job_id"] == "12345"
+    assert body["configure_evidence"]["ninja_version"] == (
+        "1.13.0.git.kitware.jobserver-pipe-1"
+    )
     assert body["vllm_cutlass"]["commit"] == cutlass_commit
     assert body["vllm_cutlass"]["archive"]["sha256"] == hashlib.sha256(
         cutlass_archive.read_bytes()

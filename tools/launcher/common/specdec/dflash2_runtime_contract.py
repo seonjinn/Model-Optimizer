@@ -560,7 +560,7 @@ def _flashmla_configure_evidence(configure_log: Path) -> dict[str, str]:
         "cmake_path": r"(?m)^cmake_path=(\S*/runtime/bin/cmake)$",
         "cmake_version": r"(?m)^cmake version (3\.31\.6)$",
         "ninja_path": r"(?m)^ninja_path=(\S*/runtime/bin/ninja)$",
-        "ninja_version": r"(?m)^(1\.13\.0)$",
+        "ninja_version": r"(?m)^(1\.13\.0(?:\.git\.kitware\.jobserver-pipe-1)?)$",
         "cuda_architectures": r"CUDA target architectures:.*(10\.0[af])",
         "flashmla_architectures": r"FlashMLA CUDA architectures:.*(10\.0[af])",
         "vllm_cutlass_source": (
@@ -827,6 +827,9 @@ def write_vllm_runtime_receipt(
             or not _valid_file_descriptor(
                 build_manifest.get("configure_log"), _FLASHMLA_CONFIGURE_LOG
             )
+            or not _valid_file_descriptor(
+                build_manifest.get("focused_vllm_cmake"), "focused-CMakeLists.txt"
+            )
             or not isinstance(build_manifest.get("flashmla_submodules"), list)
         ):
             raise ValueError("FlashMLA source-build manifest identity mismatch")
@@ -956,6 +959,9 @@ def verify_vllm_runtime(
             )
             or not _valid_file_descriptor(
                 build_manifest.get("configure_log"), _FLASHMLA_CONFIGURE_LOG
+            )
+            or not _valid_file_descriptor(
+                build_manifest.get("focused_vllm_cmake"), "focused-CMakeLists.txt"
             )
             or not isinstance(build_manifest.get("flashmla_submodules"), list)
         ):
