@@ -13,7 +13,7 @@ required=(
     REPO_ROOT SOURCE_COMMIT SOURCE_INVENTORY TOKENIZER_RECEIPT
     TOKENIZER_RECEIPT_SHA256 BASELINE_AUDIT BASELINE_AUDIT_SHA256
     HELD_OUT_UUIDS HELD_OUT_FILE_SHA256 POLICY POLICY_FILE_SHA256 OUTPUT_DIR
-    IMAGE_PATH IMAGE_SHA256
+    DIAGNOSTIC_RECEIPT IMAGE_PATH IMAGE_SHA256
 )
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
@@ -35,6 +35,8 @@ done
 [[ "$IMAGE_SHA256" =~ ^[0-9a-f]{64}$ \
     && "$(sha256sum "$IMAGE_PATH" | cut -d' ' -f1)" == "$IMAGE_SHA256" ]] || exit 2
 [[ "$OUTPUT_DIR" == /* && ! -e "$OUTPUT_DIR" && ! -L "$OUTPUT_DIR" ]] || exit 2
+[[ "$DIAGNOSTIC_RECEIPT" == /* && ! -e "$DIAGNOSTIC_RECEIPT" \
+    && ! -L "$DIAGNOSTIC_RECEIPT" ]] || exit 2
 for pair in "$TOKENIZER_RECEIPT:$TOKENIZER_RECEIPT_SHA256" \
     "$BASELINE_AUDIT:$BASELINE_AUDIT_SHA256" "$HELD_OUT_UUIDS:$HELD_OUT_FILE_SHA256" \
     "$POLICY:$POLICY_FILE_SHA256"; do
@@ -63,6 +65,7 @@ srun --nodes=1 --ntasks=1 --cpus-per-task=96 --kill-on-bad-exit=1 \
         --policy "$POLICY" \
         --storage-dir "$scratch" \
         --output-dir "$OUTPUT_DIR" \
+        --diagnostic-receipt "$DIAGNOSTIC_RECEIPT" \
         --workers "$SLURM_CPUS_PER_TASK"
 [[ -f "$OUTPUT_DIR/SELECTION_MANIFEST.json" && ! -L "$OUTPUT_DIR/SELECTION_MANIFEST.json" ]] || exit 1
 [[ -f "$OUTPUT_DIR/EXECUTION_RECEIPT.json" && ! -L "$OUTPUT_DIR/EXECUTION_RECEIPT.json" ]] || exit 1

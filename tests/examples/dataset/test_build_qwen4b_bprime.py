@@ -22,7 +22,11 @@ try:
         SelectionBoundary,
         write_audit_receipt,
     )
-    from build_qwen4b_bprime import authenticate_baseline_audit, baseline_exclusion_from_audit
+    from build_qwen4b_bprime import (
+        authenticate_baseline_audit,
+        baseline_exclusion_from_audit,
+        publish_candidate_diagnostic_receipt,
+    )
     from build_specdec_inventory import make_exclusion_receipt
     from specdec_corpus_contracts import (
         SourceFile,
@@ -82,6 +86,20 @@ def test_baseline_exclusion_consumes_the_genuine_audit_producer(tmp_path: Path) 
         audit.occurrence_prompt_ids
     )
     assert authenticated.receipt_sha256 == json.loads(path.read_bytes())["receipt_sha256"]
+
+
+def test_candidate_diagnostic_receipt_is_exclusive_canonical_and_self_authenticated(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "diagnostics/candidate.json"
+    body = {"schema_version": 1, "source_commit": "1" * 40, "shards": []}
+    payload = body | {"receipt_sha256": sha256_bytes(canonical_json(body))}
+
+    publish_candidate_diagnostic_receipt(payload, destination)
+
+    assert destination.read_bytes() == canonical_json(payload) + b"\n"
+    with pytest.raises(FileExistsError):
+        publish_candidate_diagnostic_receipt(payload, destination)
 
 
 @pytest.mark.parametrize(

@@ -473,6 +473,7 @@ class CandidateInventory:
     ptv2_revision: str
     ptv2_allowlist_sha256: str
     execution_receipt: Mapping[str, Any] | None = None
+    diagnostic_receipt: Mapping[str, Any] | None = None
 
     def close(self) -> None:
         """Release temporary row storage after all sequence consumers finish."""
@@ -1778,22 +1779,86 @@ def _exclude_or_quarantine_classified_candidate(
     held_out_prompt_ids: set[str],
     quarantine_counts: dict[str, int],
 ) -> bool:
+    reason = _classified_candidate_reason(
+        payload,
+        historical_prompt_ids=historical_prompt_ids,
+        held_out_prompt_ids=held_out_prompt_ids,
+    )
+    if reason is None:
+        return False
+    _quarantine(quarantine_counts, reason)
+    return True
+
+
+def _classified_candidate_reason(
+    payload: Mapping[str, Any],
+    *,
+    historical_prompt_ids: set[str],
+    held_out_prompt_ids: set[str],
+) -> str | None:
+    """Return the exact phase-one exclusion/quarantine reason without mutating counts."""
     prompt_id = payload.get("prompt_uuid")
     if prompt_id in historical_prompt_ids:
-        _quarantine(quarantine_counts, "historical_exclusion")
-        return True
+        return "historical_exclusion"
     if prompt_id in held_out_prompt_ids:
-        _quarantine(quarantine_counts, "heldout_exclusion")
-        return True
+        return "heldout_exclusion"
     reason = payload.get("reason")
     if reason is not None:
         if not isinstance(reason, str) or reason not in _CANDIDATE_QUARANTINE_CODES:
             raise ValueError("candidate classification quarantine reason is invalid")
-        _quarantine(quarantine_counts, reason)
-        return True
+        return reason
     if not isinstance(prompt_id, str) or not isinstance(payload.get("pretoken_candidate"), dict):
         raise ValueError("candidate identity is missing before tokenization")
-    return False
+    return None
+
+
+def _diagnostic_exemplar(
+    exemplars: dict[str, list[dict[str, Any]]],
+    reason: str,
+    *,
+    shard_index: int,
+    source_row_index: int,
+    payload: Mapping[str, Any],
+) -> None:
+    bucket = exemplars.setdefault(reason, [])
+    if len(bucket) >= 3:
+        return
+    prompt_uuid = payload.get("prompt_uuid")
+    candidate = payload.get("candidate") or payload.get("pretoken_candidate")
+    if not isinstance(prompt_uuid, str) and isinstance(candidate, Mapping):
+        prompt_uuid = candidate.get("prompt_uuid")
+    bucket.append(
+        {
+            "shard_index": shard_index,
+            "source_row_index": source_row_index,
+            "prompt_uuid": prompt_uuid if isinstance(prompt_uuid, str) else None,
+            "payload_keys": sorted(str(key) for key in payload),
+        }
+    )
+
+
+def _raw_row_schema(path: Path) -> dict[str, Any]:
+    for _row_index, row in _iter_candidate_rows(path):
+        if row is None:
+            return {"row_type": "null"}
+        schema: dict[str, Any] = {
+            str(key): type(value).__name__ for key, value in sorted(row.items())
+        }
+        record_json = row.get("record_json")
+        if isinstance(record_json, str):
+            try:
+                decoded = json.loads(record_json)
+            except json.JSONDecodeError:
+                schema["record_json_decoded"] = "invalid_json"
+            else:
+                schema["record_json_decoded"] = type(decoded).__name__
+                if isinstance(decoded, dict):
+                    schema["record_json_fields"] = {
+                        str(key): type(value).__name__
+                        for key, value in sorted(decoded.items())
+                    }
+        return schema
+    return {"row_type": "empty"}
 
 
 def _merge_tokenized_candidate(
@@ -1844,6 +1909,7 @@ def _finalize_candidate_inventory(
     capacity: dict[CandidateCell, int],
     quarantine_counts: dict[str, int],
     execution_receipt: Mapping[str, Any] | None = None,
+    diagnostic_receipt: Mapping[str, Any] | None = None,
 ) -> CandidateInventory:
     capacity = dict(
         sorted(
@@ -1899,6 +1965,7 @@ def _finalize_candidate_inventory(
         ptv2_revision=_PTV2_REVISION,
         ptv2_allowlist_sha256=APPROVED_PTV2_ALLOWLIST_SHA256,
         execution_receipt=execution_receipt,
+        diagnostic_receipt=diagnostic_receipt,
     )
 
 
@@ -1955,6 +2022,8 @@ def _build_candidate_inventory_parallel(
     )
     capacity: dict[CandidateCell, int] = {}
     quarantine_counts: dict[str, int] = {}
+    diagnostic_shards: dict[int, dict[str, Any]] = {}
+    reason_exemplars: dict[str, list[dict[str, Any]]] = {}
     accepted_count = 0
     try:
         results = _run_candidate_shard_workers(tasks, effective_workers)
@@ -1963,6 +2032,7 @@ def _build_candidate_inventory_parallel(
         if _staged_tree_snapshot(sources_root) != initial_tree:
             raise ValueError("authenticated physical shard set changed during processing")
         for result in results:
+            task = tasks[result.index]
             observed = os.lstat(result.spool_path)
             if (
                 not stat.S_ISREG(observed.st_mode)
@@ -1975,10 +2045,26 @@ def _build_candidate_inventory_parallel(
                     "CREATE TABLE selected(source_row_index INTEGER PRIMARY KEY,payload BLOB NOT NULL) "
                     "WITHOUT ROWID"
                 )
+                classification_counts: dict[str, int] = {}
+                selected_count = 0
                 for source_row_index, raw_payload in shard.execute(
                     "SELECT source_row_index,payload FROM records ORDER BY source_row_index"
                 ):
                     payload = json.loads(raw_payload)
+                    classification_reason = _classified_candidate_reason(
+                        payload,
+                        historical_prompt_ids=historical_prompt_ids,
+                        held_out_prompt_ids=held_out_prompt_ids,
+                    )
+                    if classification_reason is not None:
+                        _quarantine(classification_counts, classification_reason)
+                        _diagnostic_exemplar(
+                            reason_exemplars,
+                            classification_reason,
+                            shard_index=result.index,
+                            source_row_index=source_row_index,
+                            payload=payload,
+                        )
                     if _exclude_or_quarantine_classified_candidate(
                         payload,
                         historical_prompt_ids=historical_prompt_ids,
@@ -1989,7 +2075,17 @@ def _build_candidate_inventory_parallel(
                     shard.execute(
                         "INSERT INTO selected VALUES(?,?)", (source_row_index, raw_payload)
                     )
+                    selected_count += 1
                 shard.commit()
+            diagnostic_shards[result.index] = {
+                "index": result.index,
+                "source_file_path": task.descriptor.path,
+                "source_file_sha256": task.descriptor.sha256,
+                "phase1_row_count": result.row_count,
+                "selected_for_tokenization_count": selected_count,
+                "classification_counts": dict(sorted(classification_counts.items())),
+                "raw_row_schema": _raw_row_schema(task.staged_path),
+            }
         connection.commit()
         tokenization_results = _run_candidate_tokenizers(
             tuple(
@@ -1998,20 +2094,50 @@ def _build_candidate_inventory_parallel(
             effective_workers,
         )
         for task in tasks:
+            tokenization_counts: dict[str, int] = {}
+            shard_accepted_count = 0
             with sqlite3.connect(task.spool_path) as shard:
-                for (raw_payload,) in shard.execute(
-                    "SELECT payload FROM tokenized ORDER BY source_row_index"
+                for source_row_index, raw_payload, classified_payload in shard.execute(
+                    "SELECT tokenized.source_row_index,tokenized.payload,selected.payload "
+                    "FROM tokenized JOIN selected USING(source_row_index) "
+                    "ORDER BY tokenized.source_row_index"
                 ):
                     payload = json.loads(raw_payload)
-                    if _merge_tokenized_candidate(
+                    merged = _merge_tokenized_candidate(
                         connection,
                         payload,
                         capacity=capacity,
                         quarantine_counts=quarantine_counts,
-                    ):
+                    )
+                    if merged:
                         accepted_count += 1
+                        shard_accepted_count += 1
                         if accepted_count % 10_000 == 0:
                             connection.commit()
+                    else:
+                        reason = payload.get("reason")
+                        if reason is None:
+                            reason = "duplicate_prompt_uuid"
+                        if not isinstance(reason, str):
+                            raise ValueError("candidate diagnostic reason is invalid")
+                        _quarantine(tokenization_counts, reason)
+                        exemplar_payload = payload
+                        if payload.get("candidate") is None:
+                            exemplar_payload = json.loads(classified_payload)
+                        _diagnostic_exemplar(
+                            reason_exemplars,
+                            reason,
+                            shard_index=task.index,
+                            source_row_index=source_row_index,
+                            payload=exemplar_payload,
+                        )
+            diagnostic_shards[task.index].update(
+                {
+                    "phase2_row_count": tokenization_results[task.index].row_count,
+                    "accepted_count": shard_accepted_count,
+                    "tokenization_counts": dict(sorted(tokenization_counts.items())),
+                }
+            )
         connection.commit()
         connection.close()
         finished_wall_ns = time.time_ns()
@@ -2036,6 +2162,32 @@ def _build_candidate_inventory_parallel(
             "tokenization_shards": [asdict(result) for result in tokenization_results],
         }
         execution["receipt_sha256"] = sha256_bytes(canonical_json(execution))
+        diagnostic: dict[str, Any] = {
+            "schema_version": 1,
+            "source_commit": source_commit,
+            "source_manifest_sha256": source_inventory.manifest_sha256,
+            "tokenizer_sha256": tokenizer_sha256,
+            "chat_template_sha256": chat_template_sha256,
+            "baseline_exclusion": {
+                "receipt_sha256": baseline_exclusion.receipt_sha256,
+                "prompt_ids_sha256": baseline_exclusion.prompt_ids_sha256,
+                "prompt_id_count": baseline_exclusion.prompt_id_count,
+            },
+            "held_out_exclusion": {
+                "receipt_sha256": held_out_exclusion.receipt_sha256,
+                "prompt_ids_sha256": held_out_exclusion.prompt_ids_sha256,
+                "prompt_id_count": held_out_exclusion.prompt_id_count,
+            },
+            "declared_shard_count": len(files),
+            "allocated_cpus": allocated_cpus,
+            "requested_workers": workers,
+            "effective_workers": effective_workers,
+            "accepted_count": accepted_count,
+            "quarantine_counts": dict(sorted(quarantine_counts.items())),
+            "reason_exemplars": dict(sorted(reason_exemplars.items())),
+            "shards": [diagnostic_shards[index] for index in range(len(files))],
+        }
+        diagnostic["receipt_sha256"] = sha256_bytes(canonical_json(diagnostic))
         return _finalize_candidate_inventory(
             source_inventory=source_inventory,
             tokenizer_sha256=tokenizer_sha256,
@@ -2047,6 +2199,7 @@ def _build_candidate_inventory_parallel(
             capacity=capacity,
             quarantine_counts=quarantine_counts,
             execution_receipt=MappingProxyType(execution),
+            diagnostic_receipt=MappingProxyType(diagnostic),
         )
     except BaseException:
         connection.close()

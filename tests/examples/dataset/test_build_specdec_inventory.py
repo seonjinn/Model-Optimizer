@@ -219,6 +219,29 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         assert parallel.execution_receipt["effective_workers"] == 96
         assert parallel.execution_receipt["declared_shard_count"] == 201
         assert set(parallel.execution_receipt["thread_environment"].values()) == {"1"}
+        assert parallel.diagnostic_receipt is not None
+        diagnostics = parallel.diagnostic_receipt
+        assert diagnostics["schema_version"] == 1
+        assert diagnostics["source_commit"] == "1" * 40
+        assert diagnostics["source_manifest_sha256"] == "a" * 64
+        assert diagnostics["declared_shard_count"] == 201
+        assert len(diagnostics["shards"]) == 201
+        assert sum(shard["phase1_row_count"] for shard in diagnostics["shards"]) == 610
+        assert sum(shard["accepted_count"] for shard in diagnostics["shards"]) == len(
+            parallel.rows
+        )
+        first = diagnostics["shards"][0]
+        assert first["classification_counts"]["historical_exclusion"] == 1
+        assert first["tokenization_counts"]["context_too_long"] == 2
+        assert first["accepted_count"] == 4
+        assert first["raw_row_schema"]["messages"] == "str"
+        assert first["raw_row_schema"]["tools"] == "str"
+        assert diagnostics["reason_exemplars"]["historical_exclusion"][0][
+            "prompt_uuid"
+        ] == excluded_uuid
+        body = dict(diagnostics)
+        claimed = body.pop("receipt_sha256")
+        assert claimed == module.sha256_bytes(module.canonical_json(body))
         assert parallel.quarantine_counts["historical_exclusion"] == 1
         assert not (tmp_path / "parallel-tokenizer-calls.excluded").exists()
         assert serial_marker.read_bytes() == b"11"

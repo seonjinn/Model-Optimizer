@@ -37,6 +37,26 @@ class AuthenticatedBaselineAudit:
     exclusion: ExclusionReceipt
 
 
+def publish_candidate_diagnostic_receipt(payload: Any, destination: Path) -> None:
+    """Durably publish one canonical diagnostic before selection can fail."""
+    if not isinstance(payload, dict) and not isinstance(payload, MappingProxyType):
+        raise ValueError("candidate diagnostic receipt must be a mapping")
+    body = dict(payload)
+    claimed = body.pop("receipt_sha256", None)
+    if not isinstance(claimed, str) or claimed != sha256_bytes(canonical_json(body)):
+        raise ValueError("candidate diagnostic receipt identity does not reconcile")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("xb") as stream:
+        stream.write(canonical_json(dict(payload)) + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def baseline_exclusion_from_audit(
     path: Path, *, expected: BaselineExpectation = EXPECTED_BASELINE
 ) -> ExclusionReceipt:
@@ -172,6 +192,7 @@ def main() -> int:
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--storage-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--diagnostic-receipt", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=96)
     args = parser.parse_args()
 
@@ -189,6 +210,11 @@ def main() -> int:
         storage_dir=args.storage_dir,
         workers=args.workers,
         source_commit=os.environ.get("SOURCE_COMMIT"),
+    )
+    if candidates.diagnostic_receipt is None:
+        raise RuntimeError("parallel Task5 candidate diagnostic receipt is missing")
+    publish_candidate_diagnostic_receipt(
+        candidates.diagnostic_receipt, args.diagnostic_receipt
     )
     if candidates.execution_receipt is None:
         raise RuntimeError("parallel Task5 candidate execution receipt is missing")
