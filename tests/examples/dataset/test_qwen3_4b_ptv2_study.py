@@ -70,6 +70,21 @@ def _digest(value: str) -> str:
     return sha256(value.encode("utf-8")).hexdigest()
 
 
+def test_task9_worker_count_is_bounded_by_allocation_and_exact_shards() -> None:
+    assert study_module.resolve_ptv2_worker_count(
+        96,
+        declared_shards=201,
+        environ={"SLURM_CPUS_PER_TASK": "48"},
+    ) == (48, 48)
+
+    with pytest.raises(PTV2StudyError, match="exact 201-shard"):
+        study_module.resolve_ptv2_worker_count(
+            96,
+            declared_shards=200,
+            environ={"SLURM_CPUS_PER_TASK": "96"},
+        )
+
+
 def _row(cell: str, source_row: int, prompt: str, *, language: str = "") -> PTV2StudySourceRow:
     conversation = f'{{"messages":[{{"content":"{prompt}","role":"user"}}]}}'
     completion = f'{{"content":"answer-{prompt}","role":"assistant"}}'

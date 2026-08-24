@@ -95,10 +95,13 @@ python3 "$REPO_ROOT/examples/dataset/qwen3_4b_ptv2_study.py" \
     --source-inventory "$SOURCE_INVENTORY" \
     --output-root "$scratch_root/selection" \
     --held-out-uuids "$HELD_OUT_UUIDS" \
-    --selection-receipt-root "$RECEIPT_ROOT"
+    --selection-receipt-root "$RECEIPT_ROOT" \
+    --workers "$SLURM_CPUS_PER_TASK"
 
 [[ -f "$RECEIPT_ROOT/SELECTION_RECEIPT.json" && ! -L "$RECEIPT_ROOT/SELECTION_RECEIPT.json" ]] || {
     echo "Task9 B selection did not publish its immutable receipt" >&2
     exit 1
 }
+[[ -f "$RECEIPT_ROOT.EXECUTION_RECEIPT.json" \
+    && ! -L "$RECEIPT_ROOT.EXECUTION_RECEIPT.json" ]] || exit 1
 sha256sum "$RECEIPT_ROOT/SELECTION_RECEIPT.json"
