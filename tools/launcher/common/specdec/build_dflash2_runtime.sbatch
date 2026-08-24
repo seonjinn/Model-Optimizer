@@ -84,7 +84,28 @@ endif ()
 """
 if source.count(upstream) != 1:
     raise SystemExit("exact b389 external-project closure mismatch")
-path.write_text(source.replace(upstream, focused))
+source = source.replace(upstream, focused)
+
+# These inherited base-runtime extensions are not rebuilt, and their CMake
+# targets require NVRTC even though neither FlashMLA target links it.
+omitted_targets = ("spinloop", "fs_io_C", "cumem_allocator")
+sections = (
+    ("# spinloop extension", "# Forward the non-CUDA device extensions"),
+    ("# cumem_allocator extension", "# Legacy _C extension"),
+)
+for start, end in sections:
+    if source.count(start) != 1 or source.count(end) != 1:
+        raise SystemExit(f"exact b389 inherited target closure mismatch: {start}")
+    left = source.index(start)
+    right = source.index(end, left)
+    source = (
+        source[:left]
+        + "# DFlash2 focused source build: omit inherited non-FlashMLA extension targets.\n"
+        + source[right:]
+    )
+if any(f"    {target}\n" in source for target in omitted_targets):
+    raise SystemExit("focused CMake still defines an inherited extension target")
+path.write_text(source)
 PY
 focused_vllm_cmake="$build_source/CMakeLists.txt"
 

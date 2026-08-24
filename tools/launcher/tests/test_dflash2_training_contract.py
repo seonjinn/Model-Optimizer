@@ -938,6 +938,8 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "da5e086dab31d63815acafdac9a9c5893b1c69e2",
         "vllm-cutlass-source.tar",
         "focused FlashMLA-only external project closure",
+        "omit inherited non-FlashMLA extension targets",
+        '"spinloop", "fs_io_C", "cumem_allocator"',
         "focused_vllm_cmake",
         'include(cmake/external_projects/flashmla.cmake)',
         "TORCH_CUDA_ARCH_LIST=10.0a",
