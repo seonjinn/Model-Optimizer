@@ -37,6 +37,7 @@ from build_specdec_inventory import (
     APPROVED_PTV2_REVISION,
     CandidateInventory,
     CandidatePrompt,
+    CandidateTokenizer,
     candidate_inventory_sha256,
     is_approved_ptv2_source,
     verify_candidate_inventory_membership,
@@ -120,6 +121,8 @@ class SelectedPrompt:
     selection_index: int
     status: Literal["primary", "reserve"]
     canonical_prompt_json: str
+    source_conversation_sha256: str | None = None
+    source_response_sha256: str | None = None
 
     @property
     def canonical_prompt(self) -> Any:
@@ -594,6 +597,8 @@ def select_bprime_prompt_view(
     policy: PromptPolicy,
     *,
     source_inventory: SourceInventory,
+    tokenizer: CandidateTokenizer,
+    tokenizer_sha256: str,
     baseline_receipt_sha256: str,
     held_out_receipt_sha256: str,
 ) -> BPrimePromptViewBundle:
@@ -612,7 +617,12 @@ def select_bprime_prompt_view(
         _validate_exclusion_receipts(inventory, baseline_receipt_sha256, held_out_receipt_sha256)
         authenticated_source_inventory = _validate_bprime_source_inventory(source_inventory)
         _validate_bprime_only_rows(inventory.rows, authenticated_source_inventory)
-        verify_candidate_inventory_membership(inventory, authenticated_source_inventory)
+        verify_candidate_inventory_membership(
+            inventory,
+            authenticated_source_inventory,
+            tokenizer=tokenizer,
+            tokenizer_sha256=tokenizer_sha256,
+        )
         connection = storage.open_working_connection()
         _create_selection_schema(connection)
         _spool_candidates(connection, inventory.rows, policy)
@@ -751,6 +761,8 @@ def _validate_bprime_only_rows(rows: Iterable[Any], source_inventory: SourceInve
             raise ValueError("PTV2 candidate does not use the canonical cell and lane")
         if row.language != expected[1]:
             raise ValueError("PTV2 candidate language does not match its source split")
+        _validate_digest(row.source_conversation_sha256 or "", "source conversation")
+        _validate_digest(row.source_response_sha256 or "", "source response")
         if (
             row.source_manifest_sha256 != source_inventory.manifest_sha256
             or (
@@ -958,6 +970,8 @@ def _candidate_payload(candidate: CandidatePrompt) -> str:
             "source_manifest_sha256": candidate.source_manifest_sha256,
             "source_file_path": candidate.source_file_path,
             "source_row_index": candidate.source_row_index,
+            "source_conversation_sha256": candidate.source_conversation_sha256,
+            "source_response_sha256": candidate.source_response_sha256,
             "canonical_prompt_json": candidate.canonical_bytes.decode("utf-8"),
         },
         ensure_ascii=False,
@@ -1727,5 +1741,7 @@ def _selected_manifest_record(row: SelectedPrompt) -> dict[str, Any]:
         "candidate_rank_sha256": row.candidate_rank_sha256,
         "selection_index": row.selection_index,
         "status": row.status,
+        "source_conversation_sha256": row.source_conversation_sha256,
+        "source_response_sha256": row.source_response_sha256,
         "canonical_prompt": row.canonical_prompt,
     }

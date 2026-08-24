@@ -174,8 +174,14 @@ def test_inventory_binds_exclusion_receipts_and_pinned_ptv2_family(tmp_path: Pat
         tmp_path,
         "math",
         [
-            {"messages": excluded, "language": "en"},
-            {"messages": admitted, "language": "en"},
+            {
+                "messages": [*excluded, {"role": "assistant", "content": "excluded-answer"}],
+                "language": "en",
+            },
+            {
+                "messages": [*admitted, {"role": "assistant", "content": "admitted-answer"}],
+                "language": "en",
+            },
         ],
     )
     source = _source(module, split="math", path=path)

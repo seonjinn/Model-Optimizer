@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 import weakref
 from collections.abc import Mapping, Sequence
@@ -29,7 +30,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, overload
+from typing import Any, Literal, Protocol, overload
 
 import yaml
 from specdec_corpus_contracts import (
@@ -48,6 +49,7 @@ __all__ = [
     "CandidateCell",
     "CandidateInventory",
     "CandidatePrompt",
+    "CandidateTokenizer",
     "DiskBackedCandidateRows",
     "ExclusionProof",
     "ExclusionReceipt",
@@ -135,6 +137,16 @@ class CandidateCell:
     lane: str
     language: str
     context_bucket: str
+
+
+class CandidateTokenizer(Protocol):
+    """Exact pinned chat-template adapter used to authenticate candidate tokenization."""
+
+    tokenizer_sha256: str
+
+    def apply_chat_template(self, messages: Any, **kwargs: Any) -> Any:
+        """Return token IDs for the supplied canonical prompt."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -231,6 +243,8 @@ class CandidatePrompt(CanonicalPrompt):
     source_repository_id: str
     source_configuration: str
     source_split: str
+    source_conversation_sha256: str | None = None
+    source_response_sha256: str | None = None
 
     @property
     def arm_domain(self) -> str:
@@ -258,6 +272,8 @@ _CANDIDATE_COLUMNS = (
     "source_repository_id",
     "source_configuration",
     "source_split",
+    "source_conversation_sha256",
+    "source_response_sha256",
 )
 
 
@@ -319,6 +335,8 @@ class DiskBackedCandidateRows(Sequence[CandidatePrompt]):
             source_repository_id=values["source_repository_id"],
             source_configuration=values["source_configuration"],
             source_split=values["source_split"],
+            source_conversation_sha256=values["source_conversation_sha256"],
+            source_response_sha256=values["source_response_sha256"],
         )
 
     def __iter__(self):
@@ -532,6 +550,108 @@ def _iter_candidate_rows(path: Path):
             row_index += 1
 
 
+def _iter_candidate_rows_fd(descriptor: int, suffix: str):
+    """Stream rows through a stable no-follow file descriptor."""
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(descriptor), "rb") as stream:
+        if suffix == ".parquet":
+            import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
+
+            row_index = 0
+            for batch in pq.ParquetFile(stream).iter_batches(batch_size=1_024):
+                for raw_row in batch.to_pylist():
+                    value: Any = raw_row
+                    if isinstance(raw_row, dict) and set(raw_row) == {"raw_json"}:
+                        encoded = raw_row["raw_json"]
+                        try:
+                            value = json.loads(encoded) if isinstance(encoded, str | bytes) else None
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            value = None
+                    yield row_index, value if isinstance(value, dict) else None
+                    row_index += 1
+            return
+        row_index = 0
+        for raw_line in stream:
+            if not raw_line.strip():
+                continue
+            try:
+                value = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                value = None
+            yield row_index, value if isinstance(value, dict) else None
+            row_index += 1
+
+
+def _sha256_fd(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(descriptor), "rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stable_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def _staged_tree_snapshot(root: Path) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Capture lexical staged-tree identities while rejecting links and special files."""
+    root_stat = os.lstat(root)
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise ValueError("staged Task 3 sources root is not a no-follow directory")
+    snapshot = {
+        ".": (root_stat.st_mode, *_stable_stat_identity(root_stat)),
+    }
+    for path in root.rglob("*"):
+        observed = os.lstat(path)
+        relative = path.relative_to(root).as_posix()
+        if stat.S_ISLNK(observed.st_mode):
+            raise ValueError("staged Task 3 physical shard set contains a symlink")
+        if not stat.S_ISREG(observed.st_mode) and not stat.S_ISDIR(observed.st_mode):
+            raise ValueError("staged Task 3 physical shard set contains a non-regular entry")
+        snapshot[relative] = (observed.st_mode, *_stable_stat_identity(observed))
+    return snapshot
+
+
+def _open_verified_source_fd(path: Path, source_file: SourceFile) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("stable source authentication requires O_NOFOLLOW")
+    flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"source file is not a no-follow regular file: {source_file.path}") from error
+    initial = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(initial.st_mode)
+        or initial.st_size != source_file.bytes
+        or _sha256_fd(descriptor) != source_file.sha256
+    ):
+        os.close(descriptor)
+        raise ValueError(f"source file stable identity mismatch: {source_file.path}")
+    return descriptor, initial
+
+
+def _verify_source_fd_stable(
+    descriptor: int, initial: os.stat_result, path: Path, source_file: SourceFile
+) -> None:
+    final = os.fstat(descriptor)
+    try:
+        pathname = os.lstat(path)
+    except OSError as error:
+        raise ValueError(f"source file changed during authentication: {source_file.path}") from error
+    if (
+        _stable_stat_identity(final) != _stable_stat_identity(initial)
+        or stat.S_ISLNK(pathname.st_mode)
+        or not stat.S_ISREG(pathname.st_mode)
+        or (pathname.st_dev, pathname.st_ino) != (final.st_dev, final.st_ino)
+        or _sha256_fd(descriptor) != source_file.sha256
+    ):
+        raise ValueError(f"source file changed during authentication: {source_file.path}")
+
+
 def _context_bucket(token_count: int) -> str:
     if token_count <= 4096:
         return "le4k"
@@ -662,6 +782,35 @@ def _target_prompt(row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict
     return messages, tools
 
 
+def _ptv2_target_prompt_identity(
+    row: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, str]:
+    """Extract a PTV2 prompt and bind its source-native terminal response."""
+    messages = _row_messages(row)
+    tools = deepcopy(row.get("tools") or [])
+    if not isinstance(tools, list):
+        raise ValueError("invalid_tools")
+    if messages[-1].get("role") != "assistant":
+        raise ValueError("PTV2 source-native assistant response is missing")
+    source_conversation = canonical_json({"messages": messages, "tools": tools})
+    source_response = canonical_json(messages[-1])
+    prompt_messages = messages[:-1]
+    if not prompt_messages:
+        raise ValueError("missing_messages")
+    has_tool_exchange = bool(tools) or any(
+        message.get("role") == "tool" or message.get("tool_calls")
+        for message in prompt_messages
+    )
+    if has_tool_exchange:
+        raise ValueError("wrong_lane")
+    return (
+        prompt_messages,
+        tools,
+        sha256_bytes(source_conversation),
+        sha256_bytes(source_response),
+    )
+
+
 def _candidate_tokenize(
     tokenizer: Any,
     messages: list[dict[str, Any]],
@@ -714,7 +863,9 @@ def _create_candidate_database(path: Path) -> sqlite3.Connection:
             source_family TEXT NOT NULL CHECK (source_family IN ('ptv2', 'ptv3')),
             source_repository_id TEXT NOT NULL,
             source_configuration TEXT NOT NULL,
-            source_split TEXT NOT NULL
+            source_split TEXT NOT NULL,
+            source_conversation_sha256 TEXT,
+            source_response_sha256 TEXT
         ) WITHOUT ROWID
         """
     )
@@ -746,6 +897,8 @@ def _insert_candidate(connection: sqlite3.Connection, candidate: CandidatePrompt
             candidate.source_repository_id,
             candidate.source_configuration,
             candidate.source_split,
+            candidate.source_conversation_sha256,
+            candidate.source_response_sha256,
         ),
     )
 
@@ -773,6 +926,8 @@ def _candidate_record(prompt: CandidatePrompt) -> dict[str, Any]:
         "source_repository_id": prompt.source_repository_id,
         "source_configuration": prompt.source_configuration,
         "source_split": prompt.source_split,
+        "source_conversation_sha256": prompt.source_conversation_sha256,
+        "source_response_sha256": prompt.source_response_sha256,
     }
 
 
@@ -854,6 +1009,8 @@ def build_candidate_inventory(
                     continue
                 row = dict(raw_row)
                 try:
+                    source_conversation_sha256: str | None = None
+                    source_response_sha256: str | None = None
                     if source.lane in {"interactive-swe-replay", "generic-tool-replay"}:
                         validation = validate_trajectory(
                             row,
@@ -867,7 +1024,15 @@ def build_candidate_inventory(
                         canonical_bytes = validation.canonical_bytes
                         replay_valid = True
                     else:
-                        messages, tools = _target_prompt(row)
+                        if _approved_ptv2_source(source):
+                            (
+                                messages,
+                                tools,
+                                source_conversation_sha256,
+                                source_response_sha256,
+                            ) = _ptv2_target_prompt_identity(row)
+                        else:
+                            messages, tools = _target_prompt(row)
                         canonical_bytes = canonicalize_prompt(messages, tools)
                         replay_valid = False
                     canonical_prompt = json.loads(canonical_bytes)
@@ -928,6 +1093,8 @@ def build_candidate_inventory(
                     source_repository_id=source.repository_id,
                     source_configuration=source.configuration,
                     source_split=source.split,
+                    source_conversation_sha256=source_conversation_sha256,
+                    source_response_sha256=source_response_sha256,
                 )
                 _insert_candidate(connection, candidate)
                 accepted_count += 1
@@ -998,16 +1165,35 @@ def build_candidate_inventory(
 
 
 def verify_candidate_inventory_membership(
-    inventory: CandidateInventory, source_inventory: SourceInventory
+    inventory: CandidateInventory,
+    source_inventory: SourceInventory,
+    *,
+    tokenizer: CandidateTokenizer,
+    tokenizer_sha256: str,
 ) -> None:
     """Rejoin every candidate to its authenticated staged physical source row."""
+    if _SHA256.fullmatch(tokenizer_sha256) is None:
+        raise ValueError("physical membership requires an exact tokenizer digest")
+    if getattr(tokenizer, "tokenizer_sha256", None) != tokenizer_sha256:
+        raise ValueError("physical membership tokenizer adapter identity mismatch")
     files = _verified_candidate_files(source_inventory)
     assert source_inventory.staged_root is not None
-    expected_paths = {path.resolve() for _source, _descriptor, path in files}
+    staged_root = source_inventory.staged_root.resolve(strict=True)
+    sources_root = staged_root / "sources"
+    expected_paths = {
+        (
+            Path("sources")
+            / source.repository_id
+            / source.revision
+            / source_file.path
+        ).as_posix()
+        for source, source_file, _path in files
+    }
+    initial_tree = _staged_tree_snapshot(sources_root)
     actual_paths = {
-        path.resolve()
-        for path in (source_inventory.staged_root / "sources").rglob("*")
-        if path.is_file()
+        (Path("sources") / relative).as_posix()
+        for relative, identity in initial_tree.items()
+        if relative != "." and stat.S_ISREG(identity[0])
     }
     if actual_paths != expected_paths:
         raise ValueError("staged Task 3 physical shard set does not match its receipt")
@@ -1021,7 +1207,8 @@ def verify_candidate_inventory_membership(
             "CREATE TABLE wanted("
             "repository_id TEXT,configuration TEXT,split TEXT,revision TEXT,file_path TEXT,"
             "source_row INTEGER,prompt_uuid TEXT,canonical_bytes BLOB,source_id TEXT,language TEXT,"
-            "domain TEXT,lane TEXT,"
+            "domain TEXT,lane TEXT,context_bucket TEXT,full_token_count INTEGER,input_ids TEXT,"
+            "tokenizer_sha256 TEXT,source_conversation_sha256 TEXT,source_response_sha256 TEXT,"
             "PRIMARY KEY(repository_id,configuration,split,revision,file_path,source_row));"
         )
         observed_capacity: dict[CandidateCell, int] = {}
@@ -1031,8 +1218,9 @@ def verify_candidate_inventory_membership(
             row = candidate
             inserted = connection.execute(
                 "INSERT OR IGNORE INTO wanted(repository_id,configuration,split,revision,file_path,"
-                "source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane,context_bucket,"
+                "full_token_count,input_ids,tokenizer_sha256,source_conversation_sha256,"
+                "source_response_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     row.source_repository_id,
                     row.source_configuration,
@@ -1046,6 +1234,12 @@ def verify_candidate_inventory_membership(
                     row.language,
                     row.domain,
                     row.lane,
+                    row.context_bucket,
+                    row.full_token_count,
+                    json.dumps(row.input_ids, separators=(",", ":")),
+                    row.tokenizer_sha256,
+                    row.source_conversation_sha256,
+                    row.source_response_sha256,
                 ),
             )
             if inserted.rowcount != 1:
@@ -1060,7 +1254,9 @@ def verify_candidate_inventory_membership(
         for source, _file, path in files:
             wanted_rows = iter(
                 connection.execute(
-                    "SELECT source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane "
+                    "SELECT source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane,"
+                    "context_bucket,full_token_count,input_ids,tokenizer_sha256,"
+                    "source_conversation_sha256,source_response_sha256 "
                     "FROM wanted WHERE repository_id=? AND configuration=? AND split=? "
                     "AND revision=? AND file_path=? ORDER BY source_row",
                     (
@@ -1073,39 +1269,66 @@ def verify_candidate_inventory_membership(
                 )
             )
             wanted = next(wanted_rows, None)
-            if wanted is None:
-                continue
-            for row_index, raw_row in _iter_candidate_rows(path):
-                if row_index < wanted[0]:
-                    continue
-                if row_index != wanted[0] or raw_row is None:
-                    raise ValueError("candidate does not match its physical Task 3 row")
-                try:
-                    raw = dict(raw_row)
-                    messages, tools = _target_prompt(raw)
-                    canonical_bytes = canonicalize_prompt(messages, tools)
-                    language = _normalize_language(raw.get("language"), source)
-                except (TypeError, ValueError) as error:
-                    raise ValueError("candidate does not match its physical Task 3 row") from error
-                expected = (
-                    sha256_bytes(canonical_bytes),
-                    canonical_bytes,
-                    f"{source.repository_id}:{source.configuration}:{source.split}",
-                    language,
-                    _candidate_domain(source),
-                    source.lane,
-                )
-                if wanted[1:] != expected:
-                    raise ValueError("candidate does not match its physical Task 3 row")
-                matched += 1
-                wanted = next(wanted_rows, None)
-                if wanted is None:
-                    break
+            file_descriptor, initial_stat = _open_verified_source_fd(path, _file)
+            try:
+                if wanted is not None:
+                    for row_index, raw_row in _iter_candidate_rows_fd(
+                        file_descriptor, path.suffix
+                    ):
+                        if row_index < wanted[0]:
+                            continue
+                        if row_index != wanted[0] or raw_row is None:
+                            raise ValueError("candidate does not match its physical Task 3 row")
+                        try:
+                            raw = dict(raw_row)
+                            (
+                                messages,
+                                tools,
+                                source_conversation_sha256,
+                                source_response_sha256,
+                            ) = _ptv2_target_prompt_identity(raw)
+                            canonical_bytes = canonicalize_prompt(messages, tools)
+                            language = _normalize_language(raw.get("language"), source)
+                            input_ids = _candidate_tokenize(
+                                tokenizer, messages, tools, add_generation_prompt=True
+                            )
+                            context_bucket = _context_bucket(len(input_ids))
+                        except (TypeError, ValueError) as error:
+                            raise ValueError(
+                                "candidate does not match its physical Task 3 row or tokenization"
+                            ) from error
+                        expected = (
+                            sha256_bytes(canonical_bytes),
+                            canonical_bytes,
+                            f"{source.repository_id}:{source.configuration}:{source.split}",
+                            language,
+                            _candidate_domain(source),
+                            source.lane,
+                            context_bucket,
+                            len(input_ids),
+                            json.dumps(input_ids, separators=(",", ":")),
+                            tokenizer_sha256,
+                            source_conversation_sha256,
+                            source_response_sha256,
+                        )
+                        if wanted[1:] != expected:
+                            raise ValueError(
+                                "candidate does not match its physical Task 3 row or tokenization"
+                            )
+                        matched += 1
+                        wanted = next(wanted_rows, None)
+                        if wanted is None:
+                            break
+                _verify_source_fd_stable(file_descriptor, initial_stat, path, _file)
+            finally:
+                os.close(file_descriptor)
             if wanted is not None:
                 raise ValueError("candidate is absent from its physical Task 3 row")
         expected_count = int(connection.execute("SELECT count(*) FROM wanted").fetchone()[0])
         if matched != expected_count:
             raise ValueError("candidate is absent from its physical Task 3 row")
+        if _staged_tree_snapshot(sources_root) != initial_tree:
+            raise ValueError("staged Task 3 source tree changed during authentication")
     finally:
         connection.close()
         database.unlink(missing_ok=True)

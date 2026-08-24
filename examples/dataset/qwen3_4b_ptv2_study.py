@@ -732,10 +732,11 @@ def iter_ptv2_staged_source_rows(
                     isinstance(item, dict) for item in messages
                 ):
                     raise PTV2StudyError("PTV2 messages must be a list of mappings")
-                assistants = [item for item in messages if item.get("role") == "assistant"]
-                if not assistants:
-                    raise PTV2StudyError("PTV2 row has no source-native assistant response")
-                response = canonical_json(assistants[-1]).decode("utf-8")
+                if not messages or messages[-1].get("role") != "assistant":
+                    raise PTV2StudyError(
+                        "PTV2 row has no terminal source-native assistant response"
+                    )
+                response = canonical_json(messages[-1]).decode("utf-8")
                 tools = record.get("tools")
                 if isinstance(tools, str):
                     tools = json.loads(tools)
@@ -746,10 +747,11 @@ def iter_ptv2_staged_source_rows(
                 conversation = canonical_json({"messages": messages, "tools": tools or []}).decode(
                     "utf-8"
                 )
-                prompt_messages = [
-                    item for item in messages if item.get("role") in {"system", "developer", "user"}
-                ]
-                if not prompt_messages:
+                prompt_messages = messages[:-1]
+                if not any(
+                    item.get("role") in {"system", "developer", "user"}
+                    for item in prompt_messages
+                ):
                     raise PTV2StudyError("PTV2 row has no prompt-bearing message")
                 yield PTV2StudySourceRow(
                     prompt_uuid=prompt_uuid(prompt_messages, tools),
@@ -777,7 +779,8 @@ def _iter_task5_selected_rows(
     try:
         connection.executescript(
             "CREATE TABLE wanted(ordinal INTEGER UNIQUE,identity_sha256 TEXT,source_row INTEGER,"
-            "prompt_uuid TEXT,PRIMARY KEY(identity_sha256,source_row));"
+            "prompt_uuid TEXT,conversation_sha256 TEXT,response_sha256 TEXT,"
+            "PRIMARY KEY(identity_sha256,source_row));"
             "CREATE TABLE joined(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT,identity_sha256 TEXT,"
             "source_row INTEGER,cell TEXT,language TEXT,conversation TEXT,response TEXT);"
         )
@@ -789,6 +792,10 @@ def _iter_task5_selected_rows(
                 raise PTV2StudyError(
                     "Task 5 complement row is not bound to this PTV2 SourceInventory"
                 )
+            _require_digest(
+                selected.source_conversation_sha256, "Task 5 source conversation digest"
+            )
+            _require_digest(selected.source_response_sha256, "Task 5 source response digest")
             identity = sha256(
                 canonical_json(
                     [
@@ -801,19 +808,35 @@ def _iter_task5_selected_rows(
                 )
             ).hexdigest()
             connection.execute(
-                "INSERT INTO wanted VALUES(?,?,?,?)",
-                (ordinal, identity, selected.source_row_index, selected.prompt_uuid),
+                "INSERT INTO wanted VALUES(?,?,?,?,?,?)",
+                (
+                    ordinal,
+                    identity,
+                    selected.source_row_index,
+                    selected.prompt_uuid,
+                    selected.source_conversation_sha256,
+                    selected.source_response_sha256,
+                ),
             )
         connection.commit()
         for row in iter_ptv2_staged_source_rows(inventory_receipt, policy=policy):
             wanted = connection.execute(
-                "SELECT ordinal,prompt_uuid FROM wanted WHERE identity_sha256=? AND source_row=?",
+                "SELECT ordinal,prompt_uuid,conversation_sha256,response_sha256 FROM wanted "
+                "WHERE identity_sha256=? AND source_row=?",
                 (row.source_identity_sha256, row.source_row),
             ).fetchone()
             if wanted is None:
                 continue
             if wanted[1] != row.prompt_uuid:
                 raise PTV2StudyError("Task 5 prompt UUID does not match Task 3 physical source row")
+            if wanted[2] != sha256(row.canonical_conversation.encode("utf-8")).hexdigest():
+                raise PTV2StudyError(
+                    "Task 5 conversation identity does not match Task 3 physical source row"
+                )
+            if wanted[3] != sha256(row.assistant_response.encode("utf-8")).hexdigest():
+                raise PTV2StudyError(
+                    "Task 5 response identity does not match Task 3 physical source row"
+                )
             connection.execute(
                 "INSERT INTO joined VALUES(?,?,?,?,?,?,?,?)",
                 (

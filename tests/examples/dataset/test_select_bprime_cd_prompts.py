@@ -35,6 +35,7 @@ MODULE_DIR = ROOT / "examples/dataset"
 
 sys.path.insert(0, str(MODULE_DIR))
 try:
+    import build_specdec_inventory as inventory_module
     import select_bprime_cd_prompts as selection_module
     from bprime_cd_policy import ArmPolicy, PromptCell, PromptPolicy, load_prompt_policy
     from build_specdec_inventory import (
@@ -83,13 +84,18 @@ PTV2_SPLITS = (
 
 
 class _CandidateTokenizer:
+    tokenizer_sha256 = "d" * 64
+
     def apply_chat_template(self, messages, **kwargs):
         assert kwargs["add_generation_prompt"] is True
         return {"input_ids": list(range(1, len(messages) + 1))}
 
 
 def _genuine_task3_ptv2(
-    tmp_path: Path, *, splits: tuple[str, ...] = PTV2_SPLITS
+    tmp_path: Path,
+    *,
+    splits: tuple[str, ...] = PTV2_SPLITS,
+    omit_first_assistant: bool = False,
 ) -> tuple[SourceInventory, CandidateInventory]:
     local = tmp_path / "local"
     sources = []
@@ -102,27 +108,22 @@ def _genuine_task3_ptv2(
             relative = f"data/{split}/{file_index:03d}.jsonl"
             source = local / PTV2_REPOSITORY / PTV2_REVISION / relative
             source.parent.mkdir(parents=True, exist_ok=True)
-            source.write_text(
-                "".join(
-                    json.dumps(
-                        {
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": f"question-{split}-{file_index}-{row_index}",
-                                },
-                                {
-                                    "role": "assistant",
-                                    "content": f"answer-{split}-{file_index}-{row_index}",
-                                },
-                            ]
-                        }
-                    )
-                    + "\n"
-                    for row_index in range(3)
-                ),
-                encoding="utf-8",
-            )
+            records = []
+            for row_index in range(3):
+                messages = [
+                    {
+                        "role": "user",
+                        "content": f"question-{split}-{file_index}-{row_index}",
+                    },
+                    {
+                        "role": "assistant",
+                        "content": f"answer-{split}-{file_index}-{row_index}",
+                    },
+                ]
+                if omit_first_assistant and split_index == file_index == row_index == 0:
+                    messages.pop()
+                records.append(json.dumps({"messages": messages}) + "\n")
+            source.write_text("".join(records), encoding="utf-8")
             files.append(
                 {
                     "path": relative,
@@ -395,6 +396,8 @@ def test_bprime_only_producer_rejects_self_hashed_unstaged_task3_inventory() -> 
             candidates,
             _policy(),
             source_inventory=source_inventory,
+            tokenizer=_CandidateTokenizer(),
+            tokenizer_sha256="d" * 64,
             baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
             held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
         )
@@ -409,6 +412,8 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         candidates,
         _policy(),
         source_inventory=source_inventory,
+        tokenizer=_CandidateTokenizer(),
+        tokenizer_sha256="d" * 64,
         baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
         held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
     )
@@ -429,6 +434,42 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         }
 
 
+def test_bprime_selection_preserves_source_response_identities(tmp_path: Path) -> None:
+    """Task5 rows and their published reload bind the physical PTV2 response."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    bundle = select_bprime_prompt_view(
+        candidates,
+        _policy(),
+        source_inventory=source_inventory,
+        tokenizer=_CandidateTokenizer(),
+        tokenizer_sha256="d" * 64,
+        baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+        held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+    )
+    try:
+        selected = bundle.B_prime.primary_rows[0]
+        assert selected.source_conversation_sha256 is not None
+        assert selected.source_response_sha256 is not None
+        published = publish_bprime_prompt_view_bundle(
+            bundle, tmp_path / "response-bound", rows_per_shard=17
+        )
+    finally:
+        bundle.close()
+        candidates.rows.close()
+    sys.path.insert(0, str(MODULE_DIR))
+    try:
+        from promote_synthesis_reserve import load_prompt_view
+    finally:
+        sys.path.pop(0)
+    loaded = load_prompt_view(
+        published.manifest_path,
+        expected_manifest_sha256=hashlib.sha256(published.manifest_path.read_bytes()).hexdigest(),
+        arm="B-prime",
+    )
+    assert loaded.primary_rows[0].source_conversation_sha256 is not None
+    assert loaded.primary_rows[0].source_response_sha256 is not None
+
+
 def test_bprime_only_producer_rejects_ptv3_candidate_contamination(tmp_path: Path) -> None:
     """No PTV3 candidate can enter the physical PTV2-only producer."""
     source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
@@ -444,6 +485,8 @@ def test_bprime_only_producer_rejects_ptv3_candidate_contamination(tmp_path: Pat
                 mixed,
                 _policy(),
                 source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -460,6 +503,8 @@ def test_bprime_only_producer_rejects_wrong_task3_split_topology(tmp_path: Path)
                 candidates,
                 _policy(),
                 source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -492,11 +537,132 @@ def test_bprime_only_producer_rejects_changed_physical_task3_shards(
                 candidates,
                 _policy(),
                 source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
     finally:
         candidates.rows.close()
+
+
+def test_bprime_only_producer_rejects_undeclared_symlink_alias(tmp_path: Path) -> None:
+    """Resolved-path set equality must not hide an extra staged directory entry."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    assert source_inventory.staged_root is not None
+    first = next(
+        path
+        for path in (source_inventory.staged_root / "sources").rglob("*.jsonl")
+        if path.is_file()
+    )
+    (first.parent / "undeclared-link.jsonl").symlink_to(first.name)
+    try:
+        with pytest.raises(ValueError, match="physical shard set"):
+            select_bprime_prompt_view(
+                candidates,
+                _policy(),
+                source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
+
+
+def test_bprime_only_producer_rejects_source_mutation_during_stable_fd_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shard changed after open cannot pass using its earlier authenticated digest."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    assert source_inventory.staged_root is not None
+    source = source_inventory.sources[0]
+    source_file = source.files[0]
+    path = (
+        source_inventory.staged_root
+        / "sources"
+        / source.repository_id
+        / source.revision
+        / source_file.path
+    )
+    original = inventory_module._iter_candidate_rows_fd
+    mutated = False
+
+    def mutating_rows(descriptor: int, suffix: str):
+        nonlocal mutated
+        for row in original(descriptor, suffix):
+            yield row
+            if not mutated:
+                path.write_bytes(path.read_bytes() + b" ")
+                mutated = True
+
+    monkeypatch.setattr(inventory_module, "_iter_candidate_rows_fd", mutating_rows)
+    try:
+        with pytest.raises(ValueError, match="changed during authentication"):
+            select_bprime_prompt_view(
+                candidates,
+                _policy(),
+                source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
+
+
+def test_bprime_only_producer_rejects_rehashed_tokenization_and_capacity(tmp_path: Path) -> None:
+    """Bucket capacity is derived from the pinned tokenizer, not candidate metadata."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    rows = list(_candidate_rows(candidates))
+    rows[0] = replace(
+        rows[0], context_bucket="16k_32k", full_token_count=20_000, input_ids=(999,)
+    )
+    capacity = Counter(
+        CandidateCell(row.domain, row.lane, row.language, row.context_bucket) for row in rows
+    )
+    forged = _rehash(
+        replace(candidates, rows=tuple(rows), capacity=MappingProxyType(dict(capacity)))
+    )
+    try:
+        with pytest.raises(ValueError, match="tokenization"):
+            select_bprime_prompt_view(
+                forged,
+                _policy(),
+                source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
+
+
+def test_bprime_only_producer_rejects_mislabeled_tokenizer_adapter(tmp_path: Path) -> None:
+    """The digest argument cannot relabel a different tokenizer/template adapter."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="tokenizer adapter identity"):
+            select_bprime_prompt_view(
+                candidates,
+                _policy(),
+                source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="e" * 64,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
+
+
+def test_bprime_only_producer_rejects_missing_source_native_response(tmp_path: Path) -> None:
+    """Every PTV2 target-synthesis candidate must bind a terminal assistant response."""
+    with pytest.raises(ValueError, match="source-native assistant response"):
+        _genuine_task3_ptv2(tmp_path, omit_first_assistant=True)
 
 
 @pytest.mark.parametrize("mutation", ["row", "uuid", "canonical"])
@@ -519,6 +685,8 @@ def test_bprime_only_producer_rejects_candidate_not_on_its_physical_row(
                 forged,
                 _policy(),
                 source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -552,6 +720,8 @@ def test_bprime_only_producer_rejects_wrong_ptv2_cell_or_language(
                 forged,
                 _policy(),
                 source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
                 baseline_receipt_sha256=inventory.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=inventory.held_out_exclusion.receipt_sha256,
             )
@@ -571,6 +741,8 @@ def test_bprime_only_producer_rejects_wrong_source_digest(tmp_path: Path) -> Non
                 forged,
                 _policy(),
                 source_inventory=source_inventory,
+                tokenizer=_CandidateTokenizer(),
+                tokenizer_sha256="d" * 64,
                 baseline_receipt_sha256=inventory.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=inventory.held_out_exclusion.receipt_sha256,
             )

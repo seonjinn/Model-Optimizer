@@ -61,6 +61,8 @@ class FakeTokenizer:
 
 
 class CandidateTokenizer:
+    tokenizer_sha256 = "f" * 64
+
     def apply_chat_template(self, messages, **kwargs):
         assert kwargs["add_generation_prompt"] is True
         return {"input_ids": [index + 1 for index, _ in enumerate(messages)]}
@@ -437,6 +439,8 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
             candidates,
             policy,
             source_inventory=inventory,
+            tokenizer=CandidateTokenizer(),
+            tokenizer_sha256="f" * 64,
             baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
             held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
         )

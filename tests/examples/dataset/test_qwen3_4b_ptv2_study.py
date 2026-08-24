@@ -97,7 +97,9 @@ def _fixture_policy():
     return replace(load_ptv2_study_policy(POLICY), ptv2_revision="a" * 40)
 
 
-def _write_authenticated_staged_parquet(tmp_path: Path) -> tuple[Path, Path]:
+def _write_authenticated_staged_parquet(
+    tmp_path: Path, *, messages_override: list[list[dict[str, str]]] | None = None
+) -> tuple[Path, Path]:
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     revision = "a" * 40
@@ -105,7 +107,7 @@ def _write_authenticated_staged_parquet(tmp_path: Path) -> tuple[Path, Path]:
         tmp_path / "source-cache" / "nvidia/PTV2Fixture" / revision / "data/declared.parquet"
     )
     source_path.parent.mkdir(parents=True)
-    messages = [
+    messages = messages_override or [
         [
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "answer-first"},
@@ -258,6 +260,8 @@ def _genuine_scaled_task5_bundle(tmp_path: Path) -> BPrimePromptViewBundle:
     )
 
     class _Tokenizer:
+        tokenizer_sha256 = "d" * 64
+
         def apply_chat_template(self, messages, **kwargs):
             assert kwargs["add_generation_prompt"] is True
             return {"input_ids": list(range(1, len(messages) + 1))}
@@ -275,6 +279,8 @@ def _genuine_scaled_task5_bundle(tmp_path: Path) -> BPrimePromptViewBundle:
             candidates,
             task5_policy,
             source_inventory=source_inventory,
+            tokenizer=_Tokenizer(),
+            tokenizer_sha256="d" * 64,
             baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
             held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
         )
@@ -1002,6 +1008,75 @@ def test_task5_published_complement_joins_the_task3_physical_row_stream(
 
     with pytest.raises(PTV2StudyError, match="B-prime"):
         tuple(study_module._iter_task5_selected_rows(view, inventory_receipt, policy))
+
+
+@pytest.mark.parametrize(
+    "forged_field", ["source_conversation_sha256", "source_response_sha256"]
+)
+def test_task5_join_rejects_forged_conversation_or_response_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forged_field: str
+) -> None:
+    """Task9 binds Task5 references to the physical conversation and terminal response."""
+    inventory_receipt, _ = _write_authenticated_staged_parquet(tmp_path)
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+    policy = _fixture_policy()
+    physical = next(iter_ptv2_staged_source_rows(inventory_receipt, policy=policy))
+    inventory = load_source_inventory(inventory_receipt)
+    source = inventory.sources[0]
+    selected = SelectedPrompt(
+        prompt_uuid=physical.prompt_uuid,
+        arm="B-prime",
+        domain="math",
+        lane="target-synth",
+        language="",
+        context_bucket="le4k",
+        source_id="fixture",
+        source_family="ptv2",
+        source_repository_id=source.repository_id,
+        source_configuration=source.configuration,
+        source_split=source.split,
+        source_revision=source.revision,
+        source_file_sha256=source.files[0].sha256,
+        source_manifest_sha256=inventory.manifest_sha256,
+        source_file_path=source.files[0].path,
+        source_row_index=physical.source_row,
+        candidate_rank=0,
+        candidate_rank_sha256="1" * 64,
+        selection_index=0,
+        status="primary",
+        canonical_prompt_json='{"messages":[],"tools":[]}',
+        source_conversation_sha256=sha256(
+            physical.canonical_conversation.encode("utf-8")
+        ).hexdigest(),
+        source_response_sha256=sha256(physical.assistant_response.encode("utf-8")).hexdigest(),
+    )
+    selected = replace(selected, **{forged_field: "f" * 64})
+    view = PromptView(
+        "B-prime", (selected,), (), {"math": 1}, {"target-synth": 1}, {}, {}, {}, "d" * 64
+    )
+
+    with pytest.raises(PTV2StudyError, match=r"conversation|response"):
+        tuple(study_module._iter_task5_selected_rows(view, inventory_receipt, policy))
+
+
+def test_ptv2_physical_stream_requires_a_terminal_assistant_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier assistant cannot be repurposed when the conversation ends with a user."""
+    inventory_receipt, _ = _write_authenticated_staged_parquet(
+        tmp_path,
+        messages_override=[
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer-first"},
+                {"role": "user", "content": "follow-up"},
+            ]
+        ],
+    )
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+
+    with pytest.raises(PTV2StudyError, match=r"terminal.*assistant"):
+        tuple(iter_ptv2_staged_source_rows(inventory_receipt, policy=_fixture_policy()))
 
 
 def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
