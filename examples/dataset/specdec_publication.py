@@ -471,6 +471,7 @@ def _reconcile_ptv2_role_lineage(payloads: Mapping[str, Mapping[str, Any]]) -> N
         return value if isinstance(value, Mapping) else payload
 
     response = identity("response")
+    tokenized_receipt = payloads["tokenized"]
     tokenized = identity("tokenized")
     exposure = identity("exposure")
     rejection = identity("rejection")
@@ -482,7 +483,25 @@ def _reconcile_ptv2_role_lineage(payloads: Mapping[str, Mapping[str, Any]]) -> N
     ):
         if payload.get("selection_sha256") != expected_selection:
             raise PublicationError(f"PTV2 {role} receipt is not bound to selection")
-    if "execution_receipt" in tokenized and (
+    selection_count = selection.get("occurrence_count")
+    tokenized_count = tokenized.get("occurrence_count")
+    if (
+        not isinstance(selection_count, int)
+        or isinstance(selection_count, bool)
+        or selection_count < 1
+        or tokenized_count != selection_count
+    ):
+        raise PublicationError("PTV2 tokenized occurrence count does not reconcile selection")
+    if selection_count == 2_000_000:
+        if not isinstance(selection.get("execution_receipt"), Mapping):
+            raise PublicationError(
+                "Task9 execution receipt is required for exact 2M publication"
+            )
+        if not isinstance(tokenized_receipt.get("execution_receipt"), Mapping):
+            raise PublicationError(
+                "Task8 execution receipt is required for exact 2M publication"
+            )
+    if "execution_receipt" in tokenized_receipt and (
         tokenized.get("source_index_sha256") != selection["index"].get("sha256")
         or tokenized.get("source_index_bytes") != selection["index"].get("bytes")
     ):
@@ -873,13 +892,18 @@ def _validate_task9_execution_receipt(
         "threads_per_worker",
         "thread_environment",
         "started_at_ns",
+        "parallel_phase_finished_at_ns",
+        "parallel_phase_elapsed_seconds",
         "finished_at_ns",
         "elapsed_seconds",
+        "selection_index_bytes",
+        "selection_index_sha256",
         "shards",
         "selection_sha256",
     }
     thread_environment = execution.get("thread_environment")
     started = execution.get("started_at_ns")
+    parallel_finished = execution.get("parallel_phase_finished_at_ns")
     finished = execution.get("finished_at_ns")
     elapsed = execution.get("elapsed_seconds")
     shards = execution.get("shards")
@@ -905,12 +929,21 @@ def _validate_task9_execution_receipt(
         or not isinstance(started, int)
         or isinstance(started, bool)
         or started < 1
+        or not isinstance(parallel_finished, int)
+        or isinstance(parallel_finished, bool)
+        or parallel_finished < started
         or not isinstance(finished, int)
         or isinstance(finished, bool)
         or finished < started
+        or parallel_finished > finished
+        or not _is_nonnegative_number(execution.get("parallel_phase_elapsed_seconds"))
         or not isinstance(elapsed, (int, float))
         or isinstance(elapsed, bool)
         or elapsed < 0
+        or execution["parallel_phase_elapsed_seconds"] > elapsed
+        or execution.get("selection_index_bytes") != selection.get("index", {}).get("bytes")
+        or execution.get("selection_index_sha256") != selection.get("index", {}).get("sha256")
+        or not _is_sha256(execution.get("selection_index_sha256"))
         or not _parallel_shards_reconcile(shards, include_spool_identity=True)
     ):
         raise PublicationError("Task9 execution receipt does not reconcile")
@@ -1182,11 +1215,6 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
         return [*shards, index, policy, *([execution] if execution is not None else [])]
     if role == "tokenized" and payload.get("schema_version") == 1:
         if payload.get("strategy") in {"A-repair", "B-balanced"}:
-            exact_two_million = payload.get("occurrence_count") == 2_000_000
-            if exact_two_million and "execution_receipt" not in payload:
-                raise PublicationError(
-                    "Task8 execution receipt is required for exact 2M publication"
-                )
             required = {
                 "strategy",
                 "occurrence_count",

@@ -189,11 +189,141 @@ def test_exact_two_million_task8_requires_execution_receipt() -> None:
         "assistant_loss_target_sha256": "2" * 64,
     }
 
+    selection = {
+        "selection_sha256": "c" * 64,
+        "source_inventory_sha256": "a" * 64,
+        "occurrence_count": 2_000_000,
+        "execution_receipt": {},
+        "index": {"bytes": 1, "sha256": "b" * 64},
+    }
+    payloads = {
+        "source": {"source_manifest_sha256": "a" * 64},
+        "selection": selection,
+        "response": {
+            "selection_sha256": "c" * 64,
+            "source_response_root_sha256": "e" * 64,
+        },
+        "tokenized": tokenized,
+        "exposure": {
+            "selection_sha256": "c" * 64,
+            "source_response_root_sha256": "e" * 64,
+            "tokenized_sha256": "3" * 64,
+            "tokenizer_sha256": "f" * 64,
+            "chat_template_sha256": "1" * 64,
+            "assistant_loss_target_sha256": "2" * 64,
+        },
+        "rejection": {"selection_sha256": "c" * 64},
+    }
+
     with pytest.raises(
         publication.PublicationError,
         match="Task8 execution receipt is required for exact 2M publication",
     ):
-        publication._role_file_descriptors("tokenized", tokenized)
+        publication._reconcile_ptv2_role_lineage(payloads)
+
+    forged = {**tokenized, "occurrence_count": 1_999_999}
+    with pytest.raises(publication.PublicationError, match="occurrence count"):
+        publication._reconcile_ptv2_role_lineage(payloads | {"tokenized": forged})
+
+
+def test_exact_two_million_task9_requires_execution_receipt() -> None:
+    payloads = {
+        "source": {"source_manifest_sha256": "a" * 64},
+        "selection": {
+            "selection_sha256": "c" * 64,
+            "source_inventory_sha256": "a" * 64,
+            "occurrence_count": 2_000_000,
+            "index": {"bytes": 1, "sha256": "b" * 64},
+        },
+        "response": {
+            "selection_sha256": "c" * 64,
+            "source_response_root_sha256": "e" * 64,
+        },
+        "tokenized": {
+            "selection_sha256": "c" * 64,
+            "occurrence_count": 2_000_000,
+            "source_response_root_sha256": "e" * 64,
+            "database_sha256": "3" * 64,
+            "tokenizer_sha256": "f" * 64,
+            "chat_template_sha256": "1" * 64,
+            "assistant_loss_target_sha256": "2" * 64,
+            "source_index_bytes": 1,
+            "source_index_sha256": "b" * 64,
+            "execution_receipt": {},
+        },
+        "exposure": {
+            "selection_sha256": "c" * 64,
+            "source_response_root_sha256": "e" * 64,
+            "tokenized_sha256": "3" * 64,
+            "tokenizer_sha256": "f" * 64,
+            "chat_template_sha256": "1" * 64,
+            "assistant_loss_target_sha256": "2" * 64,
+        },
+        "rejection": {"selection_sha256": "c" * 64},
+    }
+
+    with pytest.raises(
+        publication.PublicationError,
+        match="Task9 execution receipt is required for exact 2M publication",
+    ):
+        publication._reconcile_ptv2_role_lineage(payloads)
+
+
+def test_task9_execution_receipt_finishes_after_and_binds_selection_index(
+    tmp_path: Path,
+) -> None:
+    execution = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "source_inventory_sha256": "b" * 64,
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "parallel_phase_finished_at_ns": 2,
+        "parallel_phase_elapsed_seconds": 0.5,
+        "finished_at_ns": 3,
+        "elapsed_seconds": 1.0,
+        "selection_index_bytes": 123,
+        "selection_index_sha256": "c" * 64,
+        "shards": _parallel_shards(),
+        "selection_sha256": "d" * 64,
+    }
+    execution["receipt_sha256"] = hashlib.sha256(
+        json.dumps(execution, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    path = tmp_path / "EXECUTION_RECEIPT.json"
+    path.write_bytes(_canonical(execution))
+    descriptor = {
+        "path": path.name,
+        "bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    selection = {
+        "source_inventory_sha256": "b" * 64,
+        "selection_sha256": "d" * 64,
+        "index": {"bytes": 123, "sha256": "c" * 64},
+        "execution_receipt": descriptor,
+    }
+    files = [(path.name, path, path.stat().st_size, descriptor["sha256"])]
+
+    publication._validate_task9_execution_receipt(selection, files)
+    with pytest.raises(publication.PublicationError, match="does not reconcile"):
+        publication._validate_task9_execution_receipt(
+            selection | {"index": {"bytes": 124, "sha256": "c" * 64}}, files
+        )
 
 
 def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
@@ -332,12 +462,14 @@ def test_ptv2_lineage_flows_from_source_to_selection_then_tokenization() -> None
     selection = {
         "selection_sha256": digest("1"),
         "source_inventory_sha256": digest("2"),
+        "occurrence_count": 1,
         "baseline_receipt_sha256": digest("3"),
         "held_out_receipt_sha256": digest("4"),
     }
     response = {"selection_sha256": digest("1"), "source_response_root_sha256": digest("5")}
     tokenized = {
         **response,
+        "occurrence_count": 1,
         "database_sha256": digest("6"),
         "tokenizer_sha256": digest("7"),
         "chat_template_sha256": digest("8"),
