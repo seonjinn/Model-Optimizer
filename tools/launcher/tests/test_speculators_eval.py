@@ -608,7 +608,8 @@ def test_valid_method_block_mapping_runs_all_subsets_and_writes_provenance(
     assert len(fingerprint["sha256"]) == 64
     assert fingerprint["inputs"]["dataset"]["revision"] == _DATASET_REVISION
     assert fingerprint["inputs"]["image"]["sha256"] == _IMAGE_SHA256
-    assert fingerprint["inputs"]["runtime"]["sha256"] == _RUNTIME_SHA256
+    assert fingerprint["inputs"]["runtimes"]["client"]["sha256"] == _RUNTIME_SHA256
+    assert fingerprint["inputs"]["runtimes"]["server"]["sha256"] == _RUNTIME_SHA256
     assert fingerprint["inputs"]["source"] == {
         "modelopt_sha": _MODELOPT_SHA,
         "speculators_sha": _SPECULATORS_SHA,
@@ -717,12 +718,15 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
         "#SBATCH --gpus-per-node=4",
         "#SBATCH --segment=1",
         'JOB_ROOT="${MARS_SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
-        'readonly JOB_RUNTIME="${JOB_ROOT}/speculators-runtime"',
+        'readonly JOB_CLIENT_RUNTIME="${JOB_ROOT}/speculators-client-runtime"',
+        'JOB_SERVER_RUNTIME="${JOB_CLIENT_RUNTIME}"',
+        'JOB_SERVER_RUNTIME="${JOB_ROOT}/dflash2-server-runtime"',
         "EVAL_MODE=throughput",
         'srun --exclusive --nodes=1 --ntasks=1 --gpus="${tp_size}"',
         'run_cell "${CELL_A}" 8000',
         'run_cell "${CELL_B}" 8010',
-        'SPECULATORS_RUNTIME_ARCHIVE_SHA256="${RUNTIME_ARCHIVE_SHA256}"',
+        'SPECULATORS_RUNTIME_ARCHIVE_SHA256="${CLIENT_RUNTIME_ARCHIVE_SHA256}"',
+        'VLLM_SERVER_RUNTIME_ARCHIVE_SHA256="${SERVER_RUNTIME_ARCHIVE_SHA256}"',
         "CLUSTER_PROFILE CLUSTER_READINESS_RECEIPT",
         'CLUSTER_PROFILE="${CLUSTER_PROFILE}"',
         'CLUSTER_READINESS_RECEIPT="${CLUSTER_READINESS_RECEIPT}"',
@@ -788,8 +792,12 @@ def _run_pair_harness(
     for name in ("image.sqsh", "image.identity.json", "datasets.json", "eval.yaml", "runtime.tar"):
         (tmp_path / name).write_text("fixture\n")
     stager = modelopt / "tools/launcher/common/specdec/stage_speculators_eval_runtime.sh"
+    server_stager = (
+        modelopt / "tools/launcher/common/specdec/stage_speculators_eval_server_runtime.sh"
+    )
     wrapper = modelopt / "tools/launcher/common/specdec/run_speculators_eval.sh"
     _write_executable(stager, "#!/bin/bash\nexit 0\n")
+    _write_executable(server_stager, "#!/bin/bash\nexit 0\n")
     _write_executable(wrapper, "#!/bin/bash\nexit 0\n")
     _write_executable(
         fake_bin / "git",
@@ -826,8 +834,12 @@ def _run_pair_harness(
         "MODELOPT_REPO": str(modelopt),
         "MODELOPT_SHA": sha,
         "PAIR_LABEL": "tp-harness",
-        "RUNTIME_ARCHIVE": str(tmp_path / "runtime.tar"),
-        "RUNTIME_ARCHIVE_SHA256": "b" * 64,
+        "CLIENT_RUNTIME_ARCHIVE": str(tmp_path / "runtime.tar"),
+        "CLIENT_RUNTIME_ARCHIVE_SHA256": "b" * 64,
+        "SERVER_RUNTIME_ARCHIVE": str(tmp_path / "runtime.tar"),
+        "SERVER_RUNTIME_ARCHIVE_SHA256": "c" * 64,
+        "SERVER_RUNTIME_RECEIPT_SHA256": "d" * 64,
+        "PAIR_PHASE": "legacy",
         "SPECULATORS_REPO": str(speculators),
         "SPECULATORS_SHA": sha,
         "MARS_SCRATCH_ROOT": str(scratch),

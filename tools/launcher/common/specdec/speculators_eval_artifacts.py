@@ -285,7 +285,7 @@ def append_fixed_performance(
     fd, temporary = tempfile.mkstemp(prefix=f".{csv_path.name}.", dir=csv_path.parent)
     try:
         with os.fdopen(fd, "w", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=PERF_COLUMNS)
+            writer: csv.DictWriter[str] = csv.DictWriter(file, fieldnames=PERF_COLUMNS)
             writer.writeheader()
             writer.writerows(existing)
             writer.writerow(row)
@@ -560,7 +560,19 @@ def write_manifest(args: argparse.Namespace) -> None:
         "modelopt_repo": args.modelopt_repo,
         "modelopt_sha": args.modelopt_sha,
         "modelopt_dirty": False if args.modelopt_dirty == "false" else None,
-        "runtime": args.runtime,
+        "runtime": args.client_runtime,
+        "runtimes": {
+            "client": args.client_runtime,
+            "server": args.server_runtime,
+        },
+        "artifact_identity": (
+            {
+                "path": args.artifact_identity,
+                "sha256": args.artifact_identity_sha256,
+            }
+            if args.artifact_identity
+            else None
+        ),
         "container": container,
         "dataset": dataset,
         "provenance_error": provenance_error,
@@ -657,7 +669,10 @@ def main() -> None:
     manifest.add_argument("--modelopt-repo", required=True)
     manifest.add_argument("--modelopt-sha", required=True)
     manifest.add_argument("--modelopt-dirty", choices=("false", "unknown"), required=True)
-    manifest.add_argument("--runtime", required=True)
+    manifest.add_argument("--client-runtime", required=True)
+    manifest.add_argument("--server-runtime", required=True)
+    manifest.add_argument("--artifact-identity", required=True)
+    manifest.add_argument("--artifact-identity-sha256", required=True)
     manifest.add_argument("--container-image", required=True)
     manifest.add_argument("--container-identity", required=True)
     manifest.add_argument("--dataset-manifest", required=True)
