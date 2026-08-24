@@ -91,3 +91,16 @@ def test_task9_a_runner_is_a_96_cpu_authenticated_container_job() -> None:
     assert '--no-container-mount-home --container-image="$IMAGE_PATH"' in runner
     assert "--task5-manifest PATH --task5-manifest-sha256 SHA256" in submitter
     assert 'sbatch --test-only "${args[@]}"' in submitter
+
+
+def test_task9_a_controller_persists_the_deferred_job_identity() -> None:
+    root = Path(__file__).resolve().parents[3]
+    controller = (
+        root / "tools/launcher/common/specdec/run_qwen4b_task9_a_controller.sbatch"
+    ).read_text()
+
+    assert "TASK5_PARENT_JOB_ID" in controller
+    assert 'sha256sum "$TASK5_MANIFEST"' in controller
+    assert "submit_qwen4b_task9_a.sh" in controller
+    assert "TASK9_A_CONTROLLER_RECEIPT" in controller
+    assert 'open(receipt, "xb")' in controller
