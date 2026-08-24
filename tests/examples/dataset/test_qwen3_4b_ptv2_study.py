@@ -1474,9 +1474,49 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
 ) -> None:
     """A genuine Task5 selector/publication is replayed; a forged selection root is rejected."""
     task5_bundle = _genuine_scaled_task5_bundle(tmp_path, monkeypatch)
+    task5_source_manifest_sha256 = task5_bundle.source_manifest_sha256
+    execution: dict[str, Any] = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "source_manifest_sha256": task5_bundle.source_manifest_sha256,
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "finished_at_ns": 2,
+        "elapsed_seconds": 1.0,
+        "accepted_count": len(task5_bundle.B_prime.primary_rows),
+        "quarantine_counts": {},
+        "shards": _parallel_shards(),
+        "tokenization_shards": [
+            {
+                "index": index,
+                "row_count": index + 1,
+                "elapsed_seconds": 0.1,
+                "worker_pid": 1_000 + index,
+            }
+            for index in range(201)
+        ],
+    }
+    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
     try:
         published = publish_bprime_prompt_view_bundle(
-            task5_bundle, tmp_path / "task5", rows_per_shard=4
+            task5_bundle,
+            tmp_path / "task5",
+            rows_per_shard=4,
+            execution_receipt=execution,
         )
     finally:
         task5_bundle.close()
@@ -1504,10 +1544,31 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
         expected_manifest_sha256=manifest_sha256,
         view=view,
         policy=study_policy,
+        source_manifest_sha256=task5_source_manifest_sha256,
     )
 
     assert len(arm_identity) == 64
     manifest = json.loads(manifest_path.read_bytes())
+    execution_path = manifest_path.parent / manifest["execution_receipt"]["path"]
+    original_execution = execution_path.read_bytes()
+    execution_path.write_bytes(original_execution + b" ")
+    with pytest.raises(PTV2StudyError, match="execution receipt"):
+        study_module._authenticate_task5_bprime(
+            manifest_path,
+            expected_manifest_sha256=manifest_sha256,
+            view=view,
+            policy=study_policy,
+            source_manifest_sha256=task5_source_manifest_sha256,
+        )
+    execution_path.write_bytes(original_execution)
+    with pytest.raises(PTV2StudyError, match="source manifest"):
+        study_module._authenticate_task5_bprime(
+            manifest_path,
+            expected_manifest_sha256=manifest_sha256,
+            view=view,
+            policy=study_policy,
+            source_manifest_sha256="0" * 64,
+        )
 
     contaminated = json.loads(manifest_path.read_bytes())
     contaminated["arms"]["C"] = contaminated["arms"]["B-prime"]
@@ -1526,6 +1587,7 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
             expected_manifest_sha256=contaminated_sha256,
             view=contaminated_view,
             policy=study_policy,
+            source_manifest_sha256=task5_source_manifest_sha256,
         )
 
     manifest_path.write_bytes(canonical_json(manifest) + b"\n")
@@ -1540,12 +1602,13 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
         expected_manifest_sha256=forged_source_sha256,
         arm="B-prime",
     )
-    with pytest.raises(PTV2StudyError, match="selection digest"):
+    with pytest.raises(PTV2StudyError, match="execution receipt"):
         study_module._authenticate_task5_bprime(
             manifest_path,
             expected_manifest_sha256=forged_source_sha256,
             view=forged_source_view,
             policy=study_policy,
+            source_manifest_sha256=task5_source_manifest_sha256,
         )
 
     manifest_path.write_bytes(canonical_json(manifest) + b"\n")
@@ -1559,12 +1622,13 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
         expected_manifest_sha256=forged_manifest_sha256,
         arm="B-prime",
     )
-    with pytest.raises(PTV2StudyError, match="selection digest"):
+    with pytest.raises(PTV2StudyError, match="execution receipt"):
         study_module._authenticate_task5_bprime(
             manifest_path,
             expected_manifest_sha256=forged_manifest_sha256,
             view=forged_view,
             policy=study_policy,
+            source_manifest_sha256=task5_source_manifest_sha256,
         )
 
 

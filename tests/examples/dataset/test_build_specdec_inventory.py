@@ -93,6 +93,7 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
             ]
         ),
         "tools": "[]",
+        "language": ["excluded", "invalid"],
     }
     duplicate = {
         "messages": json.dumps(
@@ -111,6 +112,25 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
             ]
         ),
         "tools": "[]",
+    }
+    invalid_language = {
+        "messages": json.dumps(
+            [
+                {"role": "user", "content": "invalid-language"},
+                {"role": "assistant", "content": "answer"},
+            ]
+        ),
+        "tools": "[]",
+        "language": ["not", "a", "language"],
+    }
+    invalid_tools = {
+        "messages": json.dumps(
+            [
+                {"role": "user", "content": "invalid-tools"},
+                {"role": "assistant", "content": "answer"},
+            ]
+        ),
+        "tools": '{"not":"a-list"}',
     }
     for index in range(201):
         path = tmp_path / f"shard-{index}.jsonl"
@@ -133,6 +153,8 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
                 duplicate,
                 rejected_duplicate,
                 rejected_duplicate,
+                invalid_language,
+                invalid_tools,
             ]
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         descriptor = module.SourceFile(path.name, path.stat().st_size, module.sha256_file(path))
@@ -199,9 +221,12 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         assert set(parallel.execution_receipt["thread_environment"].values()) == {"1"}
         assert parallel.quarantine_counts["historical_exclusion"] == 1
         assert not (tmp_path / "parallel-tokenizer-calls.excluded").exists()
+        assert serial_marker.read_bytes() == b"11"
         assert (tmp_path / "parallel-tokenizer-calls").read_bytes() == b"11"
         assert (tmp_path / "parallel-tokenizer-calls.rejected").read_bytes() == b"11"
         assert parallel.quarantine_counts["context_too_long"] == 2
+        assert parallel.quarantine_counts["invalid_language"] == 1
+        assert parallel.quarantine_counts["invalid_tools"] == 1
     finally:
         serial.close()
         parallel.close()
@@ -215,6 +240,17 @@ def test_candidate_worker_count_respects_all_bounds() -> None:
         declared_shard_count=201,
         environ={"SLURM_CPUS_PER_TASK": "48"},
     ) == (48, 48)
+
+
+def test_candidate_diagnostic_compares_post_tokenization_accepted_rows() -> None:
+    diagnostic = (
+        MODULE_PATH.parent / "diagnose_qwen4b_candidate_shard.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_tokenize_candidate_shard(" in diagnostic
+    assert "SELECT payload FROM tokenized ORDER BY source_row_index" in diagnostic
+    assert '"phase2_row_count": tokenization_result.row_count' in diagnostic
+    assert 'first_payload = payload["candidate"]' not in diagnostic
 
 
 def _write_bound_source(tmp_path: Path, rows: list[dict]) -> Path:

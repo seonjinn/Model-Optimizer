@@ -563,12 +563,17 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         (
             descriptor["path"],
             destination / descriptor["path"],
-            descriptor.get("bytes", descriptor.get("byte_count", (destination / descriptor["path"]).stat().st_size)),
+            descriptor.get(
+                "bytes",
+                descriptor.get(
+                    "byte_count", (destination / descriptor["path"]).stat().st_size
+                ),
+            ),
             descriptor["sha256"],
         )
         for descriptor in descriptors
     )
-    publication._validate_task5_execution_receipt(manifest, list(authenticated_files))
+    publication.validate_task5_execution_receipt(manifest, destination)
     copied = tmp_path / "copied-publication"
     copied.mkdir()
     publication._copy_authenticated_inputs(

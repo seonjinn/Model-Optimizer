@@ -133,6 +133,7 @@ def main() -> int:
         expected_manifest_sha256=args.task5_manifest_sha256,
         view=task5_view,
         policy=policy,
+        source_manifest_sha256=inventory.manifest_sha256,
     )
     bundle = select_authenticated_ptv2_study_views(
         args.source_inventory,

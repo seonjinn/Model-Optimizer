@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import sqlite3
-from collections import Counter
 from pathlib import Path
 
 import build_specdec_inventory as inventory_module
@@ -17,7 +16,12 @@ from build_qwen4b_bprime import baseline_exclusion_from_audit, held_out_exclusio
 from build_specdec_inventory import (
     _authenticated_snapshot_tokenizer,
     _CandidateShardTask,
+    _CandidateTokenizeTask,
+    _create_candidate_database,
+    _exclude_or_quarantine_classified_candidate,
+    _merge_tokenized_candidate,
     _process_candidate_shard,
+    _tokenize_candidate_shard,
     build_candidate_inventory,
 )
 from specdec_corpus_contracts import canonical_json, sha256_bytes
@@ -76,6 +80,7 @@ def main() -> int:
 
     args.scratch_root.mkdir(parents=True, exist_ok=True)
     spool = args.scratch_root / "process-shard.sqlite3"
+    merge_database = args.scratch_root / "process-candidates.sqlite3"
     inventory_module._PROCESS_TOKENIZER = tokenizer
     try:
         result = _process_candidate_shard(
@@ -92,33 +97,62 @@ def main() -> int:
                 4_096,
             )
         )
+        historical = set(baseline.prompt_ids)
+        heldout = set(held_out.prompt_ids)
+        reasons: dict[str, int] = {}
+        with sqlite3.connect(spool) as connection:
+            connection.execute(
+                "CREATE TABLE selected(source_row_index INTEGER PRIMARY KEY,payload BLOB NOT NULL) "
+                "WITHOUT ROWID"
+            )
+            for source_row_index, raw in connection.execute(
+                "SELECT source_row_index,payload FROM records ORDER BY source_row_index"
+            ):
+                payload = json.loads(raw)
+                if _exclude_or_quarantine_classified_candidate(
+                    payload,
+                    historical_prompt_ids=historical,
+                    held_out_prompt_ids=heldout,
+                    quarantine_counts=reasons,
+                ):
+                    continue
+                connection.execute("INSERT INTO selected VALUES(?,?)", (source_row_index, raw))
+            connection.commit()
+        tokenization_result = _tokenize_candidate_shard(
+            _CandidateTokenizeTask(args.shard_index, spool, source)
+        )
     finally:
         inventory_module._PROCESS_TOKENIZER = None
-    historical = set(baseline.prompt_ids)
-    heldout = set(held_out.prompt_ids)
-    reasons: Counter[str] = Counter()
+    capacity = {}
+    merged = _create_candidate_database(merge_database)
     accepted = 0
-    first_payload: dict[str, object] | None = None
-    with sqlite3.connect(spool) as connection:
-        for (raw,) in connection.execute("SELECT payload FROM records ORDER BY source_row_index"):
-            payload = json.loads(raw)
-            prompt_id = payload.get("prompt_uuid")
-            if prompt_id in historical:
-                reasons["historical_exclusion"] += 1
-            elif prompt_id in heldout:
-                reasons["heldout_exclusion"] += 1
-            elif payload.get("reason") is not None:
-                reasons[str(payload["reason"])] += 1
-            else:
-                accepted += 1
-                if first_payload is None:
-                    first_payload = payload["candidate"]
+    first_prompt_uuid: str | None = None
+    try:
+        with sqlite3.connect(spool) as connection:
+            for (raw,) in connection.execute(
+                "SELECT payload FROM tokenized ORDER BY source_row_index"
+            ):
+                payload = json.loads(raw)
+                if _merge_tokenized_candidate(
+                    merged,
+                    payload,
+                    capacity=capacity,
+                    quarantine_counts=reasons,
+                ):
+                    accepted += 1
+                    if first_prompt_uuid is None:
+                        first_prompt_uuid = str(payload["candidate"]["prompt_uuid"])
+        merged.commit()
+    finally:
+        merged.close()
     process_summary = {
         "accepted_count": accepted,
         "quarantine_counts": dict(sorted(reasons.items())),
-        "row_count": result.row_count,
-        "spool_sha256": result.spool_sha256,
-        "first_candidate_prompt_uuid": None if first_payload is None else first_payload["prompt_uuid"],
+        "phase1_row_count": result.row_count,
+        "phase2_row_count": tokenization_result.row_count,
+        "phase1_spool_sha256": result.spool_sha256,
+        "final_spool_sha256": inventory_module.sha256_file(spool),
+        "first_candidate_prompt_uuid": first_prompt_uuid,
     }
     payload = {
         "schema_version": 1,

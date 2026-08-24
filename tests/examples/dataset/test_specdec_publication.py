@@ -105,7 +105,7 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
     path.write_bytes(_canonical(execution))
     descriptor = {
         "path": path.name,
-        "bytes": path.stat().st_size,
+        "byte_count": path.stat().st_size,
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
     selection = {
@@ -120,7 +120,16 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         },
         "execution_receipt": descriptor,
     }
-    files = [(path.name, path, path.stat().st_size, descriptor["sha256"])]
+    def write_execution_receipt(
+        payload: dict[str, Any], base_selection: dict[str, Any] = selection
+    ) -> dict[str, Any]:
+        path.write_bytes(_canonical(payload))
+        current_descriptor = {
+            "path": path.name,
+            "byte_count": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        return {**base_selection, "execution_receipt": current_descriptor}
 
     manifest = {
         **selection,
@@ -139,9 +148,13 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
     with pytest.raises(publication.PublicationError, match="execution receipt is missing"):
         publication._role_file_descriptors("selection", missing)
 
-    publication._validate_task5_execution_receipt(selection, files)
+    identity = publication.validate_task5_execution_receipt(selection, tmp_path)
+    assert identity.source_manifest_sha256 == "b" * 64
+    assert identity.candidate_inventory_sha256 == "c" * 64
+    path.unlink()
     with pytest.raises(publication.PublicationError, match="not authenticated"):
-        publication._validate_task5_execution_receipt(selection, [])
+        publication.validate_task5_execution_receipt(selection, tmp_path)
+    path.write_bytes(_canonical(execution))
     for field, value in (
         ("effective_workers", 1),
         ("source_manifest_sha256", "e" * 64),
@@ -154,9 +167,9 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         forged["receipt_sha256"] = hashlib.sha256(
             json.dumps(forged, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        path.write_bytes(_canonical(forged))
+        forged_selection = write_execution_receipt(forged)
         with pytest.raises(publication.PublicationError, match="does not reconcile"):
-            publication._validate_task5_execution_receipt(selection, files)
+            publication.validate_task5_execution_receipt(forged_selection, tmp_path)
 
     for field in ("shards", "tokenization_shards"):
         forged = {key: item for key, item in execution.items() if key != "receipt_sha256"}
@@ -164,9 +177,9 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         forged["receipt_sha256"] = hashlib.sha256(
             json.dumps(forged, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
-        path.write_bytes(_canonical(forged))
+        forged_selection = write_execution_receipt(forged)
         with pytest.raises(publication.PublicationError, match="does not reconcile"):
-            publication._validate_task5_execution_receipt(selection, files)
+            publication.validate_task5_execution_receipt(forged_selection, tmp_path)
 
     path.write_bytes(_canonical(execution))
     for identity_field, value in (
@@ -177,7 +190,7 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         forged_selection = {**selection, "identity": dict(selection["identity"])}
         forged_selection["identity"][identity_field] = value
         with pytest.raises(publication.PublicationError, match="does not reconcile"):
-            publication._validate_task5_execution_receipt(forged_selection, files)
+            publication.validate_task5_execution_receipt(forged_selection, tmp_path)
 
 
 def test_ptv2_lineage_flows_from_source_to_selection_then_tokenization() -> None:

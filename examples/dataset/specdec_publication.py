@@ -47,8 +47,10 @@ __all__ = [
     "PublicationPhase",
     "PublicationReceipt",
     "PublicationRecoveryState",
+    "Task5ExecutionReceiptIdentity",
     "publication_recovery_state",
     "publish_bundle",
+    "validate_task5_execution_receipt",
 ]
 
 REQUIRED_ROLES = ("source", "selection", "response", "tokenized", "exposure", "rejection")
@@ -133,6 +135,17 @@ class PublicationReceipt:
     file_count: int
     total_bytes: int
     published_path: str
+
+
+@dataclass(frozen=True)
+class Task5ExecutionReceiptIdentity:
+    """Authenticated lineage roots carried by a Task5 p96 execution receipt."""
+
+    source_commit: str
+    source_manifest_sha256: str
+    candidate_inventory_sha256: str
+    selection_sha256: str
+    receipt_sha256: str
 
 
 class PublicationPhase(str, Enum):
@@ -426,7 +439,7 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
             and payload.get("schema_version") == 2
             and payload.get("selection_mode") == "B-prime-only"
         ):
-            _validate_task5_execution_receipt(payload, files)
+            validate_task5_execution_receipt(payload, artifact.receipt_path.parent)
         authenticated.append(
             _AuthenticatedArtifact(artifact.role, receipt, artifact.receipt_sha256, tuple(files))
         )
@@ -663,17 +676,51 @@ def _validate_ptv2_selection_policy(
         raise PublicationError("PTV2 occurrence shards do not match selection index semantics")
 
 
-def _validate_task5_execution_receipt(
-    selection: Mapping[str, Any], files: list[tuple[str, Path, int, str]]
-) -> None:
+def validate_task5_execution_receipt(
+    selection: Mapping[str, Any], publication_root: Path
+) -> Task5ExecutionReceiptIdentity:
+    """Authenticate and semantically reconcile one Task5 p96 execution receipt."""
     descriptor = selection.get("execution_receipt")
-    if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("path"), str):
+    if (
+        not isinstance(descriptor, Mapping)
+        or set(descriptor) != {"path", "byte_count", "sha256"}
+        or descriptor.get("path") != "EXECUTION_RECEIPT.json"
+    ):
         raise PublicationError("Task5 selection execution receipt is missing")
-    execution_file = next((item for item in files if item[0] == descriptor["path"]), None)
-    if execution_file is None:
+    try:
+        root = publication_root.resolve(strict=True)
+        relative, expected_bytes, expected_sha256 = _file_descriptor(
+            descriptor, "selection", root
+        )
+        unresolved = publication_root / relative
+        if unresolved.is_symlink():
+            raise PublicationError("Task5 execution receipt must not be a symlink")
+        execution_path = unresolved.resolve(strict=True)
+        descriptor_fd = os.open(
+            execution_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            initial = os.fstat(descriptor_fd)
+            with os.fdopen(os.dup(descriptor_fd), "rb") as stream:
+                raw = stream.read()
+            final = os.fstat(descriptor_fd)
+            pathname = os.lstat(execution_path)
+        finally:
+            os.close(descriptor_fd)
+    except (OSError, ValueError) as error:
+        raise PublicationError("Task5 execution receipt was not authenticated") from error
+    if (
+        not execution_path.is_relative_to(root)
+        or not stat.S_ISREG(initial.st_mode)
+        or initial.st_size != expected_bytes
+        or (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns)
+        != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns)
+        or stat.S_ISLNK(pathname.st_mode)
+        or (pathname.st_dev, pathname.st_ino) != (final.st_dev, final.st_ino)
+        or hashlib.sha256(raw).hexdigest() != expected_sha256
+    ):
         raise PublicationError("Task5 execution receipt was not authenticated")
     try:
-        raw = execution_file[1].read_bytes()
         execution = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise PublicationError("Task5 execution receipt is invalid") from error
@@ -770,6 +817,20 @@ def _validate_task5_execution_receipt(
         or not _parallel_shards_reconcile(tokenization_shards, include_spool_identity=False)
     ):
         raise PublicationError("Task5 execution receipt does not reconcile")
+    assert isinstance(claimed, str)
+    assert isinstance(source_manifest_sha256, str)
+    assert isinstance(candidate_inventory_sha256, str)
+    selection_sha256 = execution["selection_sha256"]
+    assert isinstance(selection_sha256, str)
+    source_commit = execution["source_commit"]
+    assert isinstance(source_commit, str)
+    return Task5ExecutionReceiptIdentity(
+        source_commit,
+        source_manifest_sha256,
+        candidate_inventory_sha256,
+        selection_sha256,
+        claimed,
+    )
 
 
 def _validate_task9_execution_receipt(

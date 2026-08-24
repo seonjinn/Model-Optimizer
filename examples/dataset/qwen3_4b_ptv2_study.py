@@ -40,6 +40,7 @@ from build_specdec_inventory import (
 from promote_synthesis_reserve import ResponsePromotionError, load_prompt_view
 from specdec_corpus_contracts import canonical_json
 from specdec_identity import ExclusionIndex, prompt_uuid
+from specdec_publication import PublicationError, validate_task5_execution_receipt
 from stage_ptv23_sources import (
     SourceFile,
     SourceIdentity,
@@ -672,6 +673,7 @@ def select_authenticated_ptv2_study_views(
         expected_manifest_sha256=task5_manifest_sha256,
         view=task5,
         policy=policy,
+        source_manifest_sha256=inventory.manifest_sha256,
     )
     root = _selection_root(output_root)
     held_out_identity = make_exclusion_receipt("held-out", tuple(exclusions.held_out))
@@ -1371,6 +1373,7 @@ def _authenticate_task5_bprime(
     expected_manifest_sha256: str,
     view: PromptView,
     policy: PTV2StudyPolicy,
+    source_manifest_sha256: str,
 ) -> str:
     """Recompute Task 5's global selection and bind its B-prime arm proof."""
     if view.arm != "B-prime":
@@ -1387,6 +1390,14 @@ def _authenticate_task5_bprime(
     root_record = {key: value for key, value in manifest.items() if key != "root_sha256"}
     if declared_root != sha256(canonical_json(root_record)).hexdigest():
         raise PTV2StudyError("Task 5 selection root identity does not reconcile")
+    try:
+        execution_identity = validate_task5_execution_receipt(
+            manifest, manifest_path.parent
+        )
+    except PublicationError as error:
+        raise PTV2StudyError("Task 5 execution receipt does not authenticate") from error
+    if execution_identity.source_manifest_sha256 != source_manifest_sha256:
+        raise PTV2StudyError("Task 5 execution source manifest does not reconcile")
     identity = manifest.get("identity")
     arms = manifest.get("arms")
     arm_record = arms.get("B-prime") if isinstance(arms, dict) else None
@@ -1398,6 +1409,8 @@ def _authenticate_task5_bprime(
             "policy_sha256",
             "seed",
             "source_inventory_sha256",
+            "candidate_inventory_sha256",
+            "source_manifest_sha256",
             "baseline_receipt_sha256",
             "held_out_receipt_sha256",
             "ptv2_revision",
@@ -1416,11 +1429,18 @@ def _authenticate_task5_bprime(
         raise PTV2StudyError("Task 5 B-prime-only arm identity is missing")
     _require_digest(identity.get("tokenizer_sha256"), "Task 5 tokenizer digest")
     _require_digest(identity.get("chat_template_sha256"), "Task 5 chat-template digest")
+    _require_digest(identity.get("source_inventory_sha256"), "Task 5 candidate inventory digest")
+    _require_digest(
+        identity.get("candidate_inventory_sha256"), "Task 5 explicit candidate inventory digest"
+    )
+    _require_digest(identity.get("source_manifest_sha256"), "Task 5 source manifest digest")
     if (
         view.tokenizer_sha256 != identity["tokenizer_sha256"]
         or view.chat_template_sha256 != identity["chat_template_sha256"]
+        or identity["candidate_inventory_sha256"] != identity["source_inventory_sha256"]
+        or identity["source_manifest_sha256"] != source_manifest_sha256
     ):
-        raise PTV2StudyError("Task 5 tokenizer/template identity does not reconcile")
+        raise PTV2StudyError("Task 5 tokenizer/template/source identity does not reconcile")
     if not isinstance(index_record, dict) or not isinstance(index_record.get("path"), str):
         raise PTV2StudyError("Task 5 selection index identity is missing")
     expected_cells = {
