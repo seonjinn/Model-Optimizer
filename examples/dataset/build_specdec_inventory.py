@@ -1173,7 +1173,7 @@ def _candidate_tokenize(
         add_generation_prompt=add_generation_prompt,
         return_dict=True,
     )
-    input_ids = encoded.get("input_ids") if isinstance(encoded, dict) else encoded
+    input_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else encoded
     if not isinstance(input_ids, list) or any(
         isinstance(token, bool) or not isinstance(token, int) for token in input_ids
     ):

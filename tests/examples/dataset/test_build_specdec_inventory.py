@@ -69,6 +69,22 @@ class CandidateTokenizer:
         return {"input_ids": [index + 1 for index, _ in enumerate(messages)]}
 
 
+class MappingCandidateTokenizer(CandidateTokenizer):
+    def apply_chat_template(self, messages, **kwargs):
+        return MappingProxyType(super().apply_chat_template(messages, **kwargs))
+
+
+def test_candidate_tokenizer_accepts_transformers_mapping_contract() -> None:
+    module = _load_module()
+
+    assert module._candidate_tokenize(
+        MappingCandidateTokenizer(),
+        [{"role": "user", "content": "hello"}],
+        [],
+        add_generation_prompt=True,
+    ) == (1,)
+
+
 def test_candidate_process_pool_is_byte_identical_and_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
