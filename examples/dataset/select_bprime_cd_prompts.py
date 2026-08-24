@@ -39,6 +39,7 @@ from build_specdec_inventory import (
     CandidatePrompt,
     candidate_inventory_sha256,
     is_approved_ptv2_source,
+    verify_candidate_inventory_membership,
 )
 from specdec_corpus_contracts import canonical_json, sha256_bytes
 from stage_ptv23_sources import (
@@ -46,6 +47,7 @@ from stage_ptv23_sources import (
     _fsync_directory,
     _rename_no_replace,
     _write_bytes_durable,
+    load_source_inventory,
 )
 
 if TYPE_CHECKING:
@@ -608,8 +610,9 @@ def select_bprime_prompt_view(
             raise ValueError("source inventory PTV2 allowlist identity mismatch")
         _validate_digest(policy.policy_sha256, "policy")
         _validate_exclusion_receipts(inventory, baseline_receipt_sha256, held_out_receipt_sha256)
-        _validate_bprime_source_inventory(source_inventory)
-        _validate_bprime_only_rows(inventory.rows, source_inventory)
+        authenticated_source_inventory = _validate_bprime_source_inventory(source_inventory)
+        _validate_bprime_only_rows(inventory.rows, authenticated_source_inventory)
+        verify_candidate_inventory_membership(inventory, authenticated_source_inventory)
         connection = storage.open_working_connection()
         _create_selection_schema(connection)
         _spool_candidates(connection, inventory.rows, policy)
@@ -670,23 +673,43 @@ def select_bprime_prompt_view(
         raise
 
 
-def _validate_bprime_source_inventory(source_inventory: SourceInventory) -> None:
-    if (
-        not isinstance(source_inventory, SourceInventory)
-        or sha256(source_inventory.canonical_manifest).hexdigest()
-        != source_inventory.manifest_sha256
-    ):
+def _validate_bprime_source_inventory(source_inventory: SourceInventory) -> SourceInventory:
+    if not isinstance(source_inventory, SourceInventory) or source_inventory.staged_root is None:
+        raise ValueError("B-prime-only selection requires a staged Task 3 source inventory")
+    receipt = source_inventory.staged_root / "SOURCE_INVENTORY.json"
+    try:
+        authenticated = load_source_inventory(receipt)
+    except (OSError, ValueError) as error:
+        raise ValueError("B-prime-only staged Task 3 source inventory is invalid") from error
+    if authenticated != source_inventory:
         raise ValueError("B-prime-only Task 3 source inventory identity mismatch")
-    if sum(len(source.files) for source in source_inventory.sources) != 201:
+    expected_splits = {
+        "chat",
+        "code",
+        "math",
+        "stem",
+        "multilingual_ja",
+        "multilingual_it",
+        "multilingual_de",
+        "multilingual_es",
+        "multilingual_fr",
+    }
+    if (
+        len(authenticated.sources) != len(expected_splits)
+        or {source.split for source in authenticated.sources} != expected_splits
+        or sum(len(source.files) for source in authenticated.sources) != 201
+    ):
         raise ValueError("B-prime-only selection requires exactly 201 PTV2 source shards")
     if any(
         source.lane != "target-synth"
+        or source.cell != source.split
         or not is_approved_ptv2_source(
             source.repository_id, source.configuration, source.split, source.revision
         )
-        for source in source_inventory.sources
+        for source in authenticated.sources
     ):
         raise ValueError("B-prime-only selection requires a PTV2-only approved inventory")
+    return authenticated
 
 
 def _validate_bprime_only_rows(rows: Iterable[Any], source_inventory: SourceInventory) -> None:

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import sys
-from collections import Counter
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -24,15 +23,7 @@ sys.path.insert(0, str(MODULE_DIR))
 try:
     import qwen3_4b_ptv2_study as study_module
     from bprime_cd_policy import ArmPolicy, PromptCell, PromptPolicy
-    from build_specdec_inventory import (
-        APPROVED_PTV2_ALLOWLIST_SHA256,
-        CandidateCell,
-        CandidateInventory,
-        CandidatePrompt,
-        ExclusionProof,
-        candidate_inventory_sha256,
-        make_exclusion_receipt,
-    )
+    from build_specdec_inventory import build_candidate_inventory, make_exclusion_receipt
     from qwen3_4b_ptv2_study import (
         PTV2StudyError,
         PTV2StudyRecoveryError,
@@ -179,13 +170,9 @@ def _write_authenticated_staged_parquet(tmp_path: Path) -> tuple[Path, Path]:
     return receipt, staged_file
 
 
-def _genuine_scaled_task5_bundle() -> BPrimePromptViewBundle:
+def _genuine_scaled_task5_bundle(tmp_path: Path) -> BPrimePromptViewBundle:
     approved_ptv2_revision = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
     b_cells = {name: PromptCell(1) for name in ("stem", "japanese", "spanish", "french", "italian")}
-    non_agentic = {
-        name: PromptCell(1)
-        for name in ("math", "code", "stem-science", "multilingual", "instruction-chat")
-    }
     task5_policy = PromptPolicy(
         1,
         20260822,
@@ -194,22 +181,6 @@ def _genuine_scaled_task5_bundle() -> BPrimePromptViewBundle:
         MappingProxyType(
             {
                 "B-prime": ArmPolicy(5, MappingProxyType(b_cells), MappingProxyType({})),
-                "C": ArmPolicy(
-                    6,
-                    MappingProxyType({**non_agentic, "swe-agentic-tool": PromptCell(1)}),
-                    MappingProxyType({}),
-                ),
-                "D": ArmPolicy(
-                    8,
-                    MappingProxyType({**non_agentic, "swe-agentic-tool": PromptCell(3)}),
-                    MappingProxyType(
-                        {
-                            "agentless-swe": 1,
-                            "interactive-swe-replay": 1,
-                            "generic-tool-replay": 1,
-                        }
-                    ),
-                ),
             }
         ),
         (256_000_000, 1_000_000_000),
@@ -219,75 +190,6 @@ def _genuine_scaled_task5_bundle() -> BPrimePromptViewBundle:
         frozenset({"de"}),
         "a" * 64,
     )
-    specifications = (
-        ("stem-science", "target-synth", "en", "ptv2", "stem"),
-        ("multilingual", "target-synth", "ja", "ptv2", "multilingual_ja"),
-        ("multilingual", "target-synth", "es", "ptv2", "multilingual_es"),
-        ("multilingual", "target-synth", "fr", "ptv2", "multilingual_fr"),
-        ("multilingual", "target-synth", "it", "ptv2", "multilingual_it"),
-        ("math", "target-synth", "en", "ptv3", "math"),
-        ("code", "target-synth", "en", "ptv3", "code"),
-        ("stem-science", "target-synth", "en", "ptv3", "stem"),
-        ("multilingual", "target-synth", "ja", "ptv3", "multilingual"),
-        ("instruction-chat", "target-synth", "en", "ptv3", "chat"),
-        ("swe-agentic-tool", "agentless-swe", "en", "ptv3", "agentless"),
-        ("swe-agentic-tool", "interactive-swe-replay", "en", "ptv3", "interactive"),
-        ("swe-agentic-tool", "generic-tool-replay", "en", "ptv3", "generic"),
-    )
-    candidates = []
-    for ordinal, (domain, lane, language, family, split) in enumerate(specifications):
-        canonical = canonical_json(
-            {"messages": [{"role": "user", "content": f"task5-{ordinal}"}], "tools": []}
-        )
-        candidates.append(
-            CandidatePrompt(
-                sha256(canonical).hexdigest(),
-                canonical,
-                f"fixture/{ordinal}",
-                (approved_ptv2_revision if family == "ptv2" else "9" * 40),
-                sha256(f"file-{ordinal}".encode()).hexdigest(),
-                ordinal,
-                domain,
-                language,
-                lane,
-                "le4k",
-                2,
-                "c" * 64,
-                f"data/{ordinal}.jsonl",
-                (1, 2),
-                "d" * 64,
-                lane in {"interactive-swe-replay", "generic-tool-replay"},
-                family,
-                (
-                    "nvidia/Nemotron-Post-Training-Dataset-v2"
-                    if family == "ptv2"
-                    else "fixture/source"
-                ),
-                "default",
-                split,
-            )
-        )
-    candidates = [row for row in candidates if row.source_family == "ptv2"]
-    task3_manifest = b"authenticated-task3-ptv2-fixture"
-    task3_sha256 = sha256(task3_manifest).hexdigest()
-    candidates = [replace(row, source_manifest_sha256=task3_sha256) for row in candidates]
-    capacity = Counter(
-        CandidateCell(row.domain, row.lane, row.language, row.context_bucket) for row in candidates
-    )
-    baseline_sha256 = "1" * 64
-    held_out_sha256 = "2" * 64
-    inventory = CandidateInventory(
-        tuple(candidates),
-        MappingProxyType(dict(capacity)),
-        MappingProxyType({}),
-        "0" * 64,
-        ExclusionProof(baseline_sha256, "3" * 64, 0, 0),
-        ExclusionProof(held_out_sha256, "4" * 64, 0, 0),
-        approved_ptv2_revision,
-        APPROVED_PTV2_ALLOWLIST_SHA256,
-    )
-    inventory = replace(inventory, inventory_sha256=candidate_inventory_sha256(inventory))
-    matching = {row.source_split: row for row in candidates}
     source_splits = (
         "chat",
         "code",
@@ -299,52 +201,85 @@ def _genuine_scaled_task5_bundle() -> BPrimePromptViewBundle:
         "multilingual_es",
         "multilingual_fr",
     )
+    repository = "nvidia/Nemotron-Post-Training-Dataset-v2"
+    local = tmp_path / "task5-local"
     remaining = 201
     sources = []
     for index, split in enumerate(source_splits):
         count = remaining // (len(source_splits) - index)
         remaining -= count
-        selected = matching.get(split)
-        files = tuple(
-            SourceFile(
-                selected.source_file_path
-                if file_index == 0 and selected
-                else f"{split}/{file_index}.parquet",
-                1,
-                selected.source_file_sha256
-                if file_index == 0 and selected
-                else sha256(f"{split}/{file_index}".encode()).hexdigest(),
+        files = []
+        for file_index in range(count):
+            relative = f"data/{split}/{file_index:03d}.jsonl"
+            path = local / repository / approved_ptv2_revision / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"task5-{split}-{file_index}"},
+                            {"role": "assistant", "content": "answer"},
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
             )
-            for file_index in range(count)
-        )
+            files.append(
+                {
+                    "path": relative,
+                    "bytes": path.stat().st_size,
+                    "sha256": sha256(path.read_bytes()).hexdigest(),
+                }
+            )
         sources.append(
-            SourceIdentity(
-                "nvidia/Nemotron-Post-Training-Dataset-v2",
-                "default",
-                split,
-                approved_ptv2_revision,
-                "NVIDIA Open Model License",
-                True,
-                split,
-                "target-synth",
-                files,
-            )
+            {
+                "repository_id": repository,
+                "configuration": "default",
+                "split": split,
+                "revision": approved_ptv2_revision,
+                "license_expression": "NVIDIA Open Model License",
+                "approved_use": True,
+                "cell": split,
+                "lane": "target-synth",
+                "files": files,
+            }
         )
-    source_inventory = SourceInventory(
-        1,
-        "ptv2-fixture",
-        tuple(sources),
-        task3_sha256,
-        task3_manifest,
-        MappingProxyType({}),
+    plan = tmp_path / "task5-source-plan.json"
+    plan.write_text(
+        json.dumps({"schema_version": 1, "name": "task5-ptv2", "sources": sources}),
+        encoding="utf-8",
     )
-    return select_bprime_prompt_view(
-        inventory,
-        task5_policy,
-        source_inventory=source_inventory,
-        baseline_receipt_sha256=baseline_sha256,
-        held_out_receipt_sha256=held_out_sha256,
+    source_inventory = stage_source_inventory(
+        load_source_inventory(plan),
+        durable_root=tmp_path / "task5-durable",
+        scratch_root=tmp_path / "task5-scratch",
+        local_source_root=local,
     )
+
+    class _Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            assert kwargs["add_generation_prompt"] is True
+            return {"input_ids": list(range(1, len(messages) + 1))}
+
+    candidates = build_candidate_inventory(
+        source_inventory,
+        tokenizer=_Tokenizer(),
+        tokenizer_sha256="d" * 64,
+        baseline_exclusion=make_exclusion_receipt("baseline", ()),
+        held_out_exclusion=make_exclusion_receipt("held-out", ()),
+        storage_dir=tmp_path / "task5-candidates",
+    )
+    try:
+        return select_bprime_prompt_view(
+            candidates,
+            task5_policy,
+            source_inventory=source_inventory,
+            baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+            held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+        )
+    finally:
+        candidates.rows.close()
 
 
 def test_approved_ptv2_study_policy_is_exact() -> None:
@@ -1073,7 +1008,7 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
     tmp_path: Path,
 ) -> None:
     """A genuine Task5 selector/publication is replayed; a forged selection root is rejected."""
-    task5_bundle = _genuine_scaled_task5_bundle()
+    task5_bundle = _genuine_scaled_task5_bundle(tmp_path)
     try:
         published = publish_bprime_prompt_view_bundle(
             task5_bundle, tmp_path / "task5", rows_per_shard=4

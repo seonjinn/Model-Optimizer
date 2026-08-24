@@ -323,9 +323,9 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
         files = []
         for file_index in range(count):
             relative = f"data/{split}/{file_index:03d}.jsonl"
-            staged = tmp_path / "sources" / repository / revision / relative
-            staged.parent.mkdir(parents=True, exist_ok=True)
-            staged.write_text(
+            local_file = tmp_path / "local" / repository / revision / relative
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            local_file.write_text(
                 json.dumps(
                     {
                         "messages": [
@@ -345,8 +345,8 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
             files.append(
                 module.SourceFile(
                     relative,
-                    staged.stat().st_size,
-                    module.sha256_file(staged),
+                    local_file.stat().st_size,
+                    module.sha256_file(local_file),
                 )
             )
         sources.append(
@@ -362,41 +362,39 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
                 tuple(files),
             )
         )
-    canonical_manifest = module.canonical_json(
-        {
-            "schema_version": 1,
-            "name": "ptv2-normalization",
-            "sources": [
-                {
-                    "repository_id": source.repository_id,
-                    "configuration": source.configuration,
-                    "split": source.split,
-                    "revision": source.revision,
-                    "license_expression": source.license_expression,
-                    "approved_use": source.approved_use,
-                    "cell": source.cell,
-                    "lane": source.lane,
-                    "files": [
-                        {
-                            "path": file.path,
-                            "bytes": file.bytes,
-                            "sha256": file.sha256,
-                        }
-                        for file in source.files
-                    ],
-                }
-                for source in sources
-            ],
-        }
-    )
-    inventory = module.SourceInventory(
-        1,
-        "ptv2-normalization",
-        tuple(sources),
-        hashlib.sha256(canonical_manifest).hexdigest(),
-        canonical_manifest,
-        {},
-        tmp_path,
+    plan_payload = {
+        "schema_version": 1,
+        "name": "ptv2-normalization",
+        "sources": [
+            {
+                "repository_id": source.repository_id,
+                "configuration": source.configuration,
+                "split": source.split,
+                "revision": source.revision,
+                "license_expression": source.license_expression,
+                "approved_use": source.approved_use,
+                "cell": source.cell,
+                "lane": source.lane,
+                "files": [
+                    {"path": file.path, "bytes": file.bytes, "sha256": file.sha256}
+                    for file in source.files
+                ],
+            }
+            for source in sources
+        ],
+    }
+    plan_path = tmp_path / "source-plan.json"
+    plan_path.write_text(json.dumps(plan_payload), encoding="utf-8")
+    sys.path.insert(0, str(MODULE_PATH.parent))
+    try:
+        import stage_ptv23_sources as staging_module
+    finally:
+        sys.path.pop(0)
+    inventory = staging_module.stage_source_inventory(
+        staging_module.load_source_inventory(plan_path),
+        durable_root=tmp_path / "durable",
+        scratch_root=tmp_path / "scratch",
+        local_source_root=tmp_path / "local",
     )
 
     candidates = module.build_candidate_inventory(
@@ -461,6 +459,13 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
         ("multilingual", "de"),
         ("multilingual", "es"),
         ("multilingual", "fr"),
+    }
+    assert {cell.arm_domain for cell in candidates.capacity} == {
+        "instruction-chat",
+        "code",
+        "math",
+        "stem-science",
+        "multilingual",
     }
     selection_manifest = json.loads(published.manifest_path.read_bytes())
     assert selection_manifest["selection_mode"] == "B-prime-only"

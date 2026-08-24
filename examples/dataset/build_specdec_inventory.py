@@ -65,6 +65,7 @@ __all__ = [
     "make_exclusion_receipt",
     "sha256_file",
     "tokenizer_snapshot_sha256",
+    "verify_candidate_inventory_membership",
 ]
 
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -932,7 +933,7 @@ def build_candidate_inventory(
                 accepted_count += 1
                 if accepted_count % 10_000 == 0:
                     connection.commit()
-                cell = CandidateCell(source.cell, source.lane, language, context_bucket)
+                cell = CandidateCell(_candidate_domain(source), source.lane, language, context_bucket)
                 capacity[cell] = capacity.get(cell, 0) + 1
         connection.commit()
     except BaseException:
@@ -994,6 +995,120 @@ def build_candidate_inventory(
         ptv2_revision=_PTV2_REVISION,
         ptv2_allowlist_sha256=APPROVED_PTV2_ALLOWLIST_SHA256,
     )
+
+
+def verify_candidate_inventory_membership(
+    inventory: CandidateInventory, source_inventory: SourceInventory
+) -> None:
+    """Rejoin every candidate to its authenticated staged physical source row."""
+    files = _verified_candidate_files(source_inventory)
+    assert source_inventory.staged_root is not None
+    expected_paths = {path.resolve() for _source, _descriptor, path in files}
+    actual_paths = {
+        path.resolve()
+        for path in (source_inventory.staged_root / "sources").rglob("*")
+        if path.is_file()
+    }
+    if actual_paths != expected_paths:
+        raise ValueError("staged Task 3 physical shard set does not match its receipt")
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix="bprime-membership-", suffix=".sqlite3")
+    os.close(descriptor)
+    database = Path(temporary_name)
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            "CREATE TABLE wanted("
+            "repository_id TEXT,configuration TEXT,split TEXT,revision TEXT,file_path TEXT,"
+            "source_row INTEGER,prompt_uuid TEXT,canonical_bytes BLOB,source_id TEXT,language TEXT,"
+            "domain TEXT,lane TEXT,"
+            "PRIMARY KEY(repository_id,configuration,split,revision,file_path,source_row));"
+        )
+        observed_capacity: dict[CandidateCell, int] = {}
+        for candidate in inventory.rows:
+            if not isinstance(candidate, CandidatePrompt):
+                raise TypeError("candidate inventory rows must be CandidatePrompt values")
+            row = candidate
+            inserted = connection.execute(
+                "INSERT OR IGNORE INTO wanted(repository_id,configuration,split,revision,file_path,"
+                "source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    row.source_repository_id,
+                    row.source_configuration,
+                    row.source_split,
+                    row.source_revision,
+                    row.source_file_path,
+                    row.source_row_index,
+                    row.prompt_uuid,
+                    row.canonical_bytes,
+                    row.source_id,
+                    row.language,
+                    row.domain,
+                    row.lane,
+                ),
+            )
+            if inserted.rowcount != 1:
+                raise ValueError("candidate inventory repeats a physical Task 3 row")
+            cell = CandidateCell(row.domain, row.lane, row.language, row.context_bucket)
+            observed_capacity[cell] = observed_capacity.get(cell, 0) + 1
+        connection.commit()
+        if observed_capacity != dict(inventory.capacity):
+            raise ValueError("candidate inventory capacity does not reconcile with its rows")
+
+        matched = 0
+        for source, _file, path in files:
+            wanted_rows = iter(
+                connection.execute(
+                    "SELECT source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane "
+                    "FROM wanted WHERE repository_id=? AND configuration=? AND split=? "
+                    "AND revision=? AND file_path=? ORDER BY source_row",
+                    (
+                        source.repository_id,
+                        source.configuration,
+                        source.split,
+                        source.revision,
+                        _file.path,
+                    ),
+                )
+            )
+            wanted = next(wanted_rows, None)
+            if wanted is None:
+                continue
+            for row_index, raw_row in _iter_candidate_rows(path):
+                if row_index < wanted[0]:
+                    continue
+                if row_index != wanted[0] or raw_row is None:
+                    raise ValueError("candidate does not match its physical Task 3 row")
+                try:
+                    raw = dict(raw_row)
+                    messages, tools = _target_prompt(raw)
+                    canonical_bytes = canonicalize_prompt(messages, tools)
+                    language = _normalize_language(raw.get("language"), source)
+                except (TypeError, ValueError) as error:
+                    raise ValueError("candidate does not match its physical Task 3 row") from error
+                expected = (
+                    sha256_bytes(canonical_bytes),
+                    canonical_bytes,
+                    f"{source.repository_id}:{source.configuration}:{source.split}",
+                    language,
+                    _candidate_domain(source),
+                    source.lane,
+                )
+                if wanted[1:] != expected:
+                    raise ValueError("candidate does not match its physical Task 3 row")
+                matched += 1
+                wanted = next(wanted_rows, None)
+                if wanted is None:
+                    break
+            if wanted is not None:
+                raise ValueError("candidate is absent from its physical Task 3 row")
+        expected_count = int(connection.execute("SELECT count(*) FROM wanted").fetchone()[0])
+        if matched != expected_count:
+            raise ValueError("candidate is absent from its physical Task 3 row")
+    finally:
+        connection.close()
+        database.unlink(missing_ok=True)
 
 
 def iter_candidate_inventory_bytes(inventory: CandidateInventory):

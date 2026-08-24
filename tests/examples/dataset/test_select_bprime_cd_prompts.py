@@ -43,7 +43,9 @@ try:
         CandidateInventory,
         CandidatePrompt,
         ExclusionProof,
+        build_candidate_inventory,
         candidate_inventory_sha256,
+        make_exclusion_receipt,
     )
     from select_bprime_cd_prompts import (
         DiskBackedSelectedRows,
@@ -53,13 +55,114 @@ try:
         select_bprime_prompt_view,
         select_prompt_views,
     )
-    from stage_ptv23_sources import SourceFile, SourceIdentity, SourceInventory
+    from stage_ptv23_sources import (
+        SourceFile,
+        SourceIdentity,
+        SourceInventory,
+        load_source_inventory,
+        stage_source_inventory,
+    )
 finally:
     sys.path.pop(0)
 
 BASELINE_RECEIPT_SHA256 = "1" * 64
 HELD_OUT_RECEIPT_SHA256 = "2" * 64
 PTV2_REVISION = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
+PTV2_REPOSITORY = "nvidia/Nemotron-Post-Training-Dataset-v2"
+PTV2_SPLITS = (
+    "chat",
+    "code",
+    "math",
+    "stem",
+    "multilingual_ja",
+    "multilingual_it",
+    "multilingual_de",
+    "multilingual_es",
+    "multilingual_fr",
+)
+
+
+class _CandidateTokenizer:
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs["add_generation_prompt"] is True
+        return {"input_ids": list(range(1, len(messages) + 1))}
+
+
+def _genuine_task3_ptv2(
+    tmp_path: Path, *, splits: tuple[str, ...] = PTV2_SPLITS
+) -> tuple[SourceInventory, CandidateInventory]:
+    local = tmp_path / "local"
+    sources = []
+    remaining = 201
+    for split_index, split in enumerate(splits):
+        count = remaining // (len(splits) - split_index)
+        remaining -= count
+        files = []
+        for file_index in range(count):
+            relative = f"data/{split}/{file_index:03d}.jsonl"
+            source = local / PTV2_REPOSITORY / PTV2_REVISION / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": f"question-{split}-{file_index}-{row_index}",
+                                },
+                                {
+                                    "role": "assistant",
+                                    "content": f"answer-{split}-{file_index}-{row_index}",
+                                },
+                            ]
+                        }
+                    )
+                    + "\n"
+                    for row_index in range(3)
+                ),
+                encoding="utf-8",
+            )
+            files.append(
+                {
+                    "path": relative,
+                    "bytes": source.stat().st_size,
+                    "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                }
+            )
+        sources.append(
+            {
+                "repository_id": PTV2_REPOSITORY,
+                "configuration": "default",
+                "split": split,
+                "revision": PTV2_REVISION,
+                "license_expression": "NVIDIA Open Model License",
+                "approved_use": True,
+                "cell": split,
+                "lane": "target-synth",
+                "files": files,
+            }
+        )
+    plan_path = tmp_path / "SOURCE_PLAN_INPUT.json"
+    plan_path.write_text(
+        json.dumps({"schema_version": 1, "name": "ptv2-fixture", "sources": sources}),
+        encoding="utf-8",
+    )
+    staged = stage_source_inventory(
+        load_source_inventory(plan_path),
+        durable_root=tmp_path / "durable",
+        scratch_root=tmp_path / "scratch",
+        local_source_root=local,
+    )
+    candidates = build_candidate_inventory(
+        staged,
+        tokenizer=_CandidateTokenizer(),
+        tokenizer_sha256="d" * 64,
+        baseline_exclusion=make_exclusion_receipt("baseline", ()),
+        held_out_exclusion=make_exclusion_receipt("held-out", ()),
+        storage_dir=tmp_path / "candidate-storage",
+    )
+    return staged, candidates
 
 
 def _policy() -> PromptPolicy:
@@ -284,17 +387,30 @@ def _task3_ptv2_inventory(
     return source_inventory, _rehash(replace(candidates, rows=rows))
 
 
-def test_bprime_only_producer_publishes_no_cd_rows_and_rejects_mixed_inventory(
+def test_bprime_only_producer_rejects_self_hashed_unstaged_task3_inventory() -> None:
+    """An in-memory descriptor graph is not an authenticated Task3 receipt."""
+    source_inventory, candidates = _task3_ptv2_inventory(_ptv2_only_inventory())
+    with pytest.raises(ValueError, match="staged Task 3"):
+        select_bprime_prompt_view(
+            candidates,
+            _policy(),
+            source_inventory=source_inventory,
+            baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+        )
+
+
+def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bprime(
     tmp_path: Path,
 ) -> None:
-    """The A complement producer cannot admit PTV3 or publish C/D arms."""
-    source_inventory, candidates = _task3_ptv2_inventory(_ptv2_only_inventory())
+    """The genuine 201-shard stage/build/select/publish path is executable."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
     bundle = select_bprime_prompt_view(
         candidates,
         _policy(),
         source_inventory=source_inventory,
-        baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
-        held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+        baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+        held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
     )
     try:
         published = publish_bprime_prompt_view_bundle(
@@ -302,6 +418,7 @@ def test_bprime_only_producer_publishes_no_cd_rows_and_rejects_mixed_inventory(
         )
     finally:
         bundle.close()
+        candidates.rows.close()
     manifest = json.loads(published.manifest_path.read_bytes())
 
     assert manifest["selection_mode"] == "B-prime-only"
@@ -311,16 +428,102 @@ def test_bprime_only_producer_publishes_no_cd_rows_and_rejects_mixed_inventory(
             "B-prime"
         }
 
+
+def test_bprime_only_producer_rejects_ptv3_candidate_contamination(tmp_path: Path) -> None:
+    """No PTV3 candidate can enter the physical PTV2-only producer."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
     ptv3_row = next(row for row in _candidate_rows(_inventory()) if row.source_family == "ptv3")
-    mixed = _rehash(replace(candidates, rows=(*_candidate_rows(candidates), ptv3_row)))
-    with pytest.raises(ValueError, match="PTV2-only"):
-        select_bprime_prompt_view(
-            mixed,
-            _policy(),
-            source_inventory=source_inventory,
-            baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
-            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
-        )
+    rows = (*_candidate_rows(candidates), ptv3_row)
+    capacity = Counter(
+        CandidateCell(row.domain, row.lane, row.language, row.context_bucket) for row in rows
+    )
+    mixed = _rehash(replace(candidates, rows=rows, capacity=MappingProxyType(dict(capacity))))
+    try:
+        with pytest.raises(ValueError, match="PTV2-only"):
+            select_bprime_prompt_view(
+                mixed,
+                _policy(),
+                source_inventory=source_inventory,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
+
+
+def test_bprime_only_producer_rejects_wrong_task3_split_topology(tmp_path: Path) -> None:
+    """A staged 201-shard receipt must contain every approved split exactly once."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path, splits=PTV2_SPLITS[:-1])
+    try:
+        with pytest.raises(ValueError, match="exactly 201"):
+            select_bprime_prompt_view(
+                candidates,
+                _policy(),
+                source_inventory=source_inventory,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "modified"])
+def test_bprime_only_producer_rejects_changed_physical_task3_shards(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Physical staged shards remain an authenticated producer input."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    assert source_inventory.staged_root is not None
+    first = next(
+        path
+        for path in (source_inventory.staged_root / "sources").rglob("*.jsonl")
+        if path.is_file()
+    )
+    if mutation == "missing":
+        first.unlink()
+    elif mutation == "extra":
+        extra = first.parent / "undeclared.jsonl"
+        extra.write_text(first.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        first.write_bytes(first.read_bytes() + b"\n")
+    try:
+        with pytest.raises(ValueError, match="staged Task 3"):
+            select_bprime_prompt_view(
+                candidates,
+                _policy(),
+                source_inventory=source_inventory,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
+
+
+@pytest.mark.parametrize("mutation", ["row", "uuid", "canonical"])
+def test_bprime_only_producer_rejects_candidate_not_on_its_physical_row(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Rehashing forged candidate metadata cannot create physical membership."""
+    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    rows = list(_candidate_rows(candidates))
+    if mutation == "row":
+        rows[0] = replace(rows[0], source_row_index=100_000)
+    elif mutation == "uuid":
+        rows[0] = replace(rows[0], prompt_uuid="f" * 64)
+    else:
+        rows[0] = replace(rows[0], canonical_bytes=b'{"messages":[],"tools":[]}')
+    forged = _rehash(replace(candidates, rows=tuple(rows)))
+    try:
+        with pytest.raises(ValueError, match="physical Task 3 row"):
+            select_bprime_prompt_view(
+                forged,
+                _policy(),
+                source_inventory=source_inventory,
+                baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        candidates.rows.close()
 
 
 @pytest.mark.parametrize(
@@ -331,10 +534,10 @@ def test_bprime_only_producer_publishes_no_cd_rows_and_rejects_mixed_inventory(
     ],
 )
 def test_bprime_only_producer_rejects_wrong_ptv2_cell_or_language(
-    replacement: dict[str, str], message: str
+    tmp_path: Path, replacement: dict[str, str], message: str
 ) -> None:
     """Noncanonical Task3-to-Task5 cell mappings cannot enter the complement."""
-    source_inventory, inventory = _task3_ptv2_inventory(_ptv2_only_inventory())
+    source_inventory, inventory = _genuine_task3_ptv2(tmp_path)
     rows = list(_candidate_rows(inventory))
     rows[0] = replace(rows[0], **replacement)
     capacity = Counter(
@@ -343,46 +546,36 @@ def test_bprime_only_producer_rejects_wrong_ptv2_cell_or_language(
     forged = _rehash(
         replace(inventory, rows=tuple(rows), capacity=MappingProxyType(dict(capacity)))
     )
-    with pytest.raises(ValueError, match=message):
-        select_bprime_prompt_view(
-            forged,
-            _policy(),
-            source_inventory=source_inventory,
-            baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
-            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
-        )
+    try:
+        with pytest.raises(ValueError, match=message):
+            select_bprime_prompt_view(
+                forged,
+                _policy(),
+                source_inventory=source_inventory,
+                baseline_receipt_sha256=inventory.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=inventory.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        inventory.rows.close()
 
 
-def test_bprime_only_producer_rejects_wrong_shard_count_and_source_digest() -> None:
+def test_bprime_only_producer_rejects_wrong_source_digest(tmp_path: Path) -> None:
     """The dedicated producer authenticates the full Task3 shard and row identities."""
-    source_inventory, inventory = _task3_ptv2_inventory(_ptv2_only_inventory())
-    short_inventory = replace(
-        source_inventory,
-        sources=(
-            replace(source_inventory.sources[0], files=source_inventory.sources[0].files[:-1]),
-            *source_inventory.sources[1:],
-        ),
-    )
-    with pytest.raises(ValueError, match="exactly 201"):
-        select_bprime_prompt_view(
-            inventory,
-            _policy(),
-            source_inventory=short_inventory,
-            baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
-            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
-        )
-
+    source_inventory, inventory = _genuine_task3_ptv2(tmp_path)
     forged_rows = list(_candidate_rows(inventory))
     forged_rows[0] = replace(forged_rows[0], source_file_sha256="f" * 64)
     forged = _rehash(replace(inventory, rows=tuple(forged_rows)))
-    with pytest.raises(ValueError, match="source digest"):
-        select_bprime_prompt_view(
-            forged,
-            _policy(),
-            source_inventory=source_inventory,
-            baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
-            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
-        )
+    try:
+        with pytest.raises(ValueError, match="source digest"):
+            select_bprime_prompt_view(
+                forged,
+                _policy(),
+                source_inventory=source_inventory,
+                baseline_receipt_sha256=inventory.baseline_exclusion.receipt_sha256,
+                held_out_receipt_sha256=inventory.held_out_exclusion.receipt_sha256,
+            )
+    finally:
+        inventory.rows.close()
 
 
 def test_selection_requires_nonzero_inventory_bound_exclusion_receipts() -> None:
