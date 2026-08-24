@@ -14,7 +14,8 @@ required=(
     B_CANARY_MANIFEST B_CANARY_READINESS B_CANARY_BUILD_RECEIPT B_CANARY_OUTPUT
     B_CANARY_EVIDENCE B_CANARY_CHECKPOINT B_CANARY_EXPORT B_CANARY_EVALUATION_RECEIPT
     B_CANARY_GPU_EVIDENCE B_CANARY_EVAL_OUTPUT LAUNCHER_ROOT REPO_ROOT MODELOPT_RUNTIME
-    B_CANARY_SUPERVISOR_RECEIPT CONTAINER_IMAGE
+    B_CANARY_SUPERVISOR_RECEIPT B_CANARY_EXPORTER_RECEIPT CONTAINER_IMAGE
+    WANDB_NETRC_PATH SLURM_TMPDIR
     B_A_AUTHORIZATION_RECEIPT B_A_AUTHORIZATION_RECEIPT_SHA256
     B_A_SCHEDULER_OBSERVATION B_A_SCHEDULER_OBSERVATION_SHA256
 )
@@ -26,6 +27,7 @@ done
 readonly SUPERVISOR="$REPO_ROOT/tools/launcher/common/eagle3/train_eagle_streaming.sh"
 readonly DFLASH_CONFIG="$REPO_ROOT/modelopt_recipes/general/speculative_decoding/dflash.yaml"
 readonly EVALUATOR="$LAUNCHER_ROOT/common/specdec/run_qwen4b_b_canary_eval.sh"
+readonly EXPORTER="$REPO_ROOT/examples/speculative_decoding/scripts/export_hf_checkpoint.py"
 
 runtime_env="$({ PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$B_CANARY_MANIFEST" "$B_CANARY_READINESS" "$B_CANARY_BUILD_RECEIPT" \
@@ -43,6 +45,7 @@ from common.specdec.qwen4b_b_canary_manifest import (
     validate_a_scheduler_observation,
     validate_bound_artifacts,
     validate_runtime_artifacts,
+    validate_wandb_runtime,
 )
 
 manifest = load_b_canary_manifest(Path(sys.argv[1]))
@@ -77,7 +80,15 @@ validate_a_authorization_receipt(
 validate_a_scheduler_observation(
     Path(sys.argv[10]),
     sys.argv[11],
+    authorization_path=Path(sys.argv[7]),
     authorization_sha256=sys.argv[8],
+)
+wandb_paths = validate_wandb_runtime(
+    manifest,
+    netrc_path=Path(__import__("os").environ["WANDB_NETRC_PATH"]),
+    slurm_tmpdir=Path(__import__("os").environ["SLURM_TMPDIR"]),
+    job_id=__import__("os").environ["SLURM_JOB_ID"],
+    repository_root=Path(sys.argv[9]),
 )
 values = {
     "HF_MODEL_CKPT": manifest.runtime.target_path,
@@ -89,6 +100,7 @@ values = {
     "WANDB_RUN_ID": manifest.runtime.wandb_run_id,
     "B_OUTPUT_ROOT": manifest.runtime.output_root,
     "B_CANARY_OUTPUT_SHA256": manifest.builder_output_sha256,
+    **wandb_paths,
 }
 for key, value in values.items():
     print(f"{key}={shlex.quote(value)}")
@@ -97,7 +109,18 @@ PY
 eval "$runtime_env"
 export HF_MODEL_CKPT SERVE_NODES SERVE_TP SERVE_REPLICAS_PER_NODE EAGLE_CAPTURE_IDS
 export WANDB_PROJECT WANDB_RUN_ID MODELOPT_RUNTIME B_OUTPUT_ROOT B_CANARY_OUTPUT_SHA256
-export EXPORT_PATH="$B_CANARY_EXPORT"
+export WANDB_DIR WANDB_CONFIG_DIR WANDB_ARTIFACT_DIR WANDB_CACHE_DIR WANDB_NETRC_PATH
+export EXPORT_PATH="$B_OUTPUT_ROOT/control/parent-export"
+
+for wandb_path in "$WANDB_DIR" "$WANDB_CONFIG_DIR" "$WANDB_ARTIFACT_DIR" \
+    "$WANDB_CACHE_DIR"; do
+    [[ ! -e "$wandb_path" && ! -L "$wandb_path" ]] || {
+        echo "B W&B job state already exists: $wandb_path" >&2
+        exit 2
+    }
+    mkdir -p "$wandb_path"
+    chmod 700 "$wandb_path"
+done
 
 for output in "$B_CANARY_CHECKPOINT" "$B_CANARY_EXPORT" \
     "$B_CANARY_EVALUATION_RECEIPT" "$B_CANARY_EVAL_OUTPUT" \
@@ -109,7 +132,8 @@ for output in "$B_CANARY_CHECKPOINT" "$B_CANARY_EXPORT" \
 done
 for output in "$B_OUTPUT_ROOT" "$B_CANARY_CHECKPOINT" "$B_CANARY_EXPORT" \
     "$B_CANARY_EVIDENCE" "$B_CANARY_EVALUATION_RECEIPT" "$B_CANARY_EVAL_OUTPUT" \
-    "$B_CANARY_GPU_EVIDENCE" "$B_CANARY_SUPERVISOR_RECEIPT"; do
+    "$B_CANARY_GPU_EVIDENCE" "$B_CANARY_SUPERVISOR_RECEIPT" \
+    "$B_CANARY_EXPORTER_RECEIPT"; do
     [[ ! -e "$output" && ! -L "$output" ]] || {
         echo "B canary output already exists: $output" >&2
         exit 2
@@ -175,7 +199,45 @@ srun --overlap --nodes=16 --ntasks=16 --ntasks-per-node=1 --gpus-per-task=4 --cp
         dflash.dflash_architecture_config.head_dim=128 \
         dflash.dflash_architecture_config.intermediate_size=9728
     ' bash "$MODELOPT_RUNTIME" "$SUPERVISOR" "$DFLASH_CONFIG"
-supervisor_finished_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+# The canonical supervisor's compatibility export reads the training parent. The
+# final evaluator artifact is instead produced by this bound, current-job reload
+# of the exact checkpoint-200 child.
+exporter_started_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+srun --overlap --nodes=1 --ntasks=1 --gpus=4 --cpus-per-task=72 \
+    --kill-on-bad-exit=1 bash -c '
+    source "$1/bin/activate"
+    cd "$2"
+    exec python3 "$3" --model_path "$4" --export_path "$5"
+    ' bash "$MODELOPT_RUNTIME" "$REPO_ROOT" "$EXPORTER" \
+    "$B_CANARY_CHECKPOINT/checkpoint-200" "$B_CANARY_EXPORT"
+exporter_finished_at="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+
+PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    "$B_CANARY_MANIFEST" "$B_CANARY_EXPORTER_RECEIPT" "$SLURM_JOB_ID" \
+    "$EXPORTER" "$B_CANARY_CHECKPOINT/checkpoint-200" "$B_CANARY_EXPORT" \
+    "$exporter_started_at" "$exporter_finished_at" <<'PY'
+import sys
+from pathlib import Path
+from common.specdec.qwen4b_b_canary_manifest import (
+    load_b_canary_manifest,
+    publish_b_exporter_invocation,
+)
+exporter = Path(sys.argv[4])
+checkpoint = Path(sys.argv[5])
+export = Path(sys.argv[6])
+publish_b_exporter_invocation(
+    Path(sys.argv[2]),
+    load_b_canary_manifest(Path(sys.argv[1])),
+    job_id=sys.argv[3],
+    exporter_path=exporter,
+    checkpoint_path=checkpoint,
+    export_path=export,
+    argv=[str(exporter), "--model_path", str(checkpoint), "--export_path", str(export)],
+    started_at=sys.argv[7],
+    finished_at=sys.argv[8],
+)
+PY
+
 cleanup_monitor
 trap - EXIT INT TERM
 
@@ -193,8 +255,8 @@ srun --overlap --nodes=1 --ntasks=1 --gpus=4 --cpus-per-task=72 \
 PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$B_CANARY_MANIFEST" "$B_CANARY_SUPERVISOR_RECEIPT" "$SLURM_JOB_ID" \
     "$B_CANARY_CHECKPOINT/checkpoint-200" "$B_CANARY_EXPORT" \
-    "$B_CANARY_EVALUATION_RECEIPT" "$supervisor_started_at" \
-    "$supervisor_finished_at" <<'PY'
+    "$B_CANARY_EXPORTER_RECEIPT" "$B_CANARY_EVALUATION_RECEIPT" \
+    "$supervisor_started_at" "$exporter_finished_at" <<'PY'
 import sys
 from pathlib import Path
 from common.specdec.qwen4b_b_canary_manifest import (
@@ -207,15 +269,17 @@ publish_b_supervisor_completion(
     job_id=sys.argv[3],
     checkpoint_path=Path(sys.argv[4]),
     export_path=Path(sys.argv[5]),
-    evaluation_receipt_path=Path(sys.argv[6]),
-    started_at=sys.argv[7],
-    finished_at=sys.argv[8],
+    exporter_receipt_path=Path(sys.argv[6]),
+    evaluation_receipt_path=Path(sys.argv[7]),
+    started_at=sys.argv[8],
+    finished_at=sys.argv[9],
 )
 PY
 
 PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$B_CANARY_MANIFEST" "$B_CANARY_EVIDENCE" "$SLURM_JOB_ID" \
-    "$B_CANARY_CHECKPOINT/checkpoint-200" "$B_CANARY_EXPORT" "$B_CANARY_EVALUATION_RECEIPT" \
+    "$B_CANARY_CHECKPOINT/checkpoint-200" "$B_CANARY_EXPORT" \
+    "$B_CANARY_EXPORTER_RECEIPT" "$B_CANARY_EVALUATION_RECEIPT" \
     "$B_CANARY_GPU_EVIDENCE" "$B_CANARY_SUPERVISOR_RECEIPT" <<'PY'
 import sys
 from pathlib import Path
@@ -228,8 +292,9 @@ publish_b_canary_evidence(
     job_id=sys.argv[3],
     checkpoint_path=Path(sys.argv[4]),
     export_path=Path(sys.argv[5]),
-    evaluation_receipt_path=Path(sys.argv[6]),
-    gpu_evidence_path=Path(sys.argv[7]),
-    supervisor_receipt_path=Path(sys.argv[8]),
+    exporter_receipt_path=Path(sys.argv[6]),
+    evaluation_receipt_path=Path(sys.argv[7]),
+    gpu_evidence_path=Path(sys.argv[8]),
+    supervisor_receipt_path=Path(sys.argv[9]),
 )
 PY

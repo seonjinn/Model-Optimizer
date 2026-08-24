@@ -5,7 +5,8 @@
 set -euo pipefail
 
 for name in B_CANARY_EXPORT B_CANARY_EVALUATION_RECEIPT B_CANARY_EVAL_OUTPUT \
-    B_CANARY_CHECKPOINT B_CANARY_MANIFEST REPO_ROOT LAUNCHER_ROOT SLURM_JOB_ID; do
+    B_CANARY_CHECKPOINT B_CANARY_MANIFEST B_CANARY_EXPORTER_RECEIPT \
+    REPO_ROOT LAUNCHER_ROOT SLURM_JOB_ID; do
     [[ -n "${!name:-}" ]] || { echo "missing evaluator environment: $name" >&2; exit 2; }
 done
 [[ "$SLURM_JOB_ID" =~ ^[0-9]+$ ]] || exit 2
@@ -41,6 +42,8 @@ run_root, receipt_path, job_id, export_path = (
 checkpoint_path, manifest_path, repo_root = Path(sys.argv[5]), Path(sys.argv[6]), Path(sys.argv[7])
 runtime = load_b_canary_manifest(manifest_path).runtime
 exporter = repo_root / "examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+exporter_receipt_path = Path(__import__("os").environ["B_CANARY_EXPORTER_RECEIPT"])
+exporter_receipt_raw = exporter_receipt_path.read_bytes()
 exporter_raw = exporter.read_bytes()
 if (
     hashlib.sha256(exporter_raw).hexdigest() != runtime.exporter_sha256
@@ -78,6 +81,8 @@ body = {
     "checkpoint_sha256": _directory_sha256(checkpoint_path),
     "exporter_path": "examples/speculative_decoding/scripts/export_hf_checkpoint.py",
     "exporter_sha256": runtime.exporter_sha256,
+    "exporter_invocation_path": str(exporter_receipt_path),
+    "exporter_invocation_sha256": hashlib.sha256(exporter_receipt_raw).hexdigest(),
     "checkpoint_reloaded_by_exporter": True,
     "completed_requests": completed,
     "metrics": {

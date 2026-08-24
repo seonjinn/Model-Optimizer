@@ -33,6 +33,7 @@ from common.specdec.qwen4b_b_canary_manifest import (
     load_b_canary_manifest,
     publish_a_scheduler_observation,
     publish_b_canary_evidence,
+    publish_b_exporter_invocation,
     publish_b_supervisor_completion,
     validate_a_authorization_receipt,
     validate_a_scheduler_observation,
@@ -786,8 +787,10 @@ def _topology() -> BCanaryTopology:
 
 
 def _runtime(tmp_path: Path, corpus_path: Path) -> BCanaryRuntimeIdentity:
-    supervisor = tmp_path / "train_eagle_streaming.sh"
-    config = tmp_path / "dflash.yaml"
+    supervisor = tmp_path / "repo/tools/launcher/common/eagle3/train_eagle_streaming.sh"
+    config = tmp_path / "repo/modelopt_recipes/general/speculative_decoding/dflash.yaml"
+    supervisor.parent.mkdir(parents=True, exist_ok=True)
+    config.parent.mkdir(parents=True, exist_ok=True)
     supervisor.write_text("supervisor\n")
     config.write_text("config\n")
     return BCanaryRuntimeIdentity(
@@ -812,12 +815,61 @@ def _runtime(tmp_path: Path, corpus_path: Path) -> BCanaryRuntimeIdentity:
         evaluator_sha256="6" * 64,
         train_script_sha256="7" * 64,
         exporter_sha256="8" * 64,
+        wandb_netrc_sha256="9" * 64,
+        wandb_durable_root="/lustre/q4b-tests/wandb",
+        wandb_scratch_namespace="qwen4b-b",
         corpus_arm="B-balanced",
         corpus_path=str(corpus_path),
         output_root=str(tmp_path / "output"),
         wandb_project="sna-qwen3-4b-dataset-study",
         wandb_run_id="q4b-b-test",
     )
+
+
+def test_wandb_runtime_requires_read_only_secret_and_job_scoped_storage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B W&B state is durable, while secrets are RO and caches stay job-local."""
+    corpus = tmp_path / "canary.jsonl"
+    corpus.write_text("{}\n")
+    manifest = _manifest(tmp_path, corpus)
+    netrc = tmp_path / "wandb.netrc"
+    netrc.write_text("machine api.wandb.ai\n")
+    manifest = replace(
+        manifest,
+        runtime=replace(
+            manifest.runtime,
+            wandb_netrc_sha256=sha256(netrc.read_bytes()).hexdigest(),
+        ),
+    )
+    monkeypatch.setattr(b_manifest_module, "_WANDB_NETRC_PATH", netrc)
+    monkeypatch.setattr(b_manifest_module, "_path_on_read_only_mount", lambda _path: True)
+    slurm_tmpdir = tmp_path / "slurm-job"
+    slurm_tmpdir.mkdir()
+
+    paths = b_manifest_module.validate_wandb_runtime(
+        manifest,
+        netrc_path=netrc,
+        slurm_tmpdir=slurm_tmpdir,
+        job_id="42",
+        repository_root=tmp_path / "repo",
+    )
+
+    assert paths == {
+        "WANDB_DIR": manifest.runtime.wandb_durable_root + "/jobs/42/run",
+        "WANDB_CONFIG_DIR": manifest.runtime.wandb_durable_root + "/jobs/42/config",
+        "WANDB_ARTIFACT_DIR": manifest.runtime.wandb_durable_root + "/jobs/42/artifacts",
+        "WANDB_CACHE_DIR": str(slurm_tmpdir / "qwen4b-b-42" / "wandb-cache"),
+    }
+    netrc.write_text("mutated\n")
+    with pytest.raises(ValueError, match="netrc identity"):
+        b_manifest_module.validate_wandb_runtime(
+            manifest,
+            netrc_path=netrc,
+            slurm_tmpdir=slurm_tmpdir,
+            job_id="42",
+            repository_root=tmp_path / "repo",
+        )
 
 
 def _directory_digest(root: Path) -> str:
@@ -1061,6 +1113,8 @@ def test_cpu_datamover_runner_passes_all_96_cpus_as_builder_workers(tmp_path: Pa
         "CONTAINER_SHA256": "f" * 64,
         "B_CANARY_OUTPUT_ROOT": str(tmp_path / "output"),
         "B_CANARY_WANDB_RUN_ID": "q4b-b-test",
+        "B_WANDB_NETRC_SHA256": "9" * 64,
+        "B_WANDB_DURABLE_ROOT": "/lustre/q4b-tests/wandb",
         "SLURM_JOB_ID": "123",
         "SLURM_JOB_PARTITION": "cpu_datamover",
         "SLURM_CPUS_PER_TASK": "96",
@@ -1223,7 +1277,7 @@ def test_a_authorization_rejects_non_producer_fixture(tmp_path: Path) -> None:
     receipt.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
     pinned = sha256(receipt.read_bytes()).hexdigest()
 
-    with pytest.raises((FileNotFoundError, ValueError), match=r"manifest|No such file"):
+    with pytest.raises((FileNotFoundError, ValueError), match=r"semantics|manifest|No such file"):
         validate_a_authorization_receipt(
             receipt,
             pinned,
@@ -1241,10 +1295,20 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
     corpus = tmp_path / "canary.jsonl"
     corpus.write_text("{}\n")
     manifest = _manifest(tmp_path, corpus)
-    checkpoint = tmp_path / "checkpoint"
-    export = tmp_path / "export"
-    checkpoint.mkdir()
-    export.mkdir()
+    checkpoint = Path(manifest.runtime.output_root) / "checkpoint" / "checkpoint-200"
+    export = Path(manifest.runtime.output_root) / "export"
+    checkpoint.mkdir(parents=True)
+    export.mkdir(parents=True)
+    exporter = tmp_path / "repo/examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+    exporter.parent.mkdir(parents=True)
+    exporter.write_text("exporter\n")
+    manifest = replace(
+        manifest,
+        runtime=replace(
+            manifest.runtime,
+            exporter_sha256=sha256(exporter.read_bytes()).hexdigest(),
+        ),
+    )
     (checkpoint / "trainer_state.json").write_text(
         json.dumps({"global_step": 200, "loss_history": [1.5, 1.25]}) + "\n"
     )
@@ -1263,6 +1327,7 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
         "checkpoint_sha256": _directory_digest(checkpoint),
         "exporter_path": "examples/speculative_decoding/scripts/export_hf_checkpoint.py",
         "exporter_sha256": manifest.runtime.exporter_sha256,
+        "exporter_invocation_sha256": "0" * 64,
         "checkpoint_reloaded_by_exporter": True,
         "completed_requests": 50,
         "metrics": {"acceptance_rate": 0.5, "generation_throughput": 123.0},
@@ -1281,13 +1346,42 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
             job_id="42",
             checkpoint_path=checkpoint,
             export_path=export,
+            exporter_receipt_path=tmp_path / "missing-exporter.json",
             evaluation_receipt_path=evaluation,
             started_at="2026-08-23T20:00:00+00:00",
             finished_at="2026-08-23T20:10:00+00:00",
         )
     (checkpoint / "trainer_state.json").write_text(
-        json.dumps({"global_step": 200, "log_history": [{"loss": 1.5}, {"loss": 1.25}]}) + "\n"
+        json.dumps(
+            {
+                "global_step": 200,
+                "log_history": [{"step": 199, "loss": 1.5}, {"step": 200, "loss": 1.25}],
+            }
+        )
+        + "\n"
     )
+    exporter_receipt = tmp_path / "EXPORTER_INVOCATION.json"
+    publish_b_exporter_invocation(
+        exporter_receipt,
+        manifest,
+        job_id="42",
+        exporter_path=exporter,
+        checkpoint_path=checkpoint,
+        export_path=export,
+        argv=[
+            str(exporter),
+            "--model_path",
+            str(checkpoint),
+            "--export_path",
+            str(export),
+        ],
+        started_at="2026-08-23T20:08:00+00:00",
+        finished_at="2026-08-23T20:09:00+00:00",
+    )
+    evaluation_body["exporter_invocation_path"] = str(exporter_receipt)
+    evaluation_body["exporter_invocation_sha256"] = sha256(
+        exporter_receipt.read_bytes()
+    ).hexdigest()
     evaluation_body["checkpoint_sha256"] = _directory_digest(checkpoint)
     evaluation_body["receipt_sha256"] = sha256(
         json.dumps(
@@ -1303,6 +1397,7 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
         job_id="42",
         checkpoint_path=checkpoint,
         export_path=export,
+        exporter_receipt_path=exporter_receipt,
         evaluation_receipt_path=evaluation,
         started_at="2026-08-23T20:00:00+00:00",
         finished_at="2026-08-23T20:10:00+00:00",
@@ -1315,6 +1410,7 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
         job_id="42",
         checkpoint_path=checkpoint,
         export_path=export,
+        exporter_receipt_path=exporter_receipt,
         evaluation_receipt_path=evaluation,
         gpu_evidence_path=gpu,
         supervisor_receipt_path=supervisor_receipt,
@@ -1329,9 +1425,113 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
             job_id="42",
             checkpoint_path=checkpoint,
             export_path=export,
+            exporter_receipt_path=exporter_receipt,
             evaluation_receipt_path=evaluation,
             gpu_evidence_path=gpu,
             supervisor_receipt_path=supervisor_receipt,
+        )
+
+
+def test_exporter_invocation_requires_exact_checkpoint_200_child(tmp_path: Path) -> None:
+    """The final HF export must reload checkpoint-200, never its training parent."""
+    corpus = tmp_path / "canary.jsonl"
+    corpus.write_text("{}\n")
+    manifest = _manifest(tmp_path, corpus)
+    checkpoint_parent = Path(manifest.runtime.output_root) / "checkpoint"
+    checkpoint = checkpoint_parent / "checkpoint-200"
+    export = Path(manifest.runtime.output_root) / "export"
+    exporter = tmp_path / "repo/examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+    exporter.parent.mkdir(parents=True)
+    checkpoint.mkdir(parents=True)
+    export.mkdir(parents=True)
+    exporter.write_text("exporter\n")
+    manifest = replace(
+        manifest,
+        runtime=replace(
+            manifest.runtime,
+            exporter_sha256=sha256(exporter.read_bytes()).hexdigest(),
+        ),
+    )
+    (checkpoint / "model.safetensors").write_bytes(b"checkpoint")
+    (export / "config.json").write_text("{}\n")
+    (export / "model.safetensors").write_bytes(b"export")
+    receipt = tmp_path / "EXPORTER_INVOCATION.json"
+
+    with pytest.raises(ValueError, match="checkpoint-200"):
+        publish_b_exporter_invocation(
+            receipt,
+            manifest,
+            job_id="42",
+            exporter_path=exporter,
+            checkpoint_path=checkpoint_parent,
+            export_path=export,
+            argv=[
+                str(exporter),
+                "--model_path",
+                str(checkpoint_parent),
+                "--export_path",
+                str(export),
+            ],
+            started_at="2026-08-23T20:00:00+00:00",
+            finished_at="2026-08-23T20:01:00+00:00",
+        )
+
+    publish_b_exporter_invocation(
+        receipt,
+        manifest,
+        job_id="42",
+        exporter_path=exporter,
+        checkpoint_path=checkpoint,
+        export_path=export,
+        argv=[
+            str(exporter),
+            "--model_path",
+            str(checkpoint),
+            "--export_path",
+            str(export),
+        ],
+        started_at="2026-08-23T20:00:00+00:00",
+        finished_at="2026-08-23T20:01:00+00:00",
+    )
+    payload = json.loads(receipt.read_bytes())
+    assert payload["model_path"] == str(checkpoint)
+    assert payload["argv"][2] == str(checkpoint)
+    with pytest.raises(FileExistsError):
+        publish_b_exporter_invocation(
+            receipt,
+            manifest,
+            job_id="42",
+            exporter_path=exporter,
+            checkpoint_path=checkpoint,
+            export_path=export,
+            argv=[
+                str(exporter),
+                "--model_path",
+                str(checkpoint),
+                "--export_path",
+                str(export),
+            ],
+            started_at="2026-08-23T20:00:00+00:00",
+            finished_at="2026-08-23T20:01:00+00:00",
+        )
+
+
+def test_last_finite_loss_requires_the_exact_final_step() -> None:
+    """A later unstepped loss cannot impersonate the step-200 training result."""
+    state = {
+        "global_step": 200,
+        "log_history": [
+            {"step": 200, "loss": 1.25},
+            {"step": 199, "loss": 0.01},
+            {"loss": 0.001},
+        ],
+    }
+
+    assert b_manifest_module._last_finite_training_loss(state, expected_step=200) == 1.25
+    with pytest.raises(ValueError, match="step 200"):
+        b_manifest_module._last_finite_training_loss(
+            {"global_step": 200, "log_history": [{"step": 199, "loss": 0.01}]},
+            expected_step=200,
         )
 
 
@@ -1375,8 +1575,20 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "run_qwen4b_b_canary_eval.sh" in runner
     evaluator = (root / "run_qwen4b_b_canary_eval.sh").read_text()
     assert '"checkpoint_reloaded_by_exporter": True' in evaluator
-    assert "load_vlm_or_llm(args.model_path" in evaluator
+    assert 'export EXPORT_PATH="$B_OUTPUT_ROOT/control/parent-export"' in runner
+    assert '--model_path "$4" --export_path "$5"' in runner
+    assert '"$B_CANARY_CHECKPOINT/checkpoint-200" "$B_CANARY_EXPORT"' in runner
+    assert "publish_b_exporter_invocation" in runner
+    assert "B_CANARY_EXPORTER_RECEIPT" in evaluator
+    assert '"exporter_invocation_sha256"' in evaluator
     assert '"checkpoint_sha256": _directory_sha256(checkpoint_path)' in evaluator
+    assert "validate_wandb_runtime" in runner
+    assert "validate_wandb_runtime" in b_manifest_module.__dict__
+    assert "qwen4b-b-$SLURM_JOB_ID" not in runner
+    assert "--wandb-netrc" in submitter
+    assert "--wandb-durable-root" in submitter
+    assert "WANDB_NETRC_PATH=/run/secrets/wandb.netrc" in submitter
+    assert ":/run/secrets/wandb.netrc:ro" in submitter
     assert "publish_b_export_evaluation" not in runner
     assert "sbatch --test-only" in submitter
     assert "sbatch --parsable" in submitter
@@ -1467,6 +1679,8 @@ def test_submit_prep_schedules_only_cpu_builder(tmp_path: Path) -> None:
     task9_view_sha = sha256(task9_view.read_bytes()).hexdigest()
     task8 = tmp_path / "task8"
     task8.mkdir()
+    wandb_netrc = tmp_path / "wandb.netrc"
+    wandb_netrc.write_text("machine api.wandb.ai\n")
     receipt = tmp_path / "SUBMISSION.json"
     environment = {
         **os.environ,
@@ -1517,6 +1731,10 @@ def test_submit_prep_schedules_only_cpu_builder(tmp_path: Path) -> None:
             str(tmp_path / "runtime"),
             "--output-root",
             str(tmp_path / "output"),
+            "--wandb-netrc",
+            str(wandb_netrc),
+            "--wandb-durable-root",
+            "/lustre/q4b-tests/wandb",
         ],
         check=False,
         capture_output=True,
@@ -1558,6 +1776,8 @@ def test_submit_canary_rejects_missing_a_authorization_before_sbatch(
     task9_view_sha = sha256(task9_view.read_bytes()).hexdigest()
     task8 = tmp_path / "task8"
     task8.mkdir()
+    wandb_netrc = tmp_path / "wandb.netrc"
+    wandb_netrc.write_text("machine api.wandb.ai\n")
     result = subprocess.run(
         [
             "bash",
@@ -1601,6 +1821,10 @@ def test_submit_canary_rejects_missing_a_authorization_before_sbatch(
             str(tmp_path / "runtime"),
             "--output-root",
             str(tmp_path / "output"),
+            "--wandb-netrc",
+            str(wandb_netrc),
+            "--wandb-durable-root",
+            "/lustre/q4b-tests/wandb",
         ],
         check=False,
         capture_output=True,
@@ -1613,30 +1837,62 @@ def test_submit_canary_rejects_missing_a_authorization_before_sbatch(
 
 
 def test_sacct_observation_requires_completed_canonical_a_parent(tmp_path: Path) -> None:
-    """A numeric job ID alone cannot authorize B without fresh scheduler evidence."""
+    """B re-observes the exact A submit/completion/controller chain via live sacct."""
+    from common.specdec.qwen4b_a_canary_manifest import (
+        finalize_a_authorization,
+        publish_a_submission_receipt,
+    )
+
+    def write_self_hashed(path: Path, body: dict[str, object]) -> None:
+        body["receipt_sha256"] = sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
+
+    submission = tmp_path / "A_SUBMISSION.json"
+    publish_a_submission_receipt(
+        submission,
+        source_commit="a" * 40,
+        builder_job_id="4241",
+        gpu_job_id="4242",
+        account="nemotron_n4_post",
+        job_comment="q4-a-repair",
+        stdout_path="/logs/q4-a-4242.out",
+        manifest_path=(tmp_path / "A_MANIFEST.json").resolve(),
+    )
+    completion = tmp_path / "A_JOB_COMPLETION.json"
+    write_self_hashed(
+        completion,
+        {
+            "schema_version": 1,
+            "producer": "qwen4b-a-repair-job-completion-v1",
+            "slurm_job_id": "4242",
+            "slurm_account": "nemotron_n4_post",
+            "slurm_job_name": "q4b-a-repair-canary",
+            "slurm_job_comment": "q4-a-repair",
+            "slurm_output_path": "/logs/q4-a-4242.out",
+            "submission_receipt_path": str(submission),
+            "submission_receipt_sha256": sha256(submission.read_bytes()).hexdigest(),
+            "started_at": "2026-08-23T20:01:00+00:00",
+            "finished_at": "2026-08-23T20:19:00+00:00",
+        },
+    )
     authorization = tmp_path / "A_AUTHORIZATION.json"
-    authorization.write_text(
-        json.dumps(
-            {
-                "slurm_job_id": "4242",
-                "slurm_account": "nemotron_n4_post",
-                "slurm_job_name": "q4b-a-repair-canary",
-                "slurm_job_comment": "q4-a-repair",
-                "slurm_output_path": "/logs/q4-a-4242.out",
-                "started_at": "2026-08-23T20:01:00",
-                "finished_at": "2026-08-23T20:19:00",
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
+    controller_observation = tmp_path / "A_CONTROLLER_OBSERVATION.json"
+    row = (
+        "4242|COMPLETED|0:0|nemotron_n4_post|q4b-a-repair-canary|"
+        "2026-08-23T20:00:00+00:00|2026-08-23T20:20:00+00:00|"
+        "q4-a-repair|/logs/q4-a-4242.out\n"
+    )
+    finalize_a_authorization(
+        authorization,
+        controller_observation,
+        submission_receipt_path=submission,
+        job_completion_path=completion,
+        sacct_output=row,
     )
     authorization_sha = sha256(authorization.read_bytes()).hexdigest()
     observation = tmp_path / "A_SCHEDULER.json"
-    row = (
-        "4242|COMPLETED|0:0|nemotron_n4_post|q4b-a-repair-canary|"
-        "2026-08-23T20:00:00|2026-08-23T20:20:00|q4-a-repair|/logs/q4-a-4242.out\n"
-    )
 
     observation_sha = publish_a_scheduler_observation(
         observation,
@@ -1648,6 +1904,7 @@ def test_sacct_observation_requires_completed_canonical_a_parent(tmp_path: Path)
     validate_a_scheduler_observation(
         observation,
         observation_sha,
+        authorization_path=authorization,
         authorization_sha256=authorization_sha,
     )
     with pytest.raises(FileExistsError):
@@ -1664,4 +1921,22 @@ def test_sacct_observation_requires_completed_canonical_a_parent(tmp_path: Path)
             authorization_path=authorization,
             authorization_sha256=authorization_sha,
             sacct_output=failed,
+        )
+    forged = json.loads(observation.read_bytes())
+    forged["comment"] = "forged"
+    forged["receipt_sha256"] = sha256(
+        json.dumps(
+            {key: value for key, value in forged.items() if key != "receipt_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    forged_path = tmp_path / "FORGED_SCHEDULER.json"
+    forged_path.write_text(json.dumps(forged, sort_keys=True, separators=(",", ":")) + "\n")
+    with pytest.raises(ValueError, match="semantics"):
+        validate_a_scheduler_observation(
+            forged_path,
+            sha256(forged_path.read_bytes()).hexdigest(),
+            authorization_path=authorization,
+            authorization_sha256=authorization_sha,
         )

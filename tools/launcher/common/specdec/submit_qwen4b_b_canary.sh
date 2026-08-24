@@ -5,7 +5,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 (--test-only|--submit-prep|--submit-canary|--submit-canary-only) --account ACCOUNT --repo-root PATH --source-commit SHA --task9-view PATH --task9-view-sha256 SHA --task8-publication PATH --task8-publication-sha256 SHA --task9-selection-receipt-sha256 SHA --build-root PATH --readiness PATH --manifest PATH --evidence PATH --receipt PATH --target-path PATH --target-revision SHA --container-image PATH --container-sha256 SHA --modelopt-runtime PATH --output-root PATH [GPU modes: --speculators-runtime PATH --speculators-repo PATH --hf-home PATH --eval-config PATH --eval-dataset-manifest PATH --container-identity PATH] [--a-authorization-receipt PATH --a-authorization-receipt-sha256 SHA]" >&2
+    echo "usage: $0 (--test-only|--submit-prep|--submit-canary|--submit-canary-only) --account ACCOUNT --repo-root PATH --source-commit SHA --task9-view PATH --task9-view-sha256 SHA --task8-publication PATH --task8-publication-sha256 SHA --task9-selection-receipt-sha256 SHA --build-root PATH --readiness PATH --manifest PATH --evidence PATH --receipt PATH --target-path PATH --target-revision SHA --container-image PATH --container-sha256 SHA --modelopt-runtime PATH --output-root PATH --wandb-netrc PATH --wandb-durable-root PATH [GPU modes: --speculators-runtime PATH --speculators-repo PATH --hf-home PATH --eval-config PATH --eval-dataset-manifest PATH --container-identity PATH] [--a-authorization-receipt PATH --a-authorization-receipt-sha256 SHA]" >&2
     exit 2
 }
 
@@ -16,6 +16,7 @@ target_path="" target_revision="" container_image="" container_sha256=""
 modelopt_runtime="" output_root="" a_receipt="" a_receipt_sha256=""
 speculators_runtime="" speculators_repo="" hf_home="" eval_config=""
 eval_dataset_manifest="" container_identity=""
+wandb_netrc="" wandb_durable_root=""
 while (( $# )); do
     case "$1" in
         --test-only|--submit-prep|--submit-canary|--submit-canary-only) [[ -z "$mode" ]] || usage; mode="$1"; shift ;;
@@ -38,6 +39,8 @@ while (( $# )); do
         --container-sha256) container_sha256="${2:-}"; shift 2 ;;
         --modelopt-runtime) modelopt_runtime="${2:-}"; shift 2 ;;
         --output-root) output_root="${2:-}"; shift 2 ;;
+        --wandb-netrc) wandb_netrc="${2:-}"; shift 2 ;;
+        --wandb-durable-root) wandb_durable_root="${2:-}"; shift 2 ;;
         --a-authorization-receipt) a_receipt="${2:-}"; shift 2 ;;
         --a-authorization-receipt-sha256) a_receipt_sha256="${2:-}"; shift 2 ;;
         --speculators-runtime) speculators_runtime="${2:-}"; shift 2 ;;
@@ -54,6 +57,7 @@ done
 [[ -n "$task9_view" && -n "$task8_publication" && -n "$build_root" ]] || usage
 [[ -n "$readiness_path" && -n "$manifest_path" && -n "$evidence_path" && -n "$receipt_path" ]] || usage
 [[ -n "$target_path" && -n "$container_image" && -n "$modelopt_runtime" && -n "$output_root" ]] || usage
+[[ -n "$wandb_netrc" && -n "$wandb_durable_root" ]] || usage
 [[ "$source_commit" =~ ^[0-9a-f]{40}$ && "$target_revision" =~ ^[0-9a-f]{40}$ ]] || usage
 for digest in "$task9_view_sha256" "$task8_publication_sha256" \
     "$task9_selection_receipt_sha256" "$container_sha256"; do
@@ -65,7 +69,10 @@ for path in "$repo_root" "$task9_view" "$task8_publication" "$build_root" \
     "$container_image" "$modelopt_runtime" "$output_root"; do
     [[ "$path" == /* ]] || usage
 done
+[[ "$wandb_netrc" == /* ]] || usage
+[[ "$wandb_durable_root" == /lustre/* ]] || usage
 [[ -d "$repo_root" && -f "$task9_view" && -d "$task8_publication" ]] || usage
+[[ -f "$wandb_netrc" && ! -L "$wandb_netrc" ]] || usage
 [[ ! -e "$receipt_path" && ! -L "$receipt_path" ]] || { echo "submission receipt already exists" >&2; exit 2; }
 
 launcher_root="$repo_root/tools/launcher"
@@ -74,6 +81,15 @@ canary_runner="$launcher_root/common/specdec/run_qwen4b_b_canary.sbatch"
 wandb_run_id="q4b-b-${source_commit:0:12}"
 a_scheduler_observation="${receipt_path}.a-scheduler.json"
 a_scheduler_observation_sha256=""
+wandb_netrc_sha256="$(python3 - "$wandb_netrc" <<'PY'
+import hashlib
+import os
+import sys
+descriptor = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+with os.fdopen(descriptor, "rb") as stream:
+    print(hashlib.sha256(stream.read()).hexdigest())
+PY
+)"
 
 # This gate intentionally precedes even sbatch --test-only so a production request
 # cannot cause any scheduler mutation before its caller-pinned A trust root passes.
@@ -180,8 +196,8 @@ validate_runtime_artifacts(
 PY
 fi
 
-builder_exports="ALL,REPO_ROOT=$repo_root,SOURCE_COMMIT=$source_commit,TASK9_B_VIEW=$task9_view,TASK9_B_VIEW_SHA256=$task9_view_sha256,TASK8_PUBLICATION=$task8_publication,TASK8_PUBLICATION_SHA256=$task8_publication_sha256,TASK9_SELECTION_RECEIPT_SHA256=$task9_selection_receipt_sha256,B_CANARY_BUILD_ROOT=$build_root,B_CANARY_READINESS=$readiness_path,B_CANARY_MANIFEST=$manifest_path,B_CANARY_SEED=42,B_CANARY_ACCOUNT=$account,TARGET_PATH=$target_path,TARGET_REVISION=$target_revision,CONTAINER_IMAGE=$container_image,CONTAINER_SHA256=$container_sha256,B_CANARY_OUTPUT_ROOT=$output_root,B_CANARY_WANDB_RUN_ID=$wandb_run_id"
-canary_exports="ALL,LAUNCHER_ROOT=$launcher_root,REPO_ROOT=$repo_root,MODELOPT_REPO=$repo_root,MODELOPT_RUNTIME=$modelopt_runtime,SPECULATORS_RUNTIME=$speculators_runtime,SPECULATORS_REPO=$speculators_repo,HF_HOME=$hf_home,EVAL_CONFIG_PATH=$eval_config,DATASET_MANIFEST_PATH=$eval_dataset_manifest,CONTAINER_IMAGE=$container_image,CONTAINER_IDENTITY_PATH=$container_identity,B_CANARY_MANIFEST=$manifest_path,B_CANARY_READINESS=$readiness_path,B_CANARY_BUILD_RECEIPT=$build_root/BUILD_RECEIPT.json,B_CANARY_OUTPUT=$build_root/canary.jsonl,B_CANARY_EVIDENCE=$evidence_path,B_CANARY_CHECKPOINT=$output_root/checkpoint,B_CANARY_EXPORT=$output_root/export,B_CANARY_EVALUATION_RECEIPT=$output_root/evaluation/RESULT.json,B_CANARY_EVAL_OUTPUT=$output_root/evaluation/raw,B_CANARY_GPU_EVIDENCE=$output_root/control/GPU_ACTIVITY.json,B_CANARY_SUPERVISOR_RECEIPT=$output_root/control/SUPERVISOR_COMPLETION.json,B_A_AUTHORIZATION_RECEIPT=$a_receipt,B_A_AUTHORIZATION_RECEIPT_SHA256=$a_receipt_sha256,B_A_SCHEDULER_OBSERVATION=$a_scheduler_observation,B_A_SCHEDULER_OBSERVATION_SHA256=$a_scheduler_observation_sha256"
+builder_exports="ALL,REPO_ROOT=$repo_root,SOURCE_COMMIT=$source_commit,TASK9_B_VIEW=$task9_view,TASK9_B_VIEW_SHA256=$task9_view_sha256,TASK8_PUBLICATION=$task8_publication,TASK8_PUBLICATION_SHA256=$task8_publication_sha256,TASK9_SELECTION_RECEIPT_SHA256=$task9_selection_receipt_sha256,B_CANARY_BUILD_ROOT=$build_root,B_CANARY_READINESS=$readiness_path,B_CANARY_MANIFEST=$manifest_path,B_CANARY_SEED=42,B_CANARY_ACCOUNT=$account,TARGET_PATH=$target_path,TARGET_REVISION=$target_revision,CONTAINER_IMAGE=$container_image,CONTAINER_SHA256=$container_sha256,B_CANARY_OUTPUT_ROOT=$output_root,B_CANARY_WANDB_RUN_ID=$wandb_run_id,B_WANDB_NETRC_SHA256=$wandb_netrc_sha256,B_WANDB_DURABLE_ROOT=$wandb_durable_root"
+canary_exports="ALL,LAUNCHER_ROOT=$launcher_root,REPO_ROOT=$repo_root,MODELOPT_REPO=$repo_root,MODELOPT_RUNTIME=$modelopt_runtime,SPECULATORS_RUNTIME=$speculators_runtime,SPECULATORS_REPO=$speculators_repo,HF_HOME=$hf_home,EVAL_CONFIG_PATH=$eval_config,DATASET_MANIFEST_PATH=$eval_dataset_manifest,CONTAINER_IMAGE=$container_image,CONTAINER_IDENTITY_PATH=$container_identity,B_CANARY_MANIFEST=$manifest_path,B_CANARY_READINESS=$readiness_path,B_CANARY_BUILD_RECEIPT=$build_root/BUILD_RECEIPT.json,B_CANARY_OUTPUT=$build_root/canary.jsonl,B_CANARY_EVIDENCE=$evidence_path,B_CANARY_CHECKPOINT=$output_root/checkpoint,B_CANARY_EXPORT=$output_root/export,B_CANARY_EXPORTER_RECEIPT=$output_root/control/EXPORTER_INVOCATION.json,B_CANARY_EVALUATION_RECEIPT=$output_root/evaluation/RESULT.json,B_CANARY_EVAL_OUTPUT=$output_root/evaluation/raw,B_CANARY_GPU_EVIDENCE=$output_root/control/GPU_ACTIVITY.json,B_CANARY_SUPERVISOR_RECEIPT=$output_root/control/SUPERVISOR_COMPLETION.json,B_A_AUTHORIZATION_RECEIPT=$a_receipt,B_A_AUTHORIZATION_RECEIPT_SHA256=$a_receipt_sha256,B_A_SCHEDULER_OBSERVATION=$a_scheduler_observation,B_A_SCHEDULER_OBSERVATION_SHA256=$a_scheduler_observation_sha256,WANDB_NETRC_PATH=/run/secrets/wandb.netrc"
 
 builder_job_id="" canary_job_id=""
 if [[ "$mode" != "--submit-canary-only" ]]; then
@@ -191,7 +207,9 @@ fi
 if [[ "$mode" == "--test-only" || "$mode" == "--submit-canary" || "$mode" == "--submit-canary-only" ]]; then
     sbatch --test-only --account="$account" --partition=batch --nodes=16 --segment=16 \
         --ntasks-per-node=1 --gpus-per-node=4 --cpus-per-task=96 \
-        --container-image="$container_image" --export="$canary_exports" "$canary_runner" >/dev/null
+        --container-image="$container_image" \
+        --container-mounts="$wandb_netrc:/run/secrets/wandb.netrc:ro" \
+        --export="$canary_exports" "$canary_runner" >/dev/null
 fi
 if [[ "$mode" == "--submit-prep" || "$mode" == "--submit-canary" ]]; then
     builder_job_id="$(sbatch --parsable --account="$account" --partition=cpu_datamover \
@@ -203,13 +221,17 @@ if [[ "$mode" == "--submit-canary" ]]; then
     canary_job_id="$(sbatch --parsable --account="$account" --partition=batch \
         --dependency=afterok:"$dependency_id" --nodes=16 --segment=16 \
         --ntasks-per-node=1 --gpus-per-node=4 --cpus-per-task=96 \
-        --container-image="$container_image" --export="$canary_exports" "$canary_runner")"
+        --container-image="$container_image" \
+        --container-mounts="$wandb_netrc:/run/secrets/wandb.netrc:ro" \
+        --export="$canary_exports" "$canary_runner")"
     [[ "$canary_job_id" =~ ^[0-9]+([_;].*)?$ ]] || exit 1
 fi
 if [[ "$mode" == "--submit-canary-only" ]]; then
     canary_job_id="$(sbatch --parsable --account="$account" --partition=batch \
         --nodes=16 --segment=16 --ntasks-per-node=1 --gpus-per-node=4 --cpus-per-task=96 \
-        --container-image="$container_image" --export="$canary_exports" "$canary_runner")"
+        --container-image="$container_image" \
+        --container-mounts="$wandb_netrc:/run/secrets/wandb.netrc:ro" \
+        --export="$canary_exports" "$canary_runner")"
     [[ "$canary_job_id" =~ ^[0-9]+([_;].*)?$ ]] || exit 1
 fi
 

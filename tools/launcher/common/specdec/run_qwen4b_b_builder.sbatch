@@ -16,6 +16,7 @@ required=(
     B_CANARY_BUILD_ROOT B_CANARY_READINESS B_CANARY_MANIFEST
     B_CANARY_SEED B_CANARY_ACCOUNT TARGET_PATH TARGET_REVISION CONTAINER_SHA256
     CONTAINER_IMAGE B_CANARY_OUTPUT_ROOT B_CANARY_WANDB_RUN_ID
+    B_WANDB_NETRC_SHA256 B_WANDB_DURABLE_ROOT
 )
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
@@ -175,6 +176,9 @@ runtime = BCanaryRuntimeIdentity(
     evaluator_sha256=hashlib.sha256(evaluator.read_bytes()).hexdigest(),
     train_script_sha256=hashlib.sha256(train_script.read_bytes()).hexdigest(),
     exporter_sha256=hashlib.sha256(exporter.read_bytes()).hexdigest(),
+    wandb_netrc_sha256=__import__("os").environ["B_WANDB_NETRC_SHA256"],
+    wandb_durable_root=__import__("os").environ["B_WANDB_DURABLE_ROOT"],
+    wandb_scratch_namespace="qwen4b-b",
     corpus_arm="B-balanced",
     corpus_path=str(output_path),
     output_root=__import__("os").environ["B_CANARY_OUTPUT_ROOT"],
