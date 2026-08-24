@@ -305,17 +305,30 @@ def write_vllm_runtime_receipt(
     package_path: Path,
     expected_commit: str,
     required_ancestor: str,
+    *,
+    runtime_package_path: Path | None = None,
 ) -> str:
-    """Bind Git ancestry once, before a relocatable runtime archive is built."""
-    package = _verified_checkout(package_path, expected_commit, required_ancestor)
-    files = _runtime_files(package)
+    """Bind clean PR source plus the complete installed runtime file set."""
+    source_package = _verified_checkout(package_path, expected_commit, required_ancestor)
+    runtime_package = (
+        source_package
+        if runtime_package_path is None
+        else runtime_package_path.resolve(strict=True)
+    )
+    source_files = _runtime_files(source_package)
+    runtime_files = _runtime_files(runtime_package)
+    runtime_by_path = {descriptor["path"]: descriptor for descriptor in runtime_files}
+    if any(runtime_by_path.get(descriptor["path"]) != descriptor for descriptor in source_files):
+        raise ValueError("vLLM runtime does not preserve exact tracked source bytes")
     body: dict[str, Any] = {
-        "schema_version": 1,
-        "producer": "dflash2-vllm-runtime-receipt-v1",
+        "schema_version": 2,
+        "producer": "dflash2-vllm-runtime-receipt-v2",
         "vllm_commit": expected_commit,
         "required_pr52816_commit": required_ancestor,
-        "runtime_files": files,
-        "runtime_files_sha256": _sha_json(files),
+        "source_files": source_files,
+        "source_files_sha256": _sha_json(source_files),
+        "runtime_files": runtime_files,
+        "runtime_files_sha256": _sha_json(runtime_files),
     }
     body["receipt_sha256"] = _sha_json(body)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -342,24 +355,30 @@ def verify_vllm_runtime(
     body = json.loads(raw)
     claim = body.pop("receipt_sha256", None) if isinstance(body, dict) else None
     files = body.get("runtime_files") if isinstance(body, dict) else None
+    source_files = body.get("source_files") if isinstance(body, dict) else None
     if (
         claim != _sha_json(body)
-        or body.get("schema_version") != 1
-        or body.get("producer") != "dflash2-vllm-runtime-receipt-v1"
+        or body.get("schema_version") != 2
+        or body.get("producer") != "dflash2-vllm-runtime-receipt-v2"
         or body.get("vllm_commit") != expected_commit
         or body.get("required_pr52816_commit") != required_ancestor
         or not isinstance(files, list)
+        or not isinstance(source_files, list)
+        or body.get("source_files_sha256") != _sha_json(source_files)
         or body.get("runtime_files_sha256") != _sha_json(files)
     ):
         raise ValueError("vLLM runtime receipt identity mismatch")
     package = package_path.resolve(strict=True)
-    for descriptor in files:
+    for descriptor in [*source_files, *files]:
         if not isinstance(descriptor, dict) or set(descriptor) != {"path", "bytes", "sha256"}:
             raise ValueError("vLLM runtime file descriptor is invalid")
         relative = Path(str(descriptor["path"]))
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("vLLM runtime file path is invalid")
-    declared_paths = {descriptor["path"] for descriptor in files}
+    runtime_by_path = {descriptor["path"]: descriptor for descriptor in files}
+    if any(runtime_by_path.get(descriptor["path"]) != descriptor for descriptor in source_files):
+        raise ValueError("vLLM runtime source provenance mismatch")
+    declared_paths = set(runtime_by_path)
     runtime_paths = {descriptor["path"] for descriptor in _runtime_files(package)}
     if declared_paths != runtime_paths:
         raise ValueError("vLLM runtime file set mismatch")
@@ -381,6 +400,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     vllm = subparsers.add_parser("vllm-receipt")
     vllm.add_argument("--package", type=Path, required=True)
+    vllm.add_argument("--runtime-package", type=Path)
     vllm.add_argument("--output", type=Path, required=True)
     vllm.add_argument("--expected-commit", required=True)
     vllm.add_argument("--required-ancestor", required=True)
@@ -396,6 +416,7 @@ def main() -> None:
             args.package,
             args.expected_commit,
             args.required_ancestor,
+            runtime_package_path=args.runtime_package,
         )
     else:
         receipt_sha256 = write_artifact_receipt(

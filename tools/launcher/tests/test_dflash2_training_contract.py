@@ -144,10 +144,28 @@ def test_vllm_runtime_receipt_survives_archive_staging_without_git(tmp_path: Pat
     (staged / "injected.py").write_text("MALICIOUS = True\n")
     with pytest.raises(ValueError, match="runtime file set"):
         verify_vllm_runtime(staged, receipt, receipt_sha, expected, required)
-    (staged / "injected.py").unlink()
-    (staged / "runtime.py").write_text("SUPPORTED = False\n")
-    with pytest.raises(ValueError, match="runtime file"):
-        verify_vllm_runtime(staged, receipt, receipt_sha, expected, required)
+
+
+def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path: Path) -> None:
+    """A wheel may add ARM64 extensions, but every tracked PR source byte must remain exact."""
+    package, required, expected = _vllm_checkout(tmp_path)
+    runtime = tmp_path / "runtime/vllm"
+    runtime.parent.mkdir()
+    __import__("shutil").copytree(package, runtime)
+    (runtime / "_C.abi3.so").write_bytes(b"arm64-extension")
+    receipt = tmp_path / "vllm-runtime-v2.json"
+    receipt_sha = write_vllm_runtime_receipt(
+        receipt,
+        package,
+        expected,
+        required,
+        runtime_package_path=runtime,
+    )
+
+    assert verify_vllm_runtime(runtime, receipt, receipt_sha, expected, required) == expected
+    (runtime / "runtime.py").write_text("SUPPORTED = False\n")
+    with pytest.raises(ValueError, match="runtime file bytes"):
+        verify_vllm_runtime(runtime, receipt, receipt_sha, expected, required)
 
 
 def test_runtime_contract_cli_builds_no_replace_receipts(tmp_path: Path) -> None:
