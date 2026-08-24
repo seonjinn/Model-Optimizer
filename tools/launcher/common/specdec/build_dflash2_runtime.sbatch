@@ -5,43 +5,48 @@
 # Build a relocatable venv whose vLLM Python sources are exact PR 52816 bytes.
 set -euo pipefail
 
-[[ $# == 6 ]] || {
-    echo "usage: $0 BASE_RUNTIME OUTPUT VLLM_CHECKOUT IMAGE LAUNCHER_ROOT SCRATCH_ROOT" >&2
+[[ $# == 7 ]] || {
+    echo "usage: $0 BASE_RUNTIME OUTPUT VLLM_CHECKOUT FLASHMLA_CHECKOUT IMAGE LAUNCHER_ROOT SCRATCH_ROOT" >&2
     exit 2
 }
 BASE_RUNTIME="$(realpath "$1")"
 OUTPUT_ARCHIVE="$(realpath -m "$2")"
 VLLM_CHECKOUT="$(realpath "$3")"
-IMAGE="$(realpath "$4")"
-LAUNCHER_ROOT="$(realpath "$5")"
-SCRATCH_ROOT="$(realpath -m "$6")"
+FLASHMLA_CHECKOUT="$(realpath "$4")"
+IMAGE="$(realpath "$5")"
+LAUNCHER_ROOT="$(realpath "$6")"
+SCRATCH_ROOT="$(realpath -m "$7")"
 EXPECTED_COMMIT=b389ac29465b33f9e9c534df221ea3c129e9793f
 REQUIRED_COMMIT=b389ac29465b33f9e9c534df221ea3c129e9793f
+FLASHMLA_COMMIT=a8f794d1251cbfd88a5011445dd5582289c727e4
 
-[[ -f "$BASE_RUNTIME" && -f "$IMAGE" && -d "$VLLM_CHECKOUT/vllm" ]] || exit 2
+[[ -f "$BASE_RUNTIME" && -f "$IMAGE" && -d "$VLLM_CHECKOUT/vllm" && -d "$FLASHMLA_CHECKOUT/flash_mla" ]] || exit 2
 [[ ! -e "$OUTPUT_ARCHIVE" && ! -e "${OUTPUT_ARCHIVE}.sha256" ]] || {
     echo "refusing to replace existing runtime output" >&2
     exit 2
 }
 [[ "$(git -C "$VLLM_CHECKOUT" rev-parse HEAD)" == "$EXPECTED_COMMIT" ]]
 [[ -z "$(git -C "$VLLM_CHECKOUT" status --porcelain --untracked-files=all)" ]]
+[[ "$(git -C "$FLASHMLA_CHECKOUT" rev-parse HEAD)" == "$FLASHMLA_COMMIT" ]]
+[[ -z "$(git -C "$FLASHMLA_CHECKOUT" status --porcelain --untracked-files=all)" ]]
 
 work_root="${SCRATCH_ROOT%/}/${SLURM_JOB_ID:?SLURM_JOB_ID is required}/dflash2-runtime"
 prepared="$work_root/runtime"
 mkdir -p "$prepared" "$(dirname "$OUTPUT_ARCHIVE")"
 tar --extract --file="$BASE_RUNTIME" --directory="$prepared"
 
-mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${LAUNCHER_ROOT}:${LAUNCHER_ROOT}:ro"
+mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${FLASHMLA_CHECKOUT}:${FLASHMLA_CHECKOUT}:ro,${LAUNCHER_ROOT}:${LAUNCHER_ROOT}:ro"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
-    bash -s -- "$prepared" "$VLLM_CHECKOUT" "$LAUNCHER_ROOT" "$EXPECTED_COMMIT" \
-    "$REQUIRED_COMMIT" <<'INNER'
+    bash -s -- "$prepared" "$VLLM_CHECKOUT" "$FLASHMLA_CHECKOUT" "$LAUNCHER_ROOT" \
+    "$EXPECTED_COMMIT" "$REQUIRED_COMMIT" <<'INNER'
 set -euo pipefail
 prepared="$1"
 checkout="$2"
-launcher="$3"
-expected="$4"
-required="$5"
+flashmla_checkout="$3"
+launcher="$4"
+expected="$5"
+required="$6"
 
 system_package="$($prepared/bin/python - <<'PY'
 from pathlib import Path
@@ -63,6 +68,19 @@ while IFS= read -r -d '' extension; do
     mkdir -p "$runtime_package/$(dirname "$relative")"
     cp -a "$extension" "$runtime_package/$relative"
 done < <(find "$system_package" -type f \( -name '*.so' -o -name '_version.py' \) -print0)
+"$prepared/bin/python" - "$flashmla_checkout" "$runtime_package" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]) / "flash_mla/flash_mla_interface.py"
+output = Path(sys.argv[2]) / "third_party/flashmla/flash_mla_interface.py"
+needle = "flash_mla_cuda = torch.ops._flashmla_C"
+raw = source.read_text()
+if raw.count(needle) != 1:
+    raise SystemExit("FlashMLA interface cannot be transformed deterministically")
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(raw.replace(needle, f"import vllm._flashmla_C\n{needle}"))
+PY
 INNER
 
 runtime_package="$(<"$prepared/dflash2-vllm-runtime-package.path")"
@@ -70,7 +88,9 @@ receipt="$prepared/dflash2-vllm-runtime-receipt.json"
 PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
     "$LAUNCHER_ROOT/tools/launcher/common/specdec/dflash2_runtime_contract.py" vllm-receipt \
     --package "$VLLM_CHECKOUT/vllm" --runtime-package "$runtime_package" --output "$receipt" \
-    --expected-commit "$EXPECTED_COMMIT" --required-ancestor "$REQUIRED_COMMIT" >"$prepared/dflash2-vllm-runtime-receipt.sha256"
+    --expected-commit "$EXPECTED_COMMIT" --required-ancestor "$REQUIRED_COMMIT" \
+    --flashmla-package "$FLASHMLA_CHECKOUT/flash_mla" \
+    --flashmla-expected-commit "$FLASHMLA_COMMIT" >"$prepared/dflash2-vllm-runtime-receipt.sha256"
 receipt_sha="$(<"$prepared/dflash2-vllm-runtime-receipt.sha256")"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
@@ -94,6 +114,7 @@ from tools.launcher.common.specdec.dflash2_runtime_contract import verify_vllm_r
 verify_vllm_runtime(Path(sys.argv[1]), Path(sys.argv[2]), *sys.argv[3:])
 from vllm.model_executor.models.qwen3_dflash2 import _score_edges
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+from vllm.v1.attention.ops.flashmla import is_flashmla_dense_supported
 
 scores = _score_edges(
     torch.ones(8, 4), torch.ones(8, 4), torch.tensor([[[1, 2], [3, 4]]]),
@@ -101,6 +122,7 @@ scores = _score_edges(
 )
 assert scores.shape == (1, 2, 2, 2)
 assert DFlash2Speculator.__name__ == "DFlash2Speculator"
+assert callable(is_flashmla_dense_supported)
 PY
 INNER
 

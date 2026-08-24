@@ -79,13 +79,32 @@ def _vllm_checkout(tmp_path: Path) -> tuple[Path, str, str]:
     package = repo / "vllm"
     package.mkdir()
     (package / "__init__.py").write_text('__version__ = "test"\n')
-    _git(repo, "add", "vllm/__init__.py")
+    recipe = repo / "cmake/external_projects/flashmla.cmake"
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text("GIT_TAG test-flashmla\n")
+    _git(repo, "add", "vllm/__init__.py", "cmake/external_projects/flashmla.cmake")
     _git(repo, "commit", "-q", "-m", "required DFlash2 runtime")
     required = _git(repo, "rev-parse", "HEAD")
     (package / "runtime.py").write_text("SUPPORTED = True\n")
     _git(repo, "add", "vllm/runtime.py")
     _git(repo, "commit", "-q", "-m", "verified descendant")
     return package, required, _git(repo, "rev-parse", "HEAD")
+
+
+def _flashmla_checkout(tmp_path: Path) -> tuple[Path, str]:
+    repo = tmp_path / "flashmla"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    package = repo / "flash_mla"
+    package.mkdir()
+    (package / "flash_mla_interface.py").write_text(
+        "import torch\nflash_mla_cuda = torch.ops._flashmla_C\n"
+    )
+    _git(repo, "add", "flash_mla/flash_mla_interface.py")
+    _git(repo, "commit", "-q", "-m", "flashmla source")
+    return package, _git(repo, "rev-parse", "HEAD")
 
 
 def _dflash2_source_checkout(tmp_path: Path) -> tuple[Path, str, str]:
@@ -180,23 +199,84 @@ def test_vllm_runtime_receipt_survives_archive_staging_without_git(tmp_path: Pat
 def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path: Path) -> None:
     """A wheel may add ARM64 extensions, but every tracked PR source byte must remain exact."""
     package, required, expected = _vllm_checkout(tmp_path)
+    flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
     runtime = tmp_path / "runtime/vllm"
     runtime.parent.mkdir()
     __import__("shutil").copytree(package, runtime)
     (runtime / "_C.abi3.so").write_bytes(b"arm64-extension")
-    receipt = tmp_path / "vllm-runtime-v2.json"
+    generated = runtime / "third_party/flashmla/flash_mla_interface.py"
+    generated.parent.mkdir(parents=True)
+    generated.write_text(
+        "import torch\nimport vllm._flashmla_C\n"
+        "flash_mla_cuda = torch.ops._flashmla_C\n"
+    )
+    receipt = tmp_path / "vllm-runtime-v3.json"
     receipt_sha = write_vllm_runtime_receipt(
         receipt,
         package,
         expected,
         required,
         runtime_package_path=runtime,
+        flashmla_package_path=flashmla,
+        flashmla_expected_commit=flashmla_commit,
     )
 
-    assert verify_vllm_runtime(runtime, receipt, receipt_sha, expected, required) == expected
+    assert (
+        verify_vllm_runtime(
+            runtime,
+            receipt,
+            receipt_sha,
+            expected,
+            required,
+            expected_flashmla_commit=flashmla_commit,
+        )
+        == expected
+    )
+    body = json.loads(receipt.read_text())
+    assert body["schema_version"] == 3
+    assert body["flashmla_commit"] == flashmla_commit
+    assert body["flashmla_generated_interface"]["path"] == (
+        "third_party/flashmla/flash_mla_interface.py"
+    )
     (runtime / "runtime.py").write_text("SUPPORTED = False\n")
     with pytest.raises(ValueError, match="runtime file bytes"):
-        verify_vllm_runtime(runtime, receipt, receipt_sha, expected, required)
+        verify_vllm_runtime(
+            runtime,
+            receipt,
+            receipt_sha,
+            expected,
+            required,
+            expected_flashmla_commit=flashmla_commit,
+        )
+
+
+def test_vllm_receipt_rejects_mutated_flashmla_build_recipe(tmp_path: Path) -> None:
+    """A dirty CMake recipe cannot claim the pinned FlashMLA build provenance."""
+    package, required, expected = _vllm_checkout(tmp_path)
+    flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
+    runtime = tmp_path / "runtime/vllm"
+    runtime.parent.mkdir()
+    __import__("shutil").copytree(package, runtime)
+    generated = runtime / "third_party/flashmla/flash_mla_interface.py"
+    generated.parent.mkdir(parents=True)
+    generated.write_text(
+        "import torch\nimport vllm._flashmla_C\n"
+        "flash_mla_cuda = torch.ops._flashmla_C\n"
+    )
+    (package.parent / "cmake/external_projects/flashmla.cmake").write_text(
+        "GIT_TAG attacker-controlled\n"
+    )
+
+    with pytest.raises(ValueError, match="FlashMLA build recipe"):
+        write_vllm_runtime_receipt(
+            tmp_path / "vllm-runtime-v3.json",
+            package,
+            expected,
+            required,
+            runtime_package_path=runtime,
+            flashmla_package_path=flashmla,
+            flashmla_expected_commit=flashmla_commit,
+        )
 
 
 def test_runtime_contract_cli_builds_no_replace_receipts(tmp_path: Path) -> None:
@@ -651,6 +731,8 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "verify_vllm_runtime",
         "_score_edges",
         "DFlash2Speculator",
+        "flash_mla_interface.py",
+        "vllm.v1.attention.ops.flashmla",
         "refusing to replace existing runtime output",
     ):
         assert required in script
