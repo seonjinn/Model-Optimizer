@@ -6,6 +6,12 @@ This change implements only the B-balanced readiness and bounded-canary path.
 It intentionally does not import or modify Task9 core code, and it has no
 A-repair input or dependency.
 
+The B builder and readiness artifacts are reusable and may be prepared while
+other work runs. They do not authorize B as the first production training arm.
+Scientific execution remains A-repair, then B-balanced, then
+B-balanced-target, then PTV3 SWE/agentic/tool unless a later explicit ruling
+changes that order.
+
 ## Task9 integration seam
 
 `Task9BalancedView` in
@@ -35,11 +41,29 @@ The Task10 code does not assume a Task9 implementation type or import it.
 - The submitter permits only `sbatch --test-only` on approved accounts and
   rejects any production submission request.
 
+## CPU datamover materialization
+
+`run_qwen4b_b_builder.sbatch` requests one `cpu_datamover` node with 96 CPUs
+and passes the full `SLURM_CPUS_PER_TASK` allocation to the builder. The
+builder caps its process count by the CPU allocation and the 201 declared
+shards. Every worker fixes Arrow, OMP, BLAS, MKL, and NumExpr threads to one,
+streams one shard into one job-local spool, and reports source identity and
+timing provenance. The coordinator consumes those spools in declared-shard
+order through a disk-backed SQLite selection index, so open files and memory
+stay bounded and one-worker and multi-worker output bytes remain identical.
+Worker failures remove scratch state and prevent either output or receipt
+publication.
+
 ## Validation
 
-The red test run failed because the new B builder module was absent. Fresh
-verification executed `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tools/launcher
-python3 -m pytest -q --disable-warnings tools/launcher/tests/test_qwen4b_b_canary.py
-tools/launcher/tests/test_qwen4b_dataset_study.py` and reported 36 passing
-tests. `bash -n` and `shellcheck -S warning` completed for both shell launchers.
-`ruff` was not available in the local Python environment.
+The original red test run failed because the new B builder module was absent.
+The CPU-parallel extension also recorded red gates for missing worker
+resolution, missing materialization, and the missing sbatch runner. A cleanup
+mutation then proved the failure-propagation assertion fails if scratch state
+is retained.
+
+Fresh focused verification reports 9 passing Task10 tests and 31 passing
+Task9 regression tests. The Task10 suite includes exact one-worker versus
+multi-worker output-byte identity, 96-CPU allocation propagation, provenance,
+and failure cleanup. `ruff check`, `ruff format --check`, `pyright`, `bash -n`,
+`shellcheck -S warning`, and `git diff --check` complete without findings.
