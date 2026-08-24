@@ -154,7 +154,7 @@ def _manifest(tmp_path: Path) -> ACanaryManifest:
         runner_sha256="1" * 64,
         supervisor_path="tools/launcher/common/eagle3/train_eagle_streaming.sh",
         supervisor_sha256="2" * 64,
-        recipe_path="tools/launcher/modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/dflash.yaml",
+        recipe_path="modelopt_recipes/general/speculative_decoding/dflash.yaml",
         recipe_sha256="3" * 64,
         evaluator_path="tools/launcher/common/specdec/run_qwen4b_a_canary_eval.sh",
         evaluator_sha256="8" * 64,
@@ -266,8 +266,20 @@ def test_runner_uses_canonical_omegacon_keys_and_supervisor() -> None:
         "dflash.dflash_architecture_config.intermediate_size=9728",
     )
     assert all(fragment in runner for fragment in required)
-    forbidden = ("model.draft_", "data.dataset", "data.max_length", "streaming_server_url=")
+    forbidden = (
+        "model.draft_",
+        "data.dataset",
+        "data.max_length",
+        "data.mode",
+        "data.sample_size",
+        "streaming_server_url=",
+    )
     assert all(fragment not in runner for fragment in forbidden)
+    assert (
+        'DFLASH_CONFIG="$REPO_ROOT/modelopt_recipes/general/speculative_decoding/dflash.yaml"'
+        in runner
+    )
+    assert "LAUNCHER_ROOT/modules/Model-Optimizer/modelopt_recipes" not in runner
     supervisor = (_LAUNCHER_ROOT / "common/eagle3/train_eagle_streaming.sh").read_text()
     assert "trap cleanup INT TERM EXIT" in supervisor
     assert 'kill "$pid"' in supervisor

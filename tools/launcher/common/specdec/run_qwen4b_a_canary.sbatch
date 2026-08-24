@@ -25,7 +25,7 @@ for output in "$A_CANARY_CHECKPOINT" "$A_CANARY_EXPORT" "$A_CANARY_GPU_EVIDENCE"
     }
 done
 readonly SUPERVISOR="$LAUNCHER_ROOT/common/eagle3/train_eagle_streaming.sh"
-readonly DFLASH_CONFIG="$LAUNCHER_ROOT/modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/dflash.yaml"
+readonly DFLASH_CONFIG="$REPO_ROOT/modelopt_recipes/general/speculative_decoding/dflash.yaml"
 readonly EVALUATOR="$LAUNCHER_ROOT/common/specdec/run_qwen4b_a_canary_eval.sh"
 
 runtime_env="$({ PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
@@ -87,7 +87,7 @@ srun --overlap --nodes=16 --ntasks=16 --ntasks-per-node=1 --gpus-per-task=4 --cp
     cd "$4"
     bash "$2" --config "$3" \
         model.model_name_or_path="$HF_MODEL_CKPT" model.use_fake_base_for_offline=true \
-        data.mode=streaming data.data_path="$node_root/input/corpus" data.sample_size=102400 \
+        data.data_path="$node_root/input/corpus" \
         training.output_dir="$A_CANARY_CHECKPOINT" training.max_steps=200 \
         training.save_steps=200 training.save_total_limit=1 \
         training.training_seq_len=4096 training.answer_only_loss=true training.seed=42 \
