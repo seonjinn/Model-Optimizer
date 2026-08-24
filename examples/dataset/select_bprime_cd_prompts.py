@@ -39,6 +39,7 @@ from build_specdec_inventory import (
     CandidatePrompt,
     candidate_inventory_sha256,
     is_approved_ptv2_source,
+    validate_approved_ptv2_topology,
     verify_candidate_inventory_membership,
 )
 from specdec_corpus_contracts import canonical_json, sha256_bytes
@@ -507,6 +508,12 @@ class _MappedSequence(Sequence[str]):
     def __len__(self) -> int:
         return len(self._rows)
 
+    @overload
+    def __getitem__(self, index: int) -> str: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[str]: ...
+
     def __getitem__(self, index: int | slice) -> str | list[str]:
         value = self._rows[index]
         if isinstance(value, list):
@@ -711,33 +718,10 @@ def _validate_bprime_source_inventory(source_inventory: SourceInventory) -> Sour
         raise ValueError("B-prime-only staged Task 3 source inventory is invalid") from error
     if authenticated != source_inventory:
         raise ValueError("B-prime-only Task 3 source inventory identity mismatch")
-    expected_splits = {
-        "chat",
-        "code",
-        "math",
-        "stem",
-        "multilingual_ja",
-        "multilingual_it",
-        "multilingual_de",
-        "multilingual_es",
-        "multilingual_fr",
-    }
-    if (
-        len(authenticated.sources) != len(expected_splits)
-        or {source.split for source in authenticated.sources} != expected_splits
-        or sum(len(source.files) for source in authenticated.sources) != 201
-    ):
-        raise ValueError("B-prime-only selection requires exactly 201 PTV2 source shards")
-    if any(
-        source.lane != "target-synth"
-        or source.cell != source.split
-        or not is_approved_ptv2_source(
-            source.repository_id, source.configuration, source.split, source.revision
-        )
-        for source in authenticated.sources
-    ):
-        raise ValueError("B-prime-only selection requires a PTV2-only approved inventory")
-    return authenticated
+    try:
+        return validate_approved_ptv2_topology(authenticated)
+    except ValueError as error:
+        raise ValueError("B-prime-only selection requires the approved PTV2 topology") from error
 
 
 def _validate_bprime_only_rows(rows: Iterable[Any], source_inventory: SourceInventory) -> None:

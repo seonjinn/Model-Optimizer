@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 from types import MappingProxyType
@@ -289,6 +290,50 @@ def test_tokenizer_snapshot_receipt_rejects_forgery(tmp_path: Path, mutation: st
         module.load_tokenizer_snapshot(receipt_path, expected)
 
 
+def test_tokenizer_snapshot_rejects_symlinked_intermediate_directory(tmp_path: Path) -> None:
+    module = _load_module()
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    outside = tmp_path / "outside"
+    snapshot = outside / "tokenizer"
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.json").write_text('{"version":"1.0"}', encoding="utf-8")
+    (snapshot / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    (receipts / "alias").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match=r"no-follow|symlink|snapshot path"):
+        module.write_tokenizer_snapshot_receipt(
+            receipts / "alias" / "tokenizer", receipts / "TOKENIZER_SNAPSHOT.json"
+        )
+
+
+def test_tokenizer_snapshot_rejects_root_inode_retarget_during_internal_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    snapshot = tmp_path / "tokenizer"
+    snapshot.mkdir()
+    (snapshot / "tokenizer.json").write_text('{"version":"1.0"}', encoding="utf-8")
+    (snapshot / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    receipt = tmp_path / "TOKENIZER_SNAPSHOT.json"
+    written = module.write_tokenizer_snapshot_receipt(snapshot, receipt)
+
+    def retarget_root(_snapshot):
+        original = tmp_path / "original-tokenizer"
+        snapshot.rename(original)
+        shutil.copytree(original, snapshot)
+        return CandidateTokenizer()
+
+    monkeypatch.setattr(module, "_load_tokenizer_from_snapshot", retarget_root)
+
+    with pytest.raises(ValueError, match=r"root.*changed|inode"):
+        module._authenticated_snapshot_tokenizer(receipt, written.receipt_sha256)
+
+
 def test_inventory_reads_explicit_raw_json_parquet_shards(tmp_path: Path) -> None:
     module = _load_module()
     import pyarrow as pa  # pyright: ignore[reportMissingImports]
@@ -388,6 +433,8 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A full Task3 PTV2 inventory reaches the genuine B-prime publisher."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     module = _load_module()
     revision = module.APPROVED_PTV2_REVISION
     repository = "nvidia/Nemotron-Post-Training-Dataset-v2"
@@ -403,31 +450,42 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
         "multilingual_es",
         "multilingual_fr",
     )
-    remaining = 201
-    for split_index, split in enumerate(splits):
-        count = remaining // (len(splits) - split_index)
-        remaining -= count
+    shard_counts = {
+        "chat": 12,
+        "math": 2,
+        "code": 2,
+        "stem": 2,
+        "multilingual_de": 38,
+        "multilingual_ja": 37,
+        "multilingual_es": 33,
+        "multilingual_fr": 37,
+        "multilingual_it": 38,
+    }
+    for split in splits:
+        count = shard_counts[split]
         files = []
         for file_index in range(count):
-            relative = f"data/{split}/{file_index:03d}.jsonl"
+            relative = f"data/{split}/{file_index:03d}.parquet"
             local_file = tmp_path / "local" / repository / revision / relative
             local_file.parent.mkdir(parents=True, exist_ok=True)
-            local_file.write_text(
-                json.dumps(
-                    {
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": f"question-{split}-{file_index}",
-                            },
-                            {
-                                "role": "assistant",
-                                "content": f"answer-{split}-{file_index}",
-                            },
-                        ]
-                    }
-                )
-                + "\n"
+            pq.write_table(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": f"question-{split}-{file_index}",
+                                },
+                                {
+                                    "role": "assistant",
+                                    "content": f"answer-{split}-{file_index}",
+                                },
+                            ]
+                        }
+                    ]
+                ),
+                local_file,
             )
             files.append(
                 module.SourceFile(

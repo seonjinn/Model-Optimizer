@@ -24,12 +24,14 @@ from typing import TYPE_CHECKING, Any, Literal
 import yaml
 from audit_ptv2_baseline import BaselineAudit
 from build_specdec_inventory import (
+    APPROVED_PTV2_REVISION,
     ExclusionReceipt,
     _expected_staged_tree_entries,
     _open_verified_source_fd,
     _staged_tree_snapshot,
     _verify_source_fd_stable,
     make_exclusion_receipt,
+    validate_approved_ptv2_topology,
 )
 from promote_synthesis_reserve import ResponsePromotionError, load_prompt_view
 from specdec_corpus_contracts import canonical_json
@@ -217,6 +219,46 @@ class PTV2StudySourceRow:
     canonical_conversation: str
     assistant_response: str
     language: str = ""
+
+
+class _AuthenticatedPTV2SourceRows:
+    """Replayable rows from a completely authenticated physical PTV2 stream."""
+
+    def __init__(
+        self,
+        temporary: tempfile.TemporaryDirectory[str],
+        storage_path: Path,
+        count: int,
+    ) -> None:
+        self._temporary = temporary
+        self.storage_path = storage_path
+        self.count = count
+        self._closed = False
+
+    def __iter__(self) -> Iterator[PTV2StudySourceRow]:
+        if self._closed:
+            raise PTV2StudyError("authenticated PTV2 source spool is closed")
+        with sqlite3.connect(self.storage_path) as connection:
+            cursor = connection.execute(
+                "SELECT prompt_uuid,source_identity_sha256,source_row,cell,"
+                "canonical_conversation,assistant_response,language "
+                "FROM authenticated_rows ORDER BY ordinal"
+            )
+            for record in cursor:
+                yield PTV2StudySourceRow(*record)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._temporary.cleanup()
+
+    def __enter__(self) -> _AuthenticatedPTV2SourceRows:
+        if self._closed:
+            raise PTV2StudyError("authenticated PTV2 source spool is closed")
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
@@ -534,21 +576,30 @@ def select_authenticated_b_balanced_view(
     inventory = load_source_inventory(inventory_receipt)
     if inventory.staged_root is None:
         raise PTV2StudyError("B-balanced production selection requires staged SourceInventory")
+    try:
+        validate_approved_ptv2_topology(inventory)
+    except ValueError as error:
+        raise PTV2StudyError(
+            "B-balanced production selection requires the approved PTV2 topology"
+        ) from error
     if any(source.revision != policy.ptv2_revision for source in inventory.sources):
         raise PTV2StudyError("SourceInventory revision does not match the study policy")
     held_out_receipt = make_exclusion_receipt("held-out", tuple(exclusions.held_out))
-    return select_ptv2_b_balanced_view(
-        iter_ptv2_staged_source_rows(inventory_receipt, policy=policy),
-        policy=policy,
-        output_root=output_root,
-        held_out_prompt_uuids=exclusions.held_out,
-        trust_roots=MappingProxyType(
-            {
-                "source_inventory_sha256": inventory.manifest_sha256,
-                "held_out_receipt_sha256": held_out_receipt.receipt_sha256,
-            }
-        ),
-    )
+    with _spool_authenticated_ptv2_source_rows(
+        inventory_receipt, policy=policy, storage_dir=output_root
+    ) as source:
+        return select_ptv2_b_balanced_view(
+            source,
+            policy=policy,
+            output_root=output_root,
+            held_out_prompt_uuids=exclusions.held_out,
+            trust_roots=MappingProxyType(
+                {
+                    "source_inventory_sha256": inventory.manifest_sha256,
+                    "held_out_receipt_sha256": held_out_receipt.receipt_sha256,
+                }
+            ),
+        )
 
 
 def select_authenticated_ptv2_study_views(
@@ -580,6 +631,14 @@ def select_authenticated_ptv2_study_views(
     inventory = load_source_inventory(inventory_receipt)
     if inventory.staged_root is None:
         raise PTV2StudyError("authenticated paired selection requires staged SourceInventory")
+    try:
+        validate_approved_ptv2_topology(inventory)
+    except ValueError as error:
+        raise PTV2StudyError(
+            "authenticated paired selection requires the approved PTV2 topology"
+        ) from error
+    if any(source.revision != policy.ptv2_revision for source in inventory.sources):
+        raise PTV2StudyError("SourceInventory revision does not match the study policy")
     _validate_exclusion_receipt(baseline_receipt, "baseline", baseline.exclusion_prompt_ids)
     _validate_exclusion_receipt(held_out_receipt, "held-out", exclusions.held_out)
     try:
@@ -596,24 +655,35 @@ def select_authenticated_ptv2_study_views(
         view=task5,
         policy=policy,
     )
-    source = iter_ptv2_staged_source_rows(inventory_receipt, policy=policy)
-
     root = _selection_root(output_root)
-    a_repair = select_a_repair_view(
-        islice(source, policy.historical_occurrences),
-        _iter_task5_selected_rows(task5, inventory_receipt, policy),
-        policy=policy,
-        baseline=baseline,
-        held_out_prompt_uuids=exclusions.held_out,
-        output_root=root,
-        source_inventory=inventory,
-        baseline_receipt=baseline_receipt,
-        held_out_receipt=held_out_receipt,
-        complement_selection_sha256=complement_identity_sha256,
-    )
-    b_balanced = select_authenticated_b_balanced_view(
-        inventory_receipt, policy=policy, exclusions=exclusions, output_root=root
-    )
+    held_out_identity = make_exclusion_receipt("held-out", tuple(exclusions.held_out))
+    with _spool_authenticated_ptv2_source_rows(
+        inventory_receipt, policy=policy, storage_dir=root
+    ) as source:
+        a_repair = select_a_repair_view(
+            islice(iter(source), policy.historical_occurrences),
+            _iter_task5_selected_rows(task5, inventory_receipt, policy),
+            policy=policy,
+            baseline=baseline,
+            held_out_prompt_uuids=exclusions.held_out,
+            output_root=root,
+            source_inventory=inventory,
+            baseline_receipt=baseline_receipt,
+            held_out_receipt=held_out_receipt,
+            complement_selection_sha256=complement_identity_sha256,
+        )
+        b_balanced = select_ptv2_b_balanced_view(
+            source,
+            policy=policy,
+            output_root=root,
+            held_out_prompt_uuids=exclusions.held_out,
+            trust_roots=MappingProxyType(
+                {
+                    "source_inventory_sha256": inventory.manifest_sha256,
+                    "held_out_receipt_sha256": held_out_identity.receipt_sha256,
+                }
+            ),
+        )
     return PTV2StudyBundle(
         policy.policy_sha256,
         inventory.manifest_sha256,
@@ -682,6 +752,11 @@ def iter_ptv2_staged_source_rows(
     inventory = load_source_inventory(inventory_path)
     if inventory.staged_root is None:
         raise PTV2StudyError("B study requires an authenticated staged SourceInventory receipt")
+    if policy.ptv2_revision == APPROVED_PTV2_REVISION:
+        try:
+            validate_approved_ptv2_topology(inventory)
+        except ValueError as error:
+            raise PTV2StudyError("approved PTV2 source topology mismatch") from error
     sources_root = inventory.staged_root / "sources"
     expected: dict[Path, Any] = {}
     ordered_paths: list[Path] = []
@@ -794,6 +869,57 @@ def iter_ptv2_staged_source_rows(
             raise PTV2StudyError("staged PTV2 source tree changed during authentication")
     except (OSError, ValueError) as error:
         raise PTV2StudyError("staged PTV2 source tree changed during authentication") from error
+
+
+def _spool_authenticated_ptv2_source_rows(
+    inventory_path: Path,
+    *,
+    policy: PTV2StudyPolicy,
+    storage_dir: Path | None = None,
+) -> _AuthenticatedPTV2SourceRows:
+    """Fully authenticate the physical stream before exposing any replayable row."""
+    if storage_dir is not None:
+        storage_dir.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(prefix="ptv2-authenticated-", dir=storage_dir)
+    storage_path = Path(temporary.name) / "source-rows.sqlite3"
+    connection = sqlite3.connect(storage_path)
+    try:
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute(
+            "CREATE TABLE authenticated_rows("
+            "ordinal INTEGER PRIMARY KEY,"
+            "prompt_uuid TEXT NOT NULL,"
+            "source_identity_sha256 TEXT NOT NULL,"
+            "source_row INTEGER NOT NULL,"
+            "cell TEXT NOT NULL,"
+            "canonical_conversation TEXT NOT NULL,"
+            "assistant_response TEXT NOT NULL,"
+            "language TEXT NOT NULL)"
+        )
+        count = 0
+        for count, row in enumerate(
+            iter_ptv2_staged_source_rows(inventory_path, policy=policy), start=1
+        ):
+            connection.execute(
+                "INSERT INTO authenticated_rows VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    count - 1,
+                    row.prompt_uuid,
+                    row.source_identity_sha256,
+                    row.source_row,
+                    row.cell,
+                    row.canonical_conversation,
+                    row.assistant_response,
+                    row.language,
+                ),
+            )
+        connection.commit()
+    except BaseException:
+        connection.close()
+        temporary.cleanup()
+        raise
+    connection.close()
+    return _AuthenticatedPTV2SourceRows(temporary, storage_path, count)
 
 
 def _iter_task5_selected_rows(

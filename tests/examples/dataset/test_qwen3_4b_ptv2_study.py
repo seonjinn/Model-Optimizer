@@ -177,9 +177,106 @@ def _write_authenticated_staged_parquet(
     return receipt, staged_file
 
 
+_PTV2_SHARD_COUNTS = {
+    "chat": 12,
+    "math": 2,
+    "code": 2,
+    "stem": 2,
+    "multilingual_de": 38,
+    "multilingual_ja": 37,
+    "multilingual_es": 33,
+    "multilingual_fr": 37,
+    "multilingual_it": 38,
+}
+
+
+def _write_exact_ptv2_inventory(
+    tmp_path: Path, *, forged_field: str | None = None
+) -> tuple[Path, Path]:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    revision = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
+    repository = "nvidia/Nemotron-Post-Training-Dataset-v2"
+    local = tmp_path / "exact-source-cache"
+    sources = []
+    first_path = None
+    for split, count in _PTV2_SHARD_COUNTS.items():
+        source_repository = (
+            "nvidia/Forged-PTV2" if forged_field == "repository" and split == "chat" else repository
+        )
+        configuration = (
+            "forged" if forged_field == "configuration" and split == "chat" else "default"
+        )
+        source_split = "forged_chat" if forged_field == "split" and split == "chat" else split
+        lane = (
+            "generic-tool-replay" if forged_field == "lane" and split == "chat" else "target-synth"
+        )
+        files = []
+        for file_index in range(count):
+            relative = f"data/{split}-{file_index:05d}.parquet"
+            path = local / source_repository / revision / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(
+                pa.table(
+                    {
+                        "messages": [
+                            json.dumps(
+                                [
+                                    {"role": "user", "content": f"{split}-{file_index}"},
+                                    {"role": "assistant", "content": "answer"},
+                                ]
+                            )
+                        ]
+                    }
+                ),
+                path,
+            )
+            first_path = first_path or path
+            payload = path.read_bytes()
+            files.append(
+                {"path": relative, "bytes": len(payload), "sha256": sha256(payload).hexdigest()}
+            )
+        sources.append(
+            {
+                "repository_id": source_repository,
+                "configuration": configuration,
+                "split": source_split,
+                "revision": revision,
+                "license_expression": "NVIDIA Open Model License",
+                "approved_use": True,
+                "cell": split,
+                "lane": lane,
+                "files": files,
+            }
+        )
+    plan = tmp_path / "EXACT_SOURCE_PLAN.json"
+    plan.write_text(
+        json.dumps({"schema_version": 1, "name": "exact-ptv2", "sources": sources}),
+        encoding="utf-8",
+    )
+    staged = stage_source_inventory(
+        load_source_inventory(plan),
+        durable_root=tmp_path / "exact-durable",
+        scratch_root=tmp_path / "exact-scratch",
+        local_source_root=local,
+    )
+    assert staged.staged_root is not None and first_path is not None
+    first_source = staged.sources[0]
+    first_staged = (
+        staged.staged_root
+        / "sources"
+        / first_source.repository_id
+        / first_source.revision
+        / first_source.files[0].path
+    )
+    return staged.staged_root / "SOURCE_INVENTORY.json", first_staged
+
+
 def _genuine_scaled_task5_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> BPrimePromptViewBundle:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     approved_ptv2_revision = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
     b_cells = {name: PromptCell(1) for name in ("stem", "japanese", "spanish", "french", "italian")}
     task5_policy = PromptPolicy(
@@ -212,27 +309,29 @@ def _genuine_scaled_task5_bundle(
     )
     repository = "nvidia/Nemotron-Post-Training-Dataset-v2"
     local = tmp_path / "task5-local"
-    remaining = 201
     sources = []
-    for index, split in enumerate(source_splits):
-        count = remaining // (len(source_splits) - index)
-        remaining -= count
+    for split in source_splits:
+        count = _PTV2_SHARD_COUNTS[split]
         files = []
         for file_index in range(count):
-            relative = f"data/{split}/{file_index:03d}.jsonl"
+            relative = f"data/{split}/{file_index:03d}.parquet"
             path = local / repository / approved_ptv2_revision / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(
-                    {
-                        "messages": [
-                            {"role": "user", "content": f"task5-{split}-{file_index}"},
-                            {"role": "assistant", "content": "answer"},
-                        ]
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
+            pq.write_table(
+                pa.Table.from_pylist(
+                    [
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": f"task5-{split}-{file_index}",
+                                },
+                                {"role": "assistant", "content": "answer"},
+                            ]
+                        }
+                    ]
+                ),
+                path,
             )
             files.append(
                 {
@@ -910,6 +1009,55 @@ def test_staged_inventory_authenticates_declared_bytes_and_physical_row_order(
     staged_file.write_bytes(b"mutated payload")
     with pytest.raises(SourceManifestError, match="stale staged file"):
         tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))
+
+
+@pytest.mark.parametrize("forged_field", ["repository", "configuration", "split", "lane"])
+def test_production_ptv2_iterator_rejects_forged_task3_topology(
+    tmp_path: Path, forged_field: str
+) -> None:
+    receipt, _ = _write_exact_ptv2_inventory(tmp_path, forged_field=forged_field)
+
+    with pytest.raises(PTV2StudyError, match=r"approved PTV2.*topology"):
+        next(iter_ptv2_staged_source_rows(receipt, policy=load_ptv2_study_policy(POLICY)))
+
+
+def test_authenticated_source_spool_finishes_post_auth_before_prefix_consumption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pq = pytest.importorskip("pyarrow.parquet")
+    receipt, first_staged = _write_exact_ptv2_inventory(tmp_path)
+    original_bytes = first_staged.read_bytes()
+    real_parquet_file = pq.ParquetFile
+    mutated = False
+
+    class _MutateAndRestoreParquetFile:
+        def __init__(self, source):
+            self._inner = real_parquet_file(source)
+
+        @property
+        def schema_arrow(self):
+            return self._inner.schema_arrow
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def iter_batches(self, *args, **kwargs):
+            nonlocal mutated
+            for batch in self._inner.iter_batches(*args, **kwargs):
+                yield batch
+                if not mutated:
+                    first_staged.write_bytes(b"X" * len(original_bytes))
+                    first_staged.write_bytes(original_bytes)
+                    mutated = True
+
+    monkeypatch.setattr(pq, "ParquetFile", _MutateAndRestoreParquetFile)
+
+    with pytest.raises(PTV2StudyError, match="changed during authentication"):
+        study_module._spool_authenticated_ptv2_source_rows(
+            receipt,
+            policy=load_ptv2_study_policy(POLICY),
+            storage_dir=tmp_path / "verified-spool",
+        )
 
 
 def test_staged_inventory_rejects_undeclared_orphan_parquet(

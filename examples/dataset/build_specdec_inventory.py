@@ -71,6 +71,7 @@ __all__ = [
     "make_exclusion_receipt",
     "sha256_file",
     "tokenizer_snapshot_sha256",
+    "validate_approved_ptv2_topology",
     "verify_candidate_inventory_membership",
     "write_tokenizer_snapshot_receipt",
 ]
@@ -99,7 +100,20 @@ _APPROVED_PTV2_SOURCES = frozenset(
         "multilingual_fr",
     )
 )
-APPROVED_PTV2_ALLOWLIST_SHA256 = sha256_canonical_json(sorted(_APPROVED_PTV2_SOURCES))
+APPROVED_PTV2_ALLOWLIST_SHA256 = sha256_bytes(canonical_json(sorted(_APPROVED_PTV2_SOURCES)))
+_APPROVED_PTV2_SHARD_COUNTS = MappingProxyType(
+    {
+        "chat": 12,
+        "math": 2,
+        "code": 2,
+        "stem": 2,
+        "multilingual_de": 38,
+        "multilingual_ja": 37,
+        "multilingual_es": 33,
+        "multilingual_fr": 37,
+        "multilingual_it": 38,
+    }
+)
 _LANGUAGE_ALIASES = {
     "english": "en",
     "french": "fr",
@@ -167,6 +181,8 @@ class TokenizerSnapshot:
     chat_template_canonical_json: str
     root_sha256: str
     receipt_sha256: str
+    root_device: int
+    root_inode: int
 
 
 @dataclass(frozen=True)
@@ -232,7 +248,7 @@ def make_exclusion_receipt(
         ordered,
         prompt_ids_sha256,
         len(ordered),
-        sha256_canonical_json(payload),
+        sha256_bytes(canonical_json(payload)),
     )
 
 
@@ -263,6 +279,31 @@ def _approved_ptv2_source(source: SourceIdentity) -> bool:
     return is_approved_ptv2_source(
         source.repository_id, source.configuration, source.split, source.revision
     )
+
+
+def validate_approved_ptv2_topology(source_inventory: SourceInventory) -> SourceInventory:
+    """Require the exact staged PTV2 repository, split, lane, and Parquet topology."""
+    if not isinstance(source_inventory, SourceInventory) or source_inventory.staged_root is None:
+        raise ValueError("approved PTV2 source topology requires a staged Task 3 inventory")
+    observed: dict[str, int] = {}
+    for source in source_inventory.sources:
+        if (
+            source.repository_id != "nvidia/Nemotron-Post-Training-Dataset-v2"
+            or source.configuration != "default"
+            or source.revision != APPROVED_PTV2_REVISION
+            or source.approved_use is not True
+            or source.lane != "target-synth"
+            or source.cell != source.split
+            or source.split not in _APPROVED_PTV2_SHARD_COUNTS
+            or any(Path(file.path).suffix != ".parquet" for file in source.files)
+        ):
+            raise ValueError("approved PTV2 source topology identity mismatch")
+        if source.split in observed:
+            raise ValueError("approved PTV2 source topology repeats a split")
+        observed[source.split] = len(source.files)
+    if observed != dict(_APPROVED_PTV2_SHARD_COUNTS):
+        raise ValueError("approved PTV2 source topology shard counts mismatch")
+    return source_inventory
 
 
 @dataclass(frozen=True)
@@ -420,7 +461,7 @@ class DiskBackedCandidateRows(Sequence[CandidatePrompt]):
 class CandidateInventory:
     """Canonical candidates, usable capacity, and stable rejection receipts."""
 
-    rows: Sequence[CanonicalPrompt]
+    rows: Sequence[CandidatePrompt]
     capacity: Mapping[CandidateCell, int]
     quarantine_counts: Mapping[str, int]
     inventory_sha256: str
@@ -559,15 +600,55 @@ def _tokenizer_snapshot_payload(root_name: str, root: Path) -> dict[str, Any]:
     return payload
 
 
+def _snapshot_root_identity(parent: Path, relative: Path) -> tuple[int, int]:
+    """Open every snapshot directory component without following symlinks."""
+    if (
+        not parent.is_absolute()
+        or relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+    ):
+        raise ValueError("tokenizer snapshot path is not lexical and relative")
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise ValueError("tokenizer snapshot requires no-follow directory traversal")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(parent.anchor, flags)
+    except OSError as error:
+        raise ValueError(
+            "tokenizer snapshot filesystem root is not a no-follow directory"
+        ) from error
+    try:
+        components = (*parent.parts[1:], *relative.parts)
+        for component in components:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise ValueError(
+                    "tokenizer snapshot path contains a symlink or non-directory component"
+                ) from error
+            os.close(descriptor)
+            descriptor = child
+        observed = os.fstat(descriptor)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise ValueError("tokenizer snapshot root is not a directory")
+        return observed.st_dev, observed.st_ino
+    finally:
+        os.close(descriptor)
+
+
 def write_tokenizer_snapshot_receipt(root: Path, receipt_path: Path) -> TokenizerSnapshot:
     """Publish a typed immutable receipt for a dedicated local tokenizer snapshot."""
-    receipt_parent = receipt_path.parent.resolve(strict=True)
+    receipt_parent = receipt_path.parent.absolute()
     lexical_root = root.absolute()
     try:
         root_name = lexical_root.relative_to(receipt_parent).as_posix()
     except ValueError as error:
         raise ValueError("tokenizer snapshot must be below its receipt directory") from error
+    initial_root_identity = _snapshot_root_identity(receipt_parent, Path(root_name))
     payload = _tokenizer_snapshot_payload(root_name, lexical_root)
+    if _snapshot_root_identity(receipt_parent, Path(root_name)) != initial_root_identity:
+        raise ValueError("tokenizer snapshot root changed during authentication")
     payload["root_sha256"] = sha256_bytes(canonical_json(payload))
     encoded = canonical_json(payload) + b"\n"
     try:
@@ -628,8 +709,12 @@ def load_tokenizer_snapshot(receipt_path: Path, expected_receipt_sha256: str) ->
     relative = Path(str(payload["snapshot_path"]))
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError("tokenizer snapshot path is not lexical and relative")
-    root = receipt_path.parent.resolve(strict=True) / relative
+    receipt_parent = receipt_path.parent.absolute()
+    root = receipt_parent / relative
+    initial_root_identity = _snapshot_root_identity(receipt_parent, relative)
     expected_payload = _tokenizer_snapshot_payload(relative.as_posix(), root)
+    if _snapshot_root_identity(receipt_parent, relative) != initial_root_identity:
+        raise ValueError("tokenizer snapshot root changed during authentication")
     if expected_payload != root_record:
         raise ValueError("tokenizer snapshot physical identity mismatch")
     records = tuple(TokenizerSnapshotFile(**record) for record in payload["files"])
@@ -641,6 +726,8 @@ def load_tokenizer_snapshot(receipt_path: Path, expected_receipt_sha256: str) ->
         str(payload["chat_template_canonical_json"]),
         str(payload["root_sha256"]),
         receipt_sha256,
+        initial_root_identity[0],
+        initial_root_identity[1],
     )
 
 
@@ -671,7 +758,7 @@ def _authenticated_snapshot_tokenizer(
     snapshot = load_tokenizer_snapshot(receipt_path, expected_receipt_sha256)
     tokenizer = _load_tokenizer_from_snapshot(snapshot)
     if load_tokenizer_snapshot(receipt_path, expected_receipt_sha256) != snapshot:
-        raise ValueError("tokenizer snapshot changed while loading")
+        raise ValueError("tokenizer snapshot root or contents changed while loading")
     return snapshot, tokenizer
 
 

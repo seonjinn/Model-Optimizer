@@ -82,6 +82,17 @@ PTV2_SPLITS = (
     "multilingual_es",
     "multilingual_fr",
 )
+PTV2_SHARD_COUNTS = {
+    "chat": 12,
+    "math": 2,
+    "code": 2,
+    "stem": 2,
+    "multilingual_de": 38,
+    "multilingual_ja": 37,
+    "multilingual_es": 33,
+    "multilingual_fr": 37,
+    "multilingual_it": 38,
+}
 
 
 class _CandidateTokenizer:
@@ -115,20 +126,20 @@ def _genuine_task3_ptv2(
     splits: tuple[str, ...] = PTV2_SPLITS,
     omit_first_assistant: bool = False,
 ) -> tuple[SourceInventory, CandidateInventory, dict[str, object]]:
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
     snapshot, tokenizer_arguments = _authenticated_tokenizer_snapshot(tmp_path, monkeypatch)
     local = tmp_path / "local"
     sources = []
-    remaining = 201
     for split_index, split in enumerate(splits):
-        count = remaining // (len(splits) - split_index)
-        remaining -= count
+        count = PTV2_SHARD_COUNTS[split]
         files = []
         for file_index in range(count):
-            relative = f"data/{split}/{file_index:03d}.jsonl"
+            relative = f"data/{split}/{file_index:03d}.parquet"
             source = local / PTV2_REPOSITORY / PTV2_REVISION / relative
             source.parent.mkdir(parents=True, exist_ok=True)
             records = []
-            for row_index in range(3):
+            for row_index in range(30):
                 messages = [
                     {
                         "role": "user",
@@ -141,8 +152,8 @@ def _genuine_task3_ptv2(
                 ]
                 if omit_first_assistant and split_index == file_index == row_index == 0:
                     messages.pop()
-                records.append(json.dumps({"messages": messages}) + "\n")
-            source.write_text("".join(records), encoding="utf-8")
+                records.append({"messages": messages})
+            pq.write_table(pa.Table.from_pylist(records), source)
             files.append(
                 {
                     "path": relative,
@@ -531,7 +542,7 @@ def test_bprime_only_producer_rejects_wrong_task3_split_topology(
         tmp_path, monkeypatch, splits=PTV2_SPLITS[:-1]
     )
     try:
-        with pytest.raises(ValueError, match="exactly 201"):
+        with pytest.raises(ValueError, match="approved PTV2 topology"):
             select_bprime_prompt_view(
                 candidates,
                 _policy(),
@@ -553,14 +564,14 @@ def test_bprime_only_producer_rejects_changed_physical_task3_shards(
     assert source_inventory.staged_root is not None
     first = next(
         path
-        for path in (source_inventory.staged_root / "sources").rglob("*.jsonl")
+        for path in (source_inventory.staged_root / "sources").rglob("*.parquet")
         if path.is_file()
     )
     if mutation == "missing":
         first.unlink()
     elif mutation == "extra":
         extra = first.parent / "undeclared.jsonl"
-        extra.write_text(first.read_text(encoding="utf-8"), encoding="utf-8")
+        extra.write_bytes(first.read_bytes())
     else:
         first.write_bytes(first.read_bytes() + b"\n")
     try:
@@ -585,7 +596,7 @@ def test_bprime_only_producer_rejects_undeclared_symlink_alias(
     assert source_inventory.staged_root is not None
     first = next(
         path
-        for path in (source_inventory.staged_root / "sources").rglob("*.jsonl")
+        for path in (source_inventory.staged_root / "sources").rglob("*.parquet")
         if path.is_file()
     )
     (first.parent / "undeclared-link.jsonl").symlink_to(first.name)
