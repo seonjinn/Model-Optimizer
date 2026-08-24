@@ -18,10 +18,13 @@ import pytest
 from common.specdec.dflash2_runtime_contract import artifact_tree_sha256, write_artifact_receipt
 from common.specdec.dflash2_speculators_eval import (
     DATASET_REVISION,
+    PROBE_ROWS,
     STANDARD_SUBSETS,
+    analyze_divergence_probe,
     build_artifact_identity,
     build_target_control_allocation_receipt,
     build_target_control_receipt,
+    capture_divergence_probe,
     capture_outputs,
     compute_prompt_set,
     materialize_prompt_set,
@@ -62,6 +65,149 @@ def test_target_control_allocation_receipt_rejects_spoofed_topology(tmp_path: Pa
     receipt.write_text(json.dumps(forged) + "\n")
     with pytest.raises(ValueError, match="allocation"):
         validate_target_control_allocation_receipt(receipt)
+
+
+def test_divergence_probe_identifies_first_invalid_dflash2_token(tmp_path: Path) -> None:
+    """A target replay at the common prefix decides whether the draft token was valid."""
+    baseline = tmp_path / "baseline.json"
+    draft = tmp_path / "draft.json"
+    target_records = []
+    draft_records = []
+    for subset, index in PROBE_ROWS:
+        target_records.append(
+            {
+                "subset": subset,
+                "index": index,
+                "prompt_sha256": "a" * 64,
+                "request_sha256": "b" * 64,
+                "token_ids": [10, 11, 12],
+                "output_text": "abc",
+                "replays": [
+                    {
+                        "position": 0,
+                        "expected_token_id": 10,
+                        "token_id": 10,
+                        "top_logprobs": {"token_id:10": -0.1},
+                    },
+                    {
+                        "position": 1,
+                        "expected_token_id": 11,
+                        "token_id": 11,
+                        "top_logprobs": {"token_id:11": -0.1},
+                    },
+                    {
+                        "position": 2,
+                        "expected_token_id": 12,
+                        "token_id": 12,
+                        "top_logprobs": {"token_id:99": -9.0, "token_id:12": -0.1},
+                    },
+                ],
+            }
+        )
+        draft_records.append(
+            {
+                "subset": subset,
+                "index": index,
+                "prompt_sha256": "a" * 64,
+                "request_sha256": "b" * 64,
+                "token_ids": [10, 11, 99] if (subset, index) == PROBE_ROWS[0] else [10, 11, 12],
+                "output_text": "abx",
+                "replays": [],
+            }
+        )
+
+    def write_probe(path: Path, method: str, records: list[dict[str, Any]]) -> None:
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "producer": "q30-dflash2-first-token-probe-v1",
+            "method": method,
+            "model": "target",
+            "dataset_prompt_sha256": "c" * 64,
+            "sampling": {"temperature": 0, "top_p": 1, "seed": 42, "logprobs": 20},
+            "records": records,
+        }
+        payload["receipt_sha256"] = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path.write_text(json.dumps(payload) + "\n")
+
+    write_probe(baseline, "baseline", target_records)
+    write_probe(draft, "dflash2", draft_records)
+
+    report = analyze_divergence_probe(baseline, draft)
+
+    row = report["records"][0]
+    assert row["first_divergence_position"] == 2
+    assert row["target_token_id"] == 12
+    assert row["dflash2_token_id"] == 99
+    assert row["dflash2_token_is_target_argmax"] is False
+    assert row["dflash2_token_target_rank"] == 2
+
+    tied = json.loads(baseline.read_text())
+    tied["records"][0]["replays"][2]["top_logprobs"] = {
+        "token_id:99": -0.1,
+        "token_id:12": -0.1,
+    }
+    unsigned = {key: value for key, value in tied.items() if key != "receipt_sha256"}
+    tied["receipt_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    baseline.write_text(json.dumps(tied) + "\n")
+    tied_row = analyze_divergence_probe(baseline, draft)["records"][0]
+    assert tied_row["dflash2_token_is_target_argmax"] is True
+    assert tied_row["dflash2_token_target_rank"] == 1
+
+
+def test_capture_divergence_probe_uses_pinned_vllm_token_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe requests and consumes vLLM token IDs and top-logprob fields exactly."""
+    manifest, hf_home = _write_prompt_snapshot(tmp_path / "prompts")
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(_endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+        calls.append(body)
+        if body["max_tokens"] == 64:
+            token_ids = [10, 11]
+            prompt_ids = [1, 2]
+            top = [{"token_id:10": -0.1}, {"token_id:11": -0.1}]
+            text = "ab"
+        else:
+            position = len(body["prompt"]) - 2
+            token_ids = [10 + position]
+            prompt_ids = list(body["prompt"])
+            top = [{f"token_id:{10 + position}": -0.1}]
+            text = "a"
+        return {
+            "choices": [
+                {
+                    "text": text,
+                    "token_ids": token_ids,
+                    "prompt_token_ids": prompt_ids,
+                    "logprobs": {"top_logprobs": top},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._post_completion", fake_completion
+    )
+    output = tmp_path / "probe.json"
+    payload = capture_divergence_probe(
+        manifest,
+        hf_home,
+        output,
+        endpoint="http://target/v1",
+        model="target",
+        method="baseline",
+    )
+
+    assert len(payload["records"]) == 5
+    assert calls[0]["logprobs"] == 20
+    assert calls[0]["return_tokens_as_token_ids"] is True
+    assert calls[0]["return_token_ids"] is True
+    assert calls[1]["prompt"] == [1, 2]
+    assert calls[2]["prompt"] == [1, 2, 10]
 
 
 def _sha256(path: Path) -> str:
@@ -887,6 +1033,23 @@ def test_target_control_phase_is_baseline_only_and_never_runs_speed_cells() -> N
     assert '--allocation-receipt "${ALLOCATION_RECEIPT_PATH}"' in pair
     assert '"SLURM_JOB_NUM_NODES"' in _HELPER.read_text()
     assert '"nvidia-smi", "--query-gpu=index", "--format=csv,noheader"' in _HELPER.read_text()
+
+
+def test_first_divergence_phase_is_bounded_and_never_runs_speed_cells() -> None:
+    """The mismatch phase captures fixed probes, verifies a receipt, and exits."""
+    pair = _PAIR.read_text()
+    wrapper = _WRAPPER.read_text()
+
+    branch = pair.index('if [[ "${PAIR_PHASE}" == mismatch ]]')
+    probe = pair.index("run_pair_cells 1", branch)
+    analyze = pair.index("analyze-divergence", probe)
+    verify = pair.index("verify-divergence", analyze)
+    stop = pair.index("exit 0", verify)
+    performance = pair.index("run_pair_cells 0", stop)
+    assert branch < probe < analyze < verify < stop < performance
+    assert 'DIVERGENCE_PROBE="${DIVERGENCE_PROBE_MODE}"' in pair
+    assert "capture-probe" in wrapper
+    assert '"${DIVERGENCE_PROBE:-0}" == 1' in wrapper
 
 
 def test_pair_summary_reports_per_gpu_speed_latency_and_acceptance(tmp_path: Path) -> None:

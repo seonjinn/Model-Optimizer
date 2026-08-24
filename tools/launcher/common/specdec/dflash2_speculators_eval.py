@@ -45,6 +45,13 @@ STANDARD_SUBSETS = (
 )
 EVALUATION_REQUESTS_PER_SUBSET = 200
 CORRECTNESS_REQUESTS_PER_SUBSET = EVALUATION_REQUESTS_PER_SUBSET
+PROBE_ROWS = (
+    ("HumanEval", 1),
+    ("math_reasoning", 0),
+    ("qa", 0),
+    ("tool_call", 0),
+    ("translation", 0),
+)
 EVALUATION_STEP = 4166
 DFLASH2_BLOCK_SIZE = 8
 DFLASH2_SPECULATIVE_TOKENS = 7
@@ -1429,6 +1436,611 @@ def _expected_request_hashes(identity: dict[str, Any]) -> list[str]:
     return hashes
 
 
+def _post_completion(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        endpoint.rstrip("/") + "/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=600) as response:
+        result = json.loads(response.read())
+    if not isinstance(result, dict):
+        raise ValueError("completion response is not an object")
+    return result
+
+
+def _probe_choice(result: dict[str, Any]) -> dict[str, Any]:
+    choices = result.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise ValueError("probe response must contain exactly one choice")
+    choice = choices[0]
+    token_ids = choice.get("token_ids")
+    prompt_token_ids = choice.get("prompt_token_ids")
+    logprobs = choice.get("logprobs")
+    if (
+        not isinstance(choice.get("text"), str)
+        or not isinstance(token_ids, list)
+        or not all(isinstance(value, int) and not isinstance(value, bool) for value in token_ids)
+        or not isinstance(prompt_token_ids, list)
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) for value in prompt_token_ids
+        )
+        or not isinstance(logprobs, dict)
+        or not isinstance(logprobs.get("top_logprobs"), list)
+    ):
+        raise ValueError("probe response token/logprob schema mismatch")
+    return choice
+
+
+def capture_divergence_probe(
+    dataset_manifest_path: Path,
+    hf_home: Path,
+    output_path: Path,
+    *,
+    endpoint: str,
+    model: str,
+    method: str,
+) -> dict[str, Any]:
+    """Capture five exact prompts and replay every target prefix for next-token evidence."""
+    if method not in {"baseline", "dflash2"}:
+        raise ValueError("probe method must be baseline or dflash2")
+    prompt_set = compute_prompt_set(dataset_manifest_path, hf_home)
+    files = prompt_set.get("files")
+    if not isinstance(files, dict):
+        raise ValueError("probe dataset files are invalid")
+    records: list[dict[str, Any]] = []
+    for subset, index in PROBE_ROWS:
+        entry = files.get(subset)
+        if not isinstance(entry, dict):
+            raise ValueError(f"probe subset is missing: {subset}")
+        prompts = _read_prompt_prefix(Path(str(entry.get("path", ""))), 200)
+        source_row, prompt = prompts[index]
+        body: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 64,
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 42,
+            "logprobs": 20,
+            "return_tokens_as_token_ids": True,
+            "return_token_ids": True,
+            "request_id": f"specdec-divergence-{subset}-{index}",
+        }
+        choice = _probe_choice(_post_completion(endpoint, body))
+        token_ids = choice["token_ids"]
+        prompt_token_ids = choice["prompt_token_ids"]
+        assert isinstance(token_ids, list)
+        assert isinstance(prompt_token_ids, list)
+        replays: list[dict[str, Any]] = []
+        if method == "baseline":
+            for position, expected_token_id in enumerate(token_ids):
+                replay_body = {
+                    "model": model,
+                    "prompt": prompt_token_ids + token_ids[:position],
+                    "max_tokens": 1,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "seed": 42,
+                    "logprobs": 20,
+                    "return_tokens_as_token_ids": True,
+                    "return_token_ids": True,
+                    "request_id": f"specdec-prefix-replay-{subset}-{index}-{position}",
+                }
+                replay = _probe_choice(_post_completion(endpoint, replay_body))
+                replay_ids = replay["token_ids"]
+                replay_logprobs = replay["logprobs"]
+                assert isinstance(replay_ids, list)
+                assert isinstance(replay_logprobs, dict)
+                top = replay_logprobs["top_logprobs"]
+                if len(replay_ids) != 1 or not isinstance(top, list) or len(top) != 1:
+                    raise ValueError("target prefix replay did not return one next-token distribution")
+                replays.append(
+                    {
+                        "position": position,
+                        "expected_token_id": expected_token_id,
+                        "token_id": replay_ids[0],
+                        "top_logprobs": top[0],
+                        "request_sha256": _sha_json(replay_body),
+                    }
+                )
+        records.append(
+            {
+                "subset": subset,
+                "index": index,
+                "source_row": source_row,
+                "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                "request_sha256": _sha_json(body),
+                "output_text": choice["text"],
+                "token_ids": token_ids,
+                "prompt_token_ids": prompt_token_ids,
+                "replays": replays,
+            }
+        )
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "producer": "q30-dflash2-first-token-probe-v1",
+        "method": method,
+        "model": model,
+        "dataset_prompt_sha256": prompt_set["prompt_sha256"],
+        "sampling": {"temperature": 0, "top_p": 1, "seed": 42, "logprobs": 20},
+        "records": records,
+    }
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def _validate_probe_payload(path: Path, expected_method: str) -> dict[str, Any]:
+    payload = _load_json(path)
+    unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    if (
+        set(payload)
+        != {
+            "schema_version",
+            "producer",
+            "method",
+            "model",
+            "dataset_prompt_sha256",
+            "sampling",
+            "records",
+            "receipt_sha256",
+        }
+        or
+        payload.get("schema_version") != 1
+        or payload.get("producer") != "q30-dflash2-first-token-probe-v1"
+        or payload.get("method") != expected_method
+        or payload.get("receipt_sha256") != _sha_json(unsigned)
+        or payload.get("sampling")
+        != {"temperature": 0, "top_p": 1, "seed": 42, "logprobs": 20}
+        or not isinstance(payload.get("records"), list)
+        or len(payload["records"]) != len(PROBE_ROWS)
+    ):
+        raise ValueError("invalid divergence probe receipt")
+    return payload
+
+
+def _validate_probe_against_identity(
+    payload: dict[str, Any], identity: dict[str, Any], expected_method: str
+) -> None:
+    target = identity.get("target")
+    dataset = identity.get("dataset")
+    if not isinstance(target, dict) or not isinstance(dataset, dict):
+        raise ValueError("probe artifact identity mismatch")
+    schedule = dataset.get("ordered_prompts")
+    if (
+        payload.get("model") != target.get("path")
+        or payload.get("dataset_prompt_sha256") != dataset.get("prompt_sha256")
+        or not isinstance(schedule, list)
+    ):
+        raise ValueError("probe input identity mismatch")
+    expected_rows = {
+        (row.get("subset"), row.get("index")): row
+        for row in schedule
+        if isinstance(row, dict) and (row.get("subset"), row.get("index")) in PROBE_ROWS
+    }
+    records = payload["records"]
+    assert isinstance(records, list)
+    for expected_key, record in zip(PROBE_ROWS, records, strict=True):
+        if not isinstance(record, dict) or set(record) != {
+            "subset",
+            "index",
+            "source_row",
+            "prompt_sha256",
+            "request_sha256",
+            "output_text",
+            "token_ids",
+            "prompt_token_ids",
+            "replays",
+        }:
+            raise ValueError("probe record schema mismatch")
+        expected = expected_rows.get(expected_key)
+        token_ids = record["token_ids"]
+        prompt_token_ids = record["prompt_token_ids"]
+        replays = record["replays"]
+        if (
+            not isinstance(expected, dict)
+            or (record["subset"], record["index"]) != expected_key
+            or record["source_row"] != expected.get("source_row")
+            or record["prompt_sha256"] != expected.get("prompt_sha256")
+            or not isinstance(record["output_text"], str)
+            or not isinstance(token_ids, list)
+            or not token_ids
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in token_ids)
+            or not isinstance(prompt_token_ids, list)
+            or not prompt_token_ids
+            or not all(
+                isinstance(value, int) and not isinstance(value, bool) for value in prompt_token_ids
+            )
+            or not isinstance(replays, list)
+        ):
+            raise ValueError("probe record identity mismatch")
+        entry = dataset["files"][expected_key[0]]
+        prompt = _read_prompt_prefix(Path(str(entry["path"])), 200)[expected_key[1]][1]
+        main_body = {
+            "model": target["path"],
+            "prompt": prompt,
+            "max_tokens": 64,
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 42,
+            "logprobs": 20,
+            "return_tokens_as_token_ids": True,
+            "return_token_ids": True,
+            "request_id": f"specdec-divergence-{expected_key[0]}-{expected_key[1]}",
+        }
+        if record["request_sha256"] != _sha_json(main_body):
+            raise ValueError("probe main request mismatch")
+        if expected_method == "dflash2":
+            if replays:
+                raise ValueError("DFlash2 probe must not claim target replay evidence")
+            continue
+        if len(replays) != len(token_ids):
+            raise ValueError("target replay schedule is incomplete")
+        for position, replay in enumerate(replays):
+            if not isinstance(replay, dict) or set(replay) != {
+                "position",
+                "expected_token_id",
+                "token_id",
+                "top_logprobs",
+                "request_sha256",
+            }:
+                raise ValueError("target replay schema mismatch")
+            top = replay["top_logprobs"]
+            replay_body = {
+                "model": target["path"],
+                "prompt": prompt_token_ids + token_ids[:position],
+                "max_tokens": 1,
+                "temperature": 0,
+                "top_p": 1,
+                "seed": 42,
+                "logprobs": 20,
+                "return_tokens_as_token_ids": True,
+                "return_token_ids": True,
+                "request_id": (
+                    f"specdec-prefix-replay-{expected_key[0]}-{expected_key[1]}-{position}"
+                ),
+            }
+            if (
+                replay["position"] != position
+                or replay["expected_token_id"] != token_ids[position]
+                or replay["token_id"] != token_ids[position]
+                or replay["request_sha256"] != _sha_json(replay_body)
+                or not isinstance(top, dict)
+                or not top
+                or any(
+                    not isinstance(key, str)
+                    or not key.startswith("token_id:")
+                    or not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(value)
+                    for key, value in top.items()
+                )
+                or f"token_id:{replay['token_id']}" not in top
+            ):
+                raise ValueError("target prefix replay evidence mismatch")
+
+
+def analyze_divergence_probe(baseline_path: Path, dflash2_path: Path) -> dict[str, Any]:
+    """Find the first token divergence and replayed target rank for each exact prompt."""
+    baseline = _validate_probe_payload(baseline_path, "baseline")
+    draft = _validate_probe_payload(dflash2_path, "dflash2")
+    if (
+        baseline.get("model") != draft.get("model")
+        or baseline.get("dataset_prompt_sha256") != draft.get("dataset_prompt_sha256")
+    ):
+        raise ValueError("probe inputs are not matched")
+    output: list[dict[str, Any]] = []
+    for expected_key, target, proposed in zip(
+        PROBE_ROWS, baseline["records"], draft["records"], strict=True
+    ):
+        if not isinstance(target, dict) or not isinstance(proposed, dict):
+            raise ValueError("invalid probe record")
+        key = (target.get("subset"), target.get("index"))
+        if (
+            key != expected_key
+            or (proposed.get("subset"), proposed.get("index")) != expected_key
+            or target.get("prompt_sha256") != proposed.get("prompt_sha256")
+            or target.get("request_sha256") != proposed.get("request_sha256")
+        ):
+            raise ValueError("probe row identity mismatch")
+        target_ids = target.get("token_ids")
+        draft_ids = proposed.get("token_ids")
+        replays = target.get("replays")
+        if not isinstance(target_ids, list) or not isinstance(draft_ids, list) or not isinstance(replays, list):
+            raise ValueError("probe token evidence mismatch")
+        common = 0
+        while common < min(len(target_ids), len(draft_ids)) and target_ids[common] == draft_ids[common]:
+            common += 1
+        if common == len(target_ids) == len(draft_ids):
+            output.append({"subset": key[0], "index": key[1], "status": "exact-match"})
+            continue
+        if common >= len(target_ids) or common >= len(draft_ids) or common >= len(replays):
+            raise ValueError("probe divergence lacks target replay evidence")
+        replay = replays[common]
+        target_token = target_ids[common]
+        draft_token = draft_ids[common]
+        if (
+            not isinstance(replay, dict)
+            or replay.get("position") != common
+            or replay.get("expected_token_id", replay.get("token_id")) != target_token
+            or replay.get("token_id") != target_token
+            or not isinstance(replay.get("top_logprobs"), dict)
+        ):
+            raise ValueError("target replay does not reproduce the original argmax")
+        top_logprobs = replay["top_logprobs"]
+        assert isinstance(top_logprobs, dict)
+        draft_key = f"token_id:{draft_token}"
+        target_key = f"token_id:{target_token}"
+        target_logprob = top_logprobs.get(target_key)
+        if not isinstance(target_logprob, (int, float)) or isinstance(target_logprob, bool):
+            raise ValueError("target argmax is absent from replay top logprobs")
+        maximum_logprob = max(float(value) for value in top_logprobs.values())
+        if float(target_logprob) != maximum_logprob:
+            raise ValueError("target replay token is not an argmax at temperature zero")
+        draft_logprob = top_logprobs.get(draft_key)
+        draft_rank = None
+        draft_is_argmax = False
+        if isinstance(draft_logprob, (int, float)) and not isinstance(draft_logprob, bool):
+            draft_value = float(draft_logprob)
+            draft_rank = 1 + sum(float(value) > draft_value for value in top_logprobs.values())
+            draft_is_argmax = draft_value == maximum_logprob
+        output.append(
+            {
+                "subset": key[0],
+                "index": key[1],
+                "status": "diverged",
+                "first_divergence_position": common,
+                "target_token_id": target_token,
+                "dflash2_token_id": draft_token,
+                "dflash2_token_is_target_argmax": draft_is_argmax,
+                "dflash2_token_target_rank": draft_rank,
+                "target_top_logprobs": top_logprobs,
+            }
+        )
+    return {"schema_version": 1, "producer": "q30-dflash2-first-divergence-v1", "records": output}
+
+
+def _validate_dflash2_probe_manifest(
+    path: Path,
+    baseline: dict[str, Any],
+    baseline_fingerprint: dict[str, Any],
+    artifact_identity_path: Path,
+    identity: dict[str, Any],
+) -> tuple[dict[str, Any], Path, Path]:
+    manifest = _load_json(path)
+    target = identity["target"]
+    draft = identity["draft"]
+    evaluation = manifest.get("evaluation")
+    server_args = manifest.get("server_args")
+    config = manifest.get("config_sha256")
+    common = (
+        "target_model",
+        "speculators_repo",
+        "speculators_sha",
+        "modelopt_repo",
+        "modelopt_sha",
+        "modelopt_dirty",
+        "runtime",
+        "runtimes",
+        "container",
+        "dataset",
+        "provenance_error",
+        "slurm_job_id",
+        "versions",
+        "evaluation",
+        "artifact_identity",
+    )
+    if (
+        set(manifest) != _CONTROL_MANIFEST_KEYS
+        or manifest.get("status") != "success"
+        or manifest.get("method") != "dflash2"
+        or manifest.get("block_size") != DFLASH2_BLOCK_SIZE
+        or manifest.get("num_speculative_tokens") != DFLASH2_SPECULATIVE_TOKENS
+        or manifest.get("draft_model") != draft["export_path"]
+        or manifest.get("evaluator_args") != []
+        or any(manifest.get(name) != baseline.get(name) for name in common)
+        or not isinstance(evaluation, dict)
+        or not isinstance(server_args, list)
+        or len(server_args) != 10
+        or server_args[:6]
+        != [
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            target["path"],
+            "--tensor-parallel-size",
+            "2",
+        ]
+        or server_args[6] != "--port"
+        or server_args[7] not in {"8000", "8010"}
+        or server_args[8] != "--speculative-config"
+        or json.loads(server_args[9])
+        != {
+            "method": "dflash",
+            "model": draft["export_path"],
+            "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
+        }
+        or not isinstance(config, dict)
+        or set(config) != {"target", "draft", "launcher"}
+        or config.get("target") != _sha256(Path(target["path"]) / "config.json")
+        or config.get("draft") != _sha256(Path(draft["export_path"]) / "config.json")
+        or manifest.get("artifact_identity")
+        != {
+            "path": str(artifact_identity_path.resolve(strict=True)),
+            "sha256": _sha256(artifact_identity_path),
+        }
+    ):
+        raise ValueError("DFlash2 probe manifest mismatch")
+    launcher = _validate_control_launcher(
+        manifest.get("launcher_config"),
+        Path(str(manifest["container"]["path"])),
+        config["launcher"],
+    )
+    fingerprint_path = path.parent / "input-fingerprint.json"
+    fingerprint = _load_json(fingerprint_path)
+    baseline_inputs = baseline_fingerprint.get("inputs")
+    if not isinstance(baseline_inputs, dict):
+        raise ValueError("baseline probe fingerprint mismatch")
+    expected_inputs = json.loads(json.dumps(baseline_inputs))
+    expected_inputs["draft_config_sha256"] = config["draft"]
+    expected_inputs["evaluation"] = {
+        **expected_inputs["evaluation"],
+        "method": "dflash2",
+        "block_size": DFLASH2_BLOCK_SIZE,
+        "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
+    }
+    if (
+        fingerprint.get("schema_version") != 1
+        or fingerprint.get("inputs") != expected_inputs
+        or fingerprint.get("sha256") != _sha_json(expected_inputs)
+    ):
+        raise ValueError("DFlash2 probe input fingerprint mismatch")
+    return manifest, launcher, fingerprint_path
+
+
+def build_divergence_probe_receipt(
+    baseline_probe_path: Path,
+    dflash2_probe_path: Path,
+    baseline_manifest_path: Path,
+    dflash2_manifest_path: Path,
+    artifact_identity_path: Path,
+    allocation_receipt_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Bind exact paired job evidence to the first-token divergence diagnosis."""
+    identity = _validate_artifact_identity(artifact_identity_path)
+    baseline_probe = _validate_probe_payload(baseline_probe_path, "baseline")
+    dflash_probe = _validate_probe_payload(dflash2_probe_path, "dflash2")
+    _validate_probe_against_identity(baseline_probe, identity, "baseline")
+    _validate_probe_against_identity(dflash_probe, identity, "dflash2")
+    baseline_evidence = _validate_target_control_manifest(
+        baseline_manifest_path, artifact_identity_path, identity
+    )
+    baseline_manifest = baseline_evidence[0]
+    dflash_manifest, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
+        dflash2_manifest_path,
+        baseline_manifest,
+        baseline_evidence[2],
+        artifact_identity_path,
+        identity,
+    )
+    allocation = validate_target_control_allocation_receipt(allocation_receipt_path)
+    current = _query_current_allocation()
+    for name in (
+        "slurm_job_id",
+        "slurm_job_num_nodes",
+        "slurm_job_nodelist",
+        "gpu_count",
+        "cell_visible_devices",
+    ):
+        if allocation.get(name) != current.get(name):
+            raise ValueError(f"divergence probe live allocation mismatch: {name}")
+    if baseline_manifest["slurm_job_id"] != allocation["slurm_job_id"] or dflash_manifest[
+        "slurm_job_id"
+    ] != allocation["slurm_job_id"]:
+        raise ValueError("divergence probe job ID mismatch")
+    payload = analyze_divergence_probe(baseline_probe_path, dflash2_probe_path)
+    payload["claim_scope"] = "token-correctness diagnosis only; no speedup claim"
+    payload["allocation_evidence_scope"] = (
+        "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    )
+    payload["artifact_identity"] = _file_descriptor(artifact_identity_path)
+    payload["allocation_receipt"] = _file_descriptor(allocation_receipt_path)
+    payload["probes"] = {
+        "baseline": _file_descriptor(baseline_probe_path),
+        "dflash2": _file_descriptor(dflash2_probe_path),
+    }
+    payload["manifests"] = {
+        "baseline": _file_descriptor(baseline_manifest_path),
+        "dflash2": _file_descriptor(dflash2_manifest_path),
+    }
+    payload["input_fingerprints"] = {
+        "baseline": _file_descriptor(baseline_evidence[1]),
+        "dflash2": _file_descriptor(dflash_fingerprint),
+    }
+    payload["launcher_configs"] = {
+        "baseline": _file_descriptor(baseline_evidence[3]),
+        "dflash2": _file_descriptor(dflash_launcher),
+    }
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def validate_divergence_probe_receipt(path: Path) -> dict[str, Any]:
+    """Replay all durable first-divergence evidence without claiming scheduler origin."""
+    payload = _load_json(path)
+    claim = payload.pop("receipt_sha256", None)
+    if claim != _sha_json(payload):
+        raise ValueError("divergence probe receipt self-hash mismatch")
+    probes_value = payload.get("probes")
+    manifests_value = payload.get("manifests")
+    launchers_value = payload.get("launcher_configs")
+    fingerprints_value = payload.get("input_fingerprints")
+    if not all(
+        isinstance(value, dict) and set(value) == {"baseline", "dflash2"}
+        for value in (probes_value, manifests_value, launchers_value, fingerprints_value)
+    ):
+        raise ValueError("divergence probe evidence schema mismatch")
+    assert isinstance(probes_value, dict)
+    assert isinstance(manifests_value, dict)
+    assert isinstance(launchers_value, dict)
+    assert isinstance(fingerprints_value, dict)
+    probes = {name: _validate_file_descriptor(value) for name, value in probes_value.items()}
+    manifests = {
+        name: _validate_file_descriptor(value) for name, value in manifests_value.items()
+    }
+    launchers = {
+        name: _validate_file_descriptor(value) for name, value in launchers_value.items()
+    }
+    fingerprints = {
+        name: _validate_file_descriptor(value) for name, value in fingerprints_value.items()
+    }
+    artifact_path = _validate_file_descriptor(payload.get("artifact_identity"))
+    allocation_path = _validate_file_descriptor(payload.get("allocation_receipt"))
+    allocation = validate_target_control_allocation_receipt(allocation_path)
+    identity = _validate_artifact_identity(artifact_path)
+    baseline_probe = _validate_probe_payload(probes["baseline"], "baseline")
+    dflash_probe = _validate_probe_payload(probes["dflash2"], "dflash2")
+    _validate_probe_against_identity(baseline_probe, identity, "baseline")
+    _validate_probe_against_identity(dflash_probe, identity, "dflash2")
+    baseline_evidence = _validate_target_control_manifest(
+        manifests["baseline"], artifact_path, identity
+    )
+    _, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
+        manifests["dflash2"],
+        baseline_evidence[0],
+        baseline_evidence[2],
+        artifact_path,
+        identity,
+    )
+    if any(
+        _load_json(manifest)["slurm_job_id"] != allocation["slurm_job_id"]
+        for manifest in manifests.values()
+    ):
+        raise ValueError("divergence probe allocation replay mismatch")
+    if launchers != {"baseline": baseline_evidence[3], "dflash2": dflash_launcher}:
+        raise ValueError("divergence probe launcher evidence mismatch")
+    if fingerprints != {
+        "baseline": baseline_evidence[1],
+        "dflash2": dflash_fingerprint,
+    }:
+        raise ValueError("divergence probe fingerprint evidence mismatch")
+    replayed = analyze_divergence_probe(probes["baseline"], probes["dflash2"])
+    for name in ("schema_version", "producer", "records"):
+        if payload.get(name) != replayed.get(name):
+            raise ValueError(f"divergence probe replay mismatch: {name}")
+    if (
+        payload.get("claim_scope") != "token-correctness diagnosis only; no speedup claim"
+        or payload.get("allocation_evidence_scope")
+        != "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    ):
+        raise ValueError("divergence probe claim scope mismatch")
+    return {**payload, "receipt_sha256": claim}
+
+
 def capture_outputs(
     dataset_manifest_path: Path,
     hf_home: Path,
@@ -1527,6 +2139,14 @@ def main() -> None:
     capture.add_argument("--endpoint", required=True)
     capture.add_argument("--model", required=True)
 
+    probe = commands.add_parser("capture-probe")
+    probe.add_argument("--dataset-manifest", required=True)
+    probe.add_argument("--hf-home", required=True)
+    probe.add_argument("--output", required=True)
+    probe.add_argument("--endpoint", required=True)
+    probe.add_argument("--model", required=True)
+    probe.add_argument("--method", required=True, choices=("baseline", "dflash2"))
+
     compare = commands.add_parser("compare-outputs")
     compare.add_argument("--baseline", required=True)
     compare.add_argument("--dflash2", required=True)
@@ -1579,6 +2199,18 @@ def main() -> None:
     verify_control = commands.add_parser("verify-control")
     verify_control.add_argument("--receipt", required=True)
 
+    diagnose = commands.add_parser("analyze-divergence")
+    diagnose.add_argument("--baseline-probe", required=True)
+    diagnose.add_argument("--dflash2-probe", required=True)
+    diagnose.add_argument("--baseline-manifest", required=True)
+    diagnose.add_argument("--dflash2-manifest", required=True)
+    diagnose.add_argument("--artifact-identity", required=True)
+    diagnose.add_argument("--allocation-receipt", required=True)
+    diagnose.add_argument("--output", required=True)
+
+    verify_diagnosis = commands.add_parser("verify-divergence")
+    verify_diagnosis.add_argument("--receipt", required=True)
+
     args = parser.parse_args()
     if args.command == "prompt-set":
         payload = compute_prompt_set(Path(args.dataset_manifest), Path(args.hf_home))
@@ -1598,6 +2230,15 @@ def main() -> None:
             Path(args.output),
             endpoint=args.endpoint,
             model=args.model,
+        )
+    elif args.command == "capture-probe":
+        capture_divergence_probe(
+            Path(args.dataset_manifest),
+            Path(args.hf_home),
+            Path(args.output),
+            endpoint=args.endpoint,
+            model=args.model,
+            method=args.method,
         )
     elif args.command == "compare-outputs":
         artifact_identity_sha256 = _sha256(Path(args.artifact_identity))
@@ -1625,6 +2266,18 @@ def main() -> None:
         )
     elif args.command == "allocation-receipt":
         _publish_current_allocation_receipt(Path(args.output))
+    elif args.command == "analyze-divergence":
+        build_divergence_probe_receipt(
+            Path(args.baseline_probe),
+            Path(args.dflash2_probe),
+            Path(args.baseline_manifest),
+            Path(args.dflash2_manifest),
+            Path(args.artifact_identity),
+            Path(args.allocation_receipt),
+            Path(args.output),
+        )
+    elif args.command == "verify-divergence":
+        validate_divergence_probe_receipt(Path(args.receipt))
     elif args.command == "summarize":
         correctness = _load_json(Path(args.correctness_receipt))
         claim = correctness.pop("receipt_sha256", None)

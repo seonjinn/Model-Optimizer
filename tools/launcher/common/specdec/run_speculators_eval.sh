@@ -483,11 +483,19 @@ if [[ ${READY} -ne 1 ]]; then
 fi
 
 if [[ "${CAPTURE_EQUIVALENCE:-0}" == 1 ]]; then
-    "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
-        "${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-outputs \
-        --dataset-manifest "${DATASET_MANIFEST_PATH}" --hf-home "${HF_HOME}" \
-        --endpoint "http://127.0.0.1:${PORT}/v1" --model "${HF_MODEL_CKPT}" \
-        --output "${RUN_DIR}/output-equivalence.jsonl"
+    if [[ "${DIVERGENCE_PROBE:-0}" == 1 ]]; then
+        "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
+            "${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-probe \
+            --dataset-manifest "${DATASET_MANIFEST_PATH}" --hf-home "${HF_HOME}" \
+            --endpoint "http://127.0.0.1:${PORT}/v1" --model "${HF_MODEL_CKPT}" \
+            --method "${SPEC_METHOD}" --output "${RUN_DIR}/divergence-probe.json"
+    else
+        "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
+            "${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-outputs \
+            --dataset-manifest "${DATASET_MANIFEST_PATH}" --hf-home "${HF_HOME}" \
+            --endpoint "http://127.0.0.1:${PORT}/v1" --model "${HF_MODEL_CKPT}" \
+            --output "${RUN_DIR}/output-equivalence.jsonl"
+    fi
 fi
 if [[ "${EQUIVALENCE_ONLY:-0}" == 1 ]]; then
     [[ "${CAPTURE_EQUIVALENCE:-0}:${MAX_CONCURRENCY}:${MAX_REQUESTS}" == 1:1:200 ]] || {
@@ -495,7 +503,11 @@ if [[ "${EQUIVALENCE_ONLY:-0}" == 1 ]]; then
         exit 2
     }
     FINAL_STATUS="success"
-    echo "Speculators output-equivalence capture complete: ${RUN_DIR}"
+    if [[ "${DIVERGENCE_PROBE:-0}" == 1 ]]; then
+        echo "Speculators divergence probe complete: ${RUN_DIR}"
+    else
+        echo "Speculators output-equivalence capture complete: ${RUN_DIR}"
+    fi
     exit 0
 fi
 
