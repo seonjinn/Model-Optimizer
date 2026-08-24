@@ -118,7 +118,7 @@ def test_dflash2_runtime_contract_rejects_unvalidated_overrides(
     field: str, value: str | int
 ) -> None:
     """Runtime, warm-start, initialization, and K safety cannot drift per job."""
-    values = {"vllm_expected_commit": "f" * 40, field: value}
+    values = {"vllm_expected_commit": "f" * 40, "vllm_receipt_sha256": "e" * 64, field: value}
 
     with pytest.raises(ValueError, match="pinned safe defaults"):
         DFlash2RuntimeContract(**values)
@@ -458,7 +458,7 @@ def test_training_wave_uses_the_target_specific_streaming_topology() -> None:
         "num_attention_heads",
         "GLOBAL_BATCH_SIZE=512",
         "TRAINER_NODES",
-        'GPUS_PER_NODE="${manifest_values[24]}"',
+        'GPUS_PER_NODE="${manifest_values[30]}"',
         "PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * TRAINER_NODES * GPUS_PER_NODE",
         "/home",
         "rev-parse HEAD",
@@ -1039,7 +1039,7 @@ def test_requeued_host_staging_reuses_only_a_completed_node_local_copy() -> None
 
     for required in (
         'stage_marker="$node_root/staging.complete"',
-        'stage_fingerprint="${SOURCE_SHA}|${RUNTIME_ARCHIVE_SHA256}|${TARGET_PATH}|${DATASET_PATH}|${stage_role}"',
+        'stage_fingerprint="${SOURCE_SHA}|${RUNTIME_ARCHIVE_SHA256}|${STAGE_TARGET_IDENTITY}|${STAGE_DATASET_IDENTITY}|${stage_role}"',
         'if [[ -f "$stage_marker" && "$(<"$stage_marker")" == "$stage_fingerprint" ]]',
         '[[ "$node_root" == "${SCRATCH_ROOT%/}/${SLURM_JOB_ID}/node-${SLURM_NODEID}" ]]',
         'rm -rf -- "$node_root"',

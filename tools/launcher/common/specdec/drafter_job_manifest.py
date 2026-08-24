@@ -115,6 +115,12 @@ class PinnedPaths:
     dataset_path: str
     output_root: str
     image_sha256: str | None = None
+    target_sha256: str | None = None
+    target_receipt_path: str | None = None
+    target_receipt_sha256: str | None = None
+    dataset_sha256: str | None = None
+    dataset_receipt_path: str | None = None
+    dataset_receipt_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -127,6 +133,15 @@ class PinnedPaths:
         if self.image_sha256 is not None and not _FULL_SHA256.fullmatch(self.image_sha256):
             raise ValueError("image_sha256 must be an exact lowercase SHA-256 when provided")
         for name in (
+            "target_sha256",
+            "target_receipt_sha256",
+            "dataset_sha256",
+            "dataset_receipt_sha256",
+        ):
+            value = getattr(self, name)
+            if value is not None and not _FULL_SHA256.fullmatch(value):
+                raise ValueError(f"{name} must be an exact lowercase SHA-256 when provided")
+        for name in (
             "image_path",
             "runtime_archive_path",
             "target_path",
@@ -134,6 +149,10 @@ class PinnedPaths:
             "output_root",
         ):
             object.__setattr__(self, name, _normalized_path(name, getattr(self, name), "/lustre"))
+        for name in ("target_receipt_path", "dataset_receipt_path"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _normalized_path(name, value, "/lustre"))
 
 
 @dataclass(frozen=True)
@@ -226,6 +245,7 @@ class DFlash2RuntimeContract:
     """Pinned DFlash2 architecture, resume, and serving-runtime requirements."""
 
     vllm_expected_commit: str
+    vllm_receipt_sha256: str
     vllm_required_ancestor: str = _VLLM_DFLASH2_REQUIRED_ANCESTOR
     warmstart_policy: str = "exact-dflash2-only"
     kernel_projection_init: str = "zero"
@@ -234,10 +254,13 @@ class DFlash2RuntimeContract:
     selector_rank: int = 256
     selector_top_k: int = 16
     max_speculative_tokens: int = 7
+    vllm_receipt_relative_path: str = "dflash2-vllm-runtime-receipt.json"
 
     def __post_init__(self) -> None:
         if not _FULL_SHA.fullmatch(self.vllm_expected_commit):
             raise ValueError("DFlash2 vLLM expected commit must be an exact lowercase SHA")
+        if not _FULL_SHA256.fullmatch(self.vllm_receipt_sha256):
+            raise ValueError("DFlash2 vLLM receipt SHA-256 must be exact")
         expected = {
             "vllm_required_ancestor": _VLLM_DFLASH2_REQUIRED_ANCESTOR,
             "warmstart_policy": "exact-dflash2-only",
@@ -247,6 +270,7 @@ class DFlash2RuntimeContract:
             "selector_rank": 256,
             "selector_top_k": 16,
             "max_speculative_tokens": 7,
+            "vllm_receipt_relative_path": "dflash2-vllm-runtime-receipt.json",
         }
         if any(getattr(self, name) != value for name, value in expected.items()):
             raise ValueError("DFlash2 runtime contract must use the pinned safe defaults")
@@ -279,6 +303,16 @@ class DrafterExperiment:
                 raise ValueError("DFlash2 runtime contract is required")
             if self.num_speculative_tokens > self.dflash2.max_speculative_tokens:
                 raise ValueError("DFlash2 speculative K exceeds the validated maximum")
+            required_artifacts = (
+                self.paths.target_sha256,
+                self.paths.target_receipt_path,
+                self.paths.target_receipt_sha256,
+                self.paths.dataset_sha256,
+                self.paths.dataset_receipt_path,
+                self.paths.dataset_receipt_sha256,
+            )
+            if any(value is None for value in required_artifacts):
+                raise ValueError("DFlash2 requires authenticated target and dataset receipts")
         elif self.dflash2 is not None:
             raise ValueError("DFlash2 runtime contract is only valid for method=dflash2")
         expected_slurm = _TARGET_SLURM_DEFAULTS.get(self.topology.target_kind, ())
@@ -388,15 +422,24 @@ def topology_v2_training_fingerprint(experiment: DrafterExperiment, cluster_name
         experiment.sample_size,
     )
     if experiment.dflash2 is not None:
-        payload += (asdict(experiment.dflash2),)
+        payload += (
+            asdict(experiment.dflash2),
+            experiment.paths.target_sha256,
+            experiment.paths.target_receipt_path,
+            experiment.paths.target_receipt_sha256,
+            experiment.paths.dataset_sha256,
+            experiment.paths.dataset_receipt_path,
+            experiment.paths.dataset_receipt_sha256,
+        )
     digest = sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
     return f"topology-v2:{digest}"
 
 
 def _manifest_entry(experiment: DrafterExperiment) -> dict[str, Any]:
     entry = asdict(experiment)
-    if entry["paths"]["image_sha256"] is None:
-        del entry["paths"]["image_sha256"]
+    for name, value in tuple(entry["paths"].items()):
+        if value is None:
+            del entry["paths"][name]
     if entry["dflash2"] is None:
         del entry["dflash2"]
     entry["experiment_id"] = experiment.experiment_id

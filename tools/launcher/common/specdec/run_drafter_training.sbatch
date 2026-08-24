@@ -73,6 +73,7 @@ from common.specdec.drafter_job_manifest import (
     load_manifest,
     topology_v2_training_fingerprint,
 )
+from common.specdec.dflash2_runtime_contract import validate_artifact_receipt
 
 experiment = load_manifest(manifest)[int(sys.argv[2])]
 profile = load_cluster_profile(Path(sys.argv[3]))
@@ -93,6 +94,21 @@ if receipt_path is not None:
     receipt = json.loads(receipt_path.read_text())
     if receipt.get("profile") != profile.name or Path(receipt["scratch_root"]) != scratch_root:
         raise SystemExit("readiness receipt identity mismatch")
+if experiment.method == "dflash2":
+    validate_artifact_receipt(
+        Path(experiment.paths.target_receipt_path),
+        expected_receipt_sha256=experiment.paths.target_receipt_sha256,
+        artifact_path=Path(experiment.paths.target_path),
+        expected_artifact_sha256=experiment.paths.target_sha256,
+        kind="target",
+    )
+    validate_artifact_receipt(
+        Path(experiment.paths.dataset_receipt_path),
+        expected_receipt_sha256=experiment.paths.dataset_receipt_sha256,
+        artifact_path=Path(experiment.paths.dataset_path),
+        expected_artifact_sha256=experiment.paths.dataset_sha256,
+        kind="dataset",
+    )
 
 uses_topology_v2 = (
     experiment.topology.target_kind == "qwen3-30b-a3b" or experiment.slurm.nodes != 4
@@ -112,6 +128,9 @@ for value in (
     experiment.paths.runtime_archive_sha256,
     experiment.paths.image_sha256 or "",
     experiment.paths.target_path, experiment.paths.dataset_path, experiment.paths.output_root,
+    experiment.paths.target_sha256 or "-", experiment.paths.target_receipt_path or "-",
+    experiment.paths.target_receipt_sha256 or "-", experiment.paths.dataset_sha256 or "-",
+    experiment.paths.dataset_receipt_path or "-", experiment.paths.dataset_receipt_sha256 or "-",
     experiment.method, experiment.block_size, experiment.run_name, experiment.sample_size,
     ",".join(map(str, experiment.topology.capture_ids)), experiment.topology.serve_tp,
     experiment.topology.per_device_train_batch_size, experiment.topology.gradient_accumulation_steps,
@@ -124,6 +143,8 @@ for value in (
     fingerprint_schema,
     experiment.dflash2.vllm_expected_commit if experiment.dflash2 is not None else "-",
     experiment.dflash2.vllm_required_ancestor if experiment.dflash2 is not None else "-",
+    experiment.dflash2.vllm_receipt_relative_path if experiment.dflash2 is not None else "-",
+    experiment.dflash2.vllm_receipt_sha256 if experiment.dflash2 is not None else "-",
     experiment.dflash2.warmstart_policy if experiment.dflash2 is not None else "-",
     experiment.dflash2.kernel_projection_init if experiment.dflash2 is not None else "-",
     experiment.dflash2.conv_kernel_size if experiment.dflash2 is not None else "-",
@@ -135,7 +156,7 @@ for value in (
     print(value)
 PY
 )
-(( ${#manifest_values[@]} == 37 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
+(( ${#manifest_values[@]} == 45 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
 SOURCE_PATH="${manifest_values[0]}"
 SOURCE_SHA="${manifest_values[1]}"
 IMAGE_PATH="${manifest_values[2]}"
@@ -146,34 +167,46 @@ TARGET_PATH="${manifest_values[6]}"
 DATASET_PATH="${manifest_values[7]}"
 DATASET_LOCAL_NAME="$(basename "$DATASET_PATH")"
 OUTPUT_ROOT="${manifest_values[8]}"
-METHOD="${manifest_values[9]}"
-BLOCK_SIZE="${manifest_values[10]}"
-RUN_NAME="${manifest_values[11]}"
-SAMPLE_SIZE="${manifest_values[12]}"
-EAGLE_CAPTURE_IDS="[${manifest_values[13]}]"
-SERVE_TP="${manifest_values[14]}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${manifest_values[15]}"
-GRADIENT_ACCUMULATION_STEPS="${manifest_values[16]}"
-NUM_ATTENTION_HEADS="${manifest_values[17]}"
-NUM_KEY_VALUE_HEADS="${manifest_values[18]}"
-HEAD_DIM="${manifest_values[19]}"
-INTERMEDIATE_SIZE="${manifest_values[20]}"
-TARGET_KIND="${manifest_values[21]}"
-ALLOCATED_NODES="${manifest_values[22]}"
-ALLOCATION_SEGMENT="${manifest_values[23]}"
-GPUS_PER_NODE="${manifest_values[24]}"
-TRAINING_IDENTITY="${manifest_values[25]}"
-TRAINING_FINGERPRINT="${manifest_values[26]}"
-TRAINING_FINGERPRINT_SCHEMA="${manifest_values[27]}"
-DFLASH2_VLLM_EXPECTED_COMMIT="${manifest_values[28]}"
-DFLASH2_VLLM_REQUIRED_ANCESTOR="${manifest_values[29]}"
-DFLASH2_WARMSTART_POLICY="${manifest_values[30]}"
-DFLASH2_KERNEL_PROJECTION_INIT="${manifest_values[31]}"
-DFLASH2_CONV_KERNEL_SIZE="${manifest_values[32]}"
-DFLASH2_CONV_GROUP_SIZE="${manifest_values[33]}"
-DFLASH2_SELECTOR_RANK="${manifest_values[34]}"
-DFLASH2_SELECTOR_TOP_K="${manifest_values[35]}"
-DFLASH2_MAX_SPECULATIVE_TOKENS="${manifest_values[36]}"
+TARGET_SHA256="${manifest_values[9]}"
+DATASET_SHA256="${manifest_values[12]}"
+STAGE_TARGET_IDENTITY="$TARGET_PATH"
+STAGE_DATASET_IDENTITY="$DATASET_PATH"
+if [[ "$TARGET_SHA256" != - ]]; then
+    STAGE_TARGET_IDENTITY="$TARGET_SHA256"
+fi
+if [[ "$DATASET_SHA256" != - ]]; then
+    STAGE_DATASET_IDENTITY="$DATASET_SHA256"
+fi
+METHOD="${manifest_values[15]}"
+BLOCK_SIZE="${manifest_values[16]}"
+RUN_NAME="${manifest_values[17]}"
+SAMPLE_SIZE="${manifest_values[18]}"
+EAGLE_CAPTURE_IDS="[${manifest_values[19]}]"
+SERVE_TP="${manifest_values[20]}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${manifest_values[21]}"
+GRADIENT_ACCUMULATION_STEPS="${manifest_values[22]}"
+NUM_ATTENTION_HEADS="${manifest_values[23]}"
+NUM_KEY_VALUE_HEADS="${manifest_values[24]}"
+HEAD_DIM="${manifest_values[25]}"
+INTERMEDIATE_SIZE="${manifest_values[26]}"
+TARGET_KIND="${manifest_values[27]}"
+ALLOCATED_NODES="${manifest_values[28]}"
+ALLOCATION_SEGMENT="${manifest_values[29]}"
+GPUS_PER_NODE="${manifest_values[30]}"
+TRAINING_IDENTITY="${manifest_values[31]}"
+TRAINING_FINGERPRINT="${manifest_values[32]}"
+TRAINING_FINGERPRINT_SCHEMA="${manifest_values[33]}"
+DFLASH2_VLLM_EXPECTED_COMMIT="${manifest_values[34]}"
+DFLASH2_VLLM_REQUIRED_ANCESTOR="${manifest_values[35]}"
+DFLASH2_VLLM_RECEIPT_RELATIVE_PATH="${manifest_values[36]}"
+DFLASH2_VLLM_RECEIPT_SHA256="${manifest_values[37]}"
+DFLASH2_WARMSTART_POLICY="${manifest_values[38]}"
+DFLASH2_KERNEL_PROJECTION_INIT="${manifest_values[39]}"
+DFLASH2_CONV_KERNEL_SIZE="${manifest_values[40]}"
+DFLASH2_CONV_GROUP_SIZE="${manifest_values[41]}"
+DFLASH2_SELECTOR_RANK="${manifest_values[42]}"
+DFLASH2_SELECTOR_TOP_K="${manifest_values[43]}"
+DFLASH2_MAX_SPECULATIVE_TOKENS="${manifest_values[44]}"
 SERVE_NODES=$((ALLOCATED_NODES / 2))
 TRAINER_NODES=$((ALLOCATED_NODES - SERVE_NODES))
 EXPECTED_RNG_STATES=$((TRAINER_NODES * GPUS_PER_NODE))
@@ -251,7 +284,7 @@ esac
 export SERVE_NODES NUM_SPEC_TOKENS
 export SERVE_REPLICAS_PER_NODE
 
-export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES TRAINING_IDENTITY TRAINING_FINGERPRINT
+export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH TARGET_SHA256 STAGE_TARGET_IDENTITY DATASET_PATH DATASET_SHA256 STAGE_DATASET_IDENTITY DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES TRAINING_IDENTITY TRAINING_FINGERPRINT
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     # shellcheck source=tools/launcher/common/specdec/drafter_requeue_lifecycle.sh
     source "$LAUNCHER_ROOT/common/specdec/drafter_requeue_lifecycle.sh"
@@ -292,7 +325,7 @@ staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntas
     else
         stage_role=serve
     fi
-    stage_fingerprint="${SOURCE_SHA}|${RUNTIME_ARCHIVE_SHA256}|${TARGET_PATH}|${DATASET_PATH}|${stage_role}"
+    stage_fingerprint="${SOURCE_SHA}|${RUNTIME_ARCHIVE_SHA256}|${STAGE_TARGET_IDENTITY}|${STAGE_DATASET_IDENTITY}|${stage_role}"
     if [[ -f "$stage_marker" && "$(<"$stage_marker")" == "$stage_fingerprint" ]]; then
         echo "reusing completed host staging: node=${SLURM_NODEID}"
         exit 0
@@ -317,6 +350,18 @@ staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntas
     if (( SLURM_NODEID >= SERVE_NODES )); then
         cp -rL --no-preserve=all -- "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"
     fi
+    PYTHONPATH="$node_root/source/tools/launcher" "$node_root/runtime/bin/python" - \
+        "$node_root/input/target" "$TARGET_SHA256" \
+        "$node_root/input/$DATASET_LOCAL_NAME" "$DATASET_SHA256" "$stage_role" <<'PY'
+import sys
+from pathlib import Path
+from common.specdec.dflash2_runtime_contract import artifact_tree_sha256
+
+if artifact_tree_sha256(Path(sys.argv[1])) != sys.argv[2]:
+    raise SystemExit("staged target bytes mismatch")
+if sys.argv[5] == "trainer" and artifact_tree_sha256(Path(sys.argv[3])) != sys.argv[4]:
+    raise SystemExit("staged Nemotron dataset bytes mismatch")
+PY
     stage_marker_tmp="${stage_marker}.tmp.$$"
     printf "%s\n" "$stage_fingerprint" >"$stage_marker_tmp"
     mv "$stage_marker_tmp" "$stage_marker"
@@ -329,7 +374,7 @@ else
 fi
 
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS SAVE_STEPS RUN_NAME SAMPLE_SIZE
-export DFLASH2_VLLM_EXPECTED_COMMIT DFLASH2_VLLM_REQUIRED_ANCESTOR DFLASH2_CONV_KERNEL_SIZE DFLASH2_CONV_GROUP_SIZE DFLASH2_SELECTOR_RANK DFLASH2_SELECTOR_TOP_K
+export DFLASH2_VLLM_EXPECTED_COMMIT DFLASH2_VLLM_REQUIRED_ANCESTOR DFLASH2_VLLM_RECEIPT_RELATIVE_PATH DFLASH2_VLLM_RECEIPT_SHA256 DFLASH2_CONV_KERNEL_SIZE DFLASH2_CONV_GROUP_SIZE DFLASH2_SELECTOR_RANK DFLASH2_SELECTOR_TOP_K
 export SERVE_NODES CLUSTER_NAME WANDB_NETRC_CONTAINER_PATH
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     export WANDB_RUN_ID="${WANDB_RUN_ID}"
@@ -381,15 +426,23 @@ if not origin.is_relative_to(source):
     raise RuntimeError(f"modelopt imported outside staged source: {origin}")
 PY
     if [[ "$METHOD" == dflash2 ]]; then
-        "$MODELOPT_RUNTIME/bin/python" - "$DFLASH2_VLLM_EXPECTED_COMMIT" "$DFLASH2_VLLM_REQUIRED_ANCESTOR" <<'PY'
+        "$MODELOPT_RUNTIME/bin/python" - "$DFLASH2_VLLM_EXPECTED_COMMIT" \
+            "$DFLASH2_VLLM_REQUIRED_ANCESTOR" "$DFLASH2_VLLM_RECEIPT_RELATIVE_PATH" \
+            "$DFLASH2_VLLM_RECEIPT_SHA256" <<'PY'
 import sys
 from pathlib import Path
 
 import vllm
 
-from tools.launcher.common.specdec.dflash2_runtime_contract import verify_vllm_checkout
+from tools.launcher.common.specdec.dflash2_runtime_contract import verify_vllm_runtime
 
-verify_vllm_checkout(Path(vllm.__file__).resolve().parent, sys.argv[1], sys.argv[2])
+verify_vllm_runtime(
+    Path(vllm.__file__).resolve().parent,
+    Path(sys.prefix) / sys.argv[3],
+    sys.argv[4],
+    sys.argv[1],
+    sys.argv[2],
+)
 PY
     fi
     export HF_MODEL_CKPT="$node_root/input/target"

@@ -21,6 +21,7 @@ import argparse
 from dataclasses import replace
 from pathlib import Path
 
+from common.specdec.cluster_profile import load_cluster_profile
 from common.specdec.drafter_job_manifest import (
     DFlash2RuntimeContract,
     DrafterExperiment,
@@ -38,15 +39,20 @@ def build_dflash2_nemotron_manifest(
     source_sha: str,
     image_sha256: str,
     vllm_expected_commit: str,
+    vllm_receipt_sha256: str,
     *,
+    cluster_profile: Path,
     q30_nodes: int = 16,
     q235_nodes: int = 16,
 ) -> tuple[DrafterExperiment, ...]:
     """Build the two-model Base/Nemotron DFlash2 B8 training manifest."""
-    if q30_nodes not in (2, 16):
-        raise ValueError("Q30 DFlash2 training nodes must be 2 or 16")
-    if q235_nodes not in (4, 16):
-        raise ValueError("Q235 DFlash2 training nodes must be 4 or 16")
+    if q30_nodes != 16 or q235_nodes != 16:
+        raise ValueError("DFlash2 production requires native 16-node/segment-16 jobs")
+    profile = load_cluster_profile(cluster_profile)
+    if profile.modelopt_commit != source_sha:
+        raise ValueError("DFlash2 profile source commit does not match the manifest")
+    if profile.training_nodes != 16 or profile.training_segment != 16 or profile.gpus_per_node != 4:
+        raise ValueError("DFlash2 profile must expose native 16-node/segment-16 training")
 
     seeds = tuple(
         experiment
@@ -61,7 +67,10 @@ def build_dflash2_nemotron_manifest(
     if {experiment.target for experiment in seeds} != {"q30-base", "q235-base"} or len(seeds) != 2:
         raise ValueError("template must contain the exact Q30/Q235 Base Nemotron DFlash B8 seeds")
 
-    contract = DFlash2RuntimeContract(vllm_expected_commit=vllm_expected_commit)
+    contract = DFlash2RuntimeContract(
+        vllm_expected_commit=vllm_expected_commit,
+        vllm_receipt_sha256=vllm_receipt_sha256,
+    )
 
     def rewrite(experiment: DrafterExperiment) -> DrafterExperiment:
         nodes = q30_nodes if experiment.target == "q30-base" else q235_nodes
@@ -70,6 +79,7 @@ def build_dflash2_nemotron_manifest(
         return replace(
             experiment,
             method="dflash2",
+            cumulative_max_steps=(20, 4166, 14500, 25391),
             run_name=f"{experiment.run_name}{suffix}",
             topology=replace(
                 experiment.topology,
@@ -82,7 +92,13 @@ def build_dflash2_nemotron_manifest(
                 image_sha256=image_sha256,
                 output_root=f"{experiment.paths.output_root}{suffix}",
             ),
-            slurm=replace(experiment.slurm, nodes=nodes, segment=nodes),
+            slurm=replace(
+                experiment.slurm,
+                account=profile.account,
+                partition=profile.partition,
+                nodes=nodes,
+                segment=nodes,
+            ),
             dflash2=contract,
         )
 
@@ -100,8 +116,8 @@ def main() -> None:
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--image-sha256", required=True)
     parser.add_argument("--vllm-expected-commit", required=True)
-    parser.add_argument("--q30-nodes", type=int, choices=(2, 16), default=16)
-    parser.add_argument("--q235-nodes", type=int, choices=(4, 16), default=16)
+    parser.add_argument("--vllm-receipt-sha256", required=True)
+    parser.add_argument("--cluster-profile", type=Path, required=True)
     args = parser.parse_args()
     experiments = build_dflash2_nemotron_manifest(
         args.template,
@@ -110,8 +126,8 @@ def main() -> None:
         args.source_sha,
         args.image_sha256,
         args.vllm_expected_commit,
-        q30_nodes=args.q30_nodes,
-        q235_nodes=args.q235_nodes,
+        args.vllm_receipt_sha256,
+        cluster_profile=args.cluster_profile,
     )
     print(f"wrote {len(experiments)} DFlash2 experiments to {args.output}")
 

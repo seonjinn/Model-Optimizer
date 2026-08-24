@@ -18,11 +18,18 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from common.specdec.build_dflash2_nemotron_manifest import build_dflash2_nemotron_manifest
-from common.specdec.dflash2_runtime_contract import verify_vllm_checkout
+from common.specdec.dflash2_runtime_contract import (
+    artifact_tree_sha256,
+    validate_artifact_receipt,
+    verify_vllm_runtime,
+    write_artifact_receipt,
+    write_vllm_runtime_receipt,
+)
 from common.specdec.drafter_job_manifest import (
     DrafterExperiment,
     PinnedPaths,
@@ -64,19 +71,80 @@ def _vllm_checkout(tmp_path: Path) -> tuple[Path, str, str]:
     return package, required, _git(repo, "rev-parse", "HEAD")
 
 
-def test_vllm_runtime_accepts_the_exact_pinned_descendant(tmp_path: Path) -> None:
-    """The runtime checkout must match the manifest head and contain PR 52816."""
+def test_vllm_runtime_receipt_survives_archive_staging_without_git(tmp_path: Path) -> None:
+    """A staged venv proves PR 52816 from immutable package bytes, not a copied .git tree."""
     package, required, expected = _vllm_checkout(tmp_path)
+    receipt = tmp_path / "vllm-runtime.json"
+    receipt_sha = write_vllm_runtime_receipt(receipt, package, expected, required)
+    staged = tmp_path / "staged/vllm"
+    staged.parent.mkdir()
+    __import__("shutil").copytree(package, staged)
 
-    assert verify_vllm_checkout(package, expected, required) == expected
+    assert verify_vllm_runtime(staged, receipt, receipt_sha, expected, required) == expected
+    (staged / "injected.py").write_text("MALICIOUS = True\n")
+    with pytest.raises(ValueError, match="runtime file set"):
+        verify_vllm_runtime(staged, receipt, receipt_sha, expected, required)
+    (staged / "injected.py").unlink()
+    (staged / "runtime.py").write_text("SUPPORTED = False\n")
+    with pytest.raises(ValueError, match="runtime file"):
+        verify_vllm_runtime(staged, receipt, receipt_sha, expected, required)
+
+
+def test_runtime_contract_cli_builds_no_replace_receipts(tmp_path: Path) -> None:
+    """Artifact staging has one auditable CLI rather than ad-hoc Python snippets."""
+    package, required, expected = _vllm_checkout(tmp_path)
+    receipt = tmp_path / "vllm-runtime.json"
+    script = Path(__file__).resolve().parents[1] / "common/specdec/dflash2_runtime_contract.py"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "vllm-receipt",
+            "--package",
+            str(package),
+            "--output",
+            str(receipt),
+            "--expected-commit",
+            expected,
+            "--required-ancestor",
+            required,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        completed.stdout.strip() == __import__("hashlib").sha256(receipt.read_bytes()).hexdigest()
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "vllm-receipt",
+                "--package",
+                str(package),
+                "--output",
+                str(receipt),
+                "--expected-commit",
+                expected,
+                "--required-ancestor",
+                required,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 def test_vllm_runtime_rejects_a_manifest_head_mismatch(tmp_path: Path) -> None:
     """A different checkout cannot reuse another image's DFlash2 attestation."""
-    package, required, _expected = _vllm_checkout(tmp_path)
+    package, required, expected = _vllm_checkout(tmp_path)
+    receipt = tmp_path / "vllm-runtime.json"
+    receipt_sha = write_vllm_runtime_receipt(receipt, package, expected, required)
 
-    with pytest.raises(ValueError, match="expected commit"):
-        verify_vllm_checkout(package, "a" * 40, required)
+    with pytest.raises(ValueError, match="receipt identity"):
+        verify_vllm_runtime(package, receipt, receipt_sha, "a" * 40, required)
 
 
 def test_vllm_runtime_rejects_a_missing_required_ancestor(tmp_path: Path) -> None:
@@ -84,17 +152,53 @@ def test_vllm_runtime_rejects_a_missing_required_ancestor(tmp_path: Path) -> Non
     package, _required, expected = _vllm_checkout(tmp_path)
 
     with pytest.raises(ValueError, match="required DFlash2 commit"):
-        verify_vllm_checkout(package, expected, "b" * 40)
+        write_vllm_runtime_receipt(tmp_path / "receipt.json", package, expected, "b" * 40)
 
 
-def test_vllm_runtime_rejects_a_non_git_install(tmp_path: Path) -> None:
+def test_vllm_runtime_receipt_rejects_dirty_checkout_bytes(tmp_path: Path) -> None:
+    """A commit claim cannot attest modified or untracked package bytes."""
+    package, required, expected = _vllm_checkout(tmp_path)
+    (package / "runtime.py").write_text("SUPPORTED = False\n")
+
+    with pytest.raises(ValueError, match="clean tracked checkout"):
+        write_vllm_runtime_receipt(tmp_path / "receipt.json", package, expected, required)
+
+
+def test_vllm_runtime_rejects_a_non_attested_install(tmp_path: Path) -> None:
     """Version strings alone cannot prove that PR 52816 is present."""
     package = tmp_path / "site-packages" / "vllm"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text('__version__ = "0.20.0"\n')
 
-    with pytest.raises(ValueError, match="Git checkout"):
-        verify_vllm_checkout(package, "a" * 40, "b" * 40)
+    with pytest.raises(ValueError, match="receipt is missing"):
+        verify_vllm_runtime(package, tmp_path / "missing.json", "c" * 64, "a" * 40, "b" * 40)
+
+
+def _profile(tmp_path: Path, source_sha: str = _SOURCE_SHA) -> Path:
+    path = tmp_path / "profile.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "name: oci-hsg",
+                f"modelopt_commit: {source_sha}",
+                "ssh_host: host",
+                "account: nemotron_n3_post",
+                "partition: batch",
+                "fallback_partition: null",
+                "durable_root: /lustre/results",
+                "scratch_candidates: [/raid/scratch]",
+                "training_nodes: 16",
+                "training_segment: 16",
+                "evaluation_nodes: 1",
+                "evaluation_segment: 1",
+                "gpus_per_node: 4",
+                "explicit_gpu_flag: true",
+                'walltime: "03:55:00"',
+                "",
+            )
+        )
+    )
+    return path
 
 
 def _template_experiment(target: str) -> DrafterExperiment:
@@ -119,6 +223,12 @@ def _template_experiment(target: str) -> DrafterExperiment:
             target_path=f"/lustre/models/{target}",
             dataset_path="/lustre/datasets/nemotron-1.3m.parquet",
             output_root=f"/lustre/results/{target}-nemo-dflash-b8",
+            target_sha256="1" * 64,
+            target_receipt_path=f"/lustre/models/{target}.receipt.json",
+            target_receipt_sha256="2" * 64,
+            dataset_sha256="3" * 64,
+            dataset_receipt_path="/lustre/datasets/nemotron-1.3m.receipt.json",
+            dataset_receipt_sha256="4" * 64,
         ),
         slurm=SlurmSettings(
             account="nemotron_n3_post",
@@ -146,6 +256,8 @@ def test_builder_emits_exact_q30_q235_base_nemotron_dflash2_matrix(tmp_path: Pat
         _SOURCE_SHA,
         _SHA256,
         "f" * 40,
+        "e" * 64,
+        cluster_profile=_profile(tmp_path),
     )
 
     assert load_manifest(output) == experiments
@@ -172,6 +284,24 @@ def test_builder_emits_exact_q30_q235_base_nemotron_dflash2_matrix(tmp_path: Pat
         assert experiment.dflash2.vllm_expected_commit == "f" * 40
         assert experiment.paths.source_sha == _SOURCE_SHA
         assert experiment.paths.image_sha256 == _SHA256
+        assert experiment.cumulative_max_steps == (20, 4166, 14500, 25391)
+
+
+def test_builder_rejects_profile_source_or_native_16_node_drift(tmp_path: Path) -> None:
+    """The manifest cannot target a stale source commit or a four-node capacity profile."""
+    template = tmp_path / "template.json"
+    write_manifest(template, (_template_experiment("q30-base"), _template_experiment("q235-base")))
+    with pytest.raises(ValueError, match="profile source commit"):
+        build_dflash2_nemotron_manifest(
+            template,
+            tmp_path / "output.json",
+            "/home/user/ModelOpt-dflash2",
+            _SOURCE_SHA,
+            _SHA256,
+            "f" * 40,
+            "e" * 64,
+            cluster_profile=_profile(tmp_path, "a" * 40),
+        )
 
 
 def test_builder_rejects_a_template_without_both_base_nemotron_seeds(tmp_path: Path) -> None:
@@ -187,7 +317,70 @@ def test_builder_rejects_a_template_without_both_base_nemotron_seeds(tmp_path: P
             _SOURCE_SHA,
             _SHA256,
             "f" * 40,
+            "e" * 64,
+            cluster_profile=_profile(tmp_path),
         )
+
+
+def test_target_and_dataset_receipts_bind_exact_bytes(tmp_path: Path) -> None:
+    """A path-only target or 1.3M dataset cannot enter a DFlash2 job."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "config.json").write_text("{}\n")
+    dataset = tmp_path / "nemotron.jsonl"
+    dataset.write_bytes(b'{"messages":[]}\n' * 1_300_000)
+    target_receipt = tmp_path / "target.json"
+    dataset_receipt = tmp_path / "dataset.json"
+    write_artifact_receipt(target_receipt, target, kind="target")
+    write_artifact_receipt(dataset_receipt, dataset, kind="dataset", occurrence_count=1_300_000)
+    target_sha256 = artifact_tree_sha256(target)
+    validate_artifact_receipt(
+        target_receipt,
+        expected_receipt_sha256=__import__("hashlib")
+        .sha256(target_receipt.read_bytes())
+        .hexdigest(),
+        artifact_path=target,
+        expected_artifact_sha256=target_sha256,
+        kind="target",
+    )
+    (target / "config.json").write_text("forged\n")
+    with pytest.raises(ValueError, match="artifact bytes"):
+        validate_artifact_receipt(
+            target_receipt,
+            expected_receipt_sha256=__import__("hashlib")
+            .sha256(target_receipt.read_bytes())
+            .hexdigest(),
+            artifact_path=target,
+            expected_artifact_sha256=target_sha256,
+            kind="target",
+        )
+
+
+def test_dataset_receipt_rejects_a_claimed_1_3m_count_for_other_bytes(tmp_path: Path) -> None:
+    """The receipt builder derives row count instead of trusting its caller."""
+    dataset = tmp_path / "not-1.3m.jsonl"
+    dataset.write_text('{"messages":[]}\n')
+
+    with pytest.raises(ValueError, match="occurrence count"):
+        write_artifact_receipt(
+            tmp_path / "forged.json",
+            dataset,
+            kind="dataset",
+            occurrence_count=1_300_000,
+        )
+
+
+def test_dflash2_submitter_serializes_canary_and_cumulative_writers() -> None:
+    """Each model uses 20→4166→14500→25391 afterok dependencies on one output root."""
+    script = (
+        Path(__file__).resolve().parents[1] / "common/specdec/submit_dflash2_nemotron_chain.sh"
+    ).read_text()
+    assert "20 4166 14500 25391" in script
+    assert '--dependency "$previous_job_id"' in script
+    assert "previous_job_id=" in script
+    assert "submit_drafter_training_wave.sh" in script
+    assert "--target) TARGET=" in script
+    assert "experiment.target != sys.argv[2]" in script
 
 
 def test_shared_runner_enforces_and_consumes_the_dflash2_contract() -> None:
@@ -201,7 +394,7 @@ def test_shared_runner_enforces_and_consumes_the_dflash2_contract() -> None:
         '[[ "$DFLASH2_WARMSTART_POLICY" == exact-dflash2-only ]]',
         '[[ "$DFLASH2_KERNEL_PROJECTION_INIT" == zero ]]',
         '[[ "$DFLASH2_MAX_SPECULATIVE_TOKENS" == 7 ]]',
-        "verify_vllm_checkout",
+        "verify_vllm_runtime",
         '"dflash.dflash_architecture_config.projector_type=dflash2"',
         '"dflash.dflash_architecture_config.conv_kernel_size=${DFLASH2_CONV_KERNEL_SIZE}"',
         '"dflash.dflash_architecture_config.conv_group_size=${DFLASH2_CONV_GROUP_SIZE}"',
