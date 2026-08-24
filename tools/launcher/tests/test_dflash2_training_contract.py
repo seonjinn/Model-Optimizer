@@ -737,7 +737,7 @@ def _profile(tmp_path: Path, source_sha: str = _SOURCE_SHA) -> Path:
 
 
 def _template_experiment(target: str) -> DrafterExperiment:
-    is_q30 = target == "q30-base"
+    is_q30 = target.startswith("q30-")
     kind = "qwen3-30b-a3b" if is_q30 else "qwen3-235b-a22b"
     nodes = 2 if is_q30 else 4
     return DrafterExperiment(
@@ -820,6 +820,83 @@ def test_builder_emits_exact_q30_q235_base_nemotron_dflash2_matrix(tmp_path: Pat
         assert experiment.paths.source_sha == _SOURCE_SHA
         assert experiment.paths.image_sha256 == _SHA256
         assert experiment.cumulative_max_steps == (20, 4166, 14500, 25391)
+
+
+def test_builder_emits_exact_q30_q235_thinking_nemotron_dflash2_matrix(
+    tmp_path: Path,
+) -> None:
+    """Thinking targets keep the family topology and get isolated clear identities."""
+    template = tmp_path / "template.json"
+    output = tmp_path / "thinking-dflash2.json"
+    write_manifest(
+        template,
+        (_template_experiment("q30-thinking"), _template_experiment("q235-thinking")),
+    )
+
+    experiments = build_dflash2_nemotron_manifest(
+        template,
+        output,
+        "/home/user/ModelOpt-dflash2",
+        _SOURCE_SHA,
+        _SHA256,
+        "f" * 40,
+        "e" * 64,
+        cluster_profile=_profile(tmp_path),
+        target_variant="thinking",
+    )
+
+    assert load_manifest(output) == experiments
+    assert {item.target for item in experiments} == {"q30-thinking", "q235-thinking"}
+    expected = {
+        "q30-thinking": ((2, 13, 24, 35, 46, 48), 2, 4, 4, 32, 4, 128, 6144),
+        "q235-thinking": ((2, 25, 47, 69, 92, 94), 4, 2, 8, 64, 4, 128, 12288),
+    }
+    expected_names = {
+        "q30-thinking": "dfl2-q30t-nemo1p3m-b8k7-n16",
+        "q235-thinking": "dfl2-q235t-nemo1p3m-b8k7-n16",
+    }
+    for experiment in experiments:
+        topology = experiment.topology
+        assert (
+            topology.capture_ids,
+            topology.serve_tp,
+            topology.per_device_train_batch_size,
+            topology.gradient_accumulation_steps,
+            topology.num_attention_heads,
+            topology.num_key_value_heads,
+            topology.head_dim,
+            topology.intermediate_size,
+        ) == expected[experiment.target]
+        assert experiment.run_name == expected_names[experiment.target]
+        assert experiment.paths.output_root.endswith("-dflash2-16n")
+        assert experiment.paths.target_receipt_path is not None
+        assert experiment.paths.target_receipt_sha256 is not None
+        assert experiment.paths.target_sha256 is not None
+        assert experiment.cumulative_max_steps == (20, 4166, 14500, 25391)
+    assert len({item.paths.output_root for item in experiments}) == 2
+    assert len({item.experiment_id for item in experiments}) == 2
+
+
+def test_builder_rejects_base_thinking_target_mix(tmp_path: Path) -> None:
+    """A target-variant manifest cannot silently mix Base and Thinking snapshots."""
+    template = tmp_path / "template.json"
+    write_manifest(
+        template,
+        (_template_experiment("q30-thinking"), _template_experiment("q235-base")),
+    )
+
+    with pytest.raises(ValueError, match="exact Q30/Q235 Thinking Nemotron DFlash B8 seeds"):
+        build_dflash2_nemotron_manifest(
+            template,
+            tmp_path / "output.json",
+            "/home/user/ModelOpt-dflash2",
+            _SOURCE_SHA,
+            _SHA256,
+            "f" * 40,
+            "e" * 64,
+            cluster_profile=_profile(tmp_path),
+            target_variant="thinking",
+        )
 
 
 def test_builder_rejects_profile_source_or_native_16_node_drift(tmp_path: Path) -> None:
@@ -1127,10 +1204,10 @@ def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> Non
         "to_empty(device=\"cpu\")",
         "parameter.zero_()",
         "base_kernel[:, 0].fill_(1.0)",
-        '"num_attention_heads": 32',
-        '"num_key_value_heads": 4',
-        '"head_dim": 128',
-        '"intermediate_size": 6144',
+        '"num_attention_heads": int(num_attention_heads)',
+        '"num_key_value_heads": int(num_key_value_heads)',
+        '"head_dim": int(head_dim)',
+        '"intermediate_size": int(intermediate_size)',
         '"dflash_block_size": 8',
         '"num_speculative_tokens": 7',
         '"method": "dflash"',
@@ -1142,7 +1219,7 @@ def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> Non
         "DFlash2DraftModel",
         "vllm._flashmla_C",
         "vllm._flashmla_extension_C",
-        "tensor-parallel-size 2",
+        '--tensor-parallel-size "$serve_tp"',
         "/health",
         "/v1/completions",
         'tee "$server_log"',
@@ -1155,6 +1232,30 @@ def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> Non
         "receipt_sha256",
         "SLURM_JOB_ID",
         "refusing to replace existing serve-gate output",
+        "TARGET_LABEL",
+        "TARGET_REVISION",
+        "144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
+        "6cbffae6d8e28b986a6b17bd36f42f9fa0f1f0a5",
+        '"q30-thinking":',
+        '"q235-thinking":',
+        "source_identity",
+    ):
+        assert required in script
+
+
+def test_dflash2_chain_accepts_thinking_targets_and_uses_clear_job_names() -> None:
+    """Thinking canaries use target-labelled names without weakening duplicate identity."""
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/submit_dflash2_nemotron_chain.sh"
+    ).read_text()
+    for required in (
+        "q30-thinking",
+        "q235-thinking",
+        "dfl2-q30t-nemo1p3m-b8k7-n16",
+        "dfl2-q235t-nemo1p3m-b8k7-n16",
+        "--canary-only",
+        '--job-name "$job_name"',
     ):
         assert required in script
 

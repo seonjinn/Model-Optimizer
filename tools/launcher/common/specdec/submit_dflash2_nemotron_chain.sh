@@ -6,11 +6,11 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --manifest PATH --receipt PATH --cluster-profile PATH [--target q30-base|q235-base] [--readiness-receipt PATH] [--dry-run]" >&2
+    echo "usage: $0 --manifest PATH --receipt PATH --cluster-profile PATH [--target q30-base|q235-base|q30-thinking|q235-thinking] [--readiness-receipt PATH] [--canary-only] [--dry-run]" >&2
     exit 2
 }
 
-MANIFEST="" RECEIPT="" CLUSTER_PROFILE="" TARGET="" READINESS_RECEIPT="" DRY_RUN=0
+MANIFEST="" RECEIPT="" CLUSTER_PROFILE="" TARGET="" READINESS_RECEIPT="" CANARY_ONLY=0 DRY_RUN=0
 while (( $# )); do
     case "$1" in
         --manifest) MANIFEST="${2:-}"; shift 2 ;;
@@ -18,6 +18,7 @@ while (( $# )); do
         --cluster-profile) CLUSTER_PROFILE="${2:-}"; shift 2 ;;
         --target) TARGET="${2:-}"; shift 2 ;;
         --readiness-receipt) READINESS_RECEIPT="${2:-}"; shift 2 ;;
+        --canary-only) CANARY_ONLY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         *) usage ;;
     esac
@@ -30,7 +31,10 @@ if [[ "$RECEIPT" != /lustre/* ]] || ! is_launcher_path "$CLUSTER_PROFILE"; then
     usage
 fi
 [[ -f "$CLUSTER_PROFILE" ]] || usage
-[[ -z "$TARGET" || "$TARGET" == "q30-base" || "$TARGET" == "q235-base" ]] || usage
+case "$TARGET" in
+    ""|q30-base|q235-base|q30-thinking|q235-thinking) ;;
+    *) usage ;;
+esac
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
@@ -43,8 +47,13 @@ from pathlib import Path
 from common.specdec.drafter_job_manifest import load_manifest
 
 experiments = load_manifest(Path(sys.argv[1]))
-if len(experiments) != 2 or {item.target for item in experiments} != {"q30-base", "q235-base"}:
-    raise SystemExit("DFlash2 chain requires the exact Q30/Q235 matrix")
+targets = {item.target for item in experiments}
+valid_targets = (
+    {"q30-base", "q235-base"},
+    {"q30-thinking", "q235-thinking"},
+)
+if len(experiments) != 2 or targets not in valid_targets:
+    raise SystemExit("DFlash2 chain requires one exact Q30/Q235 target-variant matrix")
 for index, experiment in enumerate(experiments):
     if sys.argv[2] and experiment.target != sys.argv[2]:
         continue
@@ -55,7 +64,11 @@ for index, experiment in enumerate(experiments):
         or experiment.cumulative_max_steps != (20, 4166, 14500, 25391)
     ):
         raise SystemExit("DFlash2 chain manifest is not the native 16-node canary/full plan")
-    print(f"{index}\t{experiment.experiment_id}")
+    clear_names = {
+        "q30-thinking": "dfl2-q30t-nemo1p3m-b8k7-n16",
+        "q235-thinking": "dfl2-q235t-nemo1p3m-b8k7-n16",
+    }
+    print(f"{index}\t{experiment.experiment_id}\t{clear_names.get(experiment.target, '')}")
 PY
 )
 expected_records=2
@@ -63,14 +76,20 @@ expected_records=2
 (( ${#experiment_records[@]} == expected_records )) || exit 2
 
 for experiment_record in "${experiment_records[@]}"; do
-    IFS=$'\t' read -r experiment_index experiment_id <<<"$experiment_record"
+    IFS=$'\t' read -r experiment_index experiment_id clear_job_prefix <<<"$experiment_record"
     previous_job_id=""
-    for max_steps in 20 4166 14500 25391; do
+    max_steps_values=(20 4166 14500 25391)
+    (( CANARY_ONLY == 0 )) || max_steps_values=(20)
+    for max_steps in "${max_steps_values[@]}"; do
         command=(
             "$WAVE_SUBMITTER" --manifest "$MANIFEST" --receipt "$RECEIPT"
             --cluster-profile "$CLUSTER_PROFILE" --experiment-index "$experiment_index"
             --max-steps "$max_steps"
         )
+        if [[ -n "$clear_job_prefix" ]]; then
+            job_name="${clear_job_prefix}-s${max_steps}"
+            command+=(--job-name "$job_name")
+        fi
         [[ -z "$READINESS_RECEIPT" ]] || command+=(--readiness-receipt "$READINESS_RECEIPT")
         [[ -z "$previous_job_id" ]] || command+=(--dependency "$previous_job_id")
         if (( DRY_RUN )); then

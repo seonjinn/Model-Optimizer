@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Build a deterministic, untrained DFlash2 checkpoint-0 and prove the exact
-# staged runtime can reload it, become healthy, and complete one TP2 request.
+# staged runtime can reload it, become healthy, and complete one target-family request.
 set -euo pipefail
 
-[[ $# == 11 ]] || {
-    echo "usage: $0 RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA TARGET TARGET_RECEIPT TARGET_RECEIPT_SHA IMAGE LAUNCHER SOURCE_SHA OUTPUT_ROOT SCRATCH_ROOT PORT" >&2
+[[ $# == 11 || $# == 12 ]] || {
+    echo "usage: $0 RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA TARGET TARGET_RECEIPT TARGET_RECEIPT_SHA IMAGE LAUNCHER SOURCE_SHA OUTPUT_ROOT SCRATCH_ROOT PORT [TARGET_LABEL]" >&2
     exit 2
 }
 RUNTIME_ARCHIVE="$(realpath "$1")"
@@ -21,6 +21,7 @@ SOURCE_SHA="$8"
 OUTPUT_ROOT="$(realpath -m "$9")"
 SCRATCH_ROOT="$(realpath -m "${10}")"
 PORT="${11}"
+TARGET_LABEL="${12:-q30-base}"
 DFLASH2_SELECTOR_DIAGNOSTIC="${DFLASH2_SELECTOR_DIAGNOSTIC:-0}"
 [[ "$RUNTIME_ARCHIVE_SHA" =~ ^[0-9a-f]{64}$ && "$TARGET_RECEIPT_SHA" =~ ^[0-9a-f]{64}$ ]]
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$PORT" =~ ^[0-9]+$ ]]
@@ -42,9 +43,9 @@ runtime_package="$(find "$runtime/lib" -type d -path '*/site-packages/vllm' -pri
 runtime_receipt="$runtime/dflash2-vllm-runtime-receipt.json"
 runtime_receipt_sha="$(sha256sum "$runtime_receipt" | cut -d' ' -f1)"
 
-PYTHONPATH="$LAUNCHER:$LAUNCHER/tools/launcher" python3 - \
+mapfile -t target_values < <(PYTHONPATH="$LAUNCHER:$LAUNCHER/tools/launcher" python3 - \
     "$LAUNCHER" "$SOURCE_SHA" "$TARGET" "$TARGET_RECEIPT" "$TARGET_RECEIPT_SHA" \
-    "$runtime_package" "$runtime_receipt" "$runtime_receipt_sha" <<'PY'
+    "$runtime_package" "$runtime_receipt" "$runtime_receipt_sha" "$TARGET_LABEL" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -55,7 +56,17 @@ from tools.launcher.common.specdec.dflash2_runtime_contract import (
     verify_vllm_runtime,
 )
 
-launcher, source_sha, target, target_receipt, target_receipt_sha, package, receipt, receipt_sha = sys.argv[1:]
+launcher, source_sha, target, target_receipt, target_receipt_sha, package, receipt, receipt_sha, target_label = sys.argv[1:]
+target_specs = {
+    "q30-base": ("ad44e777bcd18fa416d9da3bd8f70d33ebb85d39", (2, 13, 24, 35, 46, 48), 2, 32, 4, 128, 6144),
+    "q30-thinking": ("144afc2f379b542fdd4e85a1fcd5e1f79112d95d", (2, 13, 24, 35, 46, 48), 2, 32, 4, 128, 6144),
+    "q235-base": ("8efa61729e24bd65b1d152b5ab5409052aa80e65", (2, 25, 47, 69, 92, 94), 4, 64, 4, 128, 12288),
+    "q235-thinking": ("6cbffae6d8e28b986a6b17bd36f42f9fa0f1f0a5", (2, 25, 47, 69, 92, 94), 4, 64, 4, 128, 12288),
+}
+try:
+    target_revision, capture_ids, serve_tp, num_heads, num_kv_heads, head_dim, intermediate_size = target_specs[target_label]
+except KeyError as error:
+    raise ValueError(f"unsupported DFlash2 target label: {target_label}") from error
 validate_dflash2_source_checkout(Path(launcher), source_sha, "6eda6bbf54455086a54660fe7a7b06c415b87da5")
 target_body = json.loads(Path(target_receipt).read_text())
 validate_artifact_receipt(
@@ -65,6 +76,17 @@ validate_artifact_receipt(
     expected_artifact_sha256=target_body["artifact_sha256"],
     kind="target",
 )
+snapshot = json.loads((Path(target) / "snapshot-manifest.json").read_text())
+if snapshot.get("source_identity") != target_revision:
+    raise ValueError("DFlash2 target snapshot revision mismatch")
+config = json.loads((Path(target) / "config.json").read_text())
+expected_dims = (num_heads, num_kv_heads, head_dim, intermediate_size)
+actual_dims = tuple(
+    config[name]
+    for name in ("num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size")
+)
+if actual_dims != expected_dims:
+    raise ValueError("DFlash2 target dimensions mismatch")
 verify_vllm_runtime(
     Path(package),
     Path(receipt),
@@ -73,7 +95,23 @@ verify_vllm_runtime(
     "b389ac29465b33f9e9c534df221ea3c129e9793f",
     expected_flashmla_commit="a8f794d1251cbfd88a5011445dd5582289c727e4",
 )
+print(target_revision)
+print(",".join(map(str, capture_ids)))
+print(serve_tp)
+print(num_heads)
+print(num_kv_heads)
+print(head_dim)
+print(intermediate_size)
 PY
+)
+(( ${#target_values[@]} == 7 )) || { echo "invalid target contract" >&2; exit 2; }
+TARGET_REVISION="${target_values[0]}"
+TARGET_CAPTURE_IDS="${target_values[1]}"
+SERVE_TP="${target_values[2]}"
+NUM_ATTENTION_HEADS="${target_values[3]}"
+NUM_KEY_VALUE_HEADS="${target_values[4]}"
+HEAD_DIM="${target_values[5]}"
+INTERMEDIATE_SIZE="${target_values[6]}"
 
 mounts="${work_root}:${work_root},${TARGET}:${TARGET}:ro,${TARGET_RECEIPT}:${TARGET_RECEIPT}:ro,${RUNTIME_ARCHIVE}:${RUNTIME_ARCHIVE}:ro,${LAUNCHER}:${LAUNCHER}:ro,$(dirname "$OUTPUT_ROOT"):$(dirname "$OUTPUT_ROOT")"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
@@ -82,7 +120,9 @@ srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     "$TARGET_RECEIPT_SHA" "$RUNTIME_ARCHIVE" "$RUNTIME_ARCHIVE_SHA" \
     "$runtime_receipt" "$runtime_receipt_sha" "$LAUNCHER" "$SOURCE_SHA" \
     "$attempt" "$OUTPUT_ROOT" "$PORT" "$SLURM_JOB_ID" \
-    "$DFLASH2_SELECTOR_DIAGNOSTIC" <<'INNER'
+    "$DFLASH2_SELECTOR_DIAGNOSTIC" "$TARGET_LABEL" "$TARGET_REVISION" \
+    "$TARGET_CAPTURE_IDS" "$SERVE_TP" "$NUM_ATTENTION_HEADS" \
+    "$NUM_KEY_VALUE_HEADS" "$HEAD_DIM" "$INTERMEDIATE_SIZE" <<'INNER'
 set -euo pipefail
 runtime="$1"
 runtime_package="$2"
@@ -100,6 +140,14 @@ output_root="${13}"
 port="${14}"
 slurm_job_id="${15}"
 diagnostic_mode="${16}"
+target_label="${17}"
+target_revision="${18}"
+target_capture_ids="${19}"
+serve_tp="${20}"
+num_attention_heads="${21}"
+num_key_value_heads="${22}"
+head_dim="${23}"
+intermediate_size="${24}"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export_dir="$attempt/checkpoint-0-runtime-only"
 server_log="$attempt/vllm-serve.log"
@@ -107,7 +155,8 @@ request_payload="$attempt/request.json"
 response_path="$attempt/response.json"
 export PATH="$runtime/bin:$PATH"
 export PYTHONPATH="$launcher:$launcher/tools/launcher"
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES
+CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$((serve_tp - 1))")"
 export VLLM_USE_V2_MODEL_RUNNER=1
 
 "$runtime/bin/python" - <<'PY'
@@ -118,7 +167,8 @@ from vllm.v1.attention.ops.flashmla import _is_flashmla_available
 assert _is_flashmla_available() == (True, None)
 PY
 
-"$runtime/bin/python" - "$target" "$export_dir" <<'PY'
+"$runtime/bin/python" - "$target" "$export_dir" "$num_attention_heads" \
+    "$num_key_value_heads" "$head_dim" "$intermediate_size" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -128,13 +178,14 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 import modelopt.torch.speculative as mtsp
 
-target, export_dir = sys.argv[1:]
+target, export_dir = sys.argv[1:3]
+num_attention_heads, num_key_value_heads, head_dim, intermediate_size = map(int, sys.argv[3:])
 torch.manual_seed(42)
 target_config = AutoConfig.from_pretrained(target, trust_remote_code=False)
-assert target_config.num_attention_heads == 32
-assert target_config.num_key_value_heads == 4
-assert target_config.head_dim == 128
-assert target_config.intermediate_size == 6144
+assert target_config.num_attention_heads == num_attention_heads
+assert target_config.num_key_value_heads == num_key_value_heads
+assert target_config.head_dim == head_dim
+assert target_config.intermediate_size == intermediate_size
 with torch.device("meta"):
     model = AutoModelForCausalLM.from_config(target_config, trust_remote_code=False)
 mtsp.convert(
@@ -149,10 +200,10 @@ mtsp.convert(
                 "dflash_selector_loss_alpha": 1.0,
                 "dflash_architecture_config": {
                     "num_hidden_layers": 5,
-                    "num_attention_heads": 32,
-                    "num_key_value_heads": 4,
-                    "head_dim": 128,
-                    "intermediate_size": 6144,
+                    "num_attention_heads": num_attention_heads,
+                    "num_key_value_heads": num_key_value_heads,
+                    "head_dim": head_dim,
+                    "intermediate_size": intermediate_size,
                     "projector_type": "dflash2",
                     "conv_kernel_size": 2,
                     "conv_group_size": 16,
@@ -176,10 +227,10 @@ model.get_exporter().export(Path(export_dir), dtype=torch.bfloat16)
 config = json.loads((Path(export_dir) / "config.json").read_text())
 assert config["architectures"] == ["DFlash2DraftModel"]
 assert config["block_size"] == 8
-assert config["num_attention_heads"] == 32
-assert config["num_key_value_heads"] == 4
-assert config["head_dim"] == 128
-assert config["intermediate_size"] == 6144
+assert config["num_attention_heads"] == num_attention_heads
+assert config["num_key_value_heads"] == num_key_value_heads
+assert config["head_dim"] == head_dim
+assert config["intermediate_size"] == intermediate_size
 assert config["dflash_config"]["projector_type"] == "dflash2"
 PY
 
@@ -210,7 +261,7 @@ if [[ "$diagnostic_mode" == 1 ]]; then
     "${serve_prefix[@]}" -c 'import sitecustomize; assert sitecustomize.INSTALLED'
 fi
 "${serve_prefix[@]}" -m vllm.entrypoints.cli.main serve "$target" \
-    --tensor-parallel-size 2 --max-model-len 4096 --max-num-batched-tokens 4096 \
+    --tensor-parallel-size "$serve_tp" --max-model-len 4096 --max-num-batched-tokens 4096 \
     --gpu-memory-utilization 0.85 --port "$port" --speculative-config "$SPEC_CONFIG" \
     "${serve_extra[@]}" \
     > >(tee "$server_log") 2>&1 &
@@ -251,7 +302,9 @@ finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     "$runtime_archive" "$runtime_archive_sha" "$runtime_receipt" "$runtime_receipt_sha" \
     "$launcher" "$source_sha" "$runtime_package" "$slurm_job_id" "$started_at" \
     "$finished_at" "$port" "$diagnostic_mode" \
-    "$launcher/tools/launcher/common/specdec/dflash2_selector_diagnostic/sitecustomize.py" <<'PY'
+    "$launcher/tools/launcher/common/specdec/dflash2_selector_diagnostic/sitecustomize.py" \
+    "$target_label" "$target_revision" "$target_capture_ids" "$serve_tp" \
+    "$num_attention_heads" "$num_key_value_heads" "$head_dim" "$intermediate_size" <<'PY'
 import hashlib
 import json
 import sys
@@ -275,6 +328,14 @@ from pathlib import Path
     port,
     diagnostic_mode_s,
     diagnostic_module_s,
+    target_label,
+    target_revision,
+    target_capture_ids_s,
+    serve_tp,
+    num_attention_heads,
+    num_key_value_heads,
+    head_dim,
+    intermediate_size,
 ) = sys.argv[1:]
 attempt = Path(attempt_s)
 launcher = Path(launcher_s)
@@ -298,6 +359,8 @@ body = {
     "finished_at": finished_at,
     "source_commit": source_sha,
     "target_path": target_s,
+    "target_label": target_label,
+    "target_revision": target_revision,
     "target_artifact_sha256": target_receipt["artifact_sha256"],
     "target_receipt": descriptor(Path(target_receipt_s), Path(target_receipt_s).name),
     "target_receipt_sha256": target_receipt_sha,
@@ -311,10 +374,11 @@ body = {
         "dflash_block_size": 8,
         "num_speculative_tokens": 7,
         "num_hidden_layers": 5,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 4,
-        "head_dim": 128,
-        "intermediate_size": 6144,
+        "capture_ids": [int(value) for value in target_capture_ids_s.split(",")],
+        "num_attention_heads": int(num_attention_heads),
+        "num_key_value_heads": int(num_key_value_heads),
+        "head_dim": int(head_dim),
+        "intermediate_size": int(intermediate_size),
         "conv_kernel_size": 2,
         "conv_group_size": 16,
         "selector_rank": 256,
@@ -322,7 +386,7 @@ body = {
     },
     "initialization": "all-zero-except-identity-convolution-base-kernel",
     "serve_config": {
-        "tensor_parallel_size": 2,
+        "tensor_parallel_size": int(serve_tp),
         "port": int(port),
         "max_model_len": 4096,
         "health_passed": True,

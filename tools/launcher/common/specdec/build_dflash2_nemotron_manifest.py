@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build the Q30/Q235 Base Nemotron DFlash2 B8 training manifest."""
+"""Build a Q30/Q235 target-variant Nemotron DFlash2 B8 manifest."""
 
 from __future__ import annotations
 
@@ -45,10 +45,14 @@ def build_dflash2_nemotron_manifest(
     cluster_profile: Path,
     q30_nodes: int = 16,
     q235_nodes: int = 16,
+    target_variant: str = "base",
 ) -> tuple[DrafterExperiment, ...]:
-    """Build the two-model Base/Nemotron DFlash2 B8 training manifest."""
+    """Build one exact two-model Base or Thinking DFlash2 B8 matrix."""
     if q30_nodes != 16 or q235_nodes != 16:
         raise ValueError("DFlash2 production requires native 16-node/segment-16 jobs")
+    if target_variant not in {"base", "thinking"}:
+        raise ValueError("DFlash2 target variant must be base or thinking")
+    expected_targets = {f"q30-{target_variant}", f"q235-{target_variant}"}
     profile = load_cluster_profile(cluster_profile)
     if profile.modelopt_feature_base is None:
         if profile.modelopt_commit != source_sha:
@@ -64,14 +68,17 @@ def build_dflash2_nemotron_manifest(
         experiment
         for experiment in load_manifest(template, migrate_legacy_q30_topology=True)
         if (
-            experiment.target in {"q30-base", "q235-base"}
+            experiment.target in expected_targets
             and experiment.dataset == "nemo-direct"
             and experiment.method == "dflash"
             and experiment.block_size == 8
         )
     )
-    if {experiment.target for experiment in seeds} != {"q30-base", "q235-base"} or len(seeds) != 2:
-        raise ValueError("template must contain the exact Q30/Q235 Base Nemotron DFlash B8 seeds")
+    if {experiment.target for experiment in seeds} != expected_targets or len(seeds) != 2:
+        label = target_variant.capitalize()
+        raise ValueError(
+            f"template must contain the exact Q30/Q235 {label} Nemotron DFlash B8 seeds"
+        )
 
     contract = DFlash2RuntimeContract(
         vllm_expected_commit=vllm_expected_commit,
@@ -79,14 +86,19 @@ def build_dflash2_nemotron_manifest(
     )
 
     def rewrite(experiment: DrafterExperiment) -> DrafterExperiment:
-        nodes = q30_nodes if experiment.target == "q30-base" else q235_nodes
-        accumulation = (64 if experiment.target == "q30-base" else 128) // nodes
+        is_q30 = experiment.target.startswith("q30-")
+        nodes = q30_nodes if is_q30 else q235_nodes
+        accumulation = (64 if is_q30 else 128) // nodes
         suffix = f"-dflash2-{nodes}n"
+        run_name = f"{experiment.run_name}{suffix}"
+        if target_variant == "thinking":
+            family = "q30t" if is_q30 else "q235t"
+            run_name = f"dfl2-{family}-nemo1p3m-b8k7-n16"
         return replace(
             experiment,
             method="dflash2",
             cumulative_max_steps=(20, 4166, 14500, 25391),
-            run_name=f"{experiment.run_name}{suffix}",
+            run_name=run_name,
             topology=replace(
                 experiment.topology,
                 gradient_accumulation_steps=accumulation,
@@ -124,6 +136,7 @@ def main() -> None:
     parser.add_argument("--vllm-expected-commit", required=True)
     parser.add_argument("--vllm-receipt-sha256", required=True)
     parser.add_argument("--cluster-profile", type=Path, required=True)
+    parser.add_argument("--target-variant", choices=("base", "thinking"), default="base")
     args = parser.parse_args()
     experiments = build_dflash2_nemotron_manifest(
         args.template,
@@ -134,6 +147,7 @@ def main() -> None:
         args.vllm_expected_commit,
         args.vllm_receipt_sha256,
         cluster_profile=args.cluster_profile,
+        target_variant=args.target_variant,
     )
     print(f"wrote {len(experiments)} DFlash2 experiments to {args.output}")
 
