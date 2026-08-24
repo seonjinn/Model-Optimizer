@@ -22,7 +22,7 @@ try:
         SelectionBoundary,
         write_audit_receipt,
     )
-    from build_qwen4b_bprime import baseline_exclusion_from_audit
+    from build_qwen4b_bprime import authenticate_baseline_audit, baseline_exclusion_from_audit
     from build_specdec_inventory import make_exclusion_receipt
     from specdec_corpus_contracts import (
         SourceFile,
@@ -74,6 +74,14 @@ def test_baseline_exclusion_consumes_the_genuine_audit_producer(tmp_path: Path) 
     assert baseline_exclusion_from_audit(path, expected=expected) == make_exclusion_receipt(
         "baseline", audit.exclusion_prompt_ids
     )
+    authenticated = authenticate_baseline_audit(path, expected=expected)
+    assert authenticated.exclusion == make_exclusion_receipt(
+        "baseline", audit.exclusion_prompt_ids
+    )
+    assert authenticated.payload["occurrence_prompt_ids"] == list(
+        audit.occurrence_prompt_ids
+    )
+    assert authenticated.receipt_sha256 == json.loads(path.read_bytes())["receipt_sha256"]
 
 
 @pytest.mark.parametrize(

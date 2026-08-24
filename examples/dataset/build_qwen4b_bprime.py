@@ -8,8 +8,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from audit_ptv2_baseline import EXPECTED_BASELINE, BaselineAudit, BaselineExpectation
@@ -27,10 +28,26 @@ from stage_ptv23_sources import load_source_inventory
 _PTV2_REVISION = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
 
 
+@dataclass(frozen=True)
+class AuthenticatedBaselineAudit:
+    """One stable whole-audit receipt and its independently derived exclusion set."""
+
+    payload: MappingProxyType[str, Any]
+    receipt_sha256: str
+    exclusion: ExclusionReceipt
+
+
 def baseline_exclusion_from_audit(
     path: Path, *, expected: BaselineExpectation = EXPECTED_BASELINE
 ) -> ExclusionReceipt:
     """Rebuild the typed historical exclusion and authenticate the audit's root."""
+    return authenticate_baseline_audit(path, expected=expected).exclusion
+
+
+def authenticate_baseline_audit(
+    path: Path, *, expected: BaselineExpectation = EXPECTED_BASELINE
+) -> AuthenticatedBaselineAudit:
+    """Authenticate one stable producer receipt without conflating its exclusion root."""
     if path.is_symlink() or not path.is_file():
         raise ValueError("baseline audit must be a no-follow regular file")
     try:
@@ -49,14 +66,20 @@ def baseline_exclusion_from_audit(
         raise ValueError("baseline audit is not a stable canonical receipt")
     receipt_sha256 = payload.get("receipt_sha256")
     body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
-    if receipt_sha256 != sha256_bytes(canonical_json(body)):
+    if (
+        not isinstance(receipt_sha256, str)
+        or receipt_sha256 != sha256_bytes(canonical_json(body))
+    ):
         raise ValueError("baseline audit whole-receipt identity does not reconcile")
     genuine_keys = {field.name for field in fields(BaselineAudit)} | {"receipt_sha256"}
     if set(payload) == genuine_keys:
         prompt_ids = _validate_genuine_audit(payload, expected)
     else:
         prompt_ids = _validate_legacy_audit(payload, expected)
-    return make_exclusion_receipt("baseline", tuple(prompt_ids))
+    exclusion = make_exclusion_receipt("baseline", tuple(prompt_ids))
+    return AuthenticatedBaselineAudit(
+        MappingProxyType(payload), receipt_sha256, exclusion
+    )
 
 
 def _validate_genuine_audit(payload: dict[str, Any], expected: BaselineExpectation) -> list[str]:
