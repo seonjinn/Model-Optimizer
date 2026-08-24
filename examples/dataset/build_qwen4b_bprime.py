@@ -172,6 +172,7 @@ def main() -> int:
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--storage-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
 
     source_inventory = load_source_inventory(args.source_inventory)
@@ -186,6 +187,7 @@ def main() -> int:
         held_out_exclusion=held_out,
         training_seq_len=policy.sequence_length,
         storage_dir=args.storage_dir,
+        workers=args.workers,
     )
     bundle = None
     try:

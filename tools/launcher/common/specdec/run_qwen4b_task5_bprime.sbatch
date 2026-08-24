@@ -60,6 +60,7 @@ srun --nodes=1 --ntasks=1 --cpus-per-task=96 --kill-on-bad-exit=1 \
         --held-out-uuids "$HELD_OUT_UUIDS" \
         --policy "$POLICY" \
         --storage-dir "$scratch" \
-        --output-dir "$OUTPUT_DIR"
+        --output-dir "$OUTPUT_DIR" \
+        --workers 96
 [[ -f "$OUTPUT_DIR/SELECTION_MANIFEST.json" && ! -L "$OUTPUT_DIR/SELECTION_MANIFEST.json" ]] || exit 1
 sha256sum "$OUTPUT_DIR/SELECTION_MANIFEST.json"

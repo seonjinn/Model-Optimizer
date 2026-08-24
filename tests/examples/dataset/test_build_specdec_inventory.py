@@ -20,8 +20,10 @@ import importlib.util
 import json
 import shutil
 import sys
+import threading
+import time
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -67,6 +69,71 @@ class CandidateTokenizer:
     def apply_chat_template(self, messages, **kwargs):
         assert kwargs["add_generation_prompt"] is True
         return {"input_ids": [index + 1 for index, _ in enumerate(messages)]}
+
+
+class ConcurrentCandidateTokenizer(CandidateTokenizer):
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.active = 0
+        self.maximum_active = 0
+
+    def apply_chat_template(self, messages, **kwargs):
+        with self._lock:
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+        try:
+            time.sleep(0.005)
+            return super().apply_chat_template(messages, **kwargs)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+def test_candidate_inventory_parallelizes_bounded_tokenization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    source = SimpleNamespace(
+        repository_id="nvidia/Nemotron-Post-Training-Dataset-v2",
+        configuration="default",
+        split="chat",
+        revision=module.APPROVED_PTV2_REVISION,
+        lane="target-synth",
+        cell="chat",
+    )
+    descriptor = SimpleNamespace(path="data/chat.parquet", sha256="b" * 64)
+    rows = [
+        {
+            "messages": [
+                {"role": "user", "content": f"question-{index}"},
+                {"role": "assistant", "content": f"answer-{index}"},
+            ]
+        }
+        for index in range(32)
+    ]
+    monkeypatch.setattr(
+        module,
+        "_verified_candidate_files",
+        lambda _inventory: [(source, descriptor, tmp_path / "unused.parquet")],
+    )
+    monkeypatch.setattr(
+        module, "_iter_candidate_rows", lambda _path: iter(enumerate(rows))
+    )
+    tokenizer = ConcurrentCandidateTokenizer()
+    candidates = module.build_candidate_inventory(
+        SimpleNamespace(manifest_sha256="a" * 64),
+        tokenizer=tokenizer,
+        tokenizer_sha256="f" * 64,
+        baseline_exclusion=module.make_exclusion_receipt("baseline", ()),
+        held_out_exclusion=module.make_exclusion_receipt("held-out", ()),
+        storage_dir=tmp_path,
+        workers=4,
+    )
+    try:
+        assert len(candidates.rows) == 32
+        assert tokenizer.maximum_active > 1
+    finally:
+        candidates.close()
 
 
 def _write_bound_source(tmp_path: Path, rows: list[dict]) -> Path:
