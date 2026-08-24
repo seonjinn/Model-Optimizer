@@ -1437,6 +1437,26 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
 
     monkeypatch.setattr(study_module, "load_ptv2_study_policy", lambda _: _scaled_policy())
     monkeypatch.setattr(study_module, "select_authenticated_b_balanced_view", _authenticated)
+    monkeypatch.setattr(
+        study_module,
+        "load_source_inventory",
+        lambda _: SimpleNamespace(manifest_sha256="a" * 64),
+    )
+    monkeypatch.setattr(
+        study_module,
+        "write_ptv2_selection_receipt",
+        lambda root, view, **kwargs: (
+            seen.update(
+                {
+                    "receipt_root": root,
+                    "receipt_view": view.strategy,
+                    "source_inventory_sha256": kwargs["source_inventory_sha256"],
+                    "held_out_receipt_sha256": kwargs["held_out_receipt_sha256"],
+                }
+            )
+            or root / "SELECTION_RECEIPT.json"
+        ),
+    )
     held_out = tmp_path / "held-out.json"
     held_out.write_text("[]", encoding="utf-8")
     monkeypatch.setattr(
@@ -1452,8 +1472,15 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
             str(tmp_path / "out"),
             "--held-out-uuids",
             str(held_out),
+            "--selection-receipt-root",
+            str(tmp_path / "receipt"),
         ],
     )
 
     assert main() == 0
-    assert seen == {"policy": _scaled_policy(), "held_out": set()}
+    assert seen["policy"] == _scaled_policy()
+    assert seen["held_out"] == set()
+    assert seen["receipt_root"] == tmp_path / "receipt"
+    assert seen["receipt_view"] == "B-balanced"
+    assert seen["source_inventory_sha256"] == "a" * 64
+    assert seen["held_out_receipt_sha256"] == make_exclusion_receipt("held-out", ()).receipt_sha256

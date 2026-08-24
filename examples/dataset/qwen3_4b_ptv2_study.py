@@ -1227,6 +1227,7 @@ def main() -> int:
     parser.add_argument("--scratch-root", type=Path)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--held-out-uuids", type=Path, required=True)
+    parser.add_argument("--selection-receipt-root", type=Path, required=True)
     args = parser.parse_args()
     if args.source_plan is not None:
         if args.source_cache is None or args.durable_root is None or args.scratch_root is None:
@@ -1259,12 +1260,23 @@ def main() -> int:
         output_root=args.output_root,
         exclusions=ExclusionIndex(held_out=set(held_out)),
     )
+    inventory = load_source_inventory(inventory_path)
+    held_out_receipt = make_exclusion_receipt("held-out", tuple(held_out))
+    receipt = write_ptv2_selection_receipt(
+        args.selection_receipt_root,
+        view,
+        policy=policy,
+        policy_path=args.policy,
+        source_inventory_sha256=inventory.manifest_sha256,
+        held_out_receipt_sha256=held_out_receipt.receipt_sha256,
+    )
     print(
         json.dumps(
             {
                 "strategy": view.strategy,
                 "index_path": str(view.index_path),
                 "selection_sha256": view.selection_sha256,
+                "selection_receipt": str(receipt),
             },
             sort_keys=True,
         )
