@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import sys
+from collections import Counter
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 MODULE_DIR = ROOT / "examples/dataset"
@@ -21,6 +23,16 @@ POLICY = MODULE_DIR / "qwen3_4b_ptv2_study.yaml"
 sys.path.insert(0, str(MODULE_DIR))
 try:
     import qwen3_4b_ptv2_study as study_module
+    from bprime_cd_policy import ArmPolicy, PromptCell, PromptPolicy
+    from build_specdec_inventory import (
+        APPROVED_PTV2_ALLOWLIST_SHA256,
+        CandidateCell,
+        CandidateInventory,
+        CandidatePrompt,
+        ExclusionProof,
+        candidate_inventory_sha256,
+        make_exclusion_receipt,
+    )
     from qwen3_4b_ptv2_study import (
         PTV2StudyError,
         PTV2StudyRecoveryError,
@@ -36,7 +48,13 @@ try:
         write_ptv2_selection_receipt,
         write_task9_balanced_view_json,
     )
-    from select_bprime_cd_prompts import PromptView, SelectedPrompt, publish_prompt_view_bundle
+    from select_bprime_cd_prompts import (
+        PromptView,
+        PromptViewBundle,
+        SelectedPrompt,
+        publish_prompt_view_bundle,
+        select_prompt_views,
+    )
     from specdec_corpus_contracts import canonical_json
     from specdec_identity import prompt_uuid
     from stage_ptv23_sources import (
@@ -158,6 +176,118 @@ def _write_authenticated_staged_parquet(tmp_path: Path) -> tuple[Path, Path]:
         staged.staged_root / "sources/nvidia/PTV2Fixture" / revision / "data/declared.parquet"
     )
     return receipt, staged_file
+
+
+def _genuine_scaled_task5_bundle() -> PromptViewBundle:
+    approved_ptv2_revision = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
+    b_cells = {name: PromptCell(1) for name in ("stem", "japanese", "spanish", "french", "italian")}
+    non_agentic = {
+        name: PromptCell(1)
+        for name in ("math", "code", "stem-science", "multilingual", "instruction-chat")
+    }
+    task5_policy = PromptPolicy(
+        1,
+        20260822,
+        1,
+        1,
+        MappingProxyType(
+            {
+                "B-prime": ArmPolicy(5, MappingProxyType(b_cells), MappingProxyType({})),
+                "C": ArmPolicy(
+                    6,
+                    MappingProxyType({**non_agentic, "swe-agentic-tool": PromptCell(1)}),
+                    MappingProxyType({}),
+                ),
+                "D": ArmPolicy(
+                    8,
+                    MappingProxyType({**non_agentic, "swe-agentic-tool": PromptCell(3)}),
+                    MappingProxyType(
+                        {
+                            "agentless-swe": 1,
+                            "interactive-swe-replay": 1,
+                            "generic-tool-replay": 1,
+                        }
+                    ),
+                ),
+            }
+        ),
+        (256_000_000, 1_000_000_000),
+        4096,
+        32768,
+        frozenset({"en", "ja", "es", "fr", "it"}),
+        frozenset({"de"}),
+        "a" * 64,
+    )
+    specifications = (
+        ("stem-science", "target-synth", "en", "ptv2", "stem"),
+        ("multilingual", "target-synth", "ja", "ptv2", "multilingual_ja"),
+        ("multilingual", "target-synth", "es", "ptv2", "multilingual_es"),
+        ("multilingual", "target-synth", "fr", "ptv2", "multilingual_fr"),
+        ("multilingual", "target-synth", "it", "ptv2", "multilingual_it"),
+        ("math", "target-synth", "en", "ptv3", "math"),
+        ("code", "target-synth", "en", "ptv3", "code"),
+        ("stem-science", "target-synth", "en", "ptv3", "stem"),
+        ("multilingual", "target-synth", "ja", "ptv3", "multilingual"),
+        ("instruction-chat", "target-synth", "en", "ptv3", "chat"),
+        ("swe-agentic-tool", "agentless-swe", "en", "ptv3", "agentless"),
+        ("swe-agentic-tool", "interactive-swe-replay", "en", "ptv3", "interactive"),
+        ("swe-agentic-tool", "generic-tool-replay", "en", "ptv3", "generic"),
+    )
+    candidates = []
+    for ordinal, (domain, lane, language, family, split) in enumerate(specifications):
+        canonical = canonical_json(
+            {"messages": [{"role": "user", "content": f"task5-{ordinal}"}], "tools": []}
+        )
+        candidates.append(
+            CandidatePrompt(
+                sha256(canonical).hexdigest(),
+                canonical,
+                f"fixture/{ordinal}",
+                (approved_ptv2_revision if family == "ptv2" else "9" * 40),
+                sha256(f"file-{ordinal}".encode()).hexdigest(),
+                ordinal,
+                domain,
+                language,
+                lane,
+                "le4k",
+                2,
+                "c" * 64,
+                f"data/{ordinal}.jsonl",
+                (1, 2),
+                "d" * 64,
+                lane in {"interactive-swe-replay", "generic-tool-replay"},
+                family,
+                (
+                    "nvidia/Nemotron-Post-Training-Dataset-v2"
+                    if family == "ptv2"
+                    else "fixture/source"
+                ),
+                "default",
+                split,
+            )
+        )
+    capacity = Counter(
+        CandidateCell(row.domain, row.lane, row.language, row.context_bucket) for row in candidates
+    )
+    baseline_sha256 = "1" * 64
+    held_out_sha256 = "2" * 64
+    inventory = CandidateInventory(
+        tuple(candidates),
+        MappingProxyType(dict(capacity)),
+        MappingProxyType({}),
+        "0" * 64,
+        ExclusionProof(baseline_sha256, "3" * 64, 0, 0),
+        ExclusionProof(held_out_sha256, "4" * 64, 0, 0),
+        approved_ptv2_revision,
+        APPROVED_PTV2_ALLOWLIST_SHA256,
+    )
+    inventory = replace(inventory, inventory_sha256=candidate_inventory_sha256(inventory))
+    return select_prompt_views(
+        inventory,
+        task5_policy,
+        baseline_receipt_sha256=baseline_sha256,
+        held_out_receipt_sha256=held_out_sha256,
+    )
 
 
 def test_approved_ptv2_study_policy_is_exact() -> None:
@@ -423,6 +553,16 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
             policy=policy,
             policy_path=policy_path,
             source_inventory_sha256="9" * 64,
+            held_out_receipt_sha256="3" * 64,
+        )
+
+    with pytest.raises(PTV2StudyError, match="must not carry baseline"):
+        write_ptv2_selection_receipt(
+            tmp_path / "baseline-forged-receipt",
+            view,
+            policy=policy,
+            policy_path=policy_path,
+            source_inventory_sha256="1" * 64,
             baseline_receipt_sha256="2" * 64,
             held_out_receipt_sha256="3" * 64,
         )
@@ -433,13 +573,14 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
         policy=policy,
         policy_path=policy_path,
         source_inventory_sha256="1" * 64,
-        baseline_receipt_sha256="2" * 64,
         held_out_receipt_sha256="3" * 64,
     )
 
     payload = json.loads(receipt.read_bytes())
     assert payload["schema_version"] == 3
     assert payload["trust_roots"] == trust_roots
+    assert "baseline_receipt_sha256" not in payload
+    assert "complement_selection_sha256" not in payload
     assert (
         payload["selection_sha256"]
         == sha256(canonical_json(payload["selection_identity"])).hexdigest()
@@ -466,6 +607,95 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
     publication._validate_ptv2_selection_policy(payload, files)
 
 
+def test_a_repair_schema_v3_receipt_replays_strategy_specific_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A-repair publishes baseline/complement roots and passes Task8 semantic replay."""
+    inventory_receipt, _ = _write_authenticated_staged_parquet(tmp_path)
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+    inventory = load_source_inventory(inventory_receipt)
+    history = (
+        _row("chat", 0, "history-a"),
+        _row("chat", 1, "history-a"),
+        _row("code", 2, "history-b"),
+    )
+    baseline_ids = tuple(row.prompt_uuid for row in history)
+    baseline = SimpleNamespace(
+        occurrence_count=3,
+        occurrence_prompt_ids=baseline_ids,
+        occurrence_prompt_ids_sha256=sha256(canonical_json(list(baseline_ids))).hexdigest(),
+        unique_prompt_count=2,
+    )
+    complement = (
+        _row("stem", 3, "stem"),
+        _row("multilingual", 4, "ja", language="ja"),
+    )
+    policy_document = {
+        "repair": {
+            "historical": {"occurrences": 3},
+            "complement": {"stem": 1, "ja": 1, "es": 0, "fr": 0, "it": 0, "de": 0},
+        },
+        "balanced": {"multilingual_occurrences": {"de": 0, "ja": 1, "es": 0, "fr": 0, "it": 0}},
+    }
+    policy_path = tmp_path / "scaled-policy.yaml"
+    policy_path.write_text(yaml.safe_dump(policy_document), encoding="utf-8")
+    policy = replace(
+        _scaled_policy(),
+        segment_occurrences=(1_300_000, 700_000),
+        policy_sha256=sha256(canonical_json(policy_document)).hexdigest(),
+    )
+    baseline_receipt = make_exclusion_receipt("baseline", tuple(set(baseline_ids)))
+    held_out_receipt = make_exclusion_receipt("held-out", ())
+    complement_identity = "4" * 64
+    view = select_a_repair_view(
+        history,
+        complement,
+        policy=policy,
+        baseline=baseline,
+        output_root=tmp_path / "a-index",
+        source_inventory=inventory,
+        baseline_receipt=baseline_receipt,
+        held_out_receipt=held_out_receipt,
+        complement_selection_sha256=complement_identity,
+    )
+    receipt = write_ptv2_selection_receipt(
+        tmp_path / "a-receipt",
+        view,
+        policy=policy,
+        policy_path=policy_path,
+        source_inventory_sha256=inventory.manifest_sha256,
+        held_out_receipt_sha256=held_out_receipt.receipt_sha256,
+        baseline_receipt_sha256=baseline_receipt.receipt_sha256,
+        complement_selection_sha256=complement_identity,
+    )
+    payload = json.loads(receipt.read_bytes())
+
+    assert payload["trust_roots"] == {
+        "source_inventory_sha256": inventory.manifest_sha256,
+        "baseline_receipt_sha256": baseline_receipt.receipt_sha256,
+        "held_out_receipt_sha256": held_out_receipt.receipt_sha256,
+        "complement_selection_sha256": complement_identity,
+    }
+    sys.path.insert(0, str(MODULE_DIR))
+    try:
+        import specdec_publication as publication
+    finally:
+        sys.path.pop(0)
+    descriptors = publication._role_file_descriptors("selection", payload)
+    publication._validate_ptv2_selection_policy(
+        payload,
+        [
+            (
+                item["path"],
+                receipt.parent / item["path"],
+                item["bytes"],
+                item["sha256"],
+            )
+            for item in descriptors
+        ],
+    )
+
+
 def test_b_index_publication_is_no_replace_and_preserves_prior_receipt(tmp_path: Path) -> None:
     """A retry must not overwrite an immutable B index with a fresh SQLite file."""
     rows = (
@@ -483,6 +713,70 @@ def test_b_index_publication_is_no_replace_and_preserves_prior_receipt(tmp_path:
         select_ptv2_b_balanced_view(rows, policy=_scaled_policy(), output_root=root)
 
     assert first.index_path.read_bytes() == before
+
+
+def test_selection_receipt_rename_and_parent_fsync_failures_carry_typed_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ambiguous install and durability failures expose inode-bound recovery evidence."""
+    policy = _scaled_policy()
+    trust_roots = {
+        "source_inventory_sha256": "1" * 64,
+        "held_out_receipt_sha256": "3" * 64,
+    }
+    rows = tuple(
+        _row(cell, index, cell)
+        for index, cell in enumerate(("math", "code", "stem", "chat", "multilingual"))
+    )
+    view = select_ptv2_b_balanced_view(
+        rows, policy=policy, output_root=tmp_path / "index", trust_roots=trust_roots
+    )
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_bytes(POLICY.read_bytes())
+    rename = study_module._rename_no_replace
+
+    def ambiguous_rename(source: Path, destination: Path) -> None:
+        rename(source, destination)
+        raise OSError("lost rename acknowledgement")
+
+    monkeypatch.setattr(study_module, "_rename_no_replace", ambiguous_rename)
+    installed = tmp_path / "installed-after-error"
+    with pytest.raises(PTV2StudyRecoveryError) as caught:
+        write_ptv2_selection_receipt(
+            installed,
+            view,
+            policy=policy,
+            policy_path=policy_path,
+            source_inventory_sha256="1" * 64,
+            held_out_receipt_sha256="3" * 64,
+        )
+    state = study_module.ptv2_selection_recovery_state(caught.value)
+    assert state.phase is study_module.PTV2SelectionPublicationPhase.RENAME
+    assert state.destination_observation.identity == state.expected_partial_identity
+    assert state.partial_observation.status == "absent"
+
+    monkeypatch.setattr(study_module, "_rename_no_replace", rename)
+    fsync_directory = study_module._fsync_directory
+    installed = tmp_path / "installed-before-fsync-error"
+
+    def fail_parent_fsync(path: Path) -> None:
+        if path == installed.parent and installed.exists():
+            raise OSError("parent fsync acknowledgement lost")
+        fsync_directory(path)
+
+    monkeypatch.setattr(study_module, "_fsync_directory", fail_parent_fsync)
+    with pytest.raises(PTV2StudyRecoveryError) as caught:
+        write_ptv2_selection_receipt(
+            installed,
+            view,
+            policy=policy,
+            policy_path=policy_path,
+            source_inventory_sha256="1" * 64,
+            held_out_receipt_sha256="3" * 64,
+        )
+    state = study_module.ptv2_selection_recovery_state(caught.value)
+    assert state.phase is study_module.PTV2SelectionPublicationPhase.PARENT_FSYNC
+    assert state.destination_observation.identity == state.expected_partial_identity
 
 
 def test_b_index_publication_requires_typed_recovery_for_interrupted_partial(
@@ -714,9 +1008,64 @@ def test_task5_published_complement_joins_the_task3_physical_row_stream(
         arm="C",
     )
 
-    assert tuple(study_module._iter_task5_selected_rows(view, inventory_receipt, policy)) == (
-        physical,
+    with pytest.raises(PTV2StudyError, match="B-prime"):
+        tuple(study_module._iter_task5_selected_rows(view, inventory_receipt, policy))
+
+
+def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
+    tmp_path: Path,
+) -> None:
+    """A genuine Task5 selector/publication is replayed; a forged selection root is rejected."""
+    task5_bundle = _genuine_scaled_task5_bundle()
+    try:
+        published = publish_prompt_view_bundle(task5_bundle, tmp_path / "task5", rows_per_shard=4)
+    finally:
+        task5_bundle.close()
+    manifest_path = published.manifest_path
+    manifest_sha256 = sha256(manifest_path.read_bytes()).hexdigest()
+    view = study_module.load_prompt_view(
+        manifest_path,
+        expected_manifest_sha256=manifest_sha256,
+        arm="B-prime",
     )
+    study_policy = replace(
+        _fixture_policy(),
+        repair_complement_occurrences={
+            "stem": 1,
+            "ja": 1,
+            "es": 1,
+            "fr": 1,
+            "it": 1,
+            "de": 0,
+        },
+    )
+
+    arm_identity = study_module._authenticate_task5_bprime(
+        manifest_path,
+        expected_manifest_sha256=manifest_sha256,
+        view=view,
+        policy=study_policy,
+    )
+
+    assert len(arm_identity) == 64
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["selection_sha256"] = "f" * 64
+    root_record = {key: value for key, value in manifest.items() if key != "root_sha256"}
+    manifest["root_sha256"] = sha256(canonical_json(root_record)).hexdigest()
+    manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+    forged_manifest_sha256 = sha256(manifest_path.read_bytes()).hexdigest()
+    forged_view = study_module.load_prompt_view(
+        manifest_path,
+        expected_manifest_sha256=forged_manifest_sha256,
+        arm="B-prime",
+    )
+    with pytest.raises(PTV2StudyError, match="selection digest"):
+        study_module._authenticate_task5_bprime(
+            manifest_path,
+            expected_manifest_sha256=forged_manifest_sha256,
+            view=forged_view,
+            policy=study_policy,
+        )
 
 
 def test_b_cli_uses_the_immutable_declared_shard_contract(

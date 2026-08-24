@@ -14,6 +14,7 @@ import stat
 import tempfile
 import uuid
 from dataclasses import dataclass, replace
+from enum import Enum
 from hashlib import sha256
 from itertools import islice
 from pathlib import Path
@@ -36,7 +37,11 @@ from stage_ptv23_sources import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
 
+    from select_bprime_cd_prompts import PromptView
+
 __all__ = [
+    "PTV2SelectionPublicationPhase",
+    "PTV2SelectionRecoveryState",
     "PTV2StudyBundle",
     "PTV2StudyError",
     "PTV2StudyPolicy",
@@ -47,6 +52,7 @@ __all__ = [
     "iter_ptv2_staged_source_rows",
     "iter_ptv2_study_occurrences",
     "load_ptv2_study_policy",
+    "ptv2_selection_recovery_state",
     "select_a_repair_view",
     "select_authenticated_b_balanced_view",
     "select_authenticated_ptv2_study_views",
@@ -106,7 +112,62 @@ class PTV2StudyError(ValueError):
 
 
 class PTV2StudyRecoveryError(PTV2StudyError):
-    """An interrupted immutable index publication requires explicit recovery."""
+    """An interrupted immutable publication requires explicit recovery."""
+
+    def __init__(self, message: str, recovery_state: PTV2SelectionRecoveryState | None = None):
+        super().__init__(message)
+        self.recovery_state = recovery_state
+
+
+class PTV2SelectionPublicationPhase(str, Enum):
+    """Last attempted Task9 receipt publication operation."""
+
+    PARTIAL_SETUP = "partial_setup"
+    CONTENT_WRITE = "content_write"
+    DIRECTORY_FSYNC = "directory_fsync"
+    RENAME = "rename"
+    PARENT_FSYNC = "parent_fsync"
+
+
+@dataclass(frozen=True)
+class PTV2PathObservation:
+    """A no-follow Task9 publication pathname observation."""
+
+    path: Path
+    status: Literal["present", "absent", "unavailable"]
+    device: int | None
+    inode: int | None
+    mode: int | None
+    error: str | None
+
+    @property
+    def identity(self) -> tuple[int, int] | None:
+        if self.device is None or self.inode is None:
+            return None
+        return self.device, self.inode
+
+
+@dataclass(frozen=True)
+class PTV2SelectionRecoveryState:
+    """Typed evidence for a preserved or ambiguously installed Task9 receipt."""
+
+    phase: PTV2SelectionPublicationPhase
+    partial_path: Path
+    destination_path: Path
+    expected_parent_identity: tuple[int, int]
+    expected_partial_identity: tuple[int, int] | None
+    parent_observation: PTV2PathObservation
+    partial_observation: PTV2PathObservation
+    destination_observation: PTV2PathObservation
+    recovery_required: Literal[True] = True
+
+
+def ptv2_selection_recovery_state(error: BaseException) -> PTV2SelectionRecoveryState:
+    """Return typed Task9 selection recovery evidence from an exception."""
+    state = getattr(error, "recovery_state", None)
+    if not isinstance(state, PTV2SelectionRecoveryState):
+        raise ValueError("exception does not carry Task9 selection recovery state")
+    return state
 
 
 @dataclass(frozen=True)
@@ -319,6 +380,14 @@ def select_ptv2_study_views(
             "full PTV2 paired selection requires typed inventory, baseline, exclusion, and complement roots"
         )
     if policy.total_occurrences == 2_000_000:
+        assert isinstance(source_inventory, SourceInventory)
+        assert isinstance(baseline, BaselineAudit)
+        assert isinstance(exclusions, ExclusionIndex)
+        assert isinstance(baseline_receipt, ExclusionReceipt)
+        assert isinstance(held_out_receipt, ExclusionReceipt)
+        assert isinstance(complement_selection_sha256, str)
+        assert repair_complement_rows is not None
+        assert b_source_rows is not None
         if source_inventory.staged_root is None or any(
             source.revision != policy.ptv2_revision for source in source_inventory.sources
         ):
@@ -381,6 +450,8 @@ def select_ptv2_study_views(
             else _source_inventory_digest(connection)
         )
         _require_digest(inventory_digest, "source inventory")
+        if not isinstance(inventory_digest, str):
+            raise PTV2StudyError("source inventory must be a SHA-256 string")
         baseline_digest = _baseline_digest(baseline)
         held_out_digest = sha256(canonical_json(sorted(held_out))).hexdigest()
         _require_digest(baseline_digest, "baseline receipt")
@@ -497,6 +568,8 @@ def select_authenticated_ptv2_study_views(
         raise PTV2StudyError("authenticated paired selection is only defined for full PTV2")
     if not isinstance(exclusions, ExclusionIndex):
         raise PTV2StudyError("authenticated paired selection requires an ExclusionIndex")
+    if task5_arm != "B-prime":
+        raise PTV2StudyError("A-repair complement must be the Task 5 B-prime arm")
     inventory = load_source_inventory(inventory_receipt)
     if inventory.staged_root is None:
         raise PTV2StudyError("authenticated paired selection requires staged SourceInventory")
@@ -510,9 +583,12 @@ def select_authenticated_ptv2_study_views(
         raise PTV2StudyError(
             "A-repair requires an authenticated Task 5 selection artifact"
         ) from error
-    if getattr(task5, "selection_sha256", None) != task5_manifest_sha256:
-        # Task 5 has distinct selection-content and manifest-file identities.
-        _require_digest(str(getattr(task5, "selection_sha256", "")), "Task 5 selection")
+    complement_identity_sha256 = _authenticate_task5_bprime(
+        task5_manifest,
+        expected_manifest_sha256=task5_manifest_sha256,
+        view=task5,
+        policy=policy,
+    )
     source = iter_ptv2_staged_source_rows(inventory_receipt, policy=policy)
 
     root = _selection_root(output_root)
@@ -526,7 +602,7 @@ def select_authenticated_ptv2_study_views(
         source_inventory=inventory,
         baseline_receipt=baseline_receipt,
         held_out_receipt=held_out_receipt,
-        complement_selection_sha256=str(task5.selection_sha256),
+        complement_selection_sha256=complement_identity_sha256,
     )
     b_balanced = select_authenticated_b_balanced_view(
         inventory_receipt, policy=policy, exclusions=exclusions, output_root=root
@@ -688,9 +764,11 @@ def iter_ptv2_staged_source_rows(
 
 
 def _iter_task5_selected_rows(
-    task5: Any, inventory_receipt: Path, policy: PTV2StudyPolicy
+    task5: PromptView, inventory_receipt: Path, policy: PTV2StudyPolicy
 ) -> Iterator[PTV2StudySourceRow]:
     """Join Task 5 source references to the authenticated Task 3 physical rows."""
+    if task5.arm != "B-prime":
+        raise PTV2StudyError("A-repair complement must be the Task 5 B-prime arm")
     inventory = load_source_inventory(inventory_receipt)
     descriptor, temporary_name = tempfile.mkstemp(prefix="ptv2-task5-join-", suffix=".sqlite3")
     os.close(descriptor)
@@ -766,6 +844,136 @@ def _iter_task5_selected_rows(
         temporary.unlink(missing_ok=True)
 
 
+def _authenticate_task5_bprime(
+    manifest_path: Path,
+    *,
+    expected_manifest_sha256: str,
+    view: PromptView,
+    policy: PTV2StudyPolicy,
+) -> str:
+    """Recompute Task 5's global selection and bind its B-prime arm proof."""
+    if view.arm != "B-prime":
+        raise PTV2StudyError("A-repair complement must be the Task 5 B-prime arm")
+    if _sha256_file(manifest_path) != expected_manifest_sha256:
+        raise PTV2StudyError("Task 5 selection manifest identity changed during authentication")
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise PTV2StudyError("Task 5 selection manifest is invalid") from error
+    if not isinstance(manifest, dict):
+        raise PTV2StudyError("Task 5 selection manifest is invalid")
+    declared_root = manifest.get("root_sha256")
+    root_record = {key: value for key, value in manifest.items() if key != "root_sha256"}
+    if declared_root != sha256(canonical_json(root_record)).hexdigest():
+        raise PTV2StudyError("Task 5 selection root identity does not reconcile")
+    identity = manifest.get("identity")
+    arms = manifest.get("arms")
+    arm_record = arms.get("B-prime") if isinstance(arms, dict) else None
+    index_record = manifest.get("index")
+    if (
+        not isinstance(identity, dict)
+        or set(identity)
+        != {
+            "policy_sha256",
+            "seed",
+            "source_inventory_sha256",
+            "baseline_receipt_sha256",
+            "held_out_receipt_sha256",
+            "ptv2_revision",
+            "ptv2_allowlist_sha256",
+            "reserve_numerator",
+            "reserve_denominator",
+        }
+        or not isinstance(arm_record, dict)
+        or not isinstance(arms, dict)
+        or set(arms) != {"B-prime", "C", "D"}
+    ):
+        raise PTV2StudyError("Task 5 B-prime arm identity is missing")
+    if not isinstance(index_record, dict) or not isinstance(index_record.get("path"), str):
+        raise PTV2StudyError("Task 5 selection index identity is missing")
+    expected_cells = {
+        "stem": policy.repair_complement_occurrences["stem"],
+        "japanese": policy.repair_complement_occurrences["ja"],
+        "spanish": policy.repair_complement_occurrences["es"],
+        "french": policy.repair_complement_occurrences["fr"],
+        "italian": policy.repair_complement_occurrences["it"],
+    }
+    if (
+        arm_record.get("primary_count") != sum(expected_cells.values())
+        or arm_record.get("cell_counts") != expected_cells
+        or view.cell_counts != expected_cells
+        or len(view.primary_rows) != sum(expected_cells.values())
+    ):
+        raise PTV2StudyError("Task 5 B-prime complement counts do not match A-repair")
+    proof = {
+        "arm": "B-prime",
+        "primary_count": arm_record.get("primary_count"),
+        "reserve_count": arm_record.get("reserve_count"),
+        "cell_counts": arm_record.get("cell_counts"),
+        "lane_counts": arm_record.get("lane_counts"),
+        "bucket_floors": arm_record.get("bucket_floors"),
+        "lane_bucket_floors": arm_record.get("lane_bucket_floors"),
+        "acquisition_count": int(arm_record.get("primary_count", 0))
+        + int(arm_record.get("reserve_count", 0)),
+    }
+    if sha256(canonical_json(proof)).hexdigest() != arm_record.get("count_proof_sha256"):
+        raise PTV2StudyError("Task 5 B-prime arm count proof does not reconcile")
+    selection_metadata = {
+        "schema_version": manifest.get("schema_version"),
+        "policy_sha256": identity.get("policy_sha256"),
+        "seed": identity.get("seed"),
+        "source_inventory_sha256": identity.get("source_inventory_sha256"),
+        "baseline_receipt_sha256": identity.get("baseline_receipt_sha256"),
+        "held_out_receipt_sha256": identity.get("held_out_receipt_sha256"),
+        "ptv2_revision": identity.get("ptv2_revision"),
+        "ptv2_allowlist_sha256": identity.get("ptv2_allowlist_sha256"),
+        "paired_cd_sha256": manifest.get("paired_cd_sha256"),
+        "arms": arms,
+    }
+    digest = sha256(canonical_json(selection_metadata))
+    manifest_root = manifest_path.parent.resolve(strict=True)
+    unresolved_index = manifest_path.parent / index_record["path"]
+    if unresolved_index.is_symlink():
+        raise PTV2StudyError("Task 5 selection index must not be a symlink")
+    index_path = unresolved_index.resolve(strict=True)
+    if (
+        not index_path.is_relative_to(manifest_root)
+        or not index_path.is_file()
+        or _sha256_file(index_path) != index_record.get("sha256")
+    ):
+        raise PTV2StudyError("Task 5 selection index identity changed during authentication")
+    connection = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
+    try:
+        for row in connection.execute(
+            "SELECT arm,status,selection_index,prompt_uuid FROM rows "
+            "ORDER BY arm,status,selection_index"
+        ):
+            digest.update(canonical_json(list(row)))
+            digest.update(b"\n")
+    except sqlite3.Error as error:
+        raise PTV2StudyError("Task 5 selection digest cannot be replayed") from error
+    finally:
+        connection.close()
+    selection_sha256 = digest.hexdigest()
+    if selection_sha256 != manifest.get("selection_sha256"):
+        raise PTV2StudyError("Task 5 selection digest does not reconcile producer rows")
+    replayed_primary_count = 0
+    for selected in view.primary_rows:
+        if selected.arm != "B-prime" or selected.status != "primary":
+            raise PTV2StudyError("Task 5 B-prime shard carries another arm or status")
+        replayed_primary_count += 1
+    if replayed_primary_count != arm_record["primary_count"]:
+        raise PTV2StudyError("Task 5 B-prime row stream changed during authentication")
+    arm_identity = {
+        "manifest_sha256": expected_manifest_sha256,
+        "root_sha256": manifest.get("root_sha256"),
+        "selection_sha256": selection_sha256,
+        "arm": "B-prime",
+        "arm_record": arm_record,
+    }
+    return sha256(canonical_json(arm_identity)).hexdigest()
+
+
 def _verify_file(path: Path, expected_bytes: int, expected_sha256: str) -> None:
     if path.is_symlink() or not path.is_file() or path.stat().st_size != expected_bytes:
         raise PTV2StudyError(f"staged PTV2 shard does not match inventory: {path}")
@@ -777,12 +985,28 @@ def _verify_file(path: Path, expected_bytes: int, expected_sha256: str) -> None:
         raise PTV2StudyError(f"staged PTV2 shard digest mismatch: {path}")
 
 
-def _sha256_file(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _observe_ptv2_path(path: Path) -> PTV2PathObservation:
+    try:
+        observation = os.lstat(path)
+    except FileNotFoundError:
+        return PTV2PathObservation(path, "absent", None, None, None, None)
+    except OSError as error:
+        return PTV2PathObservation(
+            path,
+            "unavailable",
+            None,
+            None,
+            None,
+            f"{type(error).__name__}: {error}",
+        )
+    return PTV2PathObservation(
+        path,
+        "present",
+        observation.st_dev,
+        observation.st_ino,
+        observation.st_mode,
+        None,
+    )
 
 
 def _normalize_source_cell(cell: str) -> tuple[str, str]:
@@ -944,8 +1168,8 @@ def write_ptv2_selection_receipt(
     policy: PTV2StudyPolicy,
     policy_path: Path,
     source_inventory_sha256: str,
-    baseline_receipt_sha256: str,
     held_out_receipt_sha256: str,
+    baseline_receipt_sha256: str | None = None,
     complement_selection_sha256: str | None = None,
 ) -> Path:
     """Publish Task9's schema-v3 selection evidence with no synthetic row metadata.
@@ -957,7 +1181,6 @@ def write_ptv2_selection_receipt(
     """
     for label, digest in (
         ("source inventory", source_inventory_sha256),
-        ("baseline receipt", baseline_receipt_sha256),
         ("held-out receipt", held_out_receipt_sha256),
     ):
         _require_digest(digest, label)
@@ -976,8 +1199,13 @@ def write_ptv2_selection_receipt(
         "held_out_receipt_sha256": held_out_receipt_sha256,
     }
     if view.strategy == "A-repair":
-        if complement_selection_sha256 is None:
-            raise PTV2StudyError("A-repair receipt requires complement selection digest")
+        if baseline_receipt_sha256 is None or complement_selection_sha256 is None:
+            raise PTV2StudyError(
+                "A-repair receipt requires baseline and complement selection digests"
+            )
+        _require_digest(baseline_receipt_sha256, "baseline receipt")
+        if baseline_receipt_sha256 == "0" * 64:
+            raise PTV2StudyError("baseline receipt digest must be nonzero")
         _require_digest(complement_selection_sha256, "A-repair complement selection")
         if complement_selection_sha256 == "0" * 64:
             raise PTV2StudyError("A-repair complement selection digest must be nonzero")
@@ -985,16 +1213,37 @@ def write_ptv2_selection_receipt(
             "baseline_receipt_sha256": baseline_receipt_sha256,
             "complement_selection_sha256": complement_selection_sha256,
         }
+    elif baseline_receipt_sha256 is not None or complement_selection_sha256 is not None:
+        raise PTV2StudyError("B-balanced receipt must not carry baseline or complement roots")
     if sha256(canonical_json(trust_roots)).hexdigest() != view.trust_root_sha256:
         raise PTV2StudyError("selection trust-root preimage does not match the selected view")
     output_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_observation = _observe_ptv2_path(output_root.parent)
+    if (
+        parent_observation.identity is None
+        or parent_observation.mode is None
+        or not stat.S_ISDIR(parent_observation.mode)
+    ):
+        raise PTV2StudyError("selection receipt parent must be a no-follow directory")
+    expected_parent_identity = parent_observation.identity
     if output_root.is_symlink() or output_root.exists():
         raise FileExistsError(f"immutable Task9 selection receipt already exists: {output_root}")
     partial = output_root.parent / f".{output_root.name}.partial-{uuid.uuid4().hex}"
     if partial.exists() or partial.is_symlink():
         raise PTV2StudyRecoveryError("Task9 selection receipt partial requires recovery")
-    partial.mkdir(mode=0o700)
+    phase = PTV2SelectionPublicationPhase.PARTIAL_SETUP
+    expected_partial_identity: tuple[int, int] | None = None
     try:
+        partial.mkdir(mode=0o700)
+        partial_observation = _observe_ptv2_path(partial)
+        if (
+            partial_observation.identity is None
+            or partial_observation.mode is None
+            or not stat.S_ISDIR(partial_observation.mode)
+        ):
+            raise PTV2StudyError("selection receipt partial is not a no-follow directory")
+        expected_partial_identity = partial_observation.identity
+        phase = PTV2SelectionPublicationPhase.CONTENT_WRITE
         policy_copy = partial / "policy.yaml"
         index_copy = partial / "selection.sqlite3"
         _copy_regular_file_nofollow(policy_path, policy_copy)
@@ -1040,7 +1289,6 @@ def write_ptv2_selection_receipt(
             "policy_sha256": policy.policy_sha256,
             "policy_file_sha256": _sha256_file(policy_copy),
             "source_inventory_sha256": source_inventory_sha256,
-            "baseline_receipt_sha256": baseline_receipt_sha256,
             "held_out_receipt_sha256": held_out_receipt_sha256,
             "trust_roots": trust_roots,
             "strategy": view.strategy,
@@ -1051,19 +1299,41 @@ def write_ptv2_selection_receipt(
             "index": _file_descriptor(index_copy),
             "shards": [_file_descriptor(shard)],
         }
+        if view.strategy == "A-repair":
+            payload |= {
+                "baseline_receipt_sha256": baseline_receipt_sha256,
+                "complement_selection_sha256": complement_selection_sha256,
+            }
         payload["root_sha256"] = sha256(canonical_json(payload)).hexdigest()
         receipt = partial / "SELECTION_RECEIPT.json"
         _write_bytes_nofollow(receipt, canonical_json(payload) + b"\n")
+        phase = PTV2SelectionPublicationPhase.DIRECTORY_FSYNC
         _fsync_directory(partial)
+        phase = PTV2SelectionPublicationPhase.RENAME
+        if _observe_ptv2_path(output_root.parent).identity != expected_parent_identity:
+            raise PTV2StudyError("selection receipt parent inode changed before rename")
+        if _observe_ptv2_path(partial).identity != expected_partial_identity:
+            raise PTV2StudyError("selection receipt partial inode changed before rename")
         _rename_no_replace(partial, output_root)
+        if _observe_ptv2_path(output_root).identity != expected_partial_identity:
+            raise PTV2StudyError("installed selection receipt inode does not match its partial")
+        phase = PTV2SelectionPublicationPhase.PARENT_FSYNC
         _fsync_directory(output_root.parent)
         return output_root / "SELECTION_RECEIPT.json"
-    except BaseException:
-        if partial.exists() and not output_root.exists():
-            raise PTV2StudyRecoveryError(
-                f"Task9 selection receipt failed; recover preserved partial {partial}"
-            ) from None
-        raise
+    except BaseException as error:
+        state = PTV2SelectionRecoveryState(
+            phase=phase,
+            partial_path=partial,
+            destination_path=output_root,
+            expected_parent_identity=expected_parent_identity,
+            expected_partial_identity=expected_partial_identity,
+            parent_observation=_observe_ptv2_path(output_root.parent),
+            partial_observation=_observe_ptv2_path(partial),
+            destination_observation=_observe_ptv2_path(output_root),
+        )
+        raise PTV2StudyRecoveryError(
+            "Task9 selection receipt publication requires typed recovery", state
+        ) from error
 
 
 def _require_approved_policy(

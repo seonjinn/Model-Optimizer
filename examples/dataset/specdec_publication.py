@@ -493,9 +493,7 @@ def _validate_ptv2_selection_policy(
     if payload["strategy"] == "A-repair":
         expected_trust_roots |= {
             "baseline_receipt_sha256": payload["baseline_receipt_sha256"],
-            "complement_selection_sha256": trust_roots.get("complement_selection_sha256")
-            if isinstance(trust_roots, Mapping)
-            else None,
+            "complement_selection_sha256": payload["complement_selection_sha256"],
         }
     if not isinstance(trust_roots, Mapping) or dict(trust_roots) != expected_trust_roots:
         raise PublicationError("PTV2 selection trust-root preimage is invalid")
@@ -668,7 +666,6 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "policy_sha256",
             "policy_file_sha256",
             "source_inventory_sha256",
-            "baseline_receipt_sha256",
             "held_out_receipt_sha256",
             "trust_roots",
             "strategy",
@@ -679,7 +676,18 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "index",
             "shards",
         }
-        if set(payload) != required | {"schema_version", "root_sha256"}:
+        strategy = payload.get("strategy")
+        strategy_fields = (
+            {"baseline_receipt_sha256", "complement_selection_sha256"}
+            if strategy == "A-repair"
+            else set()
+        )
+        if strategy not in {"A-repair", "B-balanced"} or set(
+            payload
+        ) != required | strategy_fields | {
+            "schema_version",
+            "root_sha256",
+        }:
             raise PublicationError("PTV2 selection receipt schema is incomplete")
         policy = payload["policy"]
         index = payload["index"]
@@ -691,16 +699,17 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             or not shards
         ):
             raise PublicationError("PTV2 selection receipt declared files are malformed")
-        for key in (
+        digest_keys = (
             "root_sha256",
             "selection_sha256",
             "policy_sha256",
             "policy_file_sha256",
             "source_inventory_sha256",
-            "baseline_receipt_sha256",
             "held_out_receipt_sha256",
             "ordered_occurrences_sha256",
-        ):
+            *sorted(strategy_fields),
+        )
+        for key in digest_keys:
             value = payload[key]
             if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
                 raise PublicationError(f"PTV2 selection receipt {key} is not a SHA-256")
