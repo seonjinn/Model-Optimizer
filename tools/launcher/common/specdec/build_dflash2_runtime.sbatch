@@ -50,6 +50,12 @@ flashmla_checkout="$3"
 build_source="$4"
 build_directory="$5"
 configure_log="$prepared/dflash2-flashmla-cmake-configure.log"
+"$prepared/bin/python" -m pip install --disable-pip-version-check --no-cache-dir \
+    --only-binary=:all: --no-deps cmake==3.31.6 ninja==1.13.0
+{
+    "$prepared/bin/cmake" --version
+    "$prepared/bin/ninja" --version
+} >"$configure_log"
 
 system_package="$($prepared/bin/python - <<'PY'
 from pathlib import Path
@@ -76,16 +82,16 @@ while IFS= read -r -d '' extension; do
     cp -a "$extension" "$runtime_package/$relative"
 done < <(find "$system_package" -type f \( -name '*.so' -o -name '_version.py' \) -print0)
 TORCH_CUDA_ARCH_LIST=10.0a FLASH_MLA_SRC_DIR="$flashmla_checkout" \
-    cmake -S "$build_source" -B "$build_directory" \
+    "$prepared/bin/cmake" -S "$build_source" -B "$build_directory" \
     -G Ninja -DVLLM_TARGET_DEVICE=cuda -DVLLM_PYTHON_EXECUTABLE="$prepared/bin/python" \
     -DCMAKE_INSTALL_PREFIX="$site_package" -DCMAKE_BUILD_TYPE=Release \
-    -DNVCC_THREADS=8 2>&1 | tee "$configure_log"
+    -DCMAKE_MAKE_PROGRAM="$prepared/bin/ninja" -DNVCC_THREADS=8 2>&1 | tee -a "$configure_log"
 grep -Eq 'CUDA target architectures:.*10\.0[af]' "$configure_log"
 grep -Eq 'FlashMLA CUDA architectures:.*10\.0[af]' "$configure_log"
-FLASH_MLA_SRC_DIR="$flashmla_checkout" cmake --build "$build_directory" \
+FLASH_MLA_SRC_DIR="$flashmla_checkout" "$prepared/bin/cmake" --build "$build_directory" \
     --target _flashmla_C _flashmla_extension_C --parallel 16
-cmake --install "$build_directory" --component _flashmla_C
-cmake --install "$build_directory" --component _flashmla_extension_C
+"$prepared/bin/cmake" --install "$build_directory" --component _flashmla_C
+"$prepared/bin/cmake" --install "$build_directory" --component _flashmla_extension_C
 INNER
 
 runtime_package="$(<"$prepared/dflash2-vllm-runtime-package.path")"
