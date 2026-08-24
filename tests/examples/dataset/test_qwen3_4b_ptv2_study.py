@@ -10,6 +10,7 @@ import sqlite3
 import sys
 from dataclasses import replace
 from hashlib import sha256
+from itertools import islice
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
@@ -399,6 +400,119 @@ def test_task9_exact_201_shard_serial_and_p96_are_byte_and_semantically_identica
         }
     assert selected_sources == distinct_sources
     assert "candidate_rows" not in tables
+
+
+def test_task9_a_exact_201_shard_serial_and_p96_are_byte_and_semantically_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The genuine Task5-backed A producer changes scheduling only, never selection bytes."""
+    task5_bundle = _genuine_scaled_task5_bundle(tmp_path, monkeypatch)
+    execution = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "source_manifest_sha256": task5_bundle.source_manifest_sha256,
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "finished_at_ns": 2,
+        "elapsed_seconds": 1.0,
+        "accepted_count": len(task5_bundle.B_prime.primary_rows),
+        "quarantine_counts": {},
+        "shards": _parallel_shards(),
+        "tokenization_shards": [
+            {
+                "index": index,
+                "row_count": index + 1,
+                "elapsed_seconds": 0.1,
+                "worker_pid": 1_000 + index,
+            }
+            for index in range(201)
+        ],
+    }
+    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+    try:
+        published = publish_bprime_prompt_view_bundle(
+            task5_bundle,
+            tmp_path / "task5-a-parity",
+            rows_per_shard=4,
+            execution_receipt=execution,
+        )
+    finally:
+        task5_bundle.close()
+    inventory_receipt = next((tmp_path / "task5-durable").glob("*/SOURCE_INVENTORY.json"))
+    policy = replace(
+        load_ptv2_study_policy(POLICY),
+        historical_occurrences=3,
+        repair_complement_occurrences={
+            "stem": 1,
+            "ja": 1,
+            "es": 1,
+            "fr": 1,
+            "it": 1,
+            "de": 0,
+        },
+        segment_occurrences=(3, 5),
+    )
+    history = tuple(islice(iter_ptv2_staged_source_rows(inventory_receipt, policy=policy), 3))
+    history_ids = tuple(row.prompt_uuid for row in history)
+    baseline = SimpleNamespace(
+        occurrence_count=3,
+        occurrence_prompt_ids=history_ids,
+        occurrence_prompt_ids_sha256=sha256(canonical_json(list(history_ids))).hexdigest(),
+        unique_prompt_count=len(set(history_ids)),
+        exclusion_prompt_ids=tuple(sorted(set(history_ids))),
+    )
+    baseline_receipt = make_exclusion_receipt("baseline", baseline.exclusion_prompt_ids)
+    held_out_receipt = make_exclusion_receipt("held-out", ())
+    manifest_sha256 = sha256(published.manifest_path.read_bytes()).hexdigest()
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "96")
+
+    serial_view = study_module.select_authenticated_a_repair_view(
+        inventory_receipt,
+        policy=policy,
+        baseline=baseline,
+        exclusions=ExclusionIndex(held_out=set()),
+        baseline_receipt=baseline_receipt,
+        held_out_receipt=held_out_receipt,
+        task5_manifest=published.manifest_path,
+        task5_manifest_sha256=manifest_sha256,
+        output_root=tmp_path / "a-serial",
+    )
+    parallel_view = study_module.select_authenticated_a_repair_view(
+        inventory_receipt,
+        policy=policy,
+        baseline=baseline,
+        exclusions=ExclusionIndex(held_out=set()),
+        baseline_receipt=baseline_receipt,
+        held_out_receipt=held_out_receipt,
+        task5_manifest=published.manifest_path,
+        task5_manifest_sha256=manifest_sha256,
+        output_root=tmp_path / "a-p96",
+        workers=96,
+        source_commit="b" * 40,
+    )
+
+    assert parallel_view.execution_receipt is not None
+    assert parallel_view.execution_receipt["effective_workers"] == 96
+    assert (
+        parallel_view.execution_receipt["selection_index_sha256"]
+        == sha256(parallel_view.index_path.read_bytes()).hexdigest()
+    )
+    assert parallel_view.selection_sha256 == serial_view.selection_sha256
+    assert parallel_view.index_path.read_bytes() == serial_view.index_path.read_bytes()
 
 
 def test_task9_execution_timing_finishes_after_published_index(

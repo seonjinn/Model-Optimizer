@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter
 from hashlib import sha256
 from pathlib import Path
@@ -27,9 +28,8 @@ from build_specdec_inventory import sha256_file
 from promote_synthesis_reserve import load_prompt_view
 from qwen3_4b_ptv2_study import (
     _authenticate_task5_bprime,
-    iter_ptv2_staged_source_rows,
     load_ptv2_study_policy,
-    select_authenticated_ptv2_study_views,
+    select_authenticated_a_repair_view,
     write_ptv2_selection_receipt,
 )
 from specdec_corpus_contracts import SourceFile, sha256_canonical_json
@@ -74,7 +74,10 @@ def reconstruct_baseline_sequence(
     boundary_record = payload.get("selection_boundary")
     if not isinstance(file_records, list) or not isinstance(boundary_record, dict):
         raise ValueError("baseline audit topology is missing")
-    files = tuple(SourceFile(str(item["path"]), int(item["bytes"]), str(item["sha256"])) for item in file_records)
+    files = tuple(
+        SourceFile(str(item["path"]), int(item["bytes"]), str(item["sha256"]))
+        for item in file_records
+    )
     boundary = SelectionBoundary(
         str(boundary_record["file"]),
         int(boundary_record["rows_selected"]),
@@ -111,16 +114,13 @@ def main() -> int:
     parser.add_argument("--task5-manifest-sha256", required=True)
     parser.add_argument("--work-root", type=Path, required=True)
     parser.add_argument("--selection-receipt-root", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=96)
     args = parser.parse_args()
 
     policy = load_ptv2_study_policy(args.policy)
     inventory = load_source_inventory(args.source_inventory)
     authenticated = authenticate_baseline_audit(args.baseline_audit)
     held_out = held_out_exclusion_from_json(args.held_out_uuids)
-    baseline = reconstruct_baseline_sequence(
-        iter_ptv2_staged_source_rows(args.source_inventory, policy=policy),
-        authenticated,
-    )
     if sha256_file(args.task5_manifest) != args.task5_manifest_sha256:
         raise ValueError("caller-pinned Task5 manifest identity mismatch")
     task5_view = load_prompt_view(
@@ -135,34 +135,37 @@ def main() -> int:
         policy=policy,
         source_manifest_sha256=inventory.manifest_sha256,
     )
-    bundle = select_authenticated_ptv2_study_views(
+    view = select_authenticated_a_repair_view(
         args.source_inventory,
         policy=policy,
-        baseline=baseline,
+        baseline=None,
+        baseline_builder=lambda rows: reconstruct_baseline_sequence(rows, authenticated),
         exclusions=ExclusionIndex(held_out=set(held_out.prompt_ids)),
         baseline_receipt=authenticated.exclusion,
         held_out_receipt=held_out,
         task5_manifest=args.task5_manifest,
         task5_manifest_sha256=args.task5_manifest_sha256,
-        task5_arm="B-prime",
         output_root=args.work_root,
+        workers=args.workers,
+        source_commit=os.environ.get("SOURCE_COMMIT"),
     )
     receipt = write_ptv2_selection_receipt(
         args.selection_receipt_root,
-        bundle.a_repair,
+        view,
         policy=policy,
         policy_path=args.policy,
         source_inventory_sha256=inventory.manifest_sha256,
         held_out_receipt_sha256=held_out.receipt_sha256,
         baseline_receipt_sha256=authenticated.exclusion.receipt_sha256,
         complement_selection_sha256=complement_sha256,
+        execution_receipt=view.execution_receipt,
     )
     print(
         json.dumps(
             {
                 "receipt": str(receipt),
                 "receipt_sha256": sha256(receipt.read_bytes()).hexdigest(),
-                "selection_sha256": bundle.a_repair.selection_sha256,
+                "selection_sha256": view.selection_sha256,
             },
             sort_keys=True,
         )

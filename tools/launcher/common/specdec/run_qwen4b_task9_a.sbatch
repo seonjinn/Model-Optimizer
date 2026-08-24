@@ -35,14 +35,19 @@ scratch="$scratch_parent/qwen4b-task9-a-${SLURM_JOB_ID}"
 mkdir -p "$scratch"
 trap 'find "$scratch" -depth -delete 2>/dev/null || true' EXIT
 
+export ARROW_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1 PYTHONSAFEPATH=1
+export PYTHONPATH="$REPO_ROOT/examples/dataset"
+
 srun --nodes=1 --ntasks=1 --cpus-per-task=96 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE_PATH" \
     --container-mounts="/lustre:/lustre,$REPO_ROOT:$REPO_ROOT,$scratch:$scratch" \
-    python3 "$REPO_ROOT/examples/dataset/build_qwen4b_a_repair.py" \
+    python3 -P "$REPO_ROOT/examples/dataset/build_qwen4b_a_repair.py" \
         --source-inventory "$SOURCE_INVENTORY" --baseline-audit "$BASELINE_AUDIT" \
         --held-out-uuids "$HELD_OUT_UUIDS" --policy "$POLICY" \
         --task5-manifest "$TASK5_MANIFEST" \
         --task5-manifest-sha256 "$TASK5_MANIFEST_SHA256" \
-        --work-root "$scratch/work" --selection-receipt-root "$OUTPUT_ROOT"
+        --work-root "$scratch/work" --selection-receipt-root "$OUTPUT_ROOT" \
+        --workers 96
 [[ -f "$OUTPUT_ROOT/SELECTION_RECEIPT.json" && ! -L "$OUTPUT_ROOT/SELECTION_RECEIPT.json" ]] || exit 1
 sha256sum "$OUTPUT_ROOT/SELECTION_RECEIPT.json"

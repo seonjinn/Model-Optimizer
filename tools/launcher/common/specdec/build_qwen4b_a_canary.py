@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -79,6 +80,7 @@ _PTV2_A_SELECTION_KEYS = {
     "policy",
     "index",
     "shards",
+    "execution_receipt",
     "root_sha256",
 }
 
@@ -302,6 +304,7 @@ def load_task8_a_publication(
         or identity.get("repair_complement_counts") != expected_repair
     ):
         raise ValueError("Task9 schema-v3 A selection semantics are invalid")
+    _authenticate_task9_execution(root / "inputs/selection/files", selection)
     descriptors = manifest.get("shards")
     files = manifest.get("files")
     if (
@@ -359,6 +362,36 @@ def load_task8_a_publication(
         tokenized_sha,
         tuple(shards),
     )
+
+
+def _authenticate_task9_execution(selection_root: Path, selection: Mapping[str, Any]) -> None:
+    """Reuse the typed Task9 validator against Task8's authenticated file copies."""
+    dataset_root = Path(__file__).resolve().parents[4] / "examples/dataset"
+    sys.path.insert(0, str(dataset_root))
+    try:
+        from specdec_publication import (  # pyright: ignore[reportMissingImports]
+            PublicationError,
+            _role_file_descriptors,
+            _validate_task9_execution_receipt,
+        )
+    finally:
+        sys.path.pop(0)
+    try:
+        files = []
+        for descriptor in _role_file_descriptors("selection", selection):
+            if not isinstance(descriptor, dict):
+                raise ValueError("Task9 declared file descriptor is invalid")
+            relative = _safe_relative(descriptor.get("path"))
+            path, digest = _authenticated_declared_file(
+                selection_root, descriptor, "Task9 declared selection file"
+            )
+            size = descriptor.get("bytes")
+            if isinstance(size, bool) or not isinstance(size, int):
+                raise ValueError("Task9 declared file descriptor is invalid")
+            files.append((relative, path, size, digest))
+        _validate_task9_execution_receipt(selection, files)
+    except PublicationError as error:
+        raise ValueError("Task9 A execution receipt does not authenticate") from error
 
 
 def _replay_task9_task8(

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from common.specdec.build_qwen4b_a_canary import (
     A_COMPLEMENT_QUOTAS,
+    _authenticate_task9_execution,
     build_a_canary_occurrences,
     load_task8_a_publication,
     resolve_worker_count,
@@ -287,6 +288,50 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
         "index": descriptor(index),
         "shards": [descriptor(occurrence_shard)],
     }
+    execution = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "source_inventory_sha256": trust_roots["source_inventory_sha256"],
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "parallel_phase_finished_at_ns": 2,
+        "parallel_phase_elapsed_seconds": 0.5,
+        "finished_at_ns": max(3, index.stat().st_mtime_ns),
+        "elapsed_seconds": 1.0,
+        "selection_index_bytes": index.stat().st_size,
+        "selection_index_sha256": digest(index.read_bytes()),
+        "selection_sha256": selection["selection_sha256"],
+        "shards": [
+            {
+                "index": shard_index,
+                "spool_path": f"shard-{shard_index:03d}.sqlite3",
+                "row_count": shard_index + 1,
+                "spool_bytes": shard_index + 1,
+                "spool_sha256": digest(str(shard_index).encode()),
+                "elapsed_seconds": 0.1,
+                "worker_pid": 1_000 + shard_index,
+            }
+            for shard_index in range(201)
+        ],
+    }
+    execution["receipt_sha256"] = digest(canonical(execution).encode())
+    execution_path = selection_files / "EXECUTION_RECEIPT.json"
+    execution_path.write_text(canonical(execution) + "\n")
+    selection["execution_receipt"] = descriptor(execution_path)
     selection["root_sha256"] = digest(canonical(selection).encode())
     selection_receipt = root / "inputs/selection/receipt.json"
     selection_receipt.write_text(canonical(selection) + "\n")
@@ -371,6 +416,26 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
     publication_path = root / "PUBLICATION.json"
     publication_path.write_text(canonical(publication) + "\n")
     return digest(publication_path.read_bytes()), selection_receipt_sha
+
+
+def test_a_canary_requires_and_authenticates_typed_task9_execution(tmp_path: Path) -> None:
+    """A's consumer rejects the legacy serial receipt and tampered execution bytes."""
+    root = tmp_path / "task8"
+    _write_task9_task8_replay_fixture(root)
+    receipt_path = root / "inputs/selection/receipt.json"
+    selection = json.loads(receipt_path.read_bytes())
+    selection_root = root / "inputs/selection/files"
+
+    _authenticate_task9_execution(selection_root, selection)
+    legacy = dict(selection)
+    legacy.pop("execution_receipt")
+    with pytest.raises(ValueError, match="execution receipt"):
+        _authenticate_task9_execution(selection_root, legacy)
+
+    execution_path = selection_root / selection["execution_receipt"]["path"]
+    execution_path.write_bytes(execution_path.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="changed"):
+        _authenticate_task9_execution(selection_root, selection)
 
 
 def test_task9_to_task8_replay_rejects_authenticated_corpus_substitution(tmp_path: Path) -> None:

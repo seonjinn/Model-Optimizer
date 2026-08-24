@@ -51,7 +51,7 @@ from stage_ptv23_sources import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
     from select_bprime_cd_prompts import PromptView
 
@@ -70,6 +70,7 @@ __all__ = [
     "load_ptv2_study_policy",
     "ptv2_selection_recovery_state",
     "select_a_repair_view",
+    "select_authenticated_a_repair_view",
     "select_authenticated_b_balanced_view",
     "select_authenticated_ptv2_study_views",
     "select_ptv2_b_balanced_view",
@@ -771,6 +772,99 @@ def select_authenticated_b_balanced_view(
         return replace(view, execution_receipt=execution)
 
 
+def select_authenticated_a_repair_view(
+    inventory_receipt: Path,
+    *,
+    policy: PTV2StudyPolicy,
+    baseline: BaselineAudit | None,
+    baseline_builder: Callable[[Iterable[PTV2StudySourceRow]], BaselineAudit] | None = None,
+    exclusions: ExclusionIndex,
+    baseline_receipt: ExclusionReceipt,
+    held_out_receipt: ExclusionReceipt,
+    task5_manifest: Path,
+    task5_manifest_sha256: str,
+    output_root: Path | None = None,
+    workers: int = 1,
+    source_commit: str | None = None,
+) -> PTV2StudyView:
+    """Build A-repair from one compact, node-local authenticated source stage."""
+    if (baseline is None) == (baseline_builder is None):
+        raise PTV2StudyError("A-repair requires exactly one authenticated baseline source")
+    if not isinstance(exclusions, ExclusionIndex):
+        raise PTV2StudyError("A-repair production selection requires an ExclusionIndex")
+    inventory = load_source_inventory(inventory_receipt)
+    if inventory.staged_root is None:
+        raise PTV2StudyError("A-repair production selection requires staged SourceInventory")
+    try:
+        validate_approved_ptv2_topology(inventory)
+    except ValueError as error:
+        raise PTV2StudyError(
+            "A-repair production selection requires the approved PTV2 topology"
+        ) from error
+    if any(source.revision != policy.ptv2_revision for source in inventory.sources):
+        raise PTV2StudyError("SourceInventory revision does not match the study policy")
+    _validate_exclusion_receipt(held_out_receipt, "held-out", exclusions.held_out)
+    try:
+        task5 = load_prompt_view(
+            task5_manifest,
+            expected_manifest_sha256=task5_manifest_sha256,
+            arm="B-prime",
+        )
+    except (OSError, ValueError, ResponsePromotionError) as error:
+        raise PTV2StudyError(
+            "A-repair requires an authenticated Task 5 selection artifact"
+        ) from error
+    complement_identity_sha256 = _authenticate_task5_bprime(
+        task5_manifest,
+        expected_manifest_sha256=task5_manifest_sha256,
+        view=task5,
+        policy=policy,
+        source_manifest_sha256=inventory.manifest_sha256,
+    )
+    root = _selection_root(output_root)
+    with _spool_authenticated_ptv2_source_rows(
+        inventory_receipt,
+        policy=policy,
+        storage_dir=root,
+        workers=workers,
+        source_commit=source_commit,
+    ) as source:
+        if baseline is None:
+            if baseline_builder is None:
+                raise AssertionError("validated baseline builder is missing")
+            resolved_baseline = baseline_builder(
+                islice(iter(source), policy.historical_occurrences)
+            )
+        else:
+            resolved_baseline = baseline
+        _validate_exclusion_receipt(
+            baseline_receipt,
+            "baseline",
+            resolved_baseline.exclusion_prompt_ids,
+        )
+        view = select_a_repair_view(
+            islice(iter(source), policy.historical_occurrences),
+            _iter_task5_selected_rows(
+                task5,
+                inventory_receipt,
+                policy,
+                source_rows=source,
+            ),
+            policy=policy,
+            baseline=resolved_baseline,
+            held_out_prompt_uuids=exclusions.held_out,
+            output_root=root,
+            source_inventory=inventory,
+            baseline_receipt=baseline_receipt,
+            held_out_receipt=held_out_receipt,
+            complement_selection_sha256=complement_identity_sha256,
+        )
+        if workers > 1 and source.execution_receipt is None:
+            raise PTV2StudyError("parallel Task9 A execution receipt is missing")
+        execution = source.finalize_execution(view.index_path) if workers > 1 else None
+        return replace(view, execution_receipt=execution)
+
+
 def select_authenticated_ptv2_study_views(
     inventory_receipt: Path,
     *,
@@ -1437,7 +1531,11 @@ def _spool_authenticated_ptv2_source_rows_parallel(
 
 
 def _iter_task5_selected_rows(
-    task5: PromptView, inventory_receipt: Path, policy: PTV2StudyPolicy
+    task5: PromptView,
+    inventory_receipt: Path,
+    policy: PTV2StudyPolicy,
+    *,
+    source_rows: Iterable[PTV2StudySourceRow] | None = None,
 ) -> Iterator[PTV2StudySourceRow]:
     """Join Task 5 source references to the authenticated Task 3 physical rows."""
     if task5.arm != "B-prime":
@@ -1494,7 +1592,12 @@ def _iter_task5_selected_rows(
                 ),
             )
         connection.commit()
-        for row in iter_ptv2_staged_source_rows(inventory_receipt, policy=policy):
+        physical_rows = (
+            iter_ptv2_staged_source_rows(inventory_receipt, policy=policy)
+            if source_rows is None
+            else source_rows
+        )
+        for row in physical_rows:
             wanted = connection.execute(
                 "SELECT ordinal,prompt_uuid,conversation_sha256,response_sha256 FROM wanted "
                 "WHERE identity_sha256=? AND source_row=?",
