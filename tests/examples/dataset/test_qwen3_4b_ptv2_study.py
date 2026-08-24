@@ -71,6 +71,21 @@ def _digest(value: str) -> str:
     return sha256(value.encode("utf-8")).hexdigest()
 
 
+def _parallel_shards() -> list[dict[str, object]]:
+    return [
+        {
+            "index": index,
+            "spool_path": f"shard-{index:03d}.sqlite3",
+            "row_count": index + 1,
+            "spool_bytes": index + 1,
+            "spool_sha256": _digest(str(index)),
+            "elapsed_seconds": 0.1,
+            "worker_pid": 1_000 + index,
+        }
+        for index in range(201)
+    ]
+
+
 def test_task9_worker_count_is_bounded_by_allocation_and_exact_shards() -> None:
     assert study_module.resolve_ptv2_worker_count(
         96,
@@ -756,7 +771,7 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
         "started_at_ns": 1,
         "finished_at_ns": 2,
         "elapsed_seconds": 1.0,
-        "shards": [{"index": index} for index in range(201)],
+        "shards": _parallel_shards(),
     }
     execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
 
@@ -833,6 +848,19 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
     execution_path.write_bytes(canonical_json(forged_execution) + b"\n")
     with pytest.raises(publication.PublicationError, match="does not reconcile"):
         publication._validate_task9_execution_receipt(payload, files)
+
+    for forged_value in ("not-a-digest", [{"index": index} for index in range(201)]):
+        forged_execution = {
+            key: value for key, value in execution_payload.items() if key != "receipt_sha256"
+        }
+        if isinstance(forged_value, str):
+            forged_execution["source_inventory_sha256"] = forged_value
+        else:
+            forged_execution["shards"] = forged_value
+        forged_execution["receipt_sha256"] = sha256(canonical_json(forged_execution)).hexdigest()
+        execution_path.write_bytes(canonical_json(forged_execution) + b"\n")
+        with pytest.raises(publication.PublicationError, match="does not reconcile"):
+            publication._validate_task9_execution_receipt(payload, files)
 
 
 def test_a_repair_schema_v3_receipt_replays_strategy_specific_roots(

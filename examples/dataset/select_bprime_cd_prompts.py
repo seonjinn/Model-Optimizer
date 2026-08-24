@@ -231,6 +231,7 @@ class BPrimePromptViewBundle:
     policy_sha256: str
     seed: int
     source_inventory_sha256: str
+    source_manifest_sha256: str
     baseline_receipt_sha256: str
     held_out_receipt_sha256: str
     ptv2_revision: str
@@ -691,6 +692,7 @@ def select_bprime_prompt_view(
             policy_sha256=policy.policy_sha256,
             seed=policy.seed,
             source_inventory_sha256=inventory.inventory_sha256,
+            source_manifest_sha256=authenticated_source_inventory.manifest_sha256,
             baseline_receipt_sha256=baseline_receipt_sha256,
             held_out_receipt_sha256=held_out_receipt_sha256,
             ptv2_revision=inventory.ptv2_revision,
@@ -1324,8 +1326,6 @@ def publish_bprime_prompt_view_bundle(
     *,
     rows_per_shard: int = 10_000,
     execution_receipt: Mapping[str, Any] | None = None,
-    candidate_inventory_sha256: str | None = None,
-    source_manifest_sha256: str | None = None,
 ) -> PublishedPromptViews:
     """Publish an authenticated PTV2-only B-prime complement."""
     return _publish_prompt_view_bundle(
@@ -1335,8 +1335,6 @@ def publish_bprime_prompt_view_bundle(
         views=(bundle.B_prime,),
         selection_mode="B-prime-only",
         execution_receipt=execution_receipt,
-        candidate_inventory_sha256=candidate_inventory_sha256,
-        source_manifest_sha256=source_manifest_sha256,
     )
 
 
@@ -1348,8 +1346,6 @@ def _publish_prompt_view_bundle(
     views: tuple[PromptView, ...],
     selection_mode: str | None,
     execution_receipt: Mapping[str, Any] | None = None,
-    candidate_inventory_sha256: str | None = None,
-    source_manifest_sha256: str | None = None,
 ) -> PublishedPromptViews:
     """Stream canonical rows to hashed JSONL shards plus a compact indexed root manifest."""
     if (
@@ -1358,6 +1354,11 @@ def _publish_prompt_view_bundle(
         or rows_per_shard < 1
     ):
         raise ValueError("rows_per_shard must be a positive integer")
+    if execution_receipt is not None and (
+        not isinstance(bundle, BPrimePromptViewBundle)
+        or execution_receipt.get("source_manifest_sha256") != bundle.source_manifest_sha256
+    ):
+        raise ValueError("Task5 execution receipt source manifest does not match its selection")
     output_dir = Path(output_dir)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     partial: Path | None = None
@@ -1514,6 +1515,8 @@ def _publish_prompt_view_bundle(
         if selection_mode is not None:
             manifest["selection_mode"] = selection_mode
         if execution_receipt is not None:
+            if not isinstance(bundle, BPrimePromptViewBundle):
+                raise ValueError("execution receipts are only defined for B-prime publication")
             execution_payload = dict(execution_receipt)
             declared_execution_sha256 = execution_payload.pop("receipt_sha256", None)
             if not isinstance(
@@ -1521,13 +1524,11 @@ def _publish_prompt_view_bundle(
             ) or declared_execution_sha256 != sha256_bytes(canonical_json(execution_payload)):
                 raise ValueError("Task5 execution receipt identity is invalid")
             if (
-                not isinstance(candidate_inventory_sha256, str)
-                or re.fullmatch(r"[0-9a-f]{64}", candidate_inventory_sha256) is None
-                or not isinstance(source_manifest_sha256, str)
-                or re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256) is None
+                re.fullmatch(r"[0-9a-f]{64}", bundle.source_inventory_sha256) is None
+                or re.fullmatch(r"[0-9a-f]{64}", bundle.source_manifest_sha256) is None
             ):
                 raise ValueError("Task5 execution receipt requires source and candidate identity")
-            execution_payload["candidate_inventory_sha256"] = candidate_inventory_sha256
+            execution_payload["candidate_inventory_sha256"] = bundle.source_inventory_sha256
             execution_payload["selection_sha256"] = bundle.selection_sha256
             execution_payload["receipt_sha256"] = sha256_bytes(canonical_json(execution_payload))
             execution_path = partial / "EXECUTION_RECEIPT.json"
@@ -1538,10 +1539,8 @@ def _publish_prompt_view_bundle(
                 "byte_count": len(execution_bytes),
                 "sha256": sha256_bytes(execution_bytes),
             }
-            manifest["identity"]["candidate_inventory_sha256"] = candidate_inventory_sha256
-            manifest["identity"]["source_manifest_sha256"] = source_manifest_sha256
-        elif candidate_inventory_sha256 is not None or source_manifest_sha256 is not None:
-            raise ValueError("source and candidate identity require an execution receipt")
+            manifest["identity"]["candidate_inventory_sha256"] = bundle.source_inventory_sha256
+            manifest["identity"]["source_manifest_sha256"] = bundle.source_manifest_sha256
         root_sha256 = sha256_bytes(canonical_json(manifest))
         manifest["root_sha256"] = root_sha256
         expected_artifact_identity = PromptPublicationArtifactIdentity(

@@ -21,6 +21,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -707,6 +708,17 @@ def _validate_task5_execution_receipt(
     finished = execution.get("finished_at_ns")
     elapsed = execution.get("elapsed_seconds")
     quarantine = execution.get("quarantine_counts")
+    source_manifest_sha256 = execution.get("source_manifest_sha256")
+    candidate_inventory_sha256 = execution.get("candidate_inventory_sha256")
+    selection_source_inventory_sha256 = (
+        identity.get("source_inventory_sha256") if isinstance(identity, Mapping) else None
+    )
+    selection_source_manifest_sha256 = (
+        identity.get("source_manifest_sha256") if isinstance(identity, Mapping) else None
+    )
+    selection_candidate_inventory_sha256 = (
+        identity.get("candidate_inventory_sha256") if isinstance(identity, Mapping) else None
+    )
     if (
         set(execution) != required
         or claimed != _sha256_bytes(_identity_json(execution))
@@ -714,12 +726,16 @@ def _validate_task5_execution_receipt(
         or not isinstance(execution.get("source_commit"), str)
         or re.fullmatch(r"[0-9a-f]{40}", execution["source_commit"]) is None
         or not isinstance(identity, Mapping)
-        or execution.get("source_manifest_sha256") != identity.get("source_manifest_sha256")
-        or execution.get("candidate_inventory_sha256")
-        != identity.get("candidate_inventory_sha256")
+        or not _is_sha256(source_manifest_sha256)
+        or not _is_sha256(candidate_inventory_sha256)
+        or not _is_sha256(selection_source_inventory_sha256)
+        or not _is_sha256(selection_source_manifest_sha256)
+        or not _is_sha256(selection_candidate_inventory_sha256)
+        or source_manifest_sha256 != selection_source_manifest_sha256
+        or candidate_inventory_sha256 != selection_candidate_inventory_sha256
+        or candidate_inventory_sha256 != selection_source_inventory_sha256
         or execution.get("selection_sha256") != selection.get("selection_sha256")
-        or not isinstance(execution.get("candidate_inventory_sha256"), str)
-        or _SHA256.fullmatch(execution["candidate_inventory_sha256"]) is None
+        or not _is_sha256(execution.get("selection_sha256"))
         or execution.get("effective_workers") != 96
         or execution.get("allocated_cpus") != 96
         or execution.get("requested_workers") != 96
@@ -750,13 +766,8 @@ def _validate_task5_execution_receipt(
             or value < 0
             for key, value in quarantine.items()
         )
-        or not isinstance(shards, list)
-        or len(shards) != 201
-        or {item.get("index") for item in shards if isinstance(item, dict)} != set(range(201))
-        or not isinstance(tokenization_shards, list)
-        or len(tokenization_shards) != 201
-        or {item.get("index") for item in tokenization_shards if isinstance(item, dict)}
-        != set(range(201))
+        or not _parallel_shards_reconcile(shards, include_spool_identity=True)
+        or not _parallel_shards_reconcile(tokenization_shards, include_spool_identity=False)
     ):
         raise PublicationError("Task5 execution receipt does not reconcile")
 
@@ -805,8 +816,11 @@ def _validate_task9_execution_receipt(
         or execution.get("schema_version") != 1
         or not isinstance(execution.get("source_commit"), str)
         or re.fullmatch(r"[0-9a-f]{40}", execution["source_commit"]) is None
+        or not _is_sha256(execution.get("source_inventory_sha256"))
+        or not _is_sha256(selection.get("source_inventory_sha256"))
         or execution.get("source_inventory_sha256") != selection.get("source_inventory_sha256")
         or execution.get("selection_sha256") != selection.get("selection_sha256")
+        or not _is_sha256(execution.get("selection_sha256"))
         or execution.get("declared_shard_count") != 201
         or execution.get("allocated_cpus") != 96
         or execution.get("requested_workers") != 96
@@ -824,11 +838,64 @@ def _validate_task9_execution_receipt(
         or not isinstance(elapsed, (int, float))
         or isinstance(elapsed, bool)
         or elapsed < 0
-        or not isinstance(shards, list)
-        or len(shards) != 201
-        or {item.get("index") for item in shards if isinstance(item, dict)} != set(range(201))
+        or not _parallel_shards_reconcile(shards, include_spool_identity=True)
     ):
         raise PublicationError("Task9 execution receipt does not reconcile")
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and _SHA256.fullmatch(value) is not None
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_nonnegative_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _parallel_shards_reconcile(value: object, *, include_spool_identity: bool) -> bool:
+    if not isinstance(value, list) or len(value) != 201:
+        return False
+    common_keys = {"index", "row_count", "elapsed_seconds", "worker_pid"}
+    expected_keys = (
+        common_keys | {"spool_path", "spool_bytes", "spool_sha256"}
+        if include_spool_identity
+        else common_keys
+    )
+    seen: set[int] = set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != expected_keys:
+            return False
+        index = item.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < 201:
+            return False
+        if index in seen:
+            return False
+        seen.add(index)
+        if (
+            not _is_nonnegative_int(item.get("row_count"))
+            or not _is_nonnegative_number(item.get("elapsed_seconds"))
+            or not isinstance(item.get("worker_pid"), int)
+            or isinstance(item.get("worker_pid"), bool)
+            or item["worker_pid"] < 1
+        ):
+            return False
+        if include_spool_identity and (
+            item.get("spool_path") != f"shard-{index:03d}.sqlite3"
+            or not isinstance(item.get("spool_bytes"), int)
+            or isinstance(item.get("spool_bytes"), bool)
+            or item["spool_bytes"] < 1
+            or not _is_sha256(item.get("spool_sha256"))
+        ):
+            return False
+    return seen == set(range(201))
 
 
 def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:

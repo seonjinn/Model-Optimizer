@@ -39,6 +39,33 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def _parallel_shards() -> list[dict[str, object]]:
+    return [
+        {
+            "index": index,
+            "spool_path": f"shard-{index:03d}.sqlite3",
+            "row_count": index + 1,
+            "spool_bytes": index + 1,
+            "spool_sha256": hashlib.sha256(str(index).encode()).hexdigest(),
+            "elapsed_seconds": 0.1,
+            "worker_pid": 1_000 + index,
+        }
+        for index in range(201)
+    ]
+
+
+def _tokenization_shards() -> list[dict[str, object]]:
+    return [
+        {
+            "index": index,
+            "row_count": index + 1,
+            "elapsed_seconds": 0.1,
+            "worker_pid": 1_000 + index,
+        }
+        for index in range(201)
+    ]
+
+
 def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
     tmp_path: Path,
 ) -> None:
@@ -66,8 +93,8 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         "elapsed_seconds": 1.0,
         "accepted_count": 1,
         "quarantine_counts": {},
-        "shards": [{"index": index} for index in range(201)],
-        "tokenization_shards": [{"index": index} for index in range(201)],
+        "shards": _parallel_shards(),
+        "tokenization_shards": _tokenization_shards(),
         "candidate_inventory_sha256": "c" * 64,
         "selection_sha256": "d" * 64,
     }
@@ -87,6 +114,7 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         "selection_sha256": "d" * 64,
         "row_count": 1,
         "identity": {
+            "source_inventory_sha256": "c" * 64,
             "source_manifest_sha256": "b" * 64,
             "candidate_inventory_sha256": "c" * 64,
         },
@@ -117,6 +145,7 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
     for field, value in (
         ("effective_workers", 1),
         ("source_manifest_sha256", "e" * 64),
+        ("source_manifest_sha256", "not-a-digest"),
         ("declared_shard_count", 200),
         ("finished_at_ns", 0),
     ):
@@ -128,6 +157,27 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         path.write_bytes(_canonical(forged))
         with pytest.raises(publication.PublicationError, match="does not reconcile"):
             publication._validate_task5_execution_receipt(selection, files)
+
+    for field in ("shards", "tokenization_shards"):
+        forged = {key: item for key, item in execution.items() if key != "receipt_sha256"}
+        forged[field] = [{"index": index} for index in range(201)]
+        forged["receipt_sha256"] = hashlib.sha256(
+            json.dumps(forged, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path.write_bytes(_canonical(forged))
+        with pytest.raises(publication.PublicationError, match="does not reconcile"):
+            publication._validate_task5_execution_receipt(selection, files)
+
+    path.write_bytes(_canonical(execution))
+    for identity_field, value in (
+        ("source_inventory_sha256", "e" * 64),
+        ("source_manifest_sha256", "not-a-digest"),
+        ("candidate_inventory_sha256", "f" * 64),
+    ):
+        forged_selection = {**selection, "identity": dict(selection["identity"])}
+        forged_selection["identity"][identity_field] = value
+        with pytest.raises(publication.PublicationError, match="does not reconcile"):
+            publication._validate_task5_execution_receipt(forged_selection, files)
 
 
 def test_ptv2_lineage_flows_from_source_to_selection_then_tokenization() -> None:

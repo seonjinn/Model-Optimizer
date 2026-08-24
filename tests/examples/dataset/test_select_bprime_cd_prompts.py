@@ -83,6 +83,35 @@ PTV2_SPLITS = (
     "multilingual_es",
     "multilingual_fr",
 )
+
+
+def _parallel_shards() -> list[dict[str, object]]:
+    return [
+        {
+            "index": index,
+            "spool_path": f"shard-{index:03d}.sqlite3",
+            "row_count": index + 1,
+            "spool_bytes": index + 1,
+            "spool_sha256": hashlib.sha256(str(index).encode()).hexdigest(),
+            "elapsed_seconds": 0.1,
+            "worker_pid": 1_000 + index,
+        }
+        for index in range(201)
+    ]
+
+
+def _tokenization_shards() -> list[dict[str, object]]:
+    return [
+        {
+            "index": index,
+            "row_count": index + 1,
+            "elapsed_seconds": 0.1,
+            "worker_pid": 1_000 + index,
+        }
+        for index in range(201)
+    ]
+
+
 PTV2_SHARD_COUNTS = {
     "chat": 12,
     "math": 2,
@@ -474,19 +503,32 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         "elapsed_seconds": 1.0,
         "accepted_count": len(candidates.rows),
         "quarantine_counts": {},
-        "shards": [{"index": index} for index in range(201)],
-        "tokenization_shards": [{"index": index} for index in range(201)],
+        "shards": _parallel_shards(),
+        "tokenization_shards": _tokenization_shards(),
     }
     execution["receipt_sha256"] = hashlib.sha256(canonical_json(execution)).hexdigest()
     destination = tmp_path / "bprime-only"
     try:
+        forged_execution = dict(execution)
+        forged_execution["source_manifest_sha256"] = "f" * 64
+        forged_execution.pop("receipt_sha256")
+        forged_execution["receipt_sha256"] = hashlib.sha256(
+            canonical_json(forged_execution)
+        ).hexdigest()
+        forged_destination = tmp_path / "forged-source-root"
+        with pytest.raises(ValueError, match="source manifest"):
+            publish_bprime_prompt_view_bundle(
+                bundle,
+                forged_destination,
+                rows_per_shard=37,
+                execution_receipt=forged_execution,
+            )
+        assert not forged_destination.exists()
         published = publish_bprime_prompt_view_bundle(
             bundle,
             destination,
             rows_per_shard=37,
             execution_receipt=execution,
-            candidate_inventory_sha256=candidates.inventory_sha256,
-            source_manifest_sha256=source_inventory.manifest_sha256,
         )
         before = published.manifest_path.read_bytes()
         with pytest.raises(FileExistsError) as caught:
@@ -495,8 +537,6 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
                 destination,
                 rows_per_shard=37,
                 execution_receipt=execution,
-                candidate_inventory_sha256=candidates.inventory_sha256,
-                source_manifest_sha256=source_inventory.manifest_sha256,
             )
     finally:
         bundle.close()
@@ -505,6 +545,9 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
 
     assert manifest["selection_mode"] == "B-prime-only"
     assert set(manifest["arms"]) == {"B-prime"}
+    assert manifest["identity"]["candidate_inventory_sha256"] == candidates.inventory_sha256
+    assert manifest["identity"]["source_inventory_sha256"] == candidates.inventory_sha256
+    assert manifest["identity"]["source_manifest_sha256"] == source_inventory.manifest_sha256
     assert published.manifest_path.read_bytes() == before
     assert (destination / "EXECUTION_RECEIPT.json").is_file()
     assert getattr(caught.value, "recovery_state").destination_path == destination
