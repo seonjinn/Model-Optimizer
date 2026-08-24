@@ -6,12 +6,9 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
-import errno
 import hashlib
 import json
 import os
-import platform
 import re
 import shutil
 import tempfile
@@ -22,6 +19,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+import bootstrap_ptv2_source_manifest as _bootstrap_publication
 import yaml
 
 if TYPE_CHECKING:
@@ -412,37 +410,12 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
     """Atomically publish a sibling directory without replacing any destination."""
     if source.parent.resolve() != destination.parent.resolve():
         raise SourceManifestError("publication partial must be a sibling of its destination")
-    library = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source)
-    destination_bytes = os.fsencode(destination)
-    system = platform.system()
-    if system == "Linux":
-        try:
-            rename = library.renameat2
-        except AttributeError as error:
-            raise SourceManifestError("atomic no-replace rename is unavailable") from error
-        rename.argtypes = [
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        ]
-        rename.restype = ctypes.c_int
-        result = rename(-100, source_bytes, -100, destination_bytes, 1)
-    elif system == "Darwin":
-        rename = library.renamex_np
-        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        result = rename(source_bytes, destination_bytes, 0x00000004)
-    else:
-        raise SourceManifestError(f"atomic no-replace rename is unsupported on {system}")
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise FileExistsError(error_number, os.strerror(error_number), destination)
-    raise SourceManifestError(f"atomic no-replace rename failed: {os.strerror(error_number)}")
+    try:
+        _bootstrap_publication._rename_no_replace(source, destination)
+    except FileExistsError:
+        raise
+    except _bootstrap_publication.PTV2SourceManifestError as error:
+        raise SourceManifestError(str(error)) from error
 
 
 def _receipt_payload(

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -300,6 +301,27 @@ def test_atomic_publication_never_replaces_concurrent_winner(tmp_path: Path) -> 
     assert (destination / "winner").read_text(encoding="utf-8") in {"0", "1"}
     loser = sources[results.index("collision")]
     assert (loser / "winner").is_file()
+
+
+def test_atomic_publication_falls_back_when_lustre_rejects_renameat2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lustre EINVAL uses the shared reservation fallback without replacing a winner."""
+    source = tmp_path / "partial"
+    destination = tmp_path / "published"
+    source.mkdir()
+    (source / "payload").write_bytes(b"complete")
+
+    def unsupported(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(
+        stage_module._bootstrap_publication, "_native_rename_no_replace", unsupported
+    )
+    stage_module._rename_no_replace(source, destination)
+
+    assert not source.exists()
+    assert (destination / "payload").read_bytes() == b"complete"
 
 
 def test_unpinned_ptv3_yaml_is_refused() -> None:
