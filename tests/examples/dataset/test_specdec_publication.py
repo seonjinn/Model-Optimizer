@@ -66,8 +66,8 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         "elapsed_seconds": 1.0,
         "accepted_count": 1,
         "quarantine_counts": {},
-        "shards": [],
-        "tokenization_shards": [],
+        "shards": [{"index": index} for index in range(201)],
+        "tokenization_shards": [{"index": index} for index in range(201)],
         "candidate_inventory_sha256": "c" * 64,
         "selection_sha256": "d" * 64,
     }
@@ -85,6 +85,11 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
         "schema_version": 2,
         "selection_mode": "B-prime-only",
         "selection_sha256": "d" * 64,
+        "row_count": 1,
+        "identity": {
+            "source_manifest_sha256": "b" * 64,
+            "candidate_inventory_sha256": "c" * 64,
+        },
         "execution_receipt": descriptor,
     }
     files = [(path.name, path, path.stat().st_size, descriptor["sha256"])]
@@ -109,11 +114,20 @@ def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
     publication._validate_task5_execution_receipt(selection, files)
     with pytest.raises(publication.PublicationError, match="not authenticated"):
         publication._validate_task5_execution_receipt(selection, [])
-    tampered = dict(execution)
-    tampered["effective_workers"] = 1
-    path.write_bytes(_canonical(tampered))
-    with pytest.raises(publication.PublicationError, match="does not reconcile"):
-        publication._validate_task5_execution_receipt(selection, files)
+    for field, value in (
+        ("effective_workers", 1),
+        ("source_manifest_sha256", "e" * 64),
+        ("declared_shard_count", 200),
+        ("finished_at_ns", 0),
+    ):
+        forged = {key: item for key, item in execution.items() if key != "receipt_sha256"}
+        forged[field] = value
+        forged["receipt_sha256"] = hashlib.sha256(
+            json.dumps(forged, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path.write_bytes(_canonical(forged))
+        with pytest.raises(publication.PublicationError, match="does not reconcile"):
+            publication._validate_task5_execution_receipt(selection, files)
 
 
 def test_ptv2_lineage_flows_from_source_to_selection_then_tokenization() -> None:

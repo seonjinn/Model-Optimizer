@@ -474,8 +474,8 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         "elapsed_seconds": 1.0,
         "accepted_count": len(candidates.rows),
         "quarantine_counts": {},
-        "shards": [],
-        "tokenization_shards": [],
+        "shards": [{"index": index} for index in range(201)],
+        "tokenization_shards": [{"index": index} for index in range(201)],
     }
     execution["receipt_sha256"] = hashlib.sha256(canonical_json(execution)).hexdigest()
     destination = tmp_path / "bprime-only"
@@ -486,6 +486,7 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
             rows_per_shard=37,
             execution_receipt=execution,
             candidate_inventory_sha256=candidates.inventory_sha256,
+            source_manifest_sha256=source_inventory.manifest_sha256,
         )
         before = published.manifest_path.read_bytes()
         with pytest.raises(FileExistsError) as caught:
@@ -495,6 +496,7 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
                 rows_per_shard=37,
                 execution_receipt=execution,
                 candidate_inventory_sha256=candidates.inventory_sha256,
+                source_manifest_sha256=source_inventory.manifest_sha256,
             )
     finally:
         bundle.close()

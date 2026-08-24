@@ -1860,9 +1860,6 @@ def _build_candidate_inventory_parallel(
         sources_root = source_inventory.staged_root.resolve(strict=True) / "sources"
         if _staged_tree_snapshot(sources_root) != initial_tree:
             raise ValueError("authenticated physical shard set changed during processing")
-        connection.execute(
-            "CREATE TABLE candidate_seen(prompt_uuid TEXT PRIMARY KEY,canonical_bytes BLOB NOT NULL)"
-        )
         for result in results:
             observed = os.lstat(result.spool_path)
             if (
@@ -1887,34 +1884,14 @@ def _build_candidate_inventory_parallel(
                     if prompt_uuid in held_out_prompt_ids:
                         _quarantine(quarantine_counts, "heldout_exclusion")
                         continue
-                    canonical_prompt = payload.get("canonical_prompt")
-                    candidate_record = payload.get("pretoken_candidate")
-                    canonical_bytes = (
-                        canonical_json(canonical_prompt)
-                        if canonical_prompt is not None
-                        else canonical_json(candidate_record["canonical_prompt"])
-                        if isinstance(candidate_record, dict)
-                        else None
-                    )
-                    if prompt_uuid is not None and canonical_bytes is not None:
-                        previous = connection.execute(
-                            "SELECT canonical_bytes FROM candidate_seen WHERE prompt_uuid = ?",
-                            (prompt_uuid,),
-                        ).fetchone()
-                        if previous is not None:
-                            if previous[0] != canonical_bytes:
-                                raise UUIDCollisionError(f"UUID collision: {prompt_uuid}")
-                            _quarantine(quarantine_counts, "duplicate_prompt_uuid")
-                            continue
                     reason = payload.get("reason")
                     if reason is not None:
                         _quarantine(quarantine_counts, reason)
                         continue
-                    if prompt_uuid is None or canonical_bytes is None:
+                    if prompt_uuid is None or not isinstance(
+                        payload.get("pretoken_candidate"), dict
+                    ):
                         raise ValueError("candidate identity is missing before tokenization")
-                    connection.execute(
-                        "INSERT INTO candidate_seen VALUES(?,?)", (prompt_uuid, canonical_bytes)
-                    )
                     shard.execute(
                         "INSERT INTO selected VALUES(?,?)", (source_row_index, raw_payload)
                     )
@@ -1935,6 +1912,15 @@ def _build_candidate_inventory_parallel(
                         _quarantine(quarantine_counts, reason)
                         continue
                     candidate = _candidate_from_record(payload["candidate"])
+                    previous = connection.execute(
+                        "SELECT canonical_bytes FROM candidates WHERE prompt_uuid = ?",
+                        (candidate.prompt_uuid,),
+                    ).fetchone()
+                    if previous is not None:
+                        if previous[0] != candidate.canonical_bytes:
+                            raise UUIDCollisionError(f"UUID collision: {candidate.prompt_uuid}")
+                        _quarantine(quarantine_counts, "duplicate_prompt_uuid")
+                        continue
                     _insert_candidate(connection, candidate)
                     accepted_count += 1
                     cell = CandidateCell(
@@ -1946,7 +1932,6 @@ def _build_candidate_inventory_parallel(
                     capacity[cell] = capacity.get(cell, 0) + 1
                     if accepted_count % 10_000 == 0:
                         connection.commit()
-        connection.execute("DROP TABLE candidate_seen")
         connection.commit()
         connection.close()
         finished_wall_ns = time.time_ns()

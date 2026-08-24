@@ -101,6 +101,7 @@ def test_task9_runner_requires_the_atomically_published_execution_receipt() -> N
         "NUMEXPR_NUM_THREADS",
     ):
         assert f"{name}=1" in runner
+    assert runner.index("export ARROW_NUM_THREADS=1") < runner.index("python3 -")
 
 
 def _row(cell: str, source_row: int, prompt: str, *, language: str = "") -> PTV2StudySourceRow:
@@ -736,7 +737,26 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
     execution: dict[str, Any] = {
         "schema_version": 1,
         "source_commit": "a" * 40,
+        "source_inventory_sha256": "1" * 64,
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
         "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "finished_at_ns": 2,
+        "elapsed_seconds": 1.0,
+        "shards": [{"index": index} for index in range(201)],
     }
     execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
 
@@ -804,6 +824,15 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
         for item in descriptors
     ]
     publication._validate_ptv2_selection_policy(payload, files)
+    publication._validate_task9_execution_receipt(payload, files)
+    forged_execution = {
+        key: value for key, value in execution_payload.items() if key != "receipt_sha256"
+    }
+    forged_execution["source_inventory_sha256"] = "9" * 64
+    forged_execution["receipt_sha256"] = sha256(canonical_json(forged_execution)).hexdigest()
+    execution_path.write_bytes(canonical_json(forged_execution) + b"\n")
+    with pytest.raises(publication.PublicationError, match="does not reconcile"):
+        publication._validate_task9_execution_receipt(payload, files)
 
 
 def test_a_repair_schema_v3_receipt_replays_strategy_specific_roots(

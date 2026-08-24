@@ -208,6 +208,7 @@ def main() -> int:
             args.output_dir,
             execution_receipt=candidates.execution_receipt,
             candidate_inventory_sha256=candidates.inventory_sha256,
+            source_manifest_sha256=source_inventory.manifest_sha256,
         )
     finally:
         if bundle is not None:

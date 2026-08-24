@@ -1325,6 +1325,7 @@ def publish_bprime_prompt_view_bundle(
     rows_per_shard: int = 10_000,
     execution_receipt: Mapping[str, Any] | None = None,
     candidate_inventory_sha256: str | None = None,
+    source_manifest_sha256: str | None = None,
 ) -> PublishedPromptViews:
     """Publish an authenticated PTV2-only B-prime complement."""
     return _publish_prompt_view_bundle(
@@ -1335,6 +1336,7 @@ def publish_bprime_prompt_view_bundle(
         selection_mode="B-prime-only",
         execution_receipt=execution_receipt,
         candidate_inventory_sha256=candidate_inventory_sha256,
+        source_manifest_sha256=source_manifest_sha256,
     )
 
 
@@ -1347,6 +1349,7 @@ def _publish_prompt_view_bundle(
     selection_mode: str | None,
     execution_receipt: Mapping[str, Any] | None = None,
     candidate_inventory_sha256: str | None = None,
+    source_manifest_sha256: str | None = None,
 ) -> PublishedPromptViews:
     """Stream canonical rows to hashed JSONL shards plus a compact indexed root manifest."""
     if (
@@ -1520,8 +1523,10 @@ def _publish_prompt_view_bundle(
             if (
                 not isinstance(candidate_inventory_sha256, str)
                 or re.fullmatch(r"[0-9a-f]{64}", candidate_inventory_sha256) is None
+                or not isinstance(source_manifest_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256) is None
             ):
-                raise ValueError("Task5 execution receipt requires candidate inventory identity")
+                raise ValueError("Task5 execution receipt requires source and candidate identity")
             execution_payload["candidate_inventory_sha256"] = candidate_inventory_sha256
             execution_payload["selection_sha256"] = bundle.selection_sha256
             execution_payload["receipt_sha256"] = sha256_bytes(canonical_json(execution_payload))
@@ -1533,8 +1538,10 @@ def _publish_prompt_view_bundle(
                 "byte_count": len(execution_bytes),
                 "sha256": sha256_bytes(execution_bytes),
             }
-        elif candidate_inventory_sha256 is not None:
-            raise ValueError("candidate inventory identity requires an execution receipt")
+            manifest["identity"]["candidate_inventory_sha256"] = candidate_inventory_sha256
+            manifest["identity"]["source_manifest_sha256"] = source_manifest_sha256
+        elif candidate_inventory_sha256 is not None or source_manifest_sha256 is not None:
+            raise ValueError("source and candidate identity require an execution receipt")
         root_sha256 = sha256_bytes(canonical_json(manifest))
         manifest["root_sha256"] = root_sha256
         expected_artifact_identity = PromptPublicationArtifactIdentity(

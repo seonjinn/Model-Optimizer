@@ -103,6 +103,15 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         ),
         "tools": "[]",
     }
+    rejected_duplicate = {
+        "messages": json.dumps(
+            [
+                {"role": "user", "content": "reject-duplicate-after-tokenization"},
+                {"role": "assistant", "content": "answer"},
+            ]
+        ),
+        "tools": "[]",
+    }
     for index in range(201):
         path = tmp_path / f"shard-{index}.jsonl"
         rows = [
@@ -118,7 +127,13 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
             for row in range(3)
         ]
         if index == 0:
-            rows[:0] = [excluded, duplicate, duplicate]
+            rows[:0] = [
+                excluded,
+                duplicate,
+                duplicate,
+                rejected_duplicate,
+                rejected_duplicate,
+            ]
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         descriptor = module.SourceFile(path.name, path.stat().st_size, module.sha256_file(path))
         files.append((source, descriptor, path))
@@ -147,6 +162,13 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
             ):
                 with self.marker.open("ab") as stream:
                     stream.write(b"1")
+            if any(
+                message.get("content") == "reject-duplicate-after-tokenization"
+                for message in messages
+            ):
+                with self.marker.with_suffix(".rejected").open("ab") as stream:
+                    stream.write(b"1")
+                raise ValueError("conversation exceeds the 32K inventory limit: fixture")
             return super().apply_chat_template(messages, **kwargs)
 
     serial_marker = tmp_path / "serial-tokenizer-calls"
@@ -177,7 +199,9 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         assert set(parallel.execution_receipt["thread_environment"].values()) == {"1"}
         assert parallel.quarantine_counts["historical_exclusion"] == 1
         assert not (tmp_path / "parallel-tokenizer-calls.excluded").exists()
-        assert (tmp_path / "parallel-tokenizer-calls").read_bytes() == b"1"
+        assert (tmp_path / "parallel-tokenizer-calls").read_bytes() == b"11"
+        assert (tmp_path / "parallel-tokenizer-calls.rejected").read_bytes() == b"11"
+        assert parallel.quarantine_counts["context_too_long"] == 2
     finally:
         serial.close()
         parallel.close()

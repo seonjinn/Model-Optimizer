@@ -54,6 +54,15 @@ REQUIRED_ROLES = ("source", "selection", "response", "tokenized", "exposure", "r
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _BUFFER_SIZE = 1024 * 1024
+_PARALLEL_THREAD_ENVIRONMENT = frozenset(
+    {
+        "ARROW_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    }
+)
 _PTV2_SELECTION_IDENTITY_KEYS = frozenset(
     {
         "strategy",
@@ -409,6 +418,8 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
             files.append((relative, path, size, digest))
         if artifact.role == "selection" and payload.get("schema_version") == 3:
             _validate_ptv2_selection_policy(payload, files)
+            if "execution_receipt" in payload:
+                _validate_task9_execution_receipt(payload, files)
         if (
             artifact.role == "selection"
             and payload.get("schema_version") == 2
@@ -688,20 +699,136 @@ def _validate_task5_execution_receipt(
         "candidate_inventory_sha256",
         "selection_sha256",
     }
+    identity = selection.get("identity")
     thread_environment = execution.get("thread_environment")
+    shards = execution.get("shards")
+    tokenization_shards = execution.get("tokenization_shards")
+    started = execution.get("started_at_ns")
+    finished = execution.get("finished_at_ns")
+    elapsed = execution.get("elapsed_seconds")
+    quarantine = execution.get("quarantine_counts")
     if (
-        not required.issubset(execution)
+        set(execution) != required
         or claimed != _sha256_bytes(_identity_json(execution))
+        or execution.get("schema_version") != 1
+        or not isinstance(execution.get("source_commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", execution["source_commit"]) is None
+        or not isinstance(identity, Mapping)
+        or execution.get("source_manifest_sha256") != identity.get("source_manifest_sha256")
+        or execution.get("candidate_inventory_sha256")
+        != identity.get("candidate_inventory_sha256")
         or execution.get("selection_sha256") != selection.get("selection_sha256")
         or not isinstance(execution.get("candidate_inventory_sha256"), str)
         or _SHA256.fullmatch(execution["candidate_inventory_sha256"]) is None
         or execution.get("effective_workers") != 96
         or execution.get("allocated_cpus") != 96
+        or execution.get("requested_workers") != 96
+        or execution.get("declared_shard_count") != 201
         or execution.get("threads_per_worker") != 1
         or not isinstance(thread_environment, dict)
+        or set(thread_environment) != _PARALLEL_THREAD_ENVIRONMENT
         or set(thread_environment.values()) != {"1"}
+        or not isinstance(started, int)
+        or isinstance(started, bool)
+        or started < 1
+        or not isinstance(finished, int)
+        or isinstance(finished, bool)
+        or finished < started
+        or not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+        or elapsed < 0
+        or not isinstance(execution.get("accepted_count"), int)
+        or isinstance(execution.get("accepted_count"), bool)
+        or not isinstance(selection.get("row_count"), int)
+        or isinstance(selection.get("row_count"), bool)
+        or execution["accepted_count"] < selection.get("row_count", 0)
+        or not isinstance(quarantine, dict)
+        or any(
+            not isinstance(key, str)
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            for key, value in quarantine.items()
+        )
+        or not isinstance(shards, list)
+        or len(shards) != 201
+        or {item.get("index") for item in shards if isinstance(item, dict)} != set(range(201))
+        or not isinstance(tokenization_shards, list)
+        or len(tokenization_shards) != 201
+        or {item.get("index") for item in tokenization_shards if isinstance(item, dict)}
+        != set(range(201))
     ):
         raise PublicationError("Task5 execution receipt does not reconcile")
+
+
+def _validate_task9_execution_receipt(
+    selection: Mapping[str, Any], files: list[tuple[str, Path, int, str]]
+) -> None:
+    descriptor = selection.get("execution_receipt")
+    if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("path"), str):
+        raise PublicationError("Task9 execution receipt descriptor is malformed")
+    execution_file = next((item for item in files if item[0] == descriptor["path"]), None)
+    if execution_file is None:
+        raise PublicationError("Task9 execution receipt was not authenticated")
+    try:
+        raw = execution_file[1].read_bytes()
+        execution = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise PublicationError("Task9 execution receipt is invalid") from error
+    if not isinstance(execution, dict) or raw != _identity_json(execution) + b"\n":
+        raise PublicationError("Task9 execution receipt is not canonical")
+    claimed = execution.pop("receipt_sha256", None)
+    required = {
+        "schema_version",
+        "source_commit",
+        "source_inventory_sha256",
+        "declared_shard_count",
+        "allocated_cpus",
+        "requested_workers",
+        "effective_workers",
+        "threads_per_worker",
+        "thread_environment",
+        "started_at_ns",
+        "finished_at_ns",
+        "elapsed_seconds",
+        "shards",
+        "selection_sha256",
+    }
+    thread_environment = execution.get("thread_environment")
+    started = execution.get("started_at_ns")
+    finished = execution.get("finished_at_ns")
+    elapsed = execution.get("elapsed_seconds")
+    shards = execution.get("shards")
+    if (
+        set(execution) != required
+        or claimed != _sha256_bytes(_identity_json(execution))
+        or execution.get("schema_version") != 1
+        or not isinstance(execution.get("source_commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", execution["source_commit"]) is None
+        or execution.get("source_inventory_sha256") != selection.get("source_inventory_sha256")
+        or execution.get("selection_sha256") != selection.get("selection_sha256")
+        or execution.get("declared_shard_count") != 201
+        or execution.get("allocated_cpus") != 96
+        or execution.get("requested_workers") != 96
+        or execution.get("effective_workers") != 96
+        or execution.get("threads_per_worker") != 1
+        or not isinstance(thread_environment, dict)
+        or set(thread_environment) != _PARALLEL_THREAD_ENVIRONMENT
+        or set(thread_environment.values()) != {"1"}
+        or not isinstance(started, int)
+        or isinstance(started, bool)
+        or started < 1
+        or not isinstance(finished, int)
+        or isinstance(finished, bool)
+        or finished < started
+        or not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+        or elapsed < 0
+        or not isinstance(shards, list)
+        or len(shards) != 201
+        or {item.get("index") for item in shards if isinstance(item, dict)} != set(range(201))
+    ):
+        raise PublicationError("Task9 execution receipt does not reconcile")
 
 
 def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
