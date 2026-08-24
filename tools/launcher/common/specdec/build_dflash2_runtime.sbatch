@@ -51,6 +51,42 @@ git -C "$VLLM_CHECKOUT" archive HEAD | tar -x -C "$build_source"
 git -C "$VLLM_CUTLASS_CHECKOUT" archive HEAD >"$vllm_cutlass_archive"
 mkdir -p "$vllm_cutlass_source"
 tar -xf "$vllm_cutlass_archive" -C "$vllm_cutlass_source"
+# Apply a deterministic focused FlashMLA-only external project closure. The
+# runtime keeps all unrelated extensions from the authenticated base archive.
+python3 - "$build_source/CMakeLists.txt" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+upstream = """# For CUDA and HIP builds also build the triton_kernels external package.
+if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+    include(cmake/external_projects/triton_kernels.cmake)
+endif()
+
+# For CUDA we also build and ship some external projects.
+if (VLLM_GPU_LANG STREQUAL "CUDA")
+    include(cmake/external_projects/deepgemm.cmake)
+    include(cmake/external_projects/fmha_sm100.cmake)
+    include(cmake/external_projects/flashmla.cmake)
+    include(cmake/external_projects/flashkda.cmake)
+    include(cmake/external_projects/qutlass.cmake)
+    include(cmake/external_projects/tml_fa4.cmake)
+
+    # vllm-flash-attn should be last as it overwrites some CMake functions
+    include(cmake/external_projects/vllm_flash_attn.cmake)
+endif ()
+"""
+focused = """# DFlash2 focused source build: preserve only the exact FlashMLA project.
+if (VLLM_GPU_LANG STREQUAL "CUDA")
+    include(cmake/external_projects/flashmla.cmake)
+endif ()
+"""
+if source.count(upstream) != 1:
+    raise SystemExit("exact b389 external-project closure mismatch")
+path.write_text(source.replace(upstream, focused))
+PY
+focused_vllm_cmake="$build_source/CMakeLists.txt"
 
 mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${FLASHMLA_CHECKOUT}:${FLASHMLA_CHECKOUT}:ro,${LAUNCHER_ROOT}:${LAUNCHER_ROOT}:ro"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
@@ -129,6 +165,7 @@ if [[ "$MODE" == configure-only ]]; then
         --vllm-cutlass "$VLLM_CUTLASS_CHECKOUT" \
         --vllm-cutlass-archive "$vllm_cutlass_archive" \
         --vllm-cutlass-commit "$VLLM_CUTLASS_COMMIT" \
+        --focused-cmake "$focused_vllm_cmake" \
         --slurm-job-id "$SLURM_JOB_ID" >"${OUTPUT_ARCHIVE}.sha256"
     exit 0
 fi
@@ -145,6 +182,7 @@ PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
     --vllm-cutlass "$VLLM_CUTLASS_CHECKOUT" \
     --vllm-cutlass-archive "$vllm_cutlass_archive" \
     --vllm-cutlass-commit "$VLLM_CUTLASS_COMMIT" \
+    --focused-cmake "$focused_vllm_cmake" \
     >"$prepared/dflash2-flashmla-build-manifest.sha256"
 receipt="$prepared/dflash2-vllm-runtime-receipt.json"
 PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \

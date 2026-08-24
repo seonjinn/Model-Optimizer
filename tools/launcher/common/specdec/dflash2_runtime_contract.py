@@ -591,6 +591,7 @@ def write_flashmla_configure_preflight(
     vllm_cutlass_path: Path,
     vllm_cutlass_archive_path: Path,
     vllm_cutlass_commit: str,
+    focused_cmake_path: Path,
 ) -> str:
     """Publish configure-only evidence before attempting a source build."""
     if not slurm_job_id.isdigit():
@@ -632,6 +633,9 @@ def write_flashmla_configure_preflight(
         ),
         "flashmla_submodules": submodule_lines,
         "vllm_cutlass": vllm_cutlass,
+        "focused_vllm_cmake": _file_descriptor(
+            focused_cmake_path.resolve(strict=True), "focused-CMakeLists.txt"
+        ),
         "base_runtime": _file_descriptor(
             base_runtime_path.resolve(strict=True), str(base_runtime_path.resolve(strict=True))
         ),
@@ -664,6 +668,7 @@ def write_flashmla_build_manifest(
     vllm_cutlass_path: Path,
     vllm_cutlass_archive_path: Path,
     vllm_cutlass_commit: str,
+    focused_cmake_path: Path,
 ) -> str:
     """Bind exact source-build inputs to both installed FlashMLA extensions."""
     vllm_package = _verified_checkout(vllm_package_path, vllm_commit, vllm_commit)
@@ -705,6 +710,9 @@ def write_flashmla_build_manifest(
         ),
         "flashmla_submodules": submodule_lines,
         "vllm_cutlass": vllm_cutlass,
+        "focused_vllm_cmake": _file_descriptor(
+            focused_cmake_path.resolve(strict=True), "focused-CMakeLists.txt"
+        ),
         "base_runtime": _file_descriptor(
             base_runtime_path.resolve(strict=True), str(base_runtime_path.resolve(strict=True))
         ),
@@ -1008,6 +1016,7 @@ def main() -> None:
     flashmla_build.add_argument("--vllm-cutlass", type=Path, required=True)
     flashmla_build.add_argument("--vllm-cutlass-archive", type=Path, required=True)
     flashmla_build.add_argument("--vllm-cutlass-commit", required=True)
+    flashmla_build.add_argument("--focused-cmake", type=Path, required=True)
     configure = subparsers.add_parser("flashmla-configure-preflight")
     configure.add_argument("--output", type=Path, required=True)
     configure.add_argument("--vllm-package", type=Path, required=True)
@@ -1021,6 +1030,7 @@ def main() -> None:
     configure.add_argument("--vllm-cutlass", type=Path, required=True)
     configure.add_argument("--vllm-cutlass-archive", type=Path, required=True)
     configure.add_argument("--vllm-cutlass-commit", required=True)
+    configure.add_argument("--focused-cmake", type=Path, required=True)
     configure.add_argument("--slurm-job-id", required=True)
     artifact = subparsers.add_parser("artifact-receipt")
     artifact.add_argument("--artifact", type=Path, required=True)
@@ -1058,6 +1068,7 @@ def main() -> None:
             vllm_cutlass_path=args.vllm_cutlass,
             vllm_cutlass_archive_path=args.vllm_cutlass_archive,
             vllm_cutlass_commit=args.vllm_cutlass_commit,
+            focused_cmake_path=args.focused_cmake,
         )
     elif args.command == "flashmla-configure-preflight":
         receipt_sha256 = write_flashmla_configure_preflight(
@@ -1074,6 +1085,7 @@ def main() -> None:
             vllm_cutlass_path=args.vllm_cutlass,
             vllm_cutlass_archive_path=args.vllm_cutlass_archive,
             vllm_cutlass_commit=args.vllm_cutlass_commit,
+            focused_cmake_path=args.focused_cmake,
         )
     elif args.command == "artifact-receipt":
         receipt_sha256 = write_artifact_receipt(

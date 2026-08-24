@@ -243,6 +243,8 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
     builder = tmp_path / "build_dflash2_runtime.sbatch"
     builder.write_text("#!/usr/bin/env bash\ncmake --build exact-inputs\n")
     configure_log = tmp_path / "dflash2-flashmla-cmake-configure.log"
+    focused_cmake = tmp_path / "focused-CMakeLists.txt"
+    focused_cmake.write_text("include(cmake/external_projects/flashmla.cmake)\n")
     configure_log.write_text(
         "cmake_path=/scratch/job/runtime/bin/cmake\n"
         "cmake version 3.31.6\n"
@@ -267,6 +269,7 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
         vllm_cutlass_path=cutlass,
         vllm_cutlass_archive_path=cutlass_archive,
         vllm_cutlass_commit=cutlass_commit,
+        focused_cmake_path=focused_cmake,
     )
     receipt = tmp_path / "vllm-runtime-v4.json"
     receipt_sha = write_vllm_runtime_receipt(
@@ -350,6 +353,8 @@ def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) 
     runtime = tmp_path / "runtime/vllm"
     runtime.mkdir(parents=True)
     (runtime / "_flashmla_C.abi3.so").write_bytes(b"only-one-extension")
+    focused_cmake = tmp_path / "focused-CMakeLists.txt"
+    focused_cmake.write_text("include(cmake/external_projects/flashmla.cmake)\n")
     inputs = []
     for name in (
         "base-runtime.tar.zst",
@@ -385,6 +390,7 @@ def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) 
             vllm_cutlass_path=cutlass,
             vllm_cutlass_archive_path=cutlass_archive,
             vllm_cutlass_commit=cutlass_commit,
+            focused_cmake_path=focused_cmake,
         )
 
 
@@ -399,6 +405,8 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
         item.write_bytes(name.encode())
         inputs.append(item)
     configure_log = tmp_path / "dflash2-flashmla-cmake-configure.log"
+    focused_cmake = tmp_path / "focused-CMakeLists.txt"
+    focused_cmake.write_text("include(cmake/external_projects/flashmla.cmake)\n")
     configure_log.write_text(
         "cmake_path=/scratch/job/runtime/bin/cmake\n"
         "cmake version 3.31.6\n"
@@ -422,6 +430,7 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
         vllm_cutlass_path=cutlass,
         vllm_cutlass_archive_path=cutlass_archive,
         vllm_cutlass_commit=cutlass_commit,
+        focused_cmake_path=focused_cmake,
     )
 
     body = json.loads(receipt.read_text())
@@ -431,6 +440,9 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
     assert body["vllm_cutlass"]["commit"] == cutlass_commit
     assert body["vllm_cutlass"]["archive"]["sha256"] == hashlib.sha256(
         cutlass_archive.read_bytes()
+    ).hexdigest()
+    assert body["focused_vllm_cmake"]["sha256"] == hashlib.sha256(
+        focused_cmake.read_bytes()
     ).hexdigest()
     with pytest.raises(FileExistsError):
         runtime_contract.write_flashmla_configure_preflight(
@@ -445,6 +457,7 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
             vllm_cutlass_path=cutlass,
             vllm_cutlass_archive_path=cutlass_archive,
             vllm_cutlass_commit=cutlass_commit,
+            focused_cmake_path=focused_cmake,
         )
 
     (cutlass / "include/cutlass/cutlass.h").write_text("mutated\n")
@@ -461,6 +474,7 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
             vllm_cutlass_path=cutlass,
             vllm_cutlass_archive_path=cutlass_archive,
             vllm_cutlass_commit=cutlass_commit,
+            focused_cmake_path=focused_cmake,
         )
 
 
@@ -923,6 +937,9 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "VLLM_CUTLASS_SRC_DIR",
         "da5e086dab31d63815acafdac9a9c5893b1c69e2",
         "vllm-cutlass-source.tar",
+        "focused FlashMLA-only external project closure",
+        "focused_vllm_cmake",
+        'include(cmake/external_projects/flashmla.cmake)',
         "TORCH_CUDA_ARCH_LIST=10.0a",
         "cmake==3.31.6",
         "ninja==1.13.0",
