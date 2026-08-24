@@ -20,8 +20,6 @@ import importlib.util
 import json
 import shutil
 import sys
-import threading
-import time
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
@@ -71,69 +69,79 @@ class CandidateTokenizer:
         return {"input_ids": [index + 1 for index, _ in enumerate(messages)]}
 
 
-class ConcurrentCandidateTokenizer(CandidateTokenizer):
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.active = 0
-        self.maximum_active = 0
-
-    def apply_chat_template(self, messages, **kwargs):
-        with self._lock:
-            self.active += 1
-            self.maximum_active = max(self.maximum_active, self.active)
-        try:
-            time.sleep(0.005)
-            return super().apply_chat_template(messages, **kwargs)
-        finally:
-            with self._lock:
-                self.active -= 1
-
-
-def test_candidate_inventory_parallelizes_bounded_tokenization(
+def test_candidate_process_pool_is_byte_identical_and_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module = _load_module()
-    source = SimpleNamespace(
+    source = module.SourceIdentity(
         repository_id="nvidia/Nemotron-Post-Training-Dataset-v2",
         configuration="default",
         split="chat",
         revision=module.APPROVED_PTV2_REVISION,
-        lane="target-synth",
+        license_expression="ODC-BY-1.0",
+        approved_use=True,
         cell="chat",
+        lane="target-synth",
+        files=(),
     )
-    descriptor = SimpleNamespace(path="data/chat.parquet", sha256="b" * 64)
-    rows = [
-        {
-            "messages": [
-                {"role": "user", "content": f"question-{index}"},
-                {"role": "assistant", "content": f"answer-{index}"},
-            ]
-        }
-        for index in range(32)
-    ]
-    monkeypatch.setattr(
-        module,
-        "_verified_candidate_files",
-        lambda _inventory: [(source, descriptor, tmp_path / "unused.parquet")],
-    )
-    monkeypatch.setattr(
-        module, "_iter_candidate_rows", lambda _path: iter(enumerate(rows))
-    )
-    tokenizer = ConcurrentCandidateTokenizer()
-    candidates = module.build_candidate_inventory(
-        SimpleNamespace(manifest_sha256="a" * 64),
-        tokenizer=tokenizer,
+    files = []
+    for index in range(2):
+        path = tmp_path / f"shard-{index}.jsonl"
+        rows = [
+            {
+                "messages": [
+                    {"role": "user", "content": f"question-{index}-{row}"},
+                    {"role": "assistant", "content": "answer"},
+                ]
+            }
+            for row in range(3)
+        ]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        descriptor = module.SourceFile(path.name, path.stat().st_size, module.sha256_file(path))
+        files.append((source, descriptor, path))
+    inventory = SimpleNamespace(manifest_sha256="a" * 64, staged_root=tmp_path)
+    monkeypatch.setattr(module, "_verified_candidate_files", lambda _inventory: files)
+    monkeypatch.setattr(module, "_declared_candidate_files", lambda _inventory: (files, {}))
+    monkeypatch.setattr(module, "_staged_tree_snapshot", lambda _root: {})
+    baseline = module.make_exclusion_receipt("baseline", ())
+    held_out = module.make_exclusion_receipt("held-out", ())
+    serial = module.build_candidate_inventory(
+        inventory,
+        tokenizer=CandidateTokenizer(),
         tokenizer_sha256="f" * 64,
-        baseline_exclusion=module.make_exclusion_receipt("baseline", ()),
-        held_out_exclusion=module.make_exclusion_receipt("held-out", ()),
+        baseline_exclusion=baseline,
+        held_out_exclusion=held_out,
         storage_dir=tmp_path,
-        workers=4,
+    )
+    parallel = module.build_candidate_inventory(
+        inventory,
+        tokenizer=CandidateTokenizer(),
+        tokenizer_sha256="f" * 64,
+        baseline_exclusion=baseline,
+        held_out_exclusion=held_out,
+        storage_dir=tmp_path,
+        workers=96,
+        source_commit="1" * 40,
     )
     try:
-        assert len(candidates.rows) == 32
-        assert tokenizer.maximum_active > 1
+        assert module.candidate_inventory_bytes(serial) == module.candidate_inventory_bytes(parallel)
+        assert serial.inventory_sha256 == parallel.inventory_sha256
+        assert parallel.execution_receipt is not None
+        assert parallel.execution_receipt["effective_workers"] == 2
+        assert parallel.execution_receipt["declared_shard_count"] == 2
     finally:
-        candidates.close()
+        serial.close()
+        parallel.close()
+
+
+def test_candidate_worker_count_respects_all_bounds() -> None:
+    module = _load_module()
+
+    assert module.resolve_candidate_worker_count(
+        requested_workers=96,
+        declared_shard_count=201,
+        environ={"SLURM_CPUS_PER_TASK": "48"},
+    ) == (48, 48)
 
 
 def _write_bound_source(tmp_path: Path, rows: list[dict]) -> Path:

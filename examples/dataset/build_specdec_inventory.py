@@ -24,11 +24,13 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 import weakref
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from multiprocessing import get_context
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, overload
@@ -470,6 +472,7 @@ class CandidateInventory:
     held_out_exclusion: ExclusionProof
     ptv2_revision: str
     ptv2_allowlist_sha256: str
+    execution_receipt: Mapping[str, Any] | None = None
 
     def close(self) -> None:
         """Release temporary row storage after all sequence consumers finish."""
@@ -1312,6 +1315,500 @@ def _identity_chunks(
     yield canonical_json({"type": "quarantine", "counts": dict(quarantine_counts)}) + b"\n"
 
 
+_THREAD_ENVIRONMENT = (
+    "ARROW_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+)
+_PROCESS_TOKENIZER: Any | None = None
+
+
+@dataclass(frozen=True)
+class _CandidateShardTask:
+    index: int
+    source: SourceIdentity
+    descriptor: SourceFile
+    path: Path
+    spool_path: Path
+    source_manifest_sha256: str
+    tokenizer_sha256: str
+    chat_template_sha256: str | None
+    training_seq_len: int
+
+
+@dataclass(frozen=True)
+class _CandidateShardResult:
+    index: int
+    spool_path: Path
+    row_count: int
+    spool_bytes: int
+    spool_sha256: str
+    elapsed_seconds: float
+    worker_pid: int
+
+
+def resolve_candidate_worker_count(
+    *, requested_workers: int, declared_shard_count: int, environ: Mapping[str, str] | None = None
+) -> tuple[int, int]:
+    """Bound process workers by the allocation and the exact declared shard set."""
+    if isinstance(requested_workers, bool) or requested_workers < 1:
+        raise ValueError("candidate workers must be a positive integer")
+    if not 1 <= declared_shard_count <= 201:
+        raise ValueError("candidate processing requires between 1 and 201 shards")
+    environment = os.environ if environ is None else environ
+    raw_allocation = environment.get("SLURM_CPUS_PER_TASK")
+    try:
+        allocation = int(raw_allocation) if raw_allocation is not None else (os.cpu_count() or 1)
+    except ValueError as error:
+        raise ValueError("SLURM_CPUS_PER_TASK must be a positive integer") from error
+    if allocation < 1:
+        raise ValueError("candidate processing requires a positive CPU allocation")
+    return min(requested_workers, allocation, declared_shard_count, 96), allocation
+
+
+def _declared_candidate_files(
+    inventory: SourceInventory,
+) -> tuple[list[tuple[SourceIdentity, SourceFile, Path]], dict[str, tuple[int, ...]]]:
+    """Authenticate the namespace cheaply; workers authenticate shard bytes in parallel."""
+    if inventory.schema_version != 1 or inventory.staged_root is None:
+        raise ValueError("candidate inventory requires a staged version-1 SourceInventory")
+    root = inventory.staged_root.resolve(strict=True)
+    if (
+        _SHA256.fullmatch(inventory.manifest_sha256) is None
+        or hashlib.sha256(inventory.canonical_manifest).hexdigest() != inventory.manifest_sha256
+    ):
+        raise ValueError("source inventory manifest identity mismatch")
+    sources_root = root / "sources"
+    initial_tree = _staged_tree_snapshot(sources_root)
+    declared: list[tuple[SourceIdentity, SourceFile, Path]] = []
+    logical_files: set[tuple[str, str, str]] = set()
+    for source in sorted(inventory.sources, key=_source_key):
+        if not source.approved_use or _REVISION.fullmatch(source.revision) is None:
+            raise ValueError(f"unapproved or unpinned source identity: {source.repository_id}")
+        if source.lane not in {
+            "target-synth",
+            "agentless-swe",
+            "interactive-swe-replay",
+            "generic-tool-replay",
+        }:
+            raise ValueError(f"unsupported source lane: {source.lane}")
+        for descriptor in sorted(source.files, key=lambda item: item.path):
+            key = (source.repository_id, source.revision, descriptor.path)
+            if key in logical_files:
+                raise ValueError(f"duplicate logical source file: {key}")
+            logical_files.add(key)
+            path = _staged_path(root, source, descriptor)
+            try:
+                observed = os.lstat(path)
+            except OSError as error:
+                raise ValueError(f"source file is missing: {descriptor.path}") from error
+            if not stat.S_ISREG(observed.st_mode) or observed.st_size != descriptor.bytes:
+                raise ValueError(f"source file identity mismatch: {descriptor.path}")
+            declared.append((source, descriptor, path))
+    if set(initial_tree) != _expected_staged_tree_entries(
+        sources_root, [path for _source, _descriptor, path in declared]
+    ):
+        raise ValueError("authenticated physical shard set has undeclared entries")
+    return declared, initial_tree
+
+
+def _initialize_candidate_worker() -> None:
+    for name in _THREAD_ENVIRONMENT:
+        os.environ[name] = "1"
+
+
+def _spool_candidate_payload(
+    task: _CandidateShardTask, row_index: int, raw_row: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    if raw_row is None:
+        return {"reason": "invalid_row"}
+    assert _PROCESS_TOKENIZER is not None
+    row = dict(raw_row)
+    source = task.source
+    source_id = f"{source.repository_id}:{source.configuration}:{source.split}"
+    prompt_uuid: str | None = None
+    canonical_bytes: bytes | None = None
+    try:
+        source_conversation_sha256: str | None = None
+        source_response_sha256: str | None = None
+        if source.lane in {"interactive-swe-replay", "generic-tool-replay"}:
+            validation = validate_trajectory(
+                row,
+                source_id=f"{source_id}:{row_index}",
+                lane=source.lane,
+                tokenizer=_PROCESS_TOKENIZER,
+                training_seq_len=task.training_seq_len,
+            )
+            messages = validation.canonical["messages"]
+            tools = validation.canonical["tools"]
+            canonical_bytes = validation.canonical_bytes
+            replay_valid = True
+        else:
+            if _approved_ptv2_source(source):
+                messages, tools, source_conversation_sha256, source_response_sha256 = (
+                    _ptv2_target_prompt_identity(row)
+                )
+            else:
+                messages, tools = _target_prompt(row)
+            canonical_bytes = canonicalize_prompt(messages, tools)
+            replay_valid = False
+        canonical_prompt = json.loads(canonical_bytes)
+        messages = canonical_prompt["messages"]
+        tools = canonical_prompt["tools"]
+        prompt_uuid = sha256_bytes(canonical_bytes)
+        language = _normalize_language(row.get("language"), source)
+        input_ids = _candidate_tokenize(
+            _PROCESS_TOKENIZER,
+            messages,
+            tools,
+            add_generation_prompt=not replay_valid,
+        )
+        context_bucket = _context_bucket(len(input_ids))
+    except TrajectoryValidationError as error:
+        return {
+            "prompt_uuid": prompt_uuid,
+            "canonical_prompt": json.loads(canonical_bytes) if canonical_bytes is not None else None,
+            "reason": error.reason,
+        }
+    except ValueError as error:
+        reason = str(error)
+        if reason.startswith("conversation exceeds the 32K inventory limit"):
+            reason = "context_too_long"
+        if reason not in _CANDIDATE_QUARANTINE_CODES:
+            raise
+        return {
+            "prompt_uuid": prompt_uuid,
+            "canonical_prompt": json.loads(canonical_bytes) if canonical_bytes is not None else None,
+            "reason": reason,
+        }
+    candidate = CandidatePrompt(
+        prompt_uuid=prompt_uuid,
+        canonical_bytes=canonical_bytes,
+        source_id=source_id,
+        source_revision=source.revision,
+        source_file_sha256=task.descriptor.sha256,
+        source_row_index=row_index,
+        domain=_candidate_domain(source),
+        language=language,
+        lane=source.lane,
+        context_bucket=context_bucket,
+        full_token_count=len(input_ids),
+        source_manifest_sha256=task.source_manifest_sha256,
+        source_file_path=task.descriptor.path,
+        input_ids=input_ids,
+        tokenizer_sha256=task.tokenizer_sha256,
+        replay_valid=replay_valid,
+        source_family="ptv2" if _approved_ptv2_source(source) else "ptv3",
+        source_repository_id=source.repository_id,
+        source_configuration=source.configuration,
+        source_split=source.split,
+        source_conversation_sha256=source_conversation_sha256,
+        source_response_sha256=source_response_sha256,
+        chat_template_sha256=task.chat_template_sha256,
+    )
+    return {"prompt_uuid": prompt_uuid, "candidate": _candidate_record(candidate)}
+
+
+def _process_candidate_shard(task: _CandidateShardTask) -> _CandidateShardResult:
+    started = time.monotonic_ns()
+    descriptor, initial = _open_verified_source_fd(task.path, task.descriptor)
+    connection = sqlite3.connect(task.spool_path)
+    connection.execute("PRAGMA journal_mode=DELETE")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute(
+        "CREATE TABLE records (source_row_index INTEGER PRIMARY KEY, payload BLOB NOT NULL) WITHOUT ROWID"
+    )
+    row_count = 0
+    try:
+        for row_index, raw_row in _iter_candidate_rows_fd(descriptor, task.path.suffix):
+            payload = _spool_candidate_payload(task, row_index, raw_row)
+            connection.execute(
+                "INSERT INTO records VALUES (?, ?)", (row_index, canonical_json(payload))
+            )
+            row_count += 1
+            if row_count % 10_000 == 0:
+                connection.commit()
+        connection.commit()
+        _verify_source_fd_stable(descriptor, initial, task.path, task.descriptor)
+    except BaseException:
+        connection.close()
+        os.close(descriptor)
+        task.spool_path.unlink(missing_ok=True)
+        raise
+    connection.close()
+    os.close(descriptor)
+    return _CandidateShardResult(
+        task.index,
+        task.spool_path,
+        row_count,
+        task.spool_path.stat().st_size,
+        sha256_file(task.spool_path),
+        round((time.monotonic_ns() - started) / 1_000_000_000, 6),
+        os.getpid(),
+    )
+
+
+def _run_candidate_shard_workers(
+    tasks: tuple[_CandidateShardTask, ...], workers: int
+) -> tuple[_CandidateShardResult, ...]:
+    results: dict[int, _CandidateShardResult] = {}
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=get_context("fork"),
+        initializer=_initialize_candidate_worker,
+    ) as executor:
+        futures = {executor.submit(_process_candidate_shard, task): task.index for task in tasks}
+        try:
+            for future in as_completed(futures):
+                result = future.result()
+                results[result.index] = result
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    if len(results) != len(tasks):
+        raise RuntimeError("candidate processing did not return every declared shard")
+    return tuple(results[index] for index in range(len(tasks)))
+
+
+def _candidate_from_record(record: Mapping[str, Any]) -> CandidatePrompt:
+    return CandidatePrompt(
+        prompt_uuid=record["prompt_uuid"],
+        canonical_bytes=canonical_json(record["canonical_prompt"]),
+        source_id=record["source_id"],
+        source_revision=record["source_revision"],
+        source_file_sha256=record["source_file_sha256"],
+        source_row_index=record["source_row_index"],
+        domain=record["arm_domain"],
+        language=record["language"],
+        lane=record["lane"],
+        context_bucket=record["context_bucket"],
+        full_token_count=record["full_token_count"],
+        source_manifest_sha256=record["source_manifest_sha256"],
+        source_file_path=record["source_file_path"],
+        input_ids=tuple(record["input_ids"]),
+        tokenizer_sha256=record["tokenizer_sha256"],
+        replay_valid=record["replay_valid"],
+        source_family=record["source_family"],
+        source_repository_id=record["source_repository_id"],
+        source_configuration=record["source_configuration"],
+        source_split=record["source_split"],
+        source_conversation_sha256=record["source_conversation_sha256"],
+        source_response_sha256=record["source_response_sha256"],
+        chat_template_sha256=record.get("chat_template_sha256"),
+    )
+
+
+def _finalize_candidate_inventory(
+    *,
+    source_inventory: SourceInventory,
+    tokenizer_sha256: str,
+    baseline_exclusion: ExclusionReceipt,
+    held_out_exclusion: ExclusionReceipt,
+    database_path: Path,
+    storage_root: Path,
+    accepted_count: int,
+    capacity: dict[CandidateCell, int],
+    quarantine_counts: dict[str, int],
+    execution_receipt: Mapping[str, Any] | None = None,
+) -> CandidateInventory:
+    capacity = dict(
+        sorted(
+            capacity.items(),
+            key=lambda item: (
+                item[0].arm_domain,
+                item[0].lane,
+                item[0].language,
+                item[0].context_bucket,
+            ),
+        )
+    )
+    quarantine_counts = dict(sorted(quarantine_counts.items()))
+    baseline_proof = ExclusionProof(
+        baseline_exclusion.receipt_sha256,
+        baseline_exclusion.prompt_ids_sha256,
+        baseline_exclusion.prompt_id_count,
+        quarantine_counts.get("historical_exclusion", 0),
+    )
+    held_out_proof = ExclusionProof(
+        held_out_exclusion.receipt_sha256,
+        held_out_exclusion.prompt_ids_sha256,
+        held_out_exclusion.prompt_id_count,
+        quarantine_counts.get("heldout_exclusion", 0),
+    )
+    rows = DiskBackedCandidateRows(
+        database_path,
+        accepted_count,
+        source_inventory.manifest_sha256,
+        tokenizer_sha256,
+        storage_root,
+    )
+    digest = hashlib.sha256()
+    for chunk in _identity_chunks(
+        rows,
+        rows.source_manifest_sha256,
+        rows.tokenizer_sha256,
+        capacity,
+        quarantine_counts,
+        baseline_proof,
+        held_out_proof,
+        _PTV2_REVISION,
+        APPROVED_PTV2_ALLOWLIST_SHA256,
+    ):
+        digest.update(chunk)
+    return CandidateInventory(
+        rows=rows,
+        capacity=MappingProxyType(capacity),
+        quarantine_counts=MappingProxyType(quarantine_counts),
+        inventory_sha256=digest.hexdigest(),
+        baseline_exclusion=baseline_proof,
+        held_out_exclusion=held_out_proof,
+        ptv2_revision=_PTV2_REVISION,
+        ptv2_allowlist_sha256=APPROVED_PTV2_ALLOWLIST_SHA256,
+        execution_receipt=execution_receipt,
+    )
+
+
+def _build_candidate_inventory_parallel(
+    source_inventory: SourceInventory,
+    *,
+    tokenizer: Any,
+    tokenizer_sha256: str,
+    chat_template_sha256: str | None,
+    baseline_exclusion: ExclusionReceipt,
+    held_out_exclusion: ExclusionReceipt,
+    training_seq_len: int,
+    storage_dir: Path | None,
+    workers: int,
+    source_commit: str,
+) -> CandidateInventory:
+    historical_prompt_ids = _validate_exclusion_receipt(baseline_exclusion, "baseline")
+    held_out_prompt_ids = _validate_exclusion_receipt(held_out_exclusion, "held-out")
+    files, initial_tree = _declared_candidate_files(source_inventory)
+    effective_workers, allocated_cpus = resolve_candidate_worker_count(
+        requested_workers=workers, declared_shard_count=len(files)
+    )
+    storage_parent = storage_dir or Path(tempfile.gettempdir())
+    storage_parent.mkdir(parents=True, exist_ok=True)
+    storage_root = Path(tempfile.mkdtemp(prefix="specdec-candidates-", dir=storage_parent))
+    spool_root = storage_root / "shards"
+    spool_root.mkdir(mode=0o700)
+    database_path = storage_root / "candidates.sqlite3"
+    connection = _create_candidate_database(database_path)
+    started_wall_ns = time.time_ns()
+    started_monotonic_ns = time.monotonic_ns()
+    global _PROCESS_TOKENIZER
+    _PROCESS_TOKENIZER = tokenizer
+    tasks = tuple(
+        _CandidateShardTask(
+            index,
+            source,
+            descriptor,
+            path,
+            spool_root / f"shard-{index:03d}.sqlite3",
+            source_inventory.manifest_sha256,
+            tokenizer_sha256,
+            chat_template_sha256,
+            training_seq_len,
+        )
+        for index, (source, descriptor, path) in enumerate(files)
+    )
+    capacity: dict[CandidateCell, int] = {}
+    quarantine_counts: dict[str, int] = {}
+    accepted_count = 0
+    try:
+        results = _run_candidate_shard_workers(tasks, effective_workers)
+        assert source_inventory.staged_root is not None
+        sources_root = source_inventory.staged_root.resolve(strict=True) / "sources"
+        if _staged_tree_snapshot(sources_root) != initial_tree:
+            raise ValueError("authenticated physical shard set changed during processing")
+        for result in results:
+            observed = os.lstat(result.spool_path)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_size != result.spool_bytes
+                or sha256_file(result.spool_path) != result.spool_sha256
+            ):
+                raise ValueError("candidate worker spool changed before deterministic merge")
+            with sqlite3.connect(result.spool_path) as shard:
+                for (raw_payload,) in shard.execute(
+                    "SELECT payload FROM records ORDER BY source_row_index"
+                ):
+                    payload = json.loads(raw_payload)
+                    prompt_uuid = payload.get("prompt_uuid")
+                    if prompt_uuid in historical_prompt_ids:
+                        _quarantine(quarantine_counts, "historical_exclusion")
+                        continue
+                    if prompt_uuid in held_out_prompt_ids:
+                        _quarantine(quarantine_counts, "heldout_exclusion")
+                        continue
+                    reason = payload.get("reason")
+                    if reason is not None:
+                        _quarantine(quarantine_counts, reason)
+                        continue
+                    candidate = _candidate_from_record(payload["candidate"])
+                    previous = connection.execute(
+                        "SELECT canonical_bytes FROM candidates WHERE prompt_uuid = ?",
+                        (candidate.prompt_uuid,),
+                    ).fetchone()
+                    if previous is not None:
+                        if previous[0] != candidate.canonical_bytes:
+                            raise UUIDCollisionError(f"UUID collision: {candidate.prompt_uuid}")
+                        _quarantine(quarantine_counts, "duplicate_prompt_uuid")
+                        continue
+                    _insert_candidate(connection, candidate)
+                    accepted_count += 1
+                    cell = CandidateCell(
+                        candidate.arm_domain,
+                        candidate.lane,
+                        candidate.language,
+                        candidate.context_bucket,
+                    )
+                    capacity[cell] = capacity.get(cell, 0) + 1
+                    if accepted_count % 10_000 == 0:
+                        connection.commit()
+        connection.commit()
+        connection.close()
+        finished_wall_ns = time.time_ns()
+        execution: dict[str, Any] = {
+            "schema_version": 1,
+            "source_commit": source_commit,
+            "source_manifest_sha256": source_inventory.manifest_sha256,
+            "declared_shard_count": len(files),
+            "allocated_cpus": allocated_cpus,
+            "requested_workers": workers,
+            "effective_workers": effective_workers,
+            "threads_per_worker": 1,
+            "started_at_ns": started_wall_ns,
+            "finished_at_ns": finished_wall_ns,
+            "elapsed_seconds": round(
+                (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000, 6
+            ),
+            "shards": [asdict(result) | {"spool_path": result.spool_path.name} for result in results],
+        }
+        execution["receipt_sha256"] = sha256_bytes(canonical_json(execution))
+        return _finalize_candidate_inventory(
+            source_inventory=source_inventory,
+            tokenizer_sha256=tokenizer_sha256,
+            baseline_exclusion=baseline_exclusion,
+            held_out_exclusion=held_out_exclusion,
+            database_path=database_path,
+            storage_root=storage_root,
+            accepted_count=accepted_count,
+            capacity=capacity,
+            quarantine_counts=quarantine_counts,
+            execution_receipt=MappingProxyType(execution),
+        )
+    except BaseException:
+        connection.close()
+        shutil.rmtree(storage_root, ignore_errors=True)
+        raise
+    finally:
+        _PROCESS_TOKENIZER = None
+
+
 def build_candidate_inventory(
     source_inventory: SourceInventory,
     *,
@@ -1323,6 +1820,7 @@ def build_candidate_inventory(
     training_seq_len: int = 4_096,
     storage_dir: Path | None = None,
     workers: int = 1,
+    source_commit: str | None = None,
 ) -> CandidateInventory:
     """Build canonical B-prime/C/D candidates from one verified staged inventory."""
     if (
@@ -1332,9 +1830,24 @@ def build_candidate_inventory(
         or isinstance(workers, bool)
         or not isinstance(workers, int)
         or workers < 1
-        or workers > 256
     ):
         raise ValueError("tokenizer and training sequence length must be pinned")
+    if workers > 1:
+        resolved_commit = source_commit or os.environ.get("SOURCE_COMMIT", "")
+        if _REVISION.fullmatch(resolved_commit) is None:
+            raise ValueError("parallel candidate processing requires an exact source commit")
+        return _build_candidate_inventory_parallel(
+            source_inventory,
+            tokenizer=tokenizer,
+            tokenizer_sha256=tokenizer_sha256,
+            chat_template_sha256=chat_template_sha256,
+            baseline_exclusion=baseline_exclusion,
+            held_out_exclusion=held_out_exclusion,
+            training_seq_len=training_seq_len,
+            storage_dir=storage_dir,
+            workers=workers,
+            source_commit=resolved_commit,
+        )
     historical_prompt_ids = _validate_exclusion_receipt(baseline_exclusion, "baseline")
     held_out_prompt_ids = _validate_exclusion_receipt(held_out_exclusion, "held-out")
     files = _verified_candidate_files(source_inventory)
@@ -1346,172 +1859,111 @@ def build_candidate_inventory(
     database_path = storage_root / "candidates.sqlite3"
     connection = _create_candidate_database(database_path)
     accepted_count = 0
-
-    def tokenize_pending(prepared: dict[str, Any]) -> tuple[tuple[int, ...] | None, str | None]:
-        try:
-            input_ids = _candidate_tokenize(
-                tokenizer,
-                prepared["messages"],
-                prepared["tools"],
-                add_generation_prompt=prepared["add_generation_prompt"],
-            )
-            _context_bucket(len(input_ids))
-            return input_ids, None
-        except ValueError as error:
-            reason = str(error)
-            if reason.startswith("conversation exceeds the 32K inventory limit"):
-                reason = "context_too_long"
-            if reason not in _CANDIDATE_QUARANTINE_CODES:
-                raise
-            return None, reason
-
-    pending: dict[str, dict[str, Any]] = {}
-
-    def flush_pending(executor: ThreadPoolExecutor) -> None:
-        nonlocal accepted_count
-        batch = tuple(pending.values())
-        outcomes = executor.map(tokenize_pending, batch)
-        for prepared, (input_ids, reason) in zip(batch, outcomes, strict=True):
-            multiplicity = int(prepared["multiplicity"])
-            if reason is not None or input_ids is None:
-                quarantine_counts[reason or "invalid_tokenization"] = (
-                    quarantine_counts.get(reason or "invalid_tokenization", 0) + multiplicity
-                )
-                continue
-            candidate = CandidatePrompt(
-                prompt_uuid=prepared["prompt_uuid"],
-                canonical_bytes=prepared["canonical_bytes"],
-                source_id=prepared["source_id"],
-                source_revision=prepared["source"].revision,
-                source_file_sha256=prepared["descriptor"].sha256,
-                source_row_index=prepared["row_index"],
-                domain=prepared["domain"],
-                language=prepared["language"],
-                lane=prepared["source"].lane,
-                context_bucket=_context_bucket(len(input_ids)),
-                full_token_count=len(input_ids),
-                source_manifest_sha256=source_inventory.manifest_sha256,
-                source_file_path=prepared["descriptor"].path,
-                input_ids=input_ids,
-                tokenizer_sha256=tokenizer_sha256,
-                replay_valid=prepared["replay_valid"],
-                source_family="ptv2" if _approved_ptv2_source(prepared["source"]) else "ptv3",
-                source_repository_id=prepared["source"].repository_id,
-                source_configuration=prepared["source"].configuration,
-                source_split=prepared["source"].split,
-                source_conversation_sha256=prepared["source_conversation_sha256"],
-                source_response_sha256=prepared["source_response_sha256"],
-                chat_template_sha256=chat_template_sha256,
-            )
-            _insert_candidate(connection, candidate)
-            accepted_count += 1
-            if accepted_count % 10_000 == 0:
-                connection.commit()
-            if multiplicity > 1:
-                quarantine_counts["duplicate_prompt_uuid"] = (
-                    quarantine_counts.get("duplicate_prompt_uuid", 0) + multiplicity - 1
-                )
-            cell = CandidateCell(
-                prepared["domain"],
-                prepared["source"].lane,
-                prepared["language"],
-                candidate.context_bucket,
-            )
-            capacity[cell] = capacity.get(cell, 0) + 1
-        pending.clear()
-
     try:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="candidate-tokenizer") as executor:
-            for source, descriptor, path in files:
-                source_id = f"{source.repository_id}:{source.configuration}:{source.split}"
-                for row_index, raw_row in _iter_candidate_rows(path):
-                    if raw_row is None:
-                        _quarantine(quarantine_counts, "invalid_row")
-                        continue
-                    row = dict(raw_row)
-                    try:
-                        source_conversation_sha256: str | None = None
-                        source_response_sha256: str | None = None
-                        if source.lane in {"interactive-swe-replay", "generic-tool-replay"}:
-                            validation = validate_trajectory(
-                                row,
-                                source_id=f"{source_id}:{row_index}",
-                                lane=source.lane,
-                                tokenizer=tokenizer,
-                                training_seq_len=training_seq_len,
-                            )
-                            messages = validation.canonical["messages"]
-                            tools = validation.canonical["tools"]
-                            canonical_bytes = validation.canonical_bytes
-                            replay_valid = True
+        for source, descriptor, path in files:
+            source_id = f"{source.repository_id}:{source.configuration}:{source.split}"
+            for row_index, raw_row in _iter_candidate_rows(path):
+                if raw_row is None:
+                    _quarantine(quarantine_counts, "invalid_row")
+                    continue
+                row = dict(raw_row)
+                try:
+                    source_conversation_sha256: str | None = None
+                    source_response_sha256: str | None = None
+                    if source.lane in {"interactive-swe-replay", "generic-tool-replay"}:
+                        validation = validate_trajectory(
+                            row,
+                            source_id=f"{source_id}:{row_index}",
+                            lane=source.lane,
+                            tokenizer=tokenizer,
+                            training_seq_len=training_seq_len,
+                        )
+                        messages = validation.canonical["messages"]
+                        tools = validation.canonical["tools"]
+                        canonical_bytes = validation.canonical_bytes
+                        replay_valid = True
+                    else:
+                        if _approved_ptv2_source(source):
+                            (
+                                messages,
+                                tools,
+                                source_conversation_sha256,
+                                source_response_sha256,
+                            ) = _ptv2_target_prompt_identity(row)
                         else:
-                            if _approved_ptv2_source(source):
-                                (
-                                    messages,
-                                    tools,
-                                    source_conversation_sha256,
-                                    source_response_sha256,
-                                ) = _ptv2_target_prompt_identity(row)
-                            else:
-                                messages, tools = _target_prompt(row)
-                            canonical_bytes = canonicalize_prompt(messages, tools)
-                            replay_valid = False
-                        canonical_prompt = json.loads(canonical_bytes)
-                        messages = canonical_prompt["messages"]
-                        tools = canonical_prompt["tools"]
-                        uuid = sha256_bytes(canonical_bytes)
-                        if uuid in historical_prompt_ids:
-                            _quarantine(quarantine_counts, "historical_exclusion")
-                            continue
-                        if uuid in held_out_prompt_ids:
-                            _quarantine(quarantine_counts, "heldout_exclusion")
-                            continue
-                        previous_pending = pending.get(uuid)
-                        if previous_pending is not None:
-                            if previous_pending["canonical_bytes"] != canonical_bytes:
-                                raise UUIDCollisionError(f"UUID collision: {uuid}")
-                            previous_pending["multiplicity"] += 1
-                            continue
-                        previous = connection.execute(
-                            "SELECT canonical_bytes FROM candidates WHERE prompt_uuid = ?", (uuid,)
-                        ).fetchone()
-                        if previous is not None:
-                            if previous[0] != canonical_bytes:
-                                raise UUIDCollisionError(f"UUID collision: {uuid}")
-                            _quarantine(quarantine_counts, "duplicate_prompt_uuid")
-                            continue
-                        language = _normalize_language(row.get("language"), source)
-                    except TrajectoryValidationError as error:
-                        _quarantine(quarantine_counts, error.reason)
+                            messages, tools = _target_prompt(row)
+                        canonical_bytes = canonicalize_prompt(messages, tools)
+                        replay_valid = False
+                    canonical_prompt = json.loads(canonical_bytes)
+                    messages = canonical_prompt["messages"]
+                    tools = canonical_prompt["tools"]
+                    uuid = sha256_bytes(canonical_bytes)
+                    if uuid in historical_prompt_ids:
+                        _quarantine(quarantine_counts, "historical_exclusion")
                         continue
-                    except ValueError as error:
-                        reason = str(error)
-                        if reason not in _CANDIDATE_QUARANTINE_CODES:
-                            raise
-                        _quarantine(quarantine_counts, reason)
+                    if uuid in held_out_prompt_ids:
+                        _quarantine(quarantine_counts, "heldout_exclusion")
                         continue
-                    domain = _candidate_domain(source)
-                    pending[uuid] = {
-                        "prompt_uuid": uuid,
-                        "canonical_bytes": canonical_bytes,
-                        "source_id": source_id,
-                        "source": source,
-                        "descriptor": descriptor,
-                        "row_index": row_index,
-                        "domain": domain,
-                        "language": language,
-                        "messages": messages,
-                        "tools": tools,
-                        "add_generation_prompt": not replay_valid,
-                        "replay_valid": replay_valid,
-                        "source_conversation_sha256": source_conversation_sha256,
-                        "source_response_sha256": source_response_sha256,
-                        "multiplicity": 1,
-                    }
-                    if len(pending) >= workers * 4:
-                        flush_pending(executor)
-            if pending:
-                flush_pending(executor)
+                    previous = connection.execute(
+                        "SELECT canonical_bytes FROM candidates WHERE prompt_uuid = ?", (uuid,)
+                    ).fetchone()
+                    if previous is not None:
+                        if previous[0] != canonical_bytes:
+                            raise UUIDCollisionError(f"UUID collision: {uuid}")
+                        _quarantine(quarantine_counts, "duplicate_prompt_uuid")
+                        continue
+                    language = _normalize_language(row.get("language"), source)
+                    input_ids = _candidate_tokenize(
+                        tokenizer,
+                        messages,
+                        tools,
+                        add_generation_prompt=not replay_valid,
+                    )
+                    context_bucket = _context_bucket(len(input_ids))
+                except TrajectoryValidationError as error:
+                    _quarantine(quarantine_counts, error.reason)
+                    continue
+                except ValueError as error:
+                    reason = str(error)
+                    if reason.startswith("conversation exceeds the 32K inventory limit"):
+                        reason = "context_too_long"
+                    if reason not in _CANDIDATE_QUARANTINE_CODES:
+                        raise
+                    _quarantine(quarantine_counts, reason)
+                    continue
+                candidate = CandidatePrompt(
+                    prompt_uuid=uuid,
+                    canonical_bytes=canonical_bytes,
+                    source_id=source_id,
+                    source_revision=source.revision,
+                    source_file_sha256=descriptor.sha256,
+                    source_row_index=row_index,
+                    domain=_candidate_domain(source),
+                    language=language,
+                    lane=source.lane,
+                    context_bucket=context_bucket,
+                    full_token_count=len(input_ids),
+                    source_manifest_sha256=source_inventory.manifest_sha256,
+                    source_file_path=descriptor.path,
+                    input_ids=input_ids,
+                    tokenizer_sha256=tokenizer_sha256,
+                    replay_valid=replay_valid,
+                    source_family="ptv2" if _approved_ptv2_source(source) else "ptv3",
+                    source_repository_id=source.repository_id,
+                    source_configuration=source.configuration,
+                    source_split=source.split,
+                    source_conversation_sha256=source_conversation_sha256,
+                    source_response_sha256=source_response_sha256,
+                    chat_template_sha256=chat_template_sha256,
+                )
+                _insert_candidate(connection, candidate)
+                accepted_count += 1
+                if accepted_count % 10_000 == 0:
+                    connection.commit()
+                cell = CandidateCell(
+                    _candidate_domain(source), source.lane, language, context_bucket
+                )
+                capacity[cell] = capacity.get(cell, 0) + 1
         connection.commit()
     except BaseException:
         connection.close()
@@ -1584,6 +2036,7 @@ def build_candidate_inventory_from_snapshot(
     training_seq_len: int = 4_096,
     storage_dir: Path | None = None,
     workers: int = 1,
+    source_commit: str | None = None,
 ) -> CandidateInventory:
     """Build candidates with a tokenizer loaded from a caller-pinned local snapshot."""
     snapshot, tokenizer = _authenticated_snapshot_tokenizer(
@@ -1599,6 +2052,7 @@ def build_candidate_inventory_from_snapshot(
         training_seq_len=training_seq_len,
         storage_dir=storage_dir,
         workers=workers,
+        source_commit=source_commit,
     )
     if (
         load_tokenizer_snapshot(tokenizer_snapshot_receipt, tokenizer_snapshot_receipt_sha256)

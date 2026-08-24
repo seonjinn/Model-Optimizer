@@ -120,6 +120,5 @@ def test_task5_runner_uses_an_authenticated_container_runtime() -> None:
     assert 'sha256sum "$IMAGE_PATH"' in runner
     assert '--no-container-mount-home --container-image="$IMAGE_PATH"' in runner
     assert "--container-mounts=" in runner
-    assert "--workers 96" in runner
     assert "--image PATH --image-sha256 SHA256" in submitter
     assert "IMAGE_PATH=$IMAGE_PATH,IMAGE_SHA256=$IMAGE_SHA256" in submitter

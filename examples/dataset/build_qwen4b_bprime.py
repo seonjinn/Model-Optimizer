@@ -172,7 +172,7 @@ def main() -> int:
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--storage-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=96)
     args = parser.parse_args()
 
     source_inventory = load_source_inventory(args.source_inventory)
@@ -188,6 +188,7 @@ def main() -> int:
         training_seq_len=policy.sequence_length,
         storage_dir=args.storage_dir,
         workers=args.workers,
+        source_commit=os.environ.get("SOURCE_COMMIT"),
     )
     bundle = None
     try:
@@ -206,6 +207,31 @@ def main() -> int:
             bundle.close()
         candidates.close()
     manifest_sha256 = sha256_file(published.manifest_path)
+    execution_receipt_path = args.output_dir.with_name(
+        f"{args.output_dir.name}.EXECUTION_RECEIPT.json"
+    )
+    if candidates.execution_receipt is None:
+        raise RuntimeError("parallel Task5 candidate execution receipt is missing")
+    execution_payload = dict(candidates.execution_receipt)
+    execution_payload["selection_manifest_sha256"] = manifest_sha256
+    execution_payload["selection_root_sha256"] = published.root_sha256
+    execution_payload.pop("receipt_sha256", None)
+    execution_payload["receipt_sha256"] = sha256_bytes(canonical_json(execution_payload))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(execution_receipt_path, flags, 0o444)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_json(execution_payload) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        execution_receipt_path.unlink(missing_ok=True)
+        raise
+    parent_descriptor = os.open(execution_receipt_path.parent, os.O_RDONLY)
+    try:
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
     print(
         json.dumps(
             {
@@ -213,6 +239,7 @@ def main() -> int:
                 "manifest_sha256": manifest_sha256,
                 "root_sha256": published.root_sha256,
                 "row_count": published.row_count,
+                "execution_receipt": str(execution_receipt_path),
             },
             sort_keys=True,
         )
