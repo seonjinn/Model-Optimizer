@@ -17,9 +17,12 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import importlib.util
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -30,6 +33,19 @@ assert _SPEC is not None and _SPEC.loader is not None
 bundle_manifest = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = bundle_manifest
 _SPEC.loader.exec_module(bundle_manifest)
+
+
+class _UnsupportedRename:
+    argtypes: list[object] = []
+    restype: object | None = None
+
+    def __call__(self, *_arguments: object) -> int:
+        ctypes.set_errno(errno.EINVAL)
+        return -1
+
+
+class _UnsupportedRenameLibrary:
+    renameat2 = _UnsupportedRename()
 
 
 def test_completion_marker_binds_artifact_source_commit(tmp_path: Path) -> None:
@@ -96,3 +112,54 @@ def test_manifest_rejects_publication_from_another_artifact_commit(tmp_path: Pat
     )
     with pytest.raises(bundle_manifest.BundleError, match="artifact source commit"):
         bundle_manifest.create_manifest(source, durable, tmp_path / "manifest.json", "a" * 40)
+
+
+def test_atomic_install_falls_back_when_lustre_rejects_renameat2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Lustre EINVAL installs through an atomic destination reservation."""
+    durable = tmp_path / "durable"
+    partial = durable / "artifact.partial"
+    partial.mkdir(parents=True)
+    (partial / "payload.bin").write_bytes(b"payload")
+    manifest = tmp_path / "manifest.json"
+    bundle_manifest.create_manifest(partial, durable, manifest, "a" * 40)
+    destination = durable / "artifact"
+    monkeypatch.setattr(bundle_manifest.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        bundle_manifest.ctypes, "CDLL", lambda *_args, **_kwargs: _UnsupportedRenameLibrary()
+    )
+
+    assert bundle_manifest.atomic_install(manifest, partial, destination) == "installed"
+    assert not partial.exists()
+    assert (destination / "payload.bin").read_bytes() == b"payload"
+
+
+def test_lustre_fallback_never_replaces_a_concurrent_winner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exactly one fallback publisher claims an absent destination."""
+    destination = tmp_path / "artifact"
+    partials = [tmp_path / "partial-a", tmp_path / "partial-b"]
+    for index, partial in enumerate(partials):
+        partial.mkdir()
+        (partial / "winner").write_text(str(index), encoding="utf-8")
+    monkeypatch.setattr(bundle_manifest.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        bundle_manifest.ctypes, "CDLL", lambda *_args, **_kwargs: _UnsupportedRenameLibrary()
+    )
+
+    def install(partial: Path) -> str:
+        try:
+            bundle_manifest._rename_no_replace(partial, destination)
+        except FileExistsError:
+            return "collision"
+        return "installed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(install, partials))
+
+    assert sorted(results) == ["collision", "installed"]
+    assert (destination / "winner").read_text(encoding="utf-8") in {"0", "1"}
+    loser = partials[results.index("collision")]
+    assert (loser / "winner").is_file()

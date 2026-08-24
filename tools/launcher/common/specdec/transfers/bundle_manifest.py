@@ -366,7 +366,15 @@ def verify_launcher(root: Path, expected_commit: str) -> None:
         raise BundleError("launcher checkout is not clean")
 
 
-def _rename_no_replace(source: Path, destination: Path) -> None:
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _native_rename_no_replace(source: Path, destination: Path) -> None:
     system = platform.system()
     library = ctypes.CDLL(None, use_errno=True)
     source_bytes = os.fsencode(source)
@@ -375,7 +383,7 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
         try:
             rename = library.renameat2
         except AttributeError as error:
-            raise BundleError("atomic no-replace rename is unavailable") from error
+            raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable") from error
         rename.argtypes = [
             ctypes.c_int,
             ctypes.c_char_p,
@@ -391,13 +399,80 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
         rename.restype = ctypes.c_int
         result = rename(source_bytes, destination_bytes, 0x00000004)
     else:
-        raise BundleError(f"atomic no-replace rename is unsupported on {system}")
+        raise OSError(errno.ENOSYS, f"atomic no-replace rename is unsupported on {system}")
     if result == 0:
         return
     error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise FileExistsError(error_number, os.strerror(error_number), destination)
-    raise BundleError(f"atomic no-replace rename failed: {os.strerror(error_number)}")
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _rename_with_directory_reservation(source: Path, destination: Path) -> None:
+    """Reserve an absent sibling pathname before a portable directory rename."""
+    if source.parent.absolute() != destination.parent.absolute():
+        raise BundleError("download partial must be a sibling of the final destination")
+    parent = source.parent
+    try:
+        parent_before = os.lstat(parent)
+        source_before = os.lstat(source)
+    except OSError as error:
+        raise BundleError("cannot inspect download installation paths") from error
+    if stat.S_ISLNK(parent_before.st_mode) or not stat.S_ISDIR(parent_before.st_mode):
+        raise BundleError("download parent is not a no-follow directory")
+    if stat.S_ISLNK(source_before.st_mode) or not stat.S_ISDIR(source_before.st_mode):
+        raise BundleError("download partial is not a no-follow directory")
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError:
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from None
+    try:
+        reservation = os.lstat(destination)
+        _fsync_directory(parent)
+        parent_after = os.lstat(parent)
+        destination_before = os.lstat(destination)
+    except OSError as error:
+        raise BundleError("cannot verify download destination reservation") from error
+    if (parent_after.st_dev, parent_after.st_ino) != (parent_before.st_dev, parent_before.st_ino):
+        raise BundleError("download parent changed after destination reservation")
+    if (
+        stat.S_ISLNK(reservation.st_mode)
+        or not stat.S_ISDIR(reservation.st_mode)
+        or (destination_before.st_dev, destination_before.st_ino)
+        != (reservation.st_dev, reservation.st_ino)
+    ):
+        raise BundleError("download destination reservation changed before rename")
+    with os.scandir(destination) as entries:
+        if next(entries, None) is not None:
+            raise BundleError("download destination reservation changed before rename")
+    try:
+        os.rename(source, destination)
+    except OSError as error:
+        if error.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
+        raise BundleError(f"atomic reserved rename failed: {error}") from error
+    installed = os.lstat(destination)
+    if (installed.st_dev, installed.st_ino) != (source_before.st_dev, source_before.st_ino):
+        raise BundleError("installed destination differs from the verified partial")
+    _fsync_directory(parent)
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    try:
+        _native_rename_no_replace(source, destination)
+        return
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
+        unsupported = {errno.EINVAL, errno.ENOSYS}
+        unsupported.update(
+            number
+            for number in (getattr(errno, "EOPNOTSUPP", None), getattr(errno, "ENOTSUP", None))
+            if number is not None
+        )
+        if error.errno not in unsupported:
+            raise BundleError(
+                f"atomic no-replace rename failed: {os.strerror(error.errno or errno.EIO)}"
+            ) from error
+    _rename_with_directory_reservation(source, destination)
 
 
 def _validate_symlink(path: Path, durable_root: Path) -> None:
