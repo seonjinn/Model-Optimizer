@@ -258,7 +258,7 @@ def _manifest_payload(
                 "license_expression": APPROVED_LICENSE_EXPRESSION,
                 "approved_use": True,
                 "cell": split,
-                "lane": "source-native",
+                "lane": "target-synth",
                 "files": by_split[split],
             }
             for split in split_counts

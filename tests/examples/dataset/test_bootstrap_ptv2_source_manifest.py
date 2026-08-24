@@ -159,7 +159,7 @@ def test_exact_201_manifest_is_directly_loadable_and_has_exact_metadata(tmp_path
         assert source.license_expression == "CC-BY-4.0"
         assert source.approved_use is True
         assert source.cell == source.split
-        assert source.lane == "source-native"
+        assert source.lane == "target-synth"
         assert len(source.files) == PRODUCTION_COUNTS[source.split]
         for descriptor in source.files:
             basename = Path(descriptor.path).name
