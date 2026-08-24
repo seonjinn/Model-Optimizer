@@ -79,10 +79,36 @@ def _vllm_checkout(tmp_path: Path) -> tuple[Path, str, str]:
     package = repo / "vllm"
     package.mkdir()
     (package / "__init__.py").write_text('__version__ = "test"\n')
+    profile_speculator = package / "v1/worker/gpu/spec_decode/dflash/speculator.py"
+    profile_speculator.parent.mkdir(parents=True)
+    profile_speculator.write_text(
+        "        if dummy_run and skip_attn_for_dummy_run:\n"
+        "            # Memory profiling path: block_tables / kv_cache_config are not initialized.\n"
+        "            # Since DFlash needs to build its own attention metadata, we must skip the\n"
+        "            # preparation in this path and run a minimal forward pass.\n"
+        "            self.model.precompute_and_store_context_kv(\n"
+        "                self.hidden_states[:num_target_tokens],\n"
+        "                self.context_positions[:num_target_tokens],\n"
+        "            )\n"
+        "            # DFlash processes all speculative tokens in one forward pass,\n"
+        "            # so the real token count is num_query_tokens.\n"
+        "            self._prepare_eplb_forward(num_query_tokens)\n"
+        "            self._generate_draft(\n"
+        "                num_reqs,\n"
+        "                num_query_tokens,\n"
+        "                attn_metadata=None,\n"
+        "                slot_mappings=None,\n"
+        "                num_tokens_across_dp=num_tokens_across_dp,\n"
+        "                cudagraph_runtime_mode=CUDAGraphMode.NONE,\n"
+        "            )\n"
+        "            return self.draft_tokens[:num_reqs]\n\n"
+        "        # The query slot mapping is written into the shared BlockTables slot_mappings.\n"
+        "        # That buffer's address is what the captured CUDA graph reads from at replay.\n"
+    )
     recipe = repo / "cmake/external_projects/flashmla.cmake"
     recipe.parent.mkdir(parents=True)
     recipe.write_text("GIT_TAG test-flashmla\n")
-    _git(repo, "add", "vllm/__init__.py", "cmake/external_projects/flashmla.cmake")
+    _git(repo, "add", "vllm", "cmake/external_projects/flashmla.cmake")
     _git(repo, "commit", "-q", "-m", "required DFlash2 runtime")
     required = _git(repo, "rev-parse", "HEAD")
     (package / "runtime.py").write_text("SUPPORTED = True\n")
@@ -304,6 +330,63 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
         "_flashmla_C.abi3.so",
         "_flashmla_extension_C.abi3.so",
     }
+    patched_root = tmp_path / "patched-runtime"
+    patched_runtime = patched_root / "vllm"
+    __import__("shutil").copytree(runtime, patched_runtime)
+    patch_source = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/patches/vllm-b389-dflash-profile-capacity.patch"
+    )
+    patch_path = patched_root / "dflash2-vllm-profile-capacity-patch.diff"
+    base_path = patched_root / "dflash2-vllm-profile-capacity-base.py"
+    __import__("shutil").copy2(patch_source, patch_path)
+    __import__("shutil").copy2(
+        package / "v1/worker/gpu/spec_decode/dflash/speculator.py",
+        base_path,
+    )
+    subprocess.run(
+        ["git", "-C", str(patched_root), "apply", str(patch_path)],
+        check=True,
+    )
+    __import__("shutil").copy2(build_manifest, patched_root / build_manifest.name)
+    __import__("shutil").copy2(configure_log, patched_root / configure_log.name)
+    patched_receipt = patched_root / "dflash2-vllm-runtime-receipt.json"
+    patched_receipt_sha = write_vllm_runtime_receipt(
+        patched_receipt,
+        package,
+        expected,
+        required,
+        runtime_package_path=patched_runtime,
+        flashmla_package_path=flashmla,
+        flashmla_expected_commit=flashmla_commit,
+        flashmla_build_manifest_path=patched_root / build_manifest.name,
+        runtime_source_patch_path=patch_path,
+        runtime_source_patch_base_path=base_path,
+    )
+    assert json.loads(patched_receipt.read_text())["schema_version"] == 5
+    assert (
+        verify_vllm_runtime(
+            patched_runtime,
+            patched_receipt,
+            patched_receipt_sha,
+            expected,
+            required,
+            expected_flashmla_commit=flashmla_commit,
+        )
+        == expected
+    )
+    patched_file = patched_runtime / "v1/worker/gpu/spec_decode/dflash/speculator.py"
+    patched_file.write_text(patched_file.read_text() + "# forged\n")
+    with pytest.raises(ValueError, match="profile patch output mismatch"):
+        verify_vllm_runtime(
+            patched_runtime,
+            patched_receipt,
+            patched_receipt_sha,
+            expected,
+            required,
+            expected_flashmla_commit=flashmla_commit,
+        )
+
     (runtime / "runtime.py").write_text("SUPPORTED = False\n")
     with pytest.raises(ValueError, match="runtime file bytes"):
         verify_vllm_runtime(
@@ -1067,6 +1150,31 @@ def test_dflash2_serve_gate_has_a_bounded_selector_diagnostic_mode() -> None:
         "sitecustomize.INSTALLED",
     ):
         assert required in script
+
+
+def test_pinned_vllm_patch_caps_only_the_dflash_profile_query_expansion() -> None:
+    """B8 profiling must fit 1024 dummy requests into the 4096-token buffer."""
+    patch_path = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/patches/vllm-b389-dflash-profile-capacity.patch"
+    )
+    patch = patch_path.read_text()
+    builder = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/build_dflash2_runtime.sbatch"
+    ).read_text()
+    assert "Memory profiling path" in patch
+    assert "profile_num_reqs = min(" in patch
+    assert "self.max_num_tokens // self.num_query_per_req" in patch
+    assert "num_reqs=profile_num_reqs" in patch
+    assert "num_tokens_padded=profile_num_query_tokens" in patch
+    assert "return self.draft_tokens[:profile_num_reqs]" in patch
+    assert min(1024, 4096 // 8) == 512
+    assert min(1, 8 // 8) == 1
+    assert 'git -C "$build_source" apply --check "$PROFILE_PATCH"' in builder
+    assert 'git -C "$build_source" apply "$PROFILE_PATCH"' in builder
+    assert 'cp -a "$build_source/vllm/." "$runtime_package/"' in builder
+    assert "--runtime-source-patch" in builder
 
 
 def test_dflash2_artifact_receipt_builder_creates_scratch_before_pyxis() -> None:

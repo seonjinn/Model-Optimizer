@@ -26,8 +26,11 @@ EXPECTED_COMMIT=b389ac29465b33f9e9c534df221ea3c129e9793f
 REQUIRED_COMMIT=b389ac29465b33f9e9c534df221ea3c129e9793f
 FLASHMLA_COMMIT=a8f794d1251cbfd88a5011445dd5582289c727e4
 VLLM_CUTLASS_COMMIT=da5e086dab31d63815acafdac9a9c5893b1c69e2
+PROFILE_PATCH="$LAUNCHER_ROOT/tools/launcher/common/specdec/patches/vllm-b389-dflash-profile-capacity.patch"
+PROFILE_PATCH_SHA256=915b27e8c526589f2cee9e114df242b67c67ff98df9afdaf2c9c3fc93c6cdd1f
 
-[[ -f "$BASE_RUNTIME" && -f "$IMAGE" && -d "$VLLM_CHECKOUT/vllm" && -d "$FLASHMLA_CHECKOUT/flash_mla" && -d "$VLLM_CUTLASS_CHECKOUT/include/cutlass" ]] || exit 2
+[[ -f "$BASE_RUNTIME" && -f "$IMAGE" && -f "$PROFILE_PATCH" && -d "$VLLM_CHECKOUT/vllm" && -d "$FLASHMLA_CHECKOUT/flash_mla" && -d "$VLLM_CUTLASS_CHECKOUT/include/cutlass" ]] || exit 2
+[[ "$(sha256sum "$PROFILE_PATCH" | cut -d' ' -f1)" == "$PROFILE_PATCH_SHA256" ]]
 [[ ! -e "$OUTPUT_ARCHIVE" && ! -e "${OUTPUT_ARCHIVE}.sha256" ]] || {
     echo "refusing to replace existing runtime output" >&2
     exit 2
@@ -48,6 +51,11 @@ vllm_cutlass_archive="$work_root/vllm-cutlass-source.tar"
 mkdir -p "$prepared" "$build_source" "$build_directory" "$(dirname "$OUTPUT_ARCHIVE")"
 tar --extract --file="$BASE_RUNTIME" --directory="$prepared"
 git -C "$VLLM_CHECKOUT" archive HEAD | tar -x -C "$build_source"
+cp "$VLLM_CHECKOUT/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py" \
+    "$prepared/dflash2-vllm-profile-capacity-base.py"
+git -C "$build_source" apply --check "$PROFILE_PATCH"
+git -C "$build_source" apply "$PROFILE_PATCH"
+cp "$PROFILE_PATCH" "$prepared/dflash2-vllm-profile-capacity-patch.diff"
 git -C "$VLLM_CUTLASS_CHECKOUT" archive HEAD >"$vllm_cutlass_archive"
 mkdir -p "$vllm_cutlass_source"
 tar -xf "$vllm_cutlass_archive" -C "$vllm_cutlass_source"
@@ -112,16 +120,15 @@ focused_vllm_cmake="$build_source/CMakeLists.txt"
 mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${FLASHMLA_CHECKOUT}:${FLASHMLA_CHECKOUT}:ro,${LAUNCHER_ROOT}:${LAUNCHER_ROOT}:ro"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
-    bash -s -- "$prepared" "$VLLM_CHECKOUT" "$FLASHMLA_CHECKOUT" "$build_source" \
+    bash -s -- "$prepared" "$FLASHMLA_CHECKOUT" "$build_source" \
     "$build_directory" "$vllm_cutlass_source" "$MODE" <<'INNER'
 set -euo pipefail
 prepared="$1"
-checkout="$2"
-flashmla_checkout="$3"
-build_source="$4"
-build_directory="$5"
-vllm_cutlass_source="$6"
-mode="$7"
+flashmla_checkout="$2"
+build_source="$3"
+build_directory="$4"
+vllm_cutlass_source="$5"
+mode="$6"
 configure_log="$prepared/dflash2-flashmla-cmake-configure.log"
 "$prepared/bin/python" -m pip install --disable-pip-version-check --no-cache-dir \
     --only-binary=:all: --no-deps --ignore-installed cmake==3.31.6 ninja==1.13.0
@@ -150,7 +157,7 @@ runtime_package="$site_package/vllm"
 printf '%s\n' "$runtime_package" >"$prepared/dflash2-vllm-runtime-package.path"
 mkdir -p "$runtime_package"
 rm -f "$runtime_package"/_flashmla_C*.so "$runtime_package"/_flashmla_extension_C*.so
-cp -a "$checkout/vllm/." "$runtime_package/"
+cp -a "$build_source/vllm/." "$runtime_package/"
 while IFS= read -r -d '' extension; do
     relative="${extension#"$system_package/"}"
     case "$relative" in
@@ -210,6 +217,8 @@ PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
     "$LAUNCHER_ROOT/tools/launcher/common/specdec/dflash2_runtime_contract.py" vllm-receipt \
     --package "$VLLM_CHECKOUT/vllm" --runtime-package "$runtime_package" --output "$receipt" \
     --expected-commit "$EXPECTED_COMMIT" --required-ancestor "$REQUIRED_COMMIT" \
+    --runtime-source-patch "$prepared/dflash2-vllm-profile-capacity-patch.diff" \
+    --runtime-source-patch-base "$prepared/dflash2-vllm-profile-capacity-base.py" \
     --flashmla-package "$FLASHMLA_CHECKOUT/flash_mla" \
     --flashmla-expected-commit "$FLASHMLA_COMMIT" --flashmla-build-manifest "$build_manifest" \
     >"$prepared/dflash2-vllm-runtime-receipt.sha256"

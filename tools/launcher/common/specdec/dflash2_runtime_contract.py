@@ -14,6 +14,7 @@ import re
 import shutil
 import stat
 import subprocess  # nosec B404 - Git is invoked with fixed argv during receipt creation.
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,10 @@ _FLASHMLA_BUILD_MANIFEST = "dflash2-flashmla-build-manifest.json"
 _FLASHMLA_CONFIGURE_LOG = "dflash2-flashmla-cmake-configure.log"
 _FLASHMLA_EXTENSION_STEMS = ("_flashmla_C", "_flashmla_extension_C")
 _VLLM_CUTLASS_REVISION = "v4.4.2"
+_VLLM_PROFILE_PATCH_NAME = "dflash2-vllm-profile-capacity-patch.diff"
+_VLLM_PROFILE_PATCH_BASE_NAME = "dflash2-vllm-profile-capacity-base.py"
+_VLLM_PROFILE_PATCH_TARGET = "v1/worker/gpu/spec_decode/dflash/speculator.py"
+_VLLM_PROFILE_PATCH_SHA256 = "915b27e8c526589f2cee9e114df242b67c67ff98df9afdaf2c9c3fc93c6cdd1f"
 _DFLASH2_FEATURE_PATHS = (
     "modelopt/torch/export/plugins/hf_spec_export.py",
     "modelopt/torch/speculative/config.py",
@@ -544,6 +549,44 @@ def _runtime_files(package: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _verified_runtime_source_patch(
+    runtime_package: Path,
+    patch_path: Path,
+    base_path: Path,
+) -> dict[str, dict[str, Any] | str]:
+    patch = patch_path.resolve(strict=True)
+    base = base_path.resolve(strict=True)
+    patch_descriptor = _file_descriptor(patch, _VLLM_PROFILE_PATCH_NAME)
+    if patch_descriptor["sha256"] != _VLLM_PROFILE_PATCH_SHA256:
+        raise ValueError("DFlash2 vLLM profile-capacity patch bytes mismatch")
+    base_descriptor = _file_descriptor(base, _VLLM_PROFILE_PATCH_BASE_NAME)
+    target = runtime_package.resolve(strict=True) / _VLLM_PROFILE_PATCH_TARGET
+    patched_descriptor = _file_descriptor(target, _VLLM_PROFILE_PATCH_TARGET)
+    if _GIT is None:
+        raise ValueError("Git is required to verify the DFlash2 vLLM profile patch")
+    with tempfile.TemporaryDirectory(prefix="dflash2-vllm-patch-") as temporary:
+        root = Path(temporary)
+        candidate = root / "vllm" / _VLLM_PROFILE_PATCH_TARGET
+        candidate.parent.mkdir(parents=True)
+        candidate.write_bytes(_stable_bytes(base))
+        completed = subprocess.run(  # nosec B603 - fixed Git argv and pinned patch bytes.
+            [_GIT, "-C", str(root), "apply", str(patch)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode:
+            raise ValueError("DFlash2 vLLM profile patch does not apply to pinned base bytes")
+        if _stable_bytes(candidate) != _stable_bytes(target):
+            raise ValueError("DFlash2 vLLM profile patch output mismatch")
+    return {
+        "source_patch": patch_descriptor,
+        "source_patch_target": _VLLM_PROFILE_PATCH_TARGET,
+        "source_patch_base": base_descriptor,
+        "patched_source_file": patched_descriptor,
+    }
+
+
 def _flashmla_extension_descriptors(runtime_package: Path) -> list[dict[str, Any]]:
     extensions: list[Path] = []
     for stem in _FLASHMLA_EXTENSION_STEMS:
@@ -742,6 +785,8 @@ def write_vllm_runtime_receipt(
     flashmla_package_path: Path | None = None,
     flashmla_expected_commit: str = _FLASHMLA_REQUIRED_COMMIT,
     flashmla_build_manifest_path: Path | None = None,
+    runtime_source_patch_path: Path | None = None,
+    runtime_source_patch_base_path: Path | None = None,
 ) -> str:
     """Bind clean PR source plus the complete installed runtime file set."""
     source_package = _verified_checkout(package_path, expected_commit, required_ancestor)
@@ -752,8 +797,30 @@ def write_vllm_runtime_receipt(
     )
     source_files = _runtime_files(source_package)
     runtime_files = _runtime_files(runtime_package)
+    source_by_path = {descriptor["path"]: descriptor for descriptor in source_files}
     runtime_by_path = {descriptor["path"]: descriptor for descriptor in runtime_files}
-    if any(runtime_by_path.get(descriptor["path"]) != descriptor for descriptor in source_files):
+    patch_provenance: dict[str, dict[str, Any] | str] | None = None
+    if (runtime_source_patch_path is None) != (runtime_source_patch_base_path is None):
+        raise ValueError("DFlash2 vLLM profile patch requires patch and base bytes")
+    if runtime_source_patch_path is not None and runtime_source_patch_base_path is not None:
+        if runtime_package_path is None:
+            raise ValueError("source-only vLLM receipts cannot claim a runtime source patch")
+        patch_provenance = _verified_runtime_source_patch(
+            runtime_package,
+            runtime_source_patch_path,
+            runtime_source_patch_base_path,
+        )
+        if source_by_path.get(_VLLM_PROFILE_PATCH_TARGET) != _file_descriptor(
+            runtime_source_patch_base_path.resolve(strict=True),
+            _VLLM_PROFILE_PATCH_TARGET,
+        ):
+            raise ValueError("DFlash2 vLLM profile patch base is not exact b389 source")
+    allowed_difference = _VLLM_PROFILE_PATCH_TARGET if patch_provenance else None
+    if any(
+        runtime_by_path.get(descriptor["path"]) != descriptor
+        for descriptor in source_files
+        if descriptor["path"] != allowed_difference
+    ):
         raise ValueError("vLLM runtime does not preserve exact tracked source bytes")
     body: dict[str, Any] = {
         "vllm_commit": expected_commit,
@@ -834,9 +901,10 @@ def write_vllm_runtime_receipt(
         ):
             raise ValueError("FlashMLA source-build manifest identity mismatch")
 
+        schema_version = 5 if patch_provenance else 4
         body.update(
-            schema_version=4,
-            producer="dflash2-vllm-runtime-receipt-v4",
+            schema_version=schema_version,
+            producer=f"dflash2-vllm-runtime-receipt-v{schema_version}",
             flashmla_commit=flashmla_expected_commit,
             flashmla_source_interface=_file_descriptor(
                 source_interface, _FLASHMLA_SOURCE_INTERFACE
@@ -850,6 +918,8 @@ def write_vllm_runtime_receipt(
             ),
             flashmla_extension_binaries=extension_binaries,
         )
+        if patch_provenance is not None:
+            body.update(patch_provenance)
     body["receipt_sha256"] = _sha_json(body)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as stream:
@@ -882,7 +952,7 @@ def verify_vllm_runtime(
     producer = body.get("producer") if isinstance(body, dict) else None
     if (
         claim != _sha_json(body)
-        or schema_version not in {2, 4}
+        or schema_version not in {2, 4, 5}
         or producer != f"dflash2-vllm-runtime-receipt-v{schema_version}"
         or body.get("vllm_commit") != expected_commit
         or body.get("required_pr52816_commit") != required_ancestor
@@ -900,7 +970,13 @@ def verify_vllm_runtime(
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("vLLM runtime file path is invalid")
     runtime_by_path = {descriptor["path"]: descriptor for descriptor in files}
-    if any(runtime_by_path.get(descriptor["path"]) != descriptor for descriptor in source_files):
+    source_by_path = {descriptor["path"]: descriptor for descriptor in source_files}
+    allowed_difference = _VLLM_PROFILE_PATCH_TARGET if schema_version == 5 else None
+    if any(
+        runtime_by_path.get(descriptor["path"]) != descriptor
+        for descriptor in source_files
+        if descriptor["path"] != allowed_difference
+    ):
         raise ValueError("vLLM runtime source provenance mismatch")
     if schema_version == 2:
         if files != source_files:
@@ -979,6 +1055,25 @@ def verify_vllm_runtime(
         for descriptor in extension_binaries:
             if runtime_by_path.get(descriptor.get("path")) != descriptor:
                 raise ValueError("FlashMLA extension binary is not bound to runtime bytes")
+        if schema_version == 5:
+            patch_path = receipt_path.parent / _VLLM_PROFILE_PATCH_NAME
+            base_path = receipt_path.parent / _VLLM_PROFILE_PATCH_BASE_NAME
+            patch_provenance = _verified_runtime_source_patch(
+                package,
+                patch_path,
+                base_path,
+            )
+            if any(body.get(name) != value for name, value in patch_provenance.items()):
+                raise ValueError("DFlash2 vLLM profile patch provenance mismatch")
+            if source_by_path.get(_VLLM_PROFILE_PATCH_TARGET) != _file_descriptor(
+                base_path,
+                _VLLM_PROFILE_PATCH_TARGET,
+            ):
+                raise ValueError("DFlash2 vLLM profile patch base provenance mismatch")
+            if runtime_by_path.get(_VLLM_PROFILE_PATCH_TARGET) != body.get(
+                "patched_source_file"
+            ):
+                raise ValueError("DFlash2 vLLM patched source is not bound to runtime bytes")
     declared_paths = set(runtime_by_path)
     runtime_paths = {descriptor["path"] for descriptor in _runtime_files(package)}
     if declared_paths != runtime_paths:
@@ -1008,6 +1103,8 @@ def main() -> None:
     vllm.add_argument("--flashmla-package", type=Path)
     vllm.add_argument("--flashmla-expected-commit", default=_FLASHMLA_REQUIRED_COMMIT)
     vllm.add_argument("--flashmla-build-manifest", type=Path)
+    vllm.add_argument("--runtime-source-patch", type=Path)
+    vllm.add_argument("--runtime-source-patch-base", type=Path)
     flashmla_build = subparsers.add_parser("flashmla-build-manifest")
     flashmla_build.add_argument("--output", type=Path, required=True)
     flashmla_build.add_argument("--runtime-package", type=Path, required=True)
@@ -1058,6 +1155,8 @@ def main() -> None:
             flashmla_package_path=args.flashmla_package,
             flashmla_expected_commit=args.flashmla_expected_commit,
             flashmla_build_manifest_path=args.flashmla_build_manifest,
+            runtime_source_patch_path=args.runtime_source_patch,
+            runtime_source_patch_base_path=args.runtime_source_patch_base,
         )
     elif args.command == "flashmla-build-manifest":
         receipt_sha256 = write_flashmla_build_manifest(
