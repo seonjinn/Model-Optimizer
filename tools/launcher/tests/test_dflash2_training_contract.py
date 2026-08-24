@@ -1000,6 +1000,48 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
     )
 
 
+def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> None:
+    """The pre-training serve gate must be explicit, immutable, and non-scientific."""
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/run_dflash2_zero_init_serve_gate.sbatch"
+    ).read_text()
+    for required in (
+        "scientific_training_authorized",
+        "training_quality_claim",
+        "checkpoint-0-runtime-only",
+        "torch.device(\"meta\")",
+        "to_empty(device=\"cpu\")",
+        "parameter.zero_()",
+        "base_kernel[:, 0].fill_(1.0)",
+        '"num_attention_heads": 32',
+        '"num_key_value_heads": 4',
+        '"head_dim": 128',
+        '"intermediate_size": 6144',
+        '"dflash_block_size": 8',
+        '"num_speculative_tokens": 7',
+        '"method": "dflash"',
+        "verify_vllm_runtime",
+        "validate_artifact_receipt",
+        "DFlash2DraftModel",
+        "vllm._flashmla_C",
+        "vllm._flashmla_extension_C",
+        "tensor-parallel-size 2",
+        "/health",
+        "/v1/completions",
+        "completed_requests",
+        "exporter_sha256",
+        "reload_loader_sha256",
+        "speculator_sha256",
+        "runtime_receipt_sha256",
+        "target_receipt_sha256",
+        "receipt_sha256",
+        "SLURM_JOB_ID",
+        "refusing to replace existing serve-gate output",
+    ):
+        assert required in script
+
+
 def test_dflash2_artifact_receipt_builder_creates_scratch_before_pyxis() -> None:
     """Pyxis must never receive a mount source that the host job has not created."""
     script = (
