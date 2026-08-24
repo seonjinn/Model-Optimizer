@@ -55,6 +55,7 @@ print(sysconfig.get_paths()["purelib"])
 PY
 )"
 runtime_package="$site_package/vllm"
+printf '%s\n' "$runtime_package" >"$prepared/dflash2-vllm-runtime-package.path"
 mkdir -p "$runtime_package"
 cp -a "$checkout/vllm/." "$runtime_package/"
 while IFS= read -r -d '' extension; do
@@ -62,13 +63,27 @@ while IFS= read -r -d '' extension; do
     mkdir -p "$runtime_package/$(dirname "$relative")"
     cp -a "$extension" "$runtime_package/$relative"
 done < <(find "$system_package" -type f \( -name '*.so' -o -name '_version.py' \) -print0)
+INNER
 
+runtime_package="$(<"$prepared/dflash2-vllm-runtime-package.path")"
 receipt="$prepared/dflash2-vllm-runtime-receipt.json"
-PYTHONPATH="$launcher/tools/launcher" "$prepared/bin/python" \
-    "$launcher/tools/launcher/common/specdec/dflash2_runtime_contract.py" vllm-receipt \
-    --package "$checkout/vllm" --runtime-package "$runtime_package" --output "$receipt" \
-    --expected-commit "$expected" --required-ancestor "$required" >"$prepared/dflash2-vllm-runtime-receipt.sha256"
+PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
+    "$LAUNCHER_ROOT/tools/launcher/common/specdec/dflash2_runtime_contract.py" vllm-receipt \
+    --package "$VLLM_CHECKOUT/vllm" --runtime-package "$runtime_package" --output "$receipt" \
+    --expected-commit "$EXPECTED_COMMIT" --required-ancestor "$REQUIRED_COMMIT" >"$prepared/dflash2-vllm-runtime-receipt.sha256"
 receipt_sha="$(<"$prepared/dflash2-vllm-runtime-receipt.sha256")"
+srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
+    --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
+    bash -s -- "$prepared" "$runtime_package" "$receipt" "$receipt_sha" \
+    "$EXPECTED_COMMIT" "$REQUIRED_COMMIT" "$LAUNCHER_ROOT" <<'INNER'
+set -euo pipefail
+prepared="$1"
+runtime_package="$2"
+receipt="$3"
+receipt_sha="$4"
+expected="$5"
+required="$6"
+launcher="$7"
 PYTHONPATH="$launcher" "$prepared/bin/python" - "$runtime_package" "$receipt" \
     "$receipt_sha" "$expected" "$required" <<'PY'
 import sys
