@@ -43,6 +43,7 @@ runtime_receipt_sha="$(sha256sum "$runtime_receipt" | cut -d' ' -f1)"
 PYTHONPATH="$LAUNCHER:$LAUNCHER/tools/launcher" python3 - \
     "$LAUNCHER" "$SOURCE_SHA" "$TARGET" "$TARGET_RECEIPT" "$TARGET_RECEIPT_SHA" \
     "$runtime_package" "$runtime_receipt" "$runtime_receipt_sha" <<'PY'
+import json
 import sys
 from pathlib import Path
 
@@ -54,7 +55,14 @@ from tools.launcher.common.specdec.dflash2_runtime_contract import (
 
 launcher, source_sha, target, target_receipt, target_receipt_sha, package, receipt, receipt_sha = sys.argv[1:]
 validate_dflash2_source_checkout(Path(launcher), source_sha, "6eda6bbf54455086a54660fe7a7b06c415b87da5")
-validate_artifact_receipt(Path(target_receipt), Path(target), target_receipt_sha)
+target_body = json.loads(Path(target_receipt).read_text())
+validate_artifact_receipt(
+    Path(target_receipt),
+    expected_receipt_sha256=target_receipt_sha,
+    artifact_path=Path(target),
+    expected_artifact_sha256=target_body["artifact_sha256"],
+    kind="target",
+)
 verify_vllm_runtime(
     Path(package),
     Path(receipt),
