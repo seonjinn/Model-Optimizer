@@ -11,6 +11,9 @@
 set -euo pipefail
 
 : "${B_CANARY_MANIFEST:?B_CANARY_MANIFEST is required}"
+: "${B_CANARY_READINESS:?B_CANARY_READINESS is required}"
+: "${B_CANARY_BUILD_RECEIPT:?B_CANARY_BUILD_RECEIPT is required}"
+: "${B_CANARY_OUTPUT:?B_CANARY_OUTPUT is required}"
 : "${B_CANARY_EVIDENCE:?B_CANARY_EVIDENCE is required}"
 : "${B_CANARY_SERVE_COMMAND:?B_CANARY_SERVE_COMMAND is required}"
 : "${B_CANARY_TRAIN_COMMAND:?B_CANARY_TRAIN_COMMAND is required}"
@@ -25,13 +28,24 @@ serve_nodes=$(IFS=,; echo "${allocated_nodes[*]:0:8}")
 train_nodes=$(IFS=,; echo "${allocated_nodes[*]:8:8}")
 readonly serve_nodes train_nodes
 
-PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$B_CANARY_MANIFEST" <<'PY'
+PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    "$B_CANARY_MANIFEST" "$B_CANARY_READINESS" "$B_CANARY_BUILD_RECEIPT" \
+    "$B_CANARY_OUTPUT" <<'PY'
 import sys
 from pathlib import Path
 
-from common.specdec.qwen4b_b_canary_manifest import load_b_canary_manifest
+from common.specdec.qwen4b_b_canary_manifest import (
+    load_b_canary_manifest,
+    validate_bound_artifacts,
+)
 
 manifest = load_b_canary_manifest(Path(sys.argv[1]))
+validate_bound_artifacts(
+    manifest,
+    readiness_path=Path(sys.argv[2]),
+    builder_receipt_path=Path(sys.argv[3]),
+    builder_output_path=Path(sys.argv[4]),
+)
 assert manifest.global_batch_size == 512
 assert manifest.active_gpu_ranks == 64
 assert manifest.scientific_milestone is False

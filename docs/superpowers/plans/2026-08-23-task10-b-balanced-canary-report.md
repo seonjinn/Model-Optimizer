@@ -1,69 +1,71 @@
 # Task 10 B-balanced canary implementation report
 
-## Scope
+## Scope and scientific order
 
-This change implements only the B-balanced readiness and bounded-canary path.
-It intentionally does not import or modify Task9 core code, and it has no
-A-repair input or dependency.
+Task10 prepares only the B-balanced data artifact and its bounded 200-step
+runtime canary. It does not authorize B as the first scientific training arm.
+The fixed execution order remains A-repair, B-balanced, B-balanced-target, then
+PTV3 SWE/agentic/tool. B artifact preparation may run concurrently, but the
+submission receipt records `b_preparation_only: true` and
+`scientific_training_authorized: false`.
 
-The B builder and readiness artifacts are reusable and may be prepared while
-other work runs. They do not authorize B as the first production training arm.
-Scientific execution remains A-repair, then B-balanced, then
-B-balanced-target, then PTV3 SWE/agentic/tool unless a later explicit ruling
-changes that order.
+## Authenticated producer chain
 
-## Task9 integration seam
+The builder no longer accepts launcher-invented
+`uuid/cell/language/source_native` rows or a public `--input` escape hatch. It
+requires a digest-pinned Task8 publication, its copied genuine Task9 schema-v3
+selection receipt, the exact Task8 source commit, and the Task9 B projection.
+Task8 rows are consumed in their producer schema:
+`prompt_uuid/domain/lane/context_bucket/input_ids/loss_mask/assistant_tokens/`
+`rejection_reason/record_json`.
 
-`Task9BalancedView` in
-`tools/launcher/common/specdec/qwen4b_b_readiness.py` is the sole adapter
-contract. Task9 must publish a JSON projection with the exact fields accepted
-by `load_task9_balanced_view`: B strategy, occurrence/cell/language counts,
-declared shard names and root, trainer/schedule fields, source-native flag, and
-publication/destination/tokenizer/template/loss-mask SHA-256 identities.
-The Task10 code does not assume a Task9 implementation type or import it.
+The loader authenticates `PUBLICATION.json`, `CORPUS_MANIFEST.json`, the copied
+Task9 selection receipt, exactly 201 declared shard descriptors, the manifest
+file records, and missing/orphan shard state. Production semantics remain the
+2M `500K/400K/500K/400K/200K` B mix with DE/JA/ES/FR/IT at 40K each.
 
-## Enforced gates
+## CPU materialization and durability
 
-- B only: 2M occurrences; `500K/400K/500K/400K/200K` cells; five `40K`
-  language cells; source-native responses; one trainer epoch; GBS512; and the
-  `2540 + 1368 = 3908` schedule.
-- Exactly 201 declared JSONL/Parquet shards. Missing, duplicate, unsafe, and
-  orphan data shards produce stable blocker codes.
-- The materialized canary has exactly 102,400 occurrences: Math 25,600, Code
-  20,480, STEM 25,600, Chat 20,480, Multilingual 10,240, with 2,048 each for
-  DE/JA/ES/FR/IT.
-- OCI-HSG topology is fixed at segment 16: 8 serve and 8 train nodes, 4 GPUs
-  per node, cpu_datamover 96, 32 trainer ranks, PDB4, GA4, GBS512, and 200
-  steps. The W&B project is `sna-qwen3-4b-dataset-study`.
-- Runtime evidence must show finite loss, checkpoint reload, drafter export,
-  evaluator completion, and activity on ranks 0 through 63. It always records
-  `scientific_milestone: false`.
-- The submitter permits only `sbatch --test-only` on approved accounts and
-  rejects any production submission request.
+The `cpu_datamover` runner requests one task with 96 CPUs and zero GPUs. The
+worker count defaults from `SLURM_CPUS_PER_TASK`, caps at the 201 declared
+shards, and fixes Arrow/OMP/BLAS/MKL/NumExpr threads to one per worker. Each
+worker opens its Task8 shard once with `O_NOFOLLOW`, hashes and parses through
+that same descriptor, and rejects inode, namespace, size, timestamp, row-count,
+or manifest-digest changes. A disk-backed SQLite merge preserves deterministic
+rank order, bounded memory, and byte-identical one-worker/multi-worker output.
 
-## CPU datamover materialization
+The output is one immutable directory containing `canary.jsonl` and
+`BUILD_RECEIPT.json`. A job-unique sibling partial is fsynced, reread, and
+published with an OS no-replace rename. No failure path deletes pathname state
+or claims best-effort cleanup. Rename and parent-fsync ambiguity carries typed
+partial/destination inode observations for explicit recovery.
 
-`run_qwen4b_b_builder.sbatch` requests one `cpu_datamover` node with 96 CPUs
-and passes the full `SLURM_CPUS_PER_TASK` allocation to the builder. The
-builder caps its process count by the CPU allocation and the 201 declared
-shards. Every worker fixes Arrow, OMP, BLAS, MKL, and NumExpr threads to one,
-streams one shard into one job-local spool, and reports source identity and
-timing provenance. The coordinator consumes those spools in declared-shard
-order through a disk-backed SQLite selection index, so open files and memory
-stay bounded and one-worker and multi-worker output bytes remain identical.
-Worker failures remove scratch state and prevent either output or receipt
-publication.
+## Transitive runtime authorization
 
-## Validation
+The build receipt makes its source, output SHA, worker/CPU/thread settings, and
+per-shard timing provenance mandatory. Readiness rehashes both builder receipt
+and output and binds their exact SHA-256 identities. The 16-node OCI-HSG GPU
+manifest binds those same identities plus readiness, source commit, GBS512,
+8 serve + 8 train nodes, 4 GPUs per node, PDB4, GA4, 200 steps, and
+`sna-qwen3-4b-dataset-study`.
 
-The original red test run failed because the new B builder module was absent.
-The CPU-parallel extension also recorded red gates for missing worker
-resolution, missing materialization, and the missing sbatch runner. A cleanup
-mutation then proved the failure-propagation assertion fails if scratch state
-is retained.
+The submitter schedules the 96-core builder first and submits only the bounded
+GPU canary with `afterok:<builder_job_id>`. The GPU runner revalidates readiness,
+builder receipt, and builder output immediately before any `srun`. Runtime
+evidence still requires finite loss, checkpoint reload, drafter export,
+evaluator completion, and all 64 GPU ranks; it cannot become a scientific
+milestone.
 
-Fresh focused verification reports 9 passing Task10 tests and 31 passing
-Task9 regression tests. The Task10 suite includes exact one-worker versus
-multi-worker output-byte identity, 96-CPU allocation propagation, provenance,
-and failure cleanup. `ruff check`, `ruff format --check`, `pyright`, `bash -n`,
-`shellcheck -S warning`, and `git diff --check` complete without findings.
+## Verification
+
+- Task10 launcher suite: 17 passed, including a genuine Task9 writer → Task8
+  201-shard publisher → CPU builder → readiness → GPU manifest/runner-preflight
+  integration test, deterministic 1-worker/parallel bytes, shard namespace
+  race rejection, typed fsync recovery, worker-failure propagation, and real
+  fake-Slurm `afterok` job wiring.
+- Task9/Task8 regression suite (`qwen3_4b_ptv2_study`,
+  `build_assistant_token_views`, and `specdec_publication`): 76 passed.
+- Ruff check/format, Pyright, Bash syntax, ShellCheck, diff check, and the final
+  combined regression commands are recorded in the signed commit handoff.
+
+No cluster job was submitted and no branch was pushed by this implementation.

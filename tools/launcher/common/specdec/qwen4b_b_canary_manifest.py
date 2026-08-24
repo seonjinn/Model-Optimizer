@@ -10,20 +10,27 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from common.specdec.qwen4b_b_atomic import atomic_publish_bytes
+from common.specdec.qwen4b_b_readiness import load_b_readiness_receipt, validate_builder_artifacts
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 __all__ = [
     "BCanaryEvidence",
     "BCanaryManifest",
     "BCanaryTopology",
     "load_b_canary_manifest",
+    "validate_bound_artifacts",
     "validate_canary_evidence",
     "write_b_canary_manifest",
 ]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_CANARY_OCCURRENCE_COUNT = 102_400
 
 
 @dataclass(frozen=True)
@@ -45,15 +52,24 @@ class BCanaryTopology:
     wandb_project: str
 
     def __post_init__(self) -> None:
-        if self.cluster != "oci-hsg" or self.account not in {"nemotron_sw_post", "nemotron_n4_post"}:
+        if self.cluster != "oci-hsg" or self.account not in {
+            "nemotron_sw_post",
+            "nemotron_n4_post",
+        }:
             raise ValueError("B canary is restricted to approved OCI-HSG accounts")
         if self.partition != "batch":
             raise ValueError("B canary requires the OCI-HSG batch partition")
         if (self.nodes, self.segment, self.serve_nodes, self.train_nodes) != (16, 16, 8, 8):
-            raise ValueError("B canary requires 16 nodes split into eight serve and eight train nodes")
+            raise ValueError(
+                "B canary requires 16 nodes split into eight serve and eight train nodes"
+            )
         if self.gpus_per_node != 4 or self.cpu_datamover != 96:
             raise ValueError("B canary requires four GPUs per node and cpu_datamover=96")
-        if (self.per_device_batch_size, self.gradient_accumulation_steps, self.max_steps) != (4, 4, 200):
+        if (self.per_device_batch_size, self.gradient_accumulation_steps, self.max_steps) != (
+            4,
+            4,
+            200,
+        ):
             raise ValueError("B canary requires PDB4, GA4, and 200 steps")
         if self.wandb_project != "sna-qwen3-4b-dataset-study":
             raise ValueError("B canary requires the study W&B project")
@@ -64,16 +80,25 @@ class BCanaryManifest:
     """All identity and resource facts needed to run the bounded B canary."""
 
     readiness_receipt_sha256: str
+    builder_receipt_sha256: str
+    builder_output_sha256: str
     canary_occurrence_count: int
     topology: BCanaryTopology
     source_commit: str
     scientific_milestone: bool = False
 
     def __post_init__(self) -> None:
-        if _SHA256.fullmatch(self.readiness_receipt_sha256) is None:
-            raise ValueError("B readiness receipt must have a SHA-256 identity")
-        if self.canary_occurrence_count != 102_400:
-            raise ValueError("B canary must contain exactly 102400 occurrences")
+        for label, digest in (
+            ("readiness receipt", self.readiness_receipt_sha256),
+            ("builder receipt", self.builder_receipt_sha256),
+            ("builder output", self.builder_output_sha256),
+        ):
+            if _SHA256.fullmatch(digest) is None:
+                raise ValueError(f"B {label} must have a SHA-256 identity")
+        if self.canary_occurrence_count != _CANARY_OCCURRENCE_COUNT:
+            raise ValueError(
+                f"B canary must contain exactly {_CANARY_OCCURRENCE_COUNT} occurrences"
+            )
         if _COMMIT.fullmatch(self.source_commit) is None:
             raise ValueError("B canary source commit must be exact")
         if self.scientific_milestone:
@@ -82,7 +107,12 @@ class BCanaryManifest:
     @property
     def global_batch_size(self) -> int:
         """Compute GBS from the 32 trainer ranks, PDB4, and GA4."""
-        return self.topology.train_nodes * self.topology.gpus_per_node * self.topology.per_device_batch_size * self.topology.gradient_accumulation_steps
+        return (
+            self.topology.train_nodes
+            * self.topology.gpus_per_node
+            * self.topology.per_device_batch_size
+            * self.topology.gradient_accumulation_steps
+        )
 
     @property
     def active_gpu_ranks(self) -> int:
@@ -112,10 +142,11 @@ def write_b_canary_manifest(path: Path, manifest: BCanaryManifest) -> None:
         raise FileExistsError(f"B canary manifest already exists: {path}")
     payload = manifest.as_dict()
     payload["manifest_sha256"] = _sha256_json(payload)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.partial-{os.getpid()}")
-    temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
-    os.replace(temporary, path)
+    atomic_publish_bytes(
+        path,
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+        job_id=str(os.getpid()),
+    )
 
 
 def load_b_canary_manifest(path: Path) -> BCanaryManifest:
@@ -151,5 +182,35 @@ def validate_canary_evidence(evidence: BCanaryEvidence, manifest: BCanaryManifes
         raise ValueError("canary evidence cannot set scientific_milestone")
 
 
+def validate_bound_artifacts(
+    manifest: BCanaryManifest,
+    *,
+    readiness_path: Path,
+    builder_receipt_path: Path,
+    builder_output_path: Path,
+) -> None:
+    """Revalidate readiness and builder bytes immediately before GPU work."""
+    readiness = load_b_readiness_receipt(readiness_path)
+    claim = readiness.pop("receipt_sha256", None)
+    if (
+        claim != manifest.readiness_receipt_sha256
+        or claim != _sha256_json(readiness)
+        or readiness.get("ready") is not True
+        or readiness.get("builder_receipt_sha256") != manifest.builder_receipt_sha256
+        or readiness.get("builder_output_sha256") != manifest.builder_output_sha256
+        or readiness.get("source_commit") != manifest.source_commit
+    ):
+        raise ValueError("B readiness transitive identity mismatch")
+    validate_builder_artifacts(
+        receipt_path=builder_receipt_path,
+        receipt_sha256=manifest.builder_receipt_sha256,
+        output_path=builder_output_path,
+        output_sha256=manifest.builder_output_sha256,
+        source_commit=manifest.source_commit,
+    )
+
+
 def _sha256_json(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
