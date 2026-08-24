@@ -148,7 +148,25 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         "source_row INTEGER,cell TEXT,reuse_index INTEGER,conversation_sha256 TEXT,"
         "assistant_response_sha256 TEXT,strategy TEXT)"
     )
-    occurrence = (0, "a" * 64, "b" * 64, 7, "math", 0, "c" * 64, "d" * 64)
+    connection.execute(
+        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
+        "canonical_conversation TEXT,assistant_response TEXT)"
+    )
+    conversation = "conversation"
+    response = "response"
+    occurrence = (
+        0,
+        "a" * 64,
+        "b" * 64,
+        7,
+        "math",
+        0,
+        hashlib.sha256(conversation.encode()).hexdigest(),
+        hashlib.sha256(response.encode()).hexdigest(),
+    )
+    connection.execute(
+        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 7, conversation, response)
+    )
     connection.execute(
         "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", (*occurrence, "B-balanced")
     )
@@ -301,7 +319,25 @@ def test_ptv2_schema_v3_receipts_publish_as_a_complete_bundle(tmp_path: Path) ->
         "source_row INTEGER,cell TEXT,reuse_index INTEGER,conversation_sha256 TEXT,"
         "assistant_response_sha256 TEXT,strategy TEXT)"
     )
-    occurrence = (0, "a" * 64, "b" * 64, 0, "math", 0, "c" * 64, "d" * 64)
+    connection.execute(
+        "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
+        "canonical_conversation TEXT,assistant_response TEXT)"
+    )
+    conversation = "conversation"
+    response = "response"
+    occurrence = (
+        0,
+        "a" * 64,
+        "b" * 64,
+        0,
+        "math",
+        0,
+        digest(conversation.encode()),
+        digest(response.encode()),
+    )
+    connection.execute(
+        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 0, conversation, response)
+    )
     connection.execute(
         "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", (*occurrence, "B-balanced")
     )

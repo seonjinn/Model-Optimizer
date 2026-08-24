@@ -283,3 +283,8 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
   tokenized, exposure, and rejection receipts now pass an end-to-end
   `publish_bundle()` schema-v3 integration probe. This confirms the actual
   Task9 tokenized/exposure receipt shapes are accepted by the Task8 adapter.
+- Publication semantic validation now joins every occurrence to its SQLite
+  `source_rows` entry and recomputes the canonical-conversation and native
+  assistant-response hashes before accepting the selection index. The
+  schema-v3 integration fixture exercises these content bindings, and the
+  connection is initialized safely for malformed/unopenable indexes.
