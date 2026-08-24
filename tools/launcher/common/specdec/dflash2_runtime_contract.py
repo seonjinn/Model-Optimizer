@@ -167,6 +167,7 @@ def validate_artifact_receipt(
     artifact_path: Path,
     expected_artifact_sha256: str,
     kind: str,
+    verify_dataset_rows: bool = True,
 ) -> None:
     """Rehash an artifact and require its exact externally pinned receipt."""
     raw = _stable_bytes(receipt_path)
@@ -182,7 +183,52 @@ def validate_artifact_receipt(
         "artifact_sha256": expected_artifact_sha256,
     }
     if kind == "dataset":
-        physical, admitted_order_sha256, ordered_sources = _dataset_layout(artifact_path, 1_300_000)
+        if verify_dataset_rows:
+            physical, admitted_order_sha256, ordered_sources = _dataset_layout(
+                artifact_path, 1_300_000
+            )
+        else:
+            ordered_sources = body.get("ordered_sources")
+            if not isinstance(ordered_sources, list):
+                raise ValueError("dataset receipt ordered sources are invalid")
+            root = artifact_path.resolve(strict=True)
+            candidates = (
+                [root]
+                if root.is_file()
+                else sorted(item for item in root.glob("*") if item.is_file())
+            )
+            data_files = [item for item in candidates if item.suffix in {".jsonl", ".parquet"}]
+            if len(data_files) != len(ordered_sources):
+                raise ValueError("dataset receipt source file set mismatch")
+            remaining = 1_300_000
+            physical = 0
+            for item, descriptor in zip(data_files, ordered_sources, strict=True):
+                if not isinstance(descriptor, dict) or set(descriptor) != {
+                    "path",
+                    "sha256",
+                    "physical_occurrences",
+                    "admitted_occurrences",
+                }:
+                    raise ValueError("dataset receipt source descriptor is invalid")
+                expected_path = item.name if root.is_file() else item.relative_to(root).as_posix()
+                item_physical = descriptor["physical_occurrences"]
+                item_admitted = descriptor["admitted_occurrences"]
+                if (
+                    descriptor["path"] != expected_path
+                    or descriptor["sha256"] != hashlib.sha256(_stable_bytes(item)).hexdigest()
+                    or not isinstance(item_physical, int)
+                    or isinstance(item_physical, bool)
+                    or item_physical < 1
+                    or not isinstance(item_admitted, int)
+                    or isinstance(item_admitted, bool)
+                    or item_admitted != min(remaining, item_physical)
+                ):
+                    raise ValueError("dataset receipt source identity mismatch")
+                remaining -= item_admitted
+                physical += item_physical
+            if remaining:
+                raise ValueError("dataset receipt admitted prefix is incomplete")
+            admitted_order_sha256 = _sha_json(ordered_sources)
         expected.update(
             physical_occurrence_count=physical,
             admitted_prefix_count=1_300_000,

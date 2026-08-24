@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import common.specdec.dflash2_runtime_contract as runtime_contract
 import pytest
 from common.specdec.build_dflash2_nemotron_manifest import build_dflash2_nemotron_manifest
 from common.specdec.dflash2_runtime_contract import (
@@ -448,6 +449,31 @@ def test_target_and_dataset_receipts_bind_exact_bytes(tmp_path: Path) -> None:
             expected_artifact_sha256=target_sha256,
             kind="target",
         )
+
+
+def test_dataset_receipt_replay_does_not_require_pyarrow_after_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch preflight replays exact attested bytes without its own PyArrow install."""
+    dataset = tmp_path / "nemotron.jsonl"
+    dataset.write_bytes(b'{"messages":[]}\n' * 1_300_000)
+    receipt = tmp_path / "dataset.json"
+    write_artifact_receipt(receipt, dataset, kind="dataset", occurrence_count=1_300_000)
+    receipt_sha = __import__("hashlib").sha256(receipt.read_bytes()).hexdigest()
+    artifact_sha = artifact_tree_sha256(dataset)
+    monkeypatch.setattr(
+        runtime_contract,
+        "_dataset_layout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ImportError("no pyarrow")),
+    )
+    validate_artifact_receipt(
+        receipt,
+        expected_receipt_sha256=receipt_sha,
+        artifact_path=dataset,
+        expected_artifact_sha256=artifact_sha,
+        kind="dataset",
+        verify_dataset_rows=False,
+    )
 
 
 def test_dataset_receipt_rejects_a_claimed_1_3m_count_for_other_bytes(tmp_path: Path) -> None:

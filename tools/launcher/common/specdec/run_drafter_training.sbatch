@@ -122,6 +122,7 @@ if experiment.method == "dflash2":
         artifact_path=Path(experiment.paths.dataset_path),
         expected_artifact_sha256=experiment.paths.dataset_sha256,
         kind="dataset",
+        verify_dataset_rows=False,
     )
 
 uses_topology_v2 = (
