@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: oci-hsg
+modelopt_commit: 6eda6bbf54455086a54660fe7a7b06c415b87da5
+modelopt_feature_base: 6eda6bbf54455086a54660fe7a7b06c415b87da5
+ssh_host: oci-hsg-cs-001-vscode-01
+account: nemotron_n3_post
+partition: batch
+fallback_partition: null
+durable_root: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec/dflash2-oci
+scratch_candidates:
+  - /raid/scratch
+training_nodes: 16
+training_segment: 16
+evaluation_nodes: 1
+evaluation_segment: 1
+gpus_per_node: 4
+explicit_gpu_flag: true
+walltime: "03:55:00"

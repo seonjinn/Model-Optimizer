@@ -538,6 +538,7 @@ def test_dflash2_cluster_profiles_are_dedicated_native_16_node_profiles() -> Non
     profile_root = Path(__file__).resolve().parents[1] / "common/specdec/profiles"
     expected = {
         "lyris-dflash2.yaml": ("lyris", "gb200"),
+        "oci-hsg-dflash2.yaml": ("oci-hsg", "batch"),
         "ptyche-dflash2.yaml": ("ptyche", "36x2-a01r"),
     }
     for filename, (name, partition) in expected.items():
@@ -548,6 +549,12 @@ def test_dflash2_cluster_profiles_are_dedicated_native_16_node_profiles() -> Non
         assert profile.modelopt_feature_base == "6eda6bbf54455086a54660fe7a7b06c415b87da5"
         assert (profile.training_nodes, profile.training_segment) == (16, 16)
     assert load_cluster_profile(profile_root / "lyris.yaml").training_nodes == 4
+    legacy_oci = load_cluster_profile(profile_root / "oci-hsg.yaml")
+    dflash2_oci = load_cluster_profile(profile_root / "oci-hsg-dflash2.yaml")
+    assert legacy_oci.training_nodes == 4
+    assert dflash2_oci.account == "nemotron_n3_post"
+    assert dflash2_oci.explicit_gpu_flag is True
+    assert str(dflash2_oci.durable_root).endswith("/modelopt-specdec/dflash2-oci")
     assert load_cluster_profile(profile_root / "ptyche.yaml").training_nodes == 4
 
 
