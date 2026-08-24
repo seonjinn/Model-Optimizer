@@ -121,8 +121,15 @@ def build_dflash2_nemotron_manifest(
         )
 
     experiments = tuple(rewrite(experiment) for experiment in seeds)
-    if len({experiment.paths.output_root for experiment in experiments}) != len(experiments):
+    output_roots = tuple(Path(experiment.paths.output_root) for experiment in experiments)
+    if len(set(output_roots)) != len(output_roots):
         raise ValueError("DFlash2 experiments require unique output roots")
+    if any(
+        left.is_relative_to(right) or right.is_relative_to(left)
+        for index, left in enumerate(output_roots)
+        for right in output_roots[index + 1 :]
+    ):
+        raise ValueError("DFlash2 experiments require non-overlapping output roots")
     write_manifest(output, experiments)
     return experiments
 

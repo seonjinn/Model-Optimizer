@@ -39,6 +39,7 @@ from common.specdec.dflash2_runtime_contract import (
 from common.specdec.dflash2_target_contract import (
     dflash2_target_spec,
     validate_dflash2_target_snapshot,
+    validate_dflash2_training_target,
 )
 from common.specdec.drafter_job_manifest import (
     DrafterExperiment,
@@ -932,6 +933,35 @@ def test_builder_rejects_shared_dflash2_output_roots(tmp_path: Path) -> None:
             target_variant="thinking",
         )
 
+    nested_template = tmp_path / "nested-template.json"
+    q30 = _template_experiment("q30-thinking")
+    q235 = _template_experiment("q235-thinking")
+    write_manifest(
+        nested_template,
+        (
+            replace(q30, paths=replace(q30.paths, output_root=shared_root)),
+            replace(
+                q235,
+                paths=replace(
+                    q235.paths,
+                    output_root=f"{shared_root}-dflash2-16n/q235",
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(ValueError, match="non-overlapping output roots"):
+        build_dflash2_nemotron_manifest(
+            nested_template,
+            tmp_path / "nested-output.json",
+            "/home/user/ModelOpt-dflash2",
+            _SOURCE_SHA,
+            _SHA256,
+            "f" * 40,
+            "e" * 64,
+            cluster_profile=_profile(tmp_path),
+            target_variant="thinking",
+        )
+
 
 @pytest.mark.parametrize(
     ("target_label", "revision", "dims"),
@@ -988,6 +1018,48 @@ def test_target_contract_binds_thinking_label_to_exact_snapshot(
     (target / "config.json").write_text(json.dumps(config) + "\n")
     with pytest.raises(ValueError, match="dimensions mismatch"):
         validate_dflash2_target_snapshot(target, target_label)
+
+
+def test_training_target_contract_rejects_full_thinking_and_topology_mismatch(
+    tmp_path: Path,
+) -> None:
+    """A direct wave cannot bypass the Thinking canary or substitute Q235 topology."""
+    target = tmp_path / "q30-thinking"
+    target.mkdir()
+    spec = dflash2_target_spec("q30-thinking")
+    (target / "snapshot-manifest.json").write_text(
+        json.dumps({"source_identity": spec.revision}) + "\n"
+    )
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "num_attention_heads": spec.num_attention_heads,
+                "num_key_value_heads": spec.num_key_value_heads,
+                "head_dim": spec.head_dim,
+                "intermediate_size": spec.intermediate_size,
+            }
+        )
+        + "\n"
+    )
+    seed = _template_experiment("q30-thinking")
+    valid = replace(
+        seed,
+        topology=replace(seed.topology, gradient_accumulation_steps=4),
+        slurm=replace(seed.slurm, nodes=16, segment=16),
+    )
+    wrong = replace(
+        valid,
+        topology=replace(
+            TargetTopology.for_kind("qwen3-235b-a22b"),
+            gradient_accumulation_steps=8,
+        ),
+    )
+
+    assert validate_dflash2_training_target(target, valid, 20) == spec
+    with pytest.raises(ValueError, match="Thinking target is canary-only"):
+        validate_dflash2_training_target(target, valid, 4166)
+    with pytest.raises(ValueError, match="topology mismatch"):
+        validate_dflash2_training_target(target, wrong, 20)
 
 
 def test_builder_rejects_profile_source_or_native_16_node_drift(tmp_path: Path) -> None:
@@ -1374,8 +1446,9 @@ def test_shared_runner_validates_exact_dflash2_target_snapshot_contract() -> Non
     runner = (
         Path(__file__).resolve().parents[1] / "common/specdec/run_drafter_training.sbatch"
     ).read_text()
-    assert "validate_dflash2_target_snapshot" in runner
-    assert "experiment.target" in runner
+    assert "validate_dflash2_training_target" in runner
+    assert "experiment, int(sys.argv[7])" in runner
+    assert "MAX_STEPS" in runner
 
 
 def test_dflash2_serve_gate_has_a_bounded_selector_diagnostic_mode() -> None:

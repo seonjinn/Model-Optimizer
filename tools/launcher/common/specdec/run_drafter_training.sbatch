@@ -61,7 +61,7 @@ PY
 fi
 readonly WANDB_NETRC_PATH WANDB_NETRC_CONTAINER_PATH
 
-mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" "$CLUSTER_PROFILE_PATH" "${READINESS_RECEIPT:-}" "$CLUSTER_NAME" "$SCRATCH_ROOT" <<'PY'
+mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" "$CLUSTER_PROFILE_PATH" "${READINESS_RECEIPT:-}" "$CLUSTER_NAME" "$SCRATCH_ROOT" "$MAX_STEPS" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -78,7 +78,7 @@ from common.specdec.dflash2_runtime_contract import (
     validate_artifact_receipt,
     validate_dflash2_source_checkout,
 )
-from common.specdec.dflash2_target_contract import validate_dflash2_target_snapshot
+from common.specdec.dflash2_target_contract import validate_dflash2_training_target
 
 experiment = load_manifest(manifest)[int(sys.argv[2])]
 profile = load_cluster_profile(Path(sys.argv[3]))
@@ -119,7 +119,9 @@ if experiment.method == "dflash2":
         expected_artifact_sha256=experiment.paths.target_sha256,
         kind="target",
     )
-    validate_dflash2_target_snapshot(Path(experiment.paths.target_path), experiment.target)
+    validate_dflash2_training_target(
+        Path(experiment.paths.target_path), experiment, int(sys.argv[7])
+    )
     validate_artifact_receipt(
         Path(experiment.paths.dataset_receipt_path),
         expected_receipt_sha256=experiment.paths.dataset_receipt_sha256,
