@@ -78,6 +78,7 @@ from common.specdec.dflash2_runtime_contract import (
     validate_artifact_receipt,
     validate_dflash2_source_checkout,
 )
+from common.specdec.dflash2_target_contract import validate_dflash2_target_snapshot
 
 experiment = load_manifest(manifest)[int(sys.argv[2])]
 profile = load_cluster_profile(Path(sys.argv[3]))
@@ -118,6 +119,7 @@ if experiment.method == "dflash2":
         expected_artifact_sha256=experiment.paths.target_sha256,
         kind="target",
     )
+    validate_dflash2_target_snapshot(Path(experiment.paths.target_path), experiment.target)
     validate_artifact_receipt(
         Path(experiment.paths.dataset_receipt_path),
         expected_receipt_sha256=experiment.paths.dataset_receipt_sha256,

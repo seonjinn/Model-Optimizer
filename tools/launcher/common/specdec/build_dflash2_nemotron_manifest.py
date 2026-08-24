@@ -121,6 +121,8 @@ def build_dflash2_nemotron_manifest(
         )
 
     experiments = tuple(rewrite(experiment) for experiment in seeds)
+    if len({experiment.paths.output_root for experiment in experiments}) != len(experiments):
+        raise ValueError("DFlash2 experiments require unique output roots")
     write_manifest(output, experiments)
     return experiments
 

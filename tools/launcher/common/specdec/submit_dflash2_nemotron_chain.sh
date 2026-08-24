@@ -68,15 +68,28 @@ for index, experiment in enumerate(experiments):
         "q30-thinking": "dfl2-q30t-nemo1p3m-b8k7-n16",
         "q235-thinking": "dfl2-q235t-nemo1p3m-b8k7-n16",
     }
-    print(f"{index}\t{experiment.experiment_id}\t{clear_names.get(experiment.target, '')}")
+    print(
+        f"{index}\t{experiment.experiment_id}\t{experiment.target}"
+        f"\t{clear_names.get(experiment.target, '')}"
+    )
 PY
 )
 expected_records=2
 [[ -z "$TARGET" ]] || expected_records=1
 (( ${#experiment_records[@]} == expected_records )) || exit 2
 
+manifest_has_thinking=0
 for experiment_record in "${experiment_records[@]}"; do
-    IFS=$'\t' read -r experiment_index experiment_id clear_job_prefix <<<"$experiment_record"
+    IFS=$'\t' read -r _ _ experiment_target _ <<<"$experiment_record"
+    [[ "$experiment_target" != *-thinking ]] || manifest_has_thinking=1
+done
+if (( manifest_has_thinking && CANARY_ONLY == 0 )); then
+    echo "Thinking DFlash2 requires --canary-only until its canary is approved" >&2
+    exit 2
+fi
+
+for experiment_record in "${experiment_records[@]}"; do
+    IFS=$'\t' read -r experiment_index experiment_id experiment_target clear_job_prefix <<<"$experiment_record"
     previous_job_id=""
     max_steps_values=(20 4166 14500 25391)
     (( CANARY_ONLY == 0 )) || max_steps_values=(20)

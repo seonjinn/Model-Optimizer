@@ -22,6 +22,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import common.specdec.dflash2_runtime_contract as runtime_contract
@@ -34,6 +35,10 @@ from common.specdec.dflash2_runtime_contract import (
     verify_vllm_runtime,
     write_artifact_receipt,
     write_vllm_runtime_receipt,
+)
+from common.specdec.dflash2_target_contract import (
+    dflash2_target_spec,
+    validate_dflash2_target_snapshot,
 )
 from common.specdec.drafter_job_manifest import (
     DrafterExperiment,
@@ -899,6 +904,92 @@ def test_builder_rejects_base_thinking_target_mix(tmp_path: Path) -> None:
         )
 
 
+def test_builder_rejects_shared_dflash2_output_roots(tmp_path: Path) -> None:
+    """Two target entries can never become concurrent writers to one output root."""
+    template = tmp_path / "template.json"
+    shared_root = "/lustre/results/shared-nemo-dflash-b8"
+    write_manifest(
+        template,
+        tuple(
+            replace(
+                _template_experiment(target),
+                paths=replace(_template_experiment(target).paths, output_root=shared_root),
+            )
+            for target in ("q30-thinking", "q235-thinking")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unique output roots"):
+        build_dflash2_nemotron_manifest(
+            template,
+            tmp_path / "output.json",
+            "/home/user/ModelOpt-dflash2",
+            _SOURCE_SHA,
+            _SHA256,
+            "f" * 40,
+            "e" * 64,
+            cluster_profile=_profile(tmp_path),
+            target_variant="thinking",
+        )
+
+
+@pytest.mark.parametrize(
+    ("target_label", "revision", "dims"),
+    [
+        (
+            "q30-thinking",
+            "144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
+            (32, 4, 128, 6144),
+        ),
+        (
+            "q235-thinking",
+            "6cbffae6d8e28b986a6b17bd36f42f9fa0f1f0a5",
+            (64, 4, 128, 12288),
+        ),
+    ],
+)
+def test_target_contract_binds_thinking_label_to_exact_snapshot(
+    tmp_path: Path,
+    target_label: str,
+    revision: str,
+    dims: tuple[int, int, int, int],
+) -> None:
+    """Training and serve gates share one exact label/revision/dimension contract."""
+    target = tmp_path / target_label
+    target.mkdir()
+    (target / "snapshot-manifest.json").write_text(
+        json.dumps({"source_identity": revision}) + "\n"
+    )
+    (target / "config.json").write_text(
+        json.dumps(
+            dict(
+                zip(
+                    (
+                        "num_attention_heads",
+                        "num_key_value_heads",
+                        "head_dim",
+                        "intermediate_size",
+                    ),
+                    dims,
+                    strict=True,
+                )
+            )
+        )
+        + "\n"
+    )
+
+    assert validate_dflash2_target_snapshot(target, target_label) == dflash2_target_spec(
+        target_label
+    )
+    with pytest.raises(ValueError, match="snapshot revision mismatch"):
+        validate_dflash2_target_snapshot(target, target_label.replace("thinking", "base"))
+    config = json.loads((target / "config.json").read_text())
+    config["head_dim"] += 1
+    (target / "config.json").write_text(json.dumps(config) + "\n")
+    with pytest.raises(ValueError, match="dimensions mismatch"):
+        validate_dflash2_target_snapshot(target, target_label)
+
+
 def test_builder_rejects_profile_source_or_native_16_node_drift(tmp_path: Path) -> None:
     """The manifest cannot target a stale source commit or a four-node capacity profile."""
     template = tmp_path / "template.json"
@@ -1196,6 +1287,10 @@ def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> Non
         Path(__file__).resolve().parents[1]
         / "common/specdec/run_dflash2_zero_init_serve_gate.sbatch"
     ).read_text()
+    target_contract = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/dflash2_target_contract.py"
+    ).read_text()
     for required in (
         "scientific_training_authorized",
         "training_quality_claim",
@@ -1234,13 +1329,17 @@ def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> Non
         "refusing to replace existing serve-gate output",
         "TARGET_LABEL",
         "TARGET_REVISION",
+        "validate_dflash2_target_snapshot",
+    ):
+        assert required in script
+    for required in (
         "144afc2f379b542fdd4e85a1fcd5e1f79112d95d",
         "6cbffae6d8e28b986a6b17bd36f42f9fa0f1f0a5",
         '"q30-thinking":',
         '"q235-thinking":',
         "source_identity",
     ):
-        assert required in script
+        assert required in target_contract
 
 
 def test_dflash2_chain_accepts_thinking_targets_and_uses_clear_job_names() -> None:
@@ -1258,6 +1357,25 @@ def test_dflash2_chain_accepts_thinking_targets_and_uses_clear_job_names() -> No
         '--job-name "$job_name"',
     ):
         assert required in script
+
+
+def test_dflash2_chain_requires_canary_only_for_thinking_targets() -> None:
+    """Thinking may never fall through to the cumulative production boundaries."""
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/submit_dflash2_nemotron_chain.sh"
+    ).read_text()
+    assert 'if (( manifest_has_thinking && CANARY_ONLY == 0 )); then' in script
+    assert "Thinking DFlash2 requires --canary-only" in script
+
+
+def test_shared_runner_validates_exact_dflash2_target_snapshot_contract() -> None:
+    """The training job itself rejects a wrong target revision, not just the serve gate."""
+    runner = (
+        Path(__file__).resolve().parents[1] / "common/specdec/run_drafter_training.sbatch"
+    ).read_text()
+    assert "validate_dflash2_target_snapshot" in runner
+    assert "experiment.target" in runner
 
 
 def test_dflash2_serve_gate_has_a_bounded_selector_diagnostic_mode() -> None:

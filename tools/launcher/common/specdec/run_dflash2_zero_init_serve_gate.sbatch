@@ -55,18 +55,11 @@ from tools.launcher.common.specdec.dflash2_runtime_contract import (
     validate_dflash2_source_checkout,
     verify_vllm_runtime,
 )
+from tools.launcher.common.specdec.dflash2_target_contract import (
+    validate_dflash2_target_snapshot,
+)
 
 launcher, source_sha, target, target_receipt, target_receipt_sha, package, receipt, receipt_sha, target_label = sys.argv[1:]
-target_specs = {
-    "q30-base": ("ad44e777bcd18fa416d9da3bd8f70d33ebb85d39", (2, 13, 24, 35, 46, 48), 2, 32, 4, 128, 6144),
-    "q30-thinking": ("144afc2f379b542fdd4e85a1fcd5e1f79112d95d", (2, 13, 24, 35, 46, 48), 2, 32, 4, 128, 6144),
-    "q235-base": ("8efa61729e24bd65b1d152b5ab5409052aa80e65", (2, 25, 47, 69, 92, 94), 4, 64, 4, 128, 12288),
-    "q235-thinking": ("6cbffae6d8e28b986a6b17bd36f42f9fa0f1f0a5", (2, 25, 47, 69, 92, 94), 4, 64, 4, 128, 12288),
-}
-try:
-    target_revision, capture_ids, serve_tp, num_heads, num_kv_heads, head_dim, intermediate_size = target_specs[target_label]
-except KeyError as error:
-    raise ValueError(f"unsupported DFlash2 target label: {target_label}") from error
 validate_dflash2_source_checkout(Path(launcher), source_sha, "6eda6bbf54455086a54660fe7a7b06c415b87da5")
 target_body = json.loads(Path(target_receipt).read_text())
 validate_artifact_receipt(
@@ -76,17 +69,7 @@ validate_artifact_receipt(
     expected_artifact_sha256=target_body["artifact_sha256"],
     kind="target",
 )
-snapshot = json.loads((Path(target) / "snapshot-manifest.json").read_text())
-if snapshot.get("source_identity") != target_revision:
-    raise ValueError("DFlash2 target snapshot revision mismatch")
-config = json.loads((Path(target) / "config.json").read_text())
-expected_dims = (num_heads, num_kv_heads, head_dim, intermediate_size)
-actual_dims = tuple(
-    config[name]
-    for name in ("num_attention_heads", "num_key_value_heads", "head_dim", "intermediate_size")
-)
-if actual_dims != expected_dims:
-    raise ValueError("DFlash2 target dimensions mismatch")
+target_spec = validate_dflash2_target_snapshot(Path(target), target_label)
 verify_vllm_runtime(
     Path(package),
     Path(receipt),
@@ -95,13 +78,13 @@ verify_vllm_runtime(
     "b389ac29465b33f9e9c534df221ea3c129e9793f",
     expected_flashmla_commit="a8f794d1251cbfd88a5011445dd5582289c727e4",
 )
-print(target_revision)
-print(",".join(map(str, capture_ids)))
-print(serve_tp)
-print(num_heads)
-print(num_kv_heads)
-print(head_dim)
-print(intermediate_size)
+print(target_spec.revision)
+print(",".join(map(str, target_spec.capture_ids)))
+print(target_spec.serve_tp)
+print(target_spec.num_attention_heads)
+print(target_spec.num_key_value_heads)
+print(target_spec.head_dim)
+print(target_spec.intermediate_size)
 PY
 )
 (( ${#target_values[@]} == 7 )) || { echo "invalid target contract" >&2; exit 2; }
