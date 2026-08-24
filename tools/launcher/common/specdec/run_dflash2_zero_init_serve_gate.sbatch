@@ -193,7 +193,7 @@ PY
 "$runtime/bin/python" -m vllm.entrypoints.cli.main serve "$target" \
     --tensor-parallel-size 2 --max-model-len 4096 --max-num-batched-tokens 4096 \
     --gpu-memory-utilization 0.85 --port "$port" --speculative-config "$SPEC_CONFIG" \
-    >"$server_log" 2>&1 &
+    > >(tee "$server_log") 2>&1 &
 server_pid=$!
 cleanup() {
     kill "$server_pid" 2>/dev/null || true

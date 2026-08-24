@@ -1032,6 +1032,7 @@ def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> Non
         "tensor-parallel-size 2",
         "/health",
         "/v1/completions",
+        'tee "$server_log"',
         "completed_requests",
         "exporter_sha256",
         "reload_loader_sha256",
