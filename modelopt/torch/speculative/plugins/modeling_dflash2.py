@@ -78,6 +78,10 @@ parameter names (``attention_conv`` / ``mlp_conv`` / ``base_kernel`` /
 ``DFlash2DraftModel`` loaders so an exported checkpoint is served directly.
 """
 
+# pyright: reportPrivateImportUsage=false
+
+from typing import Any, cast
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -130,6 +134,7 @@ class DFlashGroupedConv(nn.Module):
         self.kernel_projection = nn.Linear(
             int(hidden_size), 2 * self.taps * self.num_groups, bias=False
         )
+        nn.init.zeros_(self.kernel_projection.weight)
 
     def _convolve(self, hidden_states, delta, side: int):
         """Apply the depthwise convolution for one side, with taps clipped at block starts."""
@@ -302,13 +307,29 @@ class DFlash2Module(DFlashModule):
         # existed, so initialize the new Linear layers explicitly. base_kernel and
         # the codebooks keep the init set in their own constructors.
         self._init_head_weights(std)
+        self.register_load_state_dict_post_hook(self._reject_incomplete_dflash2_checkpoint)
 
     def _init_head_weights(self, std: float):
         """Initialize the convolution and selector Linear layers (matching HF _init_weights)."""
-        linears = [self.candidate_selector.hidden_projection]
+        nn.init.normal_(self.candidate_selector.hidden_projection.weight, mean=0.0, std=std)
+        if self.candidate_selector.hidden_projection.bias is not None:
+            nn.init.zeros_(self.candidate_selector.hidden_projection.bias)
         for layer in self.layers:
-            linears += [layer.attention_conv.kernel_projection, layer.mlp_conv.kernel_projection]
-        for module in linears:
-            nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
+            for wrapper in (layer.attention_conv, layer.mlp_conv):
+                convolution = cast("DFlashGroupedConv", wrapper)
+                nn.init.zeros_(convolution.kernel_projection.weight)
+
+    def _reject_incomplete_dflash2_checkpoint(
+        self, _module: nn.Module, incompatible_keys: Any
+    ) -> None:
+        """Reject partial loads that leave any DFlash2-only parameter at initialization."""
+        dflash2_names = {
+            name
+            for name, _ in self.named_parameters()
+            if "_conv." in name or name.startswith("candidate_selector.")
+        }
+        missing = sorted(dflash2_names.intersection(incompatible_keys.missing_keys))
+        if missing:
+            raise RuntimeError(
+                "incomplete DFlash2 checkpoint: missing DFlash2 tensors: " + ", ".join(missing)
+            )

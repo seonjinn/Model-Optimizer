@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Canonical, validated job inputs for pinned drafter SLURM workflows."""
 
@@ -12,9 +24,10 @@ import tempfile
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 __all__ = [
+    "DFlash2RuntimeContract",
     "DrafterExperiment",
     "PinnedPaths",
     "SlurmSettings",
@@ -30,7 +43,13 @@ __all__ = [
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_HORIZONS = {("dflash", 8): 7, ("dflash", 16): 15, ("dspark", 8): 8, ("dspark", 16): 16}
+_HORIZONS = {
+    ("dflash", 8): 7,
+    ("dflash", 16): 15,
+    ("dflash2", 8): 7,
+    ("dspark", 8): 8,
+    ("dspark", 16): 16,
+}
 _TARGET_SLURM_DEFAULTS = {
     "qwen3-30b-a3b": (
         {"nodes": 2, "segment": 2},
@@ -41,6 +60,19 @@ _TARGET_SLURM_DEFAULTS = {
         {"nodes": 16, "segment": 16},
     ),
 }
+
+_VLLM_DFLASH2_REQUIRED_ANCESTOR = "b389ac29465b33f9e9c534df221ea3c129e9793f"
+
+
+class _TargetDefaults(TypedDict):
+    capture_ids: tuple[int, ...]
+    serve_tp: int
+    per_device_train_batch_size: int
+    gradient_accumulation_steps: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    intermediate_size: int
 
 
 def validate_topology(nodes: int, segment: int, role: str) -> None:
@@ -147,7 +179,7 @@ class TargetTopology:
             raise ValueError("Q235 accumulation must match the pinned 4/16-node topology")
 
 
-_TARGET_DEFAULTS = {
+_TARGET_DEFAULTS: dict[str, _TargetDefaults] = {
     "qwen3-30b-a3b": {
         "capture_ids": (2, 13, 24, 35, 46, 48),
         "serve_tp": 2,
@@ -190,6 +222,37 @@ class SlurmSettings:
 
 
 @dataclass(frozen=True)
+class DFlash2RuntimeContract:
+    """Pinned DFlash2 architecture, resume, and serving-runtime requirements."""
+
+    vllm_expected_commit: str
+    vllm_required_ancestor: str = _VLLM_DFLASH2_REQUIRED_ANCESTOR
+    warmstart_policy: str = "exact-dflash2-only"
+    kernel_projection_init: str = "zero"
+    conv_kernel_size: int = 2
+    conv_group_size: int = 16
+    selector_rank: int = 256
+    selector_top_k: int = 16
+    max_speculative_tokens: int = 7
+
+    def __post_init__(self) -> None:
+        if not _FULL_SHA.fullmatch(self.vllm_expected_commit):
+            raise ValueError("DFlash2 vLLM expected commit must be an exact lowercase SHA")
+        expected = {
+            "vllm_required_ancestor": _VLLM_DFLASH2_REQUIRED_ANCESTOR,
+            "warmstart_policy": "exact-dflash2-only",
+            "kernel_projection_init": "zero",
+            "conv_kernel_size": 2,
+            "conv_group_size": 16,
+            "selector_rank": 256,
+            "selector_top_k": 16,
+            "max_speculative_tokens": 7,
+        }
+        if any(getattr(self, name) != value for name, value in expected.items()):
+            raise ValueError("DFlash2 runtime contract must use the pinned safe defaults")
+
+
+@dataclass(frozen=True)
 class DrafterExperiment:
     """One cumulative drafter-training experiment specification."""
 
@@ -203,6 +266,7 @@ class DrafterExperiment:
     paths: PinnedPaths
     slurm: SlurmSettings
     sample_size: int = 1_300_000
+    dflash2: DFlash2RuntimeContract | None = None
 
     def __post_init__(self) -> None:
         if not self.target.strip() or not self.dataset.strip() or not self.run_name.strip():
@@ -210,6 +274,13 @@ class DrafterExperiment:
         method = self.method.lower()
         object.__setattr__(self, "method", method)
         speculative_tokens(method, self.block_size)
+        if method == "dflash2":
+            if self.dflash2 is None:
+                raise ValueError("DFlash2 runtime contract is required")
+            if self.num_speculative_tokens > self.dflash2.max_speculative_tokens:
+                raise ValueError("DFlash2 speculative K exceeds the validated maximum")
+        elif self.dflash2 is not None:
+            raise ValueError("DFlash2 runtime contract is only valid for method=dflash2")
         expected_slurm = _TARGET_SLURM_DEFAULTS.get(self.topology.target_kind, ())
         if not any(
             all(getattr(self.slurm, field) == value for field, value in candidate.items())
@@ -275,7 +346,7 @@ class DrafterExperiment:
 
 def legacy_training_fingerprint(experiment: DrafterExperiment) -> str:
     """Return the exact pre-topology-migration training fingerprint."""
-    payload = (
+    payload: tuple[Any, ...] = (
         experiment.target,
         experiment.dataset,
         experiment.method,
@@ -316,6 +387,8 @@ def topology_v2_training_fingerprint(experiment: DrafterExperiment, cluster_name
         experiment.paths.runtime_archive_sha256,
         experiment.sample_size,
     )
+    if experiment.dflash2 is not None:
+        payload += (asdict(experiment.dflash2),)
     digest = sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
     return f"topology-v2:{digest}"
 
@@ -324,6 +397,8 @@ def _manifest_entry(experiment: DrafterExperiment) -> dict[str, Any]:
     entry = asdict(experiment)
     if entry["paths"]["image_sha256"] is None:
         del entry["paths"]["image_sha256"]
+    if entry["dflash2"] is None:
+        del entry["dflash2"]
     entry["experiment_id"] = experiment.experiment_id
     entry["num_speculative_tokens"] = experiment.num_speculative_tokens
     return entry
@@ -407,6 +482,11 @@ def load_manifest(
             ),
             paths=PinnedPaths(**entry["paths"]),
             slurm=SlurmSettings(**entry["slurm"]),
+            dflash2=(
+                DFlash2RuntimeContract(**entry["dflash2"])
+                if entry.get("dflash2") is not None
+                else None
+            ),
         )
         for entry in raw_experiments
     )

@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=03:55:00
 
@@ -83,6 +96,7 @@ if receipt_path is not None:
 
 uses_topology_v2 = (
     experiment.topology.target_kind == "qwen3-30b-a3b" or experiment.slurm.nodes != 4
+    or experiment.method == "dflash2"
 )
 if uses_topology_v2:
     fingerprint_schema = "topology-v2"
@@ -108,11 +122,20 @@ for value in (
     experiment.experiment_id,
     fingerprint,
     fingerprint_schema,
+    experiment.dflash2.vllm_expected_commit if experiment.dflash2 is not None else "-",
+    experiment.dflash2.vllm_required_ancestor if experiment.dflash2 is not None else "-",
+    experiment.dflash2.warmstart_policy if experiment.dflash2 is not None else "-",
+    experiment.dflash2.kernel_projection_init if experiment.dflash2 is not None else "-",
+    experiment.dflash2.conv_kernel_size if experiment.dflash2 is not None else "-",
+    experiment.dflash2.conv_group_size if experiment.dflash2 is not None else "-",
+    experiment.dflash2.selector_rank if experiment.dflash2 is not None else "-",
+    experiment.dflash2.selector_top_k if experiment.dflash2 is not None else "-",
+    experiment.dflash2.max_speculative_tokens if experiment.dflash2 is not None else "-",
 ):
     print(value)
 PY
 )
-(( ${#manifest_values[@]} == 28 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
+(( ${#manifest_values[@]} == 37 )) || { echo "manifest entry is unavailable" >&2; exit 2; }
 SOURCE_PATH="${manifest_values[0]}"
 SOURCE_SHA="${manifest_values[1]}"
 IMAGE_PATH="${manifest_values[2]}"
@@ -142,6 +165,15 @@ GPUS_PER_NODE="${manifest_values[24]}"
 TRAINING_IDENTITY="${manifest_values[25]}"
 TRAINING_FINGERPRINT="${manifest_values[26]}"
 TRAINING_FINGERPRINT_SCHEMA="${manifest_values[27]}"
+DFLASH2_VLLM_EXPECTED_COMMIT="${manifest_values[28]}"
+DFLASH2_VLLM_REQUIRED_ANCESTOR="${manifest_values[29]}"
+DFLASH2_WARMSTART_POLICY="${manifest_values[30]}"
+DFLASH2_KERNEL_PROJECTION_INIT="${manifest_values[31]}"
+DFLASH2_CONV_KERNEL_SIZE="${manifest_values[32]}"
+DFLASH2_CONV_GROUP_SIZE="${manifest_values[33]}"
+DFLASH2_SELECTOR_RANK="${manifest_values[34]}"
+DFLASH2_SELECTOR_TOP_K="${manifest_values[35]}"
+DFLASH2_MAX_SPECULATIVE_TOKENS="${manifest_values[36]}"
 SERVE_NODES=$((ALLOCATED_NODES / 2))
 TRAINER_NODES=$((ALLOCATED_NODES - SERVE_NODES))
 EXPECTED_RNG_STATES=$((TRAINER_NODES * GPUS_PER_NODE))
@@ -192,6 +224,15 @@ case "${METHOD}:${BLOCK_SIZE}" in
         LOSS_OBJECTIVE=dpace
         LOSS_VALUE=0
         DFLASH_DPACE_ALPHA=0.5
+        ;;
+    dflash2:8)
+        NUM_SPEC_TOKENS=7
+        LOSS_OBJECTIVE=decay
+        LOSS_VALUE=4
+        DFLASH_DPACE_ALPHA=""
+        [[ "$DFLASH2_WARMSTART_POLICY" == exact-dflash2-only ]] || { echo "unsafe DFlash2 warm-start policy" >&2; exit 2; }
+        [[ "$DFLASH2_KERNEL_PROJECTION_INIT" == zero ]] || { echo "unsafe DFlash2 kernel initialization" >&2; exit 2; }
+        [[ "$DFLASH2_MAX_SPECULATIVE_TOKENS" == 7 ]] || { echo "DFlash2 K>7 is not validated" >&2; exit 2; }
         ;;
     dspark:8)
         NUM_SPEC_TOKENS=8
@@ -288,6 +329,7 @@ else
 fi
 
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS SAVE_STEPS RUN_NAME SAMPLE_SIZE
+export DFLASH2_VLLM_EXPECTED_COMMIT DFLASH2_VLLM_REQUIRED_ANCESTOR DFLASH2_CONV_KERNEL_SIZE DFLASH2_CONV_GROUP_SIZE DFLASH2_SELECTOR_RANK DFLASH2_SELECTOR_TOP_K
 export SERVE_NODES CLUSTER_NAME WANDB_NETRC_CONTAINER_PATH
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     export WANDB_RUN_ID="${WANDB_RUN_ID}"
@@ -338,6 +380,18 @@ origin = Path(modelopt.__file__).resolve()
 if not origin.is_relative_to(source):
     raise RuntimeError(f"modelopt imported outside staged source: {origin}")
 PY
+    if [[ "$METHOD" == dflash2 ]]; then
+        "$MODELOPT_RUNTIME/bin/python" - "$DFLASH2_VLLM_EXPECTED_COMMIT" "$DFLASH2_VLLM_REQUIRED_ANCESTOR" <<'PY'
+import sys
+from pathlib import Path
+
+import vllm
+
+from tools.launcher.common.specdec.dflash2_runtime_contract import verify_vllm_checkout
+
+verify_vllm_checkout(Path(vllm.__file__).resolve().parent, sys.argv[1], sys.argv[2])
+PY
+    fi
     export HF_MODEL_CKPT="$node_root/input/target"
     export EAGLE_CAPTURE_IDS
     export HF_HOME="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/hf"
@@ -369,6 +423,16 @@ PY
     if [[ "$METHOD" == dflash ]]; then
         loss_args+=("dflash.dflash_dpace_alpha=${DFLASH_DPACE_ALPHA}")
     fi
+    architecture_args=()
+    if [[ "$METHOD" == dflash2 ]]; then
+        architecture_args+=(
+            "dflash.dflash_architecture_config.projector_type=dflash2"
+            "dflash.dflash_architecture_config.conv_kernel_size=${DFLASH2_CONV_KERNEL_SIZE}"
+            "dflash.dflash_architecture_config.conv_group_size=${DFLASH2_CONV_GROUP_SIZE}"
+            "dflash.dflash_architecture_config.selector_rank=${DFLASH2_SELECTOR_RANK}"
+            "dflash.dflash_architecture_config.selector_top_k=${DFLASH2_SELECTOR_TOP_K}"
+        )
+    fi
     cd "$node_root/source/tools/launcher"
     exec bash common/eagle3/train_eagle_streaming.sh \
         --config "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml" \
@@ -395,6 +459,7 @@ PY
         dflash.dflash_architecture_config.num_key_value_heads="${NUM_KEY_VALUE_HEADS}" \
         dflash.dflash_architecture_config.head_dim="${HEAD_DIM}" \
         dflash.dflash_architecture_config.intermediate_size="${INTERMEDIATE_SIZE}" \
+        "${architecture_args[@]}" \
         "${loss_args[@]}"
 ')
 

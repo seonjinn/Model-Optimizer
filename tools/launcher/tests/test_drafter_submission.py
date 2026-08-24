@@ -36,6 +36,7 @@ from common.specdec.build_drafter_full_manifest import (
     validate_legacy_seed_identity,
 )
 from common.specdec.drafter_job_manifest import (
+    DFlash2RuntimeContract,
     DrafterExperiment,
     PinnedPaths,
     SlurmSettings,
@@ -75,13 +76,52 @@ def test_validate_topology_rejects_invalid_segments(nodes: int, segment: int, ro
 
 @pytest.mark.parametrize(
     ("method", "block_size", "expected"),
-    [("dflash", 8, 7), ("dflash", 16, 15), ("dspark", 8, 8), ("dspark", 16, 16)],
+    [
+        ("dflash", 8, 7),
+        ("dflash", 16, 15),
+        ("dflash2", 8, 7),
+        ("dspark", 8, 8),
+        ("dspark", 16, 16),
+    ],
 )
 def test_speculative_tokens_uses_the_pinned_b_k_matrix(
     method: str, block_size: int, expected: int
 ) -> None:
     """Every public evaluator run uses the corresponding DFlash/DSpark horizon."""
     assert speculative_tokens(method, block_size) == expected
+
+
+def test_dflash2_rejects_k_larger_than_seven() -> None:
+    """DFlash2 stays on the only validated K=7/B8 serving contract."""
+    with pytest.raises(ValueError, match="unsupported method/block-size pair"):
+        speculative_tokens("dflash2", 16)
+
+
+def test_dflash2_manifest_requires_a_runtime_and_initialization_contract() -> None:
+    """A DFlash2 job cannot rely on implicit vLLM or warm-start behavior."""
+    values = {**_experiment().__dict__, "method": "dflash2"}
+
+    with pytest.raises(ValueError, match="DFlash2 runtime contract"):
+        DrafterExperiment(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("vllm_required_ancestor", "a" * 40),
+        ("warmstart_policy", "selective"),
+        ("kernel_projection_init", "random"),
+        ("max_speculative_tokens", 8),
+    ],
+)
+def test_dflash2_runtime_contract_rejects_unvalidated_overrides(
+    field: str, value: str | int
+) -> None:
+    """Runtime, warm-start, initialization, and K safety cannot drift per job."""
+    values = {"vllm_expected_commit": "f" * 40, field: value}
+
+    with pytest.raises(ValueError, match="pinned safe defaults"):
+        DFlash2RuntimeContract(**values)
 
 
 def _experiment() -> DrafterExperiment:
