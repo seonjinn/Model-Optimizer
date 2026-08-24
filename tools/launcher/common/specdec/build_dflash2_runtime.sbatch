@@ -5,8 +5,13 @@
 # Build a relocatable venv whose vLLM Python sources are exact PR 52816 bytes.
 set -euo pipefail
 
+MODE=build
+if [[ "${1:-}" == --configure-only ]]; then
+    MODE=configure-only
+    shift
+fi
 [[ $# == 7 ]] || {
-    echo "usage: $0 BASE_RUNTIME OUTPUT VLLM_CHECKOUT FLASHMLA_CHECKOUT IMAGE LAUNCHER_ROOT SCRATCH_ROOT" >&2
+    echo "usage: $0 [--configure-only] BASE_RUNTIME OUTPUT VLLM_CHECKOUT FLASHMLA_CHECKOUT IMAGE LAUNCHER_ROOT SCRATCH_ROOT" >&2
     exit 2
 }
 BASE_RUNTIME="$(realpath "$1")"
@@ -42,18 +47,24 @@ mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${FLASHML
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
     bash -s -- "$prepared" "$VLLM_CHECKOUT" "$FLASHMLA_CHECKOUT" "$build_source" \
-    "$build_directory" <<'INNER'
+    "$build_directory" "$MODE" <<'INNER'
 set -euo pipefail
 prepared="$1"
 checkout="$2"
 flashmla_checkout="$3"
 build_source="$4"
 build_directory="$5"
+mode="$6"
 configure_log="$prepared/dflash2-flashmla-cmake-configure.log"
 "$prepared/bin/python" -m pip install --disable-pip-version-check --no-cache-dir \
     --only-binary=:all: --no-deps --ignore-installed cmake==3.31.6 ninja==1.13.0
+export PATH="$prepared/bin:$PATH"
+[[ "$(command -v cmake)" == "$prepared/bin/cmake" ]]
+[[ "$(command -v ninja)" == "$prepared/bin/ninja" ]]
 {
+    printf 'cmake_path=%s\n' "$(command -v cmake)"
     "$prepared/bin/cmake" --version
+    printf 'ninja_path=%s\n' "$(command -v ninja)"
     "$prepared/bin/ninja" --version
 } >"$configure_log"
 
@@ -88,11 +99,24 @@ TORCH_CUDA_ARCH_LIST=10.0a FLASH_MLA_SRC_DIR="$flashmla_checkout" \
     -DCMAKE_MAKE_PROGRAM="$prepared/bin/ninja" -DNVCC_THREADS=8 2>&1 | tee -a "$configure_log"
 grep -Eq 'CUDA target architectures:.*10\.0[af]' "$configure_log"
 grep -Eq 'FlashMLA CUDA architectures:.*10\.0[af]' "$configure_log"
+[[ "$mode" != configure-only ]] || exit 0
 FLASH_MLA_SRC_DIR="$flashmla_checkout" "$prepared/bin/cmake" --build "$build_directory" \
     --target _flashmla_C _flashmla_extension_C --parallel 16
 "$prepared/bin/cmake" --install "$build_directory" --component _flashmla_C
 "$prepared/bin/cmake" --install "$build_directory" --component _flashmla_extension_C
 INNER
+
+if [[ "$MODE" == configure-only ]]; then
+    PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
+        "$LAUNCHER_ROOT/tools/launcher/common/specdec/dflash2_runtime_contract.py" \
+        flashmla-configure-preflight --output "$OUTPUT_ARCHIVE" \
+        --vllm-package "$VLLM_CHECKOUT/vllm" --flashmla-package "$FLASHMLA_CHECKOUT/flash_mla" \
+        --base-runtime "$BASE_RUNTIME" --image "$IMAGE" --builder "${BASH_SOURCE[0]}" \
+        --configure-log "$prepared/dflash2-flashmla-cmake-configure.log" \
+        --vllm-commit "$EXPECTED_COMMIT" --flashmla-commit "$FLASHMLA_COMMIT" \
+        --slurm-job-id "$SLURM_JOB_ID" >"${OUTPUT_ARCHIVE}.sha256"
+    exit 0
+fi
 
 runtime_package="$(<"$prepared/dflash2-vllm-runtime-package.path")"
 build_manifest="$prepared/dflash2-flashmla-build-manifest.json"

@@ -499,6 +499,86 @@ def _flashmla_extension_descriptors(runtime_package: Path) -> list[dict[str, Any
     return [_file_descriptor(item, item.name) for item in extensions]
 
 
+def _flashmla_configure_evidence(configure_log: Path) -> dict[str, str]:
+    configure_text = _stable_bytes(configure_log).decode("utf-8")
+    patterns = {
+        "cmake_path": r"(?m)^cmake_path=(\S*/runtime/bin/cmake)$",
+        "cmake_version": r"(?m)^cmake version (3\.31\.6)$",
+        "ninja_path": r"(?m)^ninja_path=(\S*/runtime/bin/ninja)$",
+        "ninja_version": r"(?m)^(1\.13\.0)$",
+        "cuda_architectures": r"CUDA target architectures:.*(10\.0[af])",
+        "flashmla_architectures": r"FlashMLA CUDA architectures:.*(10\.0[af])",
+    }
+    evidence: dict[str, str] = {}
+    for name, pattern in patterns.items():
+        match = re.search(pattern, configure_text)
+        if match is None:
+            raise ValueError("FlashMLA configure evidence is incomplete")
+        evidence[name] = match.group(1)
+    return evidence
+
+
+def write_flashmla_configure_preflight(
+    path: Path,
+    vllm_package_path: Path,
+    flashmla_package_path: Path,
+    base_runtime_path: Path,
+    image_path: Path,
+    builder_path: Path,
+    configure_log_path: Path,
+    vllm_commit: str,
+    flashmla_commit: str,
+    slurm_job_id: str,
+) -> str:
+    """Publish configure-only evidence before attempting a source build."""
+    if not slurm_job_id.isdigit():
+        raise ValueError("FlashMLA configure preflight requires a numeric Slurm job ID")
+    vllm_package = _verified_checkout(vllm_package_path, vllm_commit, vllm_commit)
+    flashmla_package = _verified_checkout(
+        flashmla_package_path,
+        flashmla_commit,
+        flashmla_commit,
+    )
+    recipe = _verified_commit_file(
+        vllm_package.parent,
+        _FLASHMLA_VLLM_RECIPE,
+        vllm_commit,
+        "vLLM FlashMLA build recipe",
+    )
+    submodules = _git(flashmla_package.parent, "submodule", "status", "--recursive")
+    submodule_lines = [line for line in submodules.stdout.splitlines() if line]
+    if submodules.returncode or any(line[0] != " " for line in submodule_lines):
+        raise ValueError("FlashMLA configure requires initialized exact submodules")
+    configure_log = configure_log_path.resolve(strict=True)
+    body: dict[str, Any] = {
+        "schema_version": 1,
+        "producer": "dflash2-flashmla-configure-preflight-v1",
+        "slurm_job_id": slurm_job_id,
+        "vllm_commit": vllm_commit,
+        "flashmla_commit": flashmla_commit,
+        "vllm_build_recipe": _file_descriptor(recipe, _FLASHMLA_VLLM_RECIPE),
+        "flashmla_source_interface": _file_descriptor(
+            flashmla_package.parent / _FLASHMLA_SOURCE_INTERFACE,
+            _FLASHMLA_SOURCE_INTERFACE,
+        ),
+        "flashmla_submodules": submodule_lines,
+        "base_runtime": _file_descriptor(
+            base_runtime_path.resolve(strict=True), str(base_runtime_path.resolve(strict=True))
+        ),
+        "container_image": _file_descriptor(
+            image_path.resolve(strict=True), str(image_path.resolve(strict=True))
+        ),
+        "builder": _file_descriptor(builder_path.resolve(strict=True), str(builder_path.resolve(strict=True))),
+        "configure_log": _file_descriptor(configure_log, _FLASHMLA_CONFIGURE_LOG),
+        "configure_evidence": _flashmla_configure_evidence(configure_log),
+    }
+    body["receipt_sha256"] = _sha_json(body)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("x", encoding="utf-8") as stream:
+        stream.write(_canonical(body) + "\n")
+    return hashlib.sha256(_stable_bytes(path)).hexdigest()
+
+
 def write_flashmla_build_manifest(
     path: Path,
     runtime_package_path: Path,
@@ -531,12 +611,7 @@ def write_flashmla_build_manifest(
         raise ValueError("FlashMLA build requires initialized exact submodules")
     runtime_package = runtime_package_path.resolve(strict=True)
     configure_log = configure_log_path.resolve(strict=True)
-    configure_text = _stable_bytes(configure_log).decode("utf-8")
-    if not (
-        re.search(r"CUDA target architectures:.*10\.0[af]", configure_text)
-        and re.search(r"FlashMLA CUDA architectures:.*10\.0[af]", configure_text)
-    ):
-        raise ValueError("FlashMLA CMake configure did not enable Blackwell architectures")
+    configure_evidence = _flashmla_configure_evidence(configure_log)
     body: dict[str, Any] = {
         "schema_version": 1,
         "producer": "dflash2-flashmla-source-build-v1",
@@ -556,6 +631,7 @@ def write_flashmla_build_manifest(
         ),
         "builder": _file_descriptor(builder_path.resolve(strict=True), str(builder_path.resolve(strict=True))),
         "configure_log": _file_descriptor(configure_log, _FLASHMLA_CONFIGURE_LOG),
+        "configure_evidence": configure_evidence,
         "cmake_targets": list(_FLASHMLA_EXTENSION_STEMS),
         "extension_binaries": _flashmla_extension_descriptors(runtime_package),
     }
@@ -847,6 +923,17 @@ def main() -> None:
     flashmla_build.add_argument("--configure-log", type=Path, required=True)
     flashmla_build.add_argument("--vllm-commit", required=True)
     flashmla_build.add_argument("--flashmla-commit", required=True)
+    configure = subparsers.add_parser("flashmla-configure-preflight")
+    configure.add_argument("--output", type=Path, required=True)
+    configure.add_argument("--vllm-package", type=Path, required=True)
+    configure.add_argument("--flashmla-package", type=Path, required=True)
+    configure.add_argument("--base-runtime", type=Path, required=True)
+    configure.add_argument("--image", type=Path, required=True)
+    configure.add_argument("--builder", type=Path, required=True)
+    configure.add_argument("--configure-log", type=Path, required=True)
+    configure.add_argument("--vllm-commit", required=True)
+    configure.add_argument("--flashmla-commit", required=True)
+    configure.add_argument("--slurm-job-id", required=True)
     artifact = subparsers.add_parser("artifact-receipt")
     artifact.add_argument("--artifact", type=Path, required=True)
     artifact.add_argument("--output", type=Path, required=True)
@@ -880,6 +967,19 @@ def main() -> None:
             args.configure_log,
             args.vllm_commit,
             args.flashmla_commit,
+        )
+    elif args.command == "flashmla-configure-preflight":
+        receipt_sha256 = write_flashmla_configure_preflight(
+            args.output,
+            args.vllm_package,
+            args.flashmla_package,
+            args.base_runtime,
+            args.image,
+            args.builder,
+            args.configure_log,
+            args.vllm_commit,
+            args.flashmla_commit,
+            args.slurm_job_id,
         )
     elif args.command == "artifact-receipt":
         receipt_sha256 = write_artifact_receipt(

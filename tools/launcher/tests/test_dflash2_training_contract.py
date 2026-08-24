@@ -221,6 +221,10 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
     builder.write_text("#!/usr/bin/env bash\ncmake --build exact-inputs\n")
     configure_log = tmp_path / "dflash2-flashmla-cmake-configure.log"
     configure_log.write_text(
+        "cmake_path=/scratch/job/runtime/bin/cmake\n"
+        "cmake version 3.31.6\n"
+        "ninja_path=/scratch/job/runtime/bin/ninja\n"
+        "1.13.0\n"
         "-- CUDA target architectures: 10.0a\n"
         "-- FlashMLA CUDA architectures: 10.0f\n"
     )
@@ -327,8 +331,14 @@ def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) 
     ):
         item = tmp_path / name
         item.write_text(
-            "-- CUDA target architectures: 10.0a\n"
-            "-- FlashMLA CUDA architectures: 10.0f\n"
+            (
+                "cmake_path=/scratch/job/runtime/bin/cmake\n"
+                "cmake version 3.31.6\n"
+                "ninja_path=/scratch/job/runtime/bin/ninja\n"
+                "1.13.0\n"
+                "-- CUDA target architectures: 10.0a\n"
+                "-- FlashMLA CUDA architectures: 10.0f\n"
+            )
             if name.endswith(".log")
             else name
         )
@@ -343,6 +353,54 @@ def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) 
             *inputs,
             expected,
             flashmla_commit,
+        )
+
+
+def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -> None:
+    """Configure-only evidence proves exact job-local tools and Blackwell architecture gates."""
+    package, _, expected = _vllm_checkout(tmp_path)
+    flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
+    inputs = []
+    for name in ("base-runtime.tar.zst", "vllm.sqsh", "builder.sbatch"):
+        item = tmp_path / name
+        item.write_bytes(name.encode())
+        inputs.append(item)
+    configure_log = tmp_path / "dflash2-flashmla-cmake-configure.log"
+    configure_log.write_text(
+        "cmake_path=/scratch/job/runtime/bin/cmake\n"
+        "cmake version 3.31.6\n"
+        "ninja_path=/scratch/job/runtime/bin/ninja\n"
+        "1.13.0\n"
+        "-- CUDA target architectures: 10.0a\n"
+        "-- FlashMLA CUDA architectures: 10.0f\n"
+    )
+    receipt = tmp_path / "configure-preflight.json"
+
+    receipt_sha = runtime_contract.write_flashmla_configure_preflight(
+        receipt,
+        package,
+        flashmla,
+        *inputs,
+        configure_log,
+        expected,
+        flashmla_commit,
+        "12345",
+    )
+
+    body = json.loads(receipt.read_text())
+    assert hashlib.sha256(receipt.read_bytes()).hexdigest() == receipt_sha
+    assert body["producer"] == "dflash2-flashmla-configure-preflight-v1"
+    assert body["slurm_job_id"] == "12345"
+    with pytest.raises(FileExistsError):
+        runtime_contract.write_flashmla_configure_preflight(
+            receipt,
+            package,
+            flashmla,
+            *inputs,
+            configure_log,
+            expected,
+            flashmla_commit,
+            "12345",
         )
 
 
@@ -806,6 +864,10 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "cmake==3.31.6",
         "ninja==1.13.0",
         "--ignore-installed",
+        "--configure-only",
+        "flashmla-configure-preflight",
+        "cmake_path=",
+        "ninja_path=",
         '"$prepared/bin/cmake" --version',
         '"$prepared/bin/ninja" --version',
         "CUDA target architectures",
