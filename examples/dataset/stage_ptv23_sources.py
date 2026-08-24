@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import urllib.parse
 import urllib.request
@@ -314,12 +315,74 @@ def validate_ptv3_config_pins(path: Path) -> None:
             _parse_file(file, f"{label}.files[{file_index}]")
 
 
-def _local_candidates(root: Path, source: SourceIdentity, file: SourceFile) -> tuple[Path, ...]:
+def _local_candidates(
+    root: Path,
+    source: SourceIdentity,
+    file: SourceFile,
+    *,
+    authenticated_direct_projection: bool,
+) -> tuple[Path, ...]:
     cache_name = f"datasets--{source.repository_id.replace('/', '--')}"
-    return (
+    candidates = (
         root / source.repository_id / source.revision / file.path,
         root / cache_name / "snapshots" / source.revision / file.path,
     )
+    if authenticated_direct_projection:
+        return (*candidates, root / file.path)
+    return candidates
+
+
+def _read_regular_no_follow(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SourceManifestError("local projection receipt is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    pathname = os.lstat(path)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) or (pathname.st_dev, pathname.st_ino) != (after.st_dev, after.st_ino):
+        raise SourceManifestError("local projection receipt changed while reading")
+    return b"".join(chunks)
+
+
+def _authenticate_direct_projection(
+    inventory: SourceInventory, root: Path, receipt_path: Path
+) -> None:
+    try:
+        receipt = json.loads(_read_regular_no_follow(receipt_path))
+        data_root = (root / "data").resolve(strict=True)
+    except (OSError, json.JSONDecodeError) as error:
+        raise SourceManifestError("local projection receipt is unavailable") from error
+    split_counts = {source.split: len(source.files) for source in inventory.sources}
+    repositories = {source.repository_id for source in inventory.sources}
+    revisions = {source.revision for source in inventory.sources}
+    target_inventory = receipt.get("target_inventory") if isinstance(receipt, dict) else None
+    manifest = receipt.get("manifest") if isinstance(receipt, dict) else None
+    if (
+        not isinstance(receipt, dict)
+        or not isinstance(target_inventory, dict)
+        or not isinstance(manifest, dict)
+        or receipt.get("complete") is not True
+        or receipt.get("approved_use") is not True
+        or receipt.get("source_root_realpath") != str(data_root)
+        or receipt.get("repository_id") not in repositories
+        or receipt.get("revision") not in revisions
+        or receipt.get("split_counts") != split_counts
+        or target_inventory.get("count") != sum(len(source.files) for source in inventory.sources)
+        or manifest.get("sha256") != inventory.manifest_sha256
+    ):
+        raise SourceManifestError("local projection receipt does not authenticate the inventory")
 
 
 def _copy_stream(source: Path, destination: Path) -> tuple[int, str]:
@@ -553,6 +616,7 @@ def stage_source_inventory(
     durable_root: Path,
     scratch_root: Path,
     local_source_root: Path | None = None,
+    local_projection_receipt: Path | None = None,
 ) -> SourceInventory:
     """Stream, verify, count, and atomically publish one content-bound source tree."""
     durable_root = durable_root.expanduser().resolve(strict=False)
@@ -562,6 +626,12 @@ def stage_source_inventory(
         if local_source_root is not None
         else None
     )
+    if local_source_root is None and local_projection_receipt is not None:
+        raise SourceManifestError("local projection receipt requires a local source root")
+    authenticated_direct_projection = False
+    if local_source_root is not None and local_projection_receipt is not None:
+        _authenticate_direct_projection(inventory, local_source_root, local_projection_receipt)
+        authenticated_direct_projection = True
     output_root = durable_root / inventory.manifest_sha256
     if output_root.is_symlink():
         raise SourceManifestError("stale staged inventory root")
@@ -584,7 +654,12 @@ def stage_source_inventory(
                 if local_source_root is None:
                     size, digest = _download_stream(source, file, destination)
                 else:
-                    candidates = _local_candidates(local_source_root, source, file)
+                    candidates = _local_candidates(
+                        local_source_root,
+                        source,
+                        file,
+                        authenticated_direct_projection=authenticated_direct_projection,
+                    )
                     local = next(
                         (candidate for candidate in candidates if candidate.is_file()), None
                     )
@@ -645,6 +720,7 @@ def main() -> int:
     parser.add_argument("--durable-root", type=Path, required=True)
     parser.add_argument("--scratch-root", type=Path, required=True)
     parser.add_argument("--local-source-root", type=Path)
+    parser.add_argument("--local-projection-receipt", type=Path)
     parser.add_argument("--ptv3-config", type=Path)
     args = parser.parse_args()
     if args.ptv3_config is not None:
@@ -654,6 +730,7 @@ def main() -> int:
         durable_root=args.durable_root,
         scratch_root=args.scratch_root,
         local_source_root=args.local_source_root,
+        local_projection_receipt=args.local_projection_receipt,
     )
     assert inventory.staged_root is not None
     print(inventory.staged_root / "SOURCE_INVENTORY.json")

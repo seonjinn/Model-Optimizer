@@ -277,6 +277,51 @@ def test_staging_refuses_unrevisioned_local_candidate(tmp_path: Path) -> None:
         )
 
 
+def test_authenticated_bootstrap_projection_can_supply_flat_local_files(tmp_path: Path) -> None:
+    """A complete bootstrap receipt authorizes its exact flat 201-style projection."""
+    manifest, source_root = _write_manifest(tmp_path)
+    inventory = load_source_inventory(manifest)
+    projection = tmp_path / "projection"
+    data_root = projection / "data"
+    data_root.mkdir(parents=True)
+    shutil.copyfile(
+        source_root / "nvidia/Test" / ("a" * 40) / "data/train.jsonl",
+        data_root / "train.jsonl",
+    )
+    receipt = tmp_path / "SOURCE_MANIFEST_COMPLETION.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "approved_use": True,
+                "source_root_realpath": str(data_root.resolve()),
+                "repository_id": "nvidia/Test",
+                "revision": "a" * 40,
+                "split_counts": {"train": 1},
+                "target_inventory": {"count": 1},
+                "manifest": {"sha256": inventory.manifest_sha256},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    staged = stage_source_inventory(
+        inventory,
+        durable_root=tmp_path / "durable",
+        scratch_root=tmp_path / "scratch",
+        local_source_root=projection,
+        local_projection_receipt=receipt,
+    )
+
+    assert staged.raw_counts == {"math": 2}
+    assert staged.staged_root is not None
+    assert (
+        next(staged.staged_root.rglob("train.jsonl")).read_bytes()
+        == (data_root / "train.jsonl").read_bytes()
+    )
+
+
 def test_atomic_publication_never_replaces_concurrent_winner(tmp_path: Path) -> None:
     """Exactly one simultaneous publisher may claim a previously absent namespace."""
     destination = tmp_path / "published"

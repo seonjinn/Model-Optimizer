@@ -79,4 +79,11 @@ if [[ -n "${LOCAL_SOURCE_ROOT:-}" ]]; then
     [[ "$LOCAL_SOURCE_ROOT" == /* ]] || { echo "local source root must be absolute" >&2; exit 2; }
     command+=(--local-source-root "$LOCAL_SOURCE_ROOT")
 fi
+if [[ -n "${LOCAL_PROJECTION_RECEIPT:-}" ]]; then
+    [[ "$LOCAL_PROJECTION_RECEIPT" == /* ]] || {
+        echo "local projection receipt must be absolute" >&2
+        exit 2
+    }
+    command+=(--local-projection-receipt "$LOCAL_PROJECTION_RECEIPT")
+fi
 "${command[@]}"
