@@ -14,7 +14,6 @@ import re
 import shutil
 import stat
 import subprocess  # nosec B404 - Git is invoked with fixed argv during receipt creation.
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -549,6 +548,57 @@ def _runtime_files(package: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _apply_unified_patch(base: bytes, patch: bytes) -> bytes:
+    base_lines = base.splitlines(keepends=True)
+    patch_lines = patch.splitlines(keepends=True)
+    output: list[bytes] = []
+    base_cursor = 0
+    hunk_count = 0
+    index = 0
+    while index < len(patch_lines):
+        header = re.fullmatch(
+            rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@.*\n?",
+            patch_lines[index],
+        )
+        if header is None:
+            index += 1
+            continue
+        hunk_count += 1
+        old_start = int(header.group(1)) - 1
+        old_count = int(header.group(2) or b"1")
+        new_count = int(header.group(4) or b"1")
+        if old_start < base_cursor or old_start > len(base_lines):
+            raise ValueError("DFlash2 vLLM profile patch hunk offset is invalid")
+        output.extend(base_lines[base_cursor:old_start])
+        base_cursor = old_start
+        old_seen = 0
+        new_seen = 0
+        index += 1
+        while index < len(patch_lines) and not patch_lines[index].startswith(b"@@ "):
+            line = patch_lines[index]
+            if line.startswith((b"diff --git ", b"--- ", b"+++ ", b"index ")):
+                break
+            prefix = line[:1]
+            content = line[1:]
+            if prefix in {b" ", b"-"}:
+                if base_cursor >= len(base_lines) or base_lines[base_cursor] != content:
+                    raise ValueError("DFlash2 vLLM profile patch base context mismatch")
+                base_cursor += 1
+                old_seen += 1
+            if prefix in {b" ", b"+"}:
+                output.append(content)
+                new_seen += 1
+            if prefix not in {b" ", b"-", b"+"}:
+                raise ValueError("DFlash2 vLLM profile patch contains an invalid hunk line")
+            index += 1
+        if old_seen != old_count or new_seen != new_count:
+            raise ValueError("DFlash2 vLLM profile patch hunk size mismatch")
+    if hunk_count != 1:
+        raise ValueError("DFlash2 vLLM profile patch must contain exactly one hunk")
+    output.extend(base_lines[base_cursor:])
+    return b"".join(output)
+
+
 def _verified_runtime_source_patch(
     runtime_package: Path,
     patch_path: Path,
@@ -562,23 +612,9 @@ def _verified_runtime_source_patch(
     base_descriptor = _file_descriptor(base, _VLLM_PROFILE_PATCH_BASE_NAME)
     target = runtime_package.resolve(strict=True) / _VLLM_PROFILE_PATCH_TARGET
     patched_descriptor = _file_descriptor(target, _VLLM_PROFILE_PATCH_TARGET)
-    if _GIT is None:
-        raise ValueError("Git is required to verify the DFlash2 vLLM profile patch")
-    with tempfile.TemporaryDirectory(prefix="dflash2-vllm-patch-") as temporary:
-        root = Path(temporary)
-        candidate = root / "vllm" / _VLLM_PROFILE_PATCH_TARGET
-        candidate.parent.mkdir(parents=True)
-        candidate.write_bytes(_stable_bytes(base))
-        completed = subprocess.run(  # nosec B603 - fixed Git argv and pinned patch bytes.
-            [_GIT, "-C", str(root), "apply", str(patch)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode:
-            raise ValueError("DFlash2 vLLM profile patch does not apply to pinned base bytes")
-        if _stable_bytes(candidate) != _stable_bytes(target):
-            raise ValueError("DFlash2 vLLM profile patch output mismatch")
+    patched_bytes = _apply_unified_patch(_stable_bytes(base), _stable_bytes(patch))
+    if patched_bytes != _stable_bytes(target):
+        raise ValueError("DFlash2 vLLM profile patch output mismatch")
     return {
         "source_patch": patch_descriptor,
         "source_patch_target": _VLLM_PROFILE_PATCH_TARGET,

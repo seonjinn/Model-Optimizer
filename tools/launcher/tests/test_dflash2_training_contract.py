@@ -82,7 +82,8 @@ def _vllm_checkout(tmp_path: Path) -> tuple[Path, str, str]:
     profile_speculator = package / "v1/worker/gpu/spec_decode/dflash/speculator.py"
     profile_speculator.parent.mkdir(parents=True)
     profile_speculator.write_text(
-        "        if dummy_run and skip_attn_for_dummy_run:\n"
+        "".join(f"# pinned b389 line {line}\n" for line in range(1, 364))
+        + "        if dummy_run and skip_attn_for_dummy_run:\n"
         "            # Memory profiling path: block_tables / kv_cache_config are not initialized.\n"
         "            # Since DFlash needs to build its own attention metadata, we must skip the\n"
         "            # preparation in this path and run a minimal forward pass.\n"
@@ -244,7 +245,10 @@ def test_vllm_runtime_receipt_survives_archive_staging_without_git(tmp_path: Pat
         verify_vllm_runtime(staged, receipt, receipt_sha, expected, required)
 
 
-def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path: Path) -> None:
+def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A wheel may add ARM64 extensions, but every tracked PR source byte must remain exact."""
     package, required, expected = _vllm_checkout(tmp_path)
     flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
@@ -364,6 +368,18 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
         runtime_source_patch_base_path=base_path,
     )
     assert json.loads(patched_receipt.read_text())["schema_version"] == 5
+    assert (
+        verify_vllm_runtime(
+            patched_runtime,
+            patched_receipt,
+            patched_receipt_sha,
+            expected,
+            required,
+            expected_flashmla_commit=flashmla_commit,
+        )
+        == expected
+    )
+    monkeypatch.setattr(runtime_contract, "_GIT", None)
     assert (
         verify_vllm_runtime(
             patched_runtime,
