@@ -92,7 +92,9 @@ done
 [[ -d "$(dirname "$slurm_output")" && "$slurm_output" != "$output_root"/* ]] || usage
 for path in "$wandb_dir" "$wandb_cache_dir" "$wandb_config_dir" "$wandb_artifact_dir"; do
     [[ "$path" != "$repo_root" && "$path" != "$repo_root"/* ]] || exit 2
+    [[ "$path" == /lustre/* ]] || exit 2
 done
+[[ "$wandb_cache_dir" == */scratch/* ]] || exit 2
 [[ "$(git -C "$repo_root" rev-parse HEAD)" == "$source_commit" ]] || exit 2
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || exit 2
 
@@ -114,8 +116,11 @@ PY
 readonly LAUNCHER_ROOT="$repo_root/tools/launcher"
 readonly CPU_SCRIPT="$LAUNCHER_ROOT/common/specdec/run_qwen4b_a_builder.sbatch"
 readonly GPU_SCRIPT="$LAUNCHER_ROOT/common/specdec/run_qwen4b_a_canary.sbatch"
-builder_exports="ALL,REPO_ROOT=$repo_root,SOURCE_COMMIT=$source_commit,TASK9_A_SELECTION=$task9_selection,TASK9_A_SELECTION_SHA256=$selection_sha,TASK8_PUBLICATION=$task8_publication,TASK8_PUBLICATION_SHA256=$publication_sha,A_CANARY_BUILD_ROOT=$build_root,A_CANARY_MANIFEST=$manifest,A_CANARY_ACCOUNT=$account,TARGET_REVISION=$target_revision,TARGET_PATH=$target_path,CONTAINER_IMAGE=$container_image,WANDB_NETRC_HOST_PATH=$wandb_netrc,WANDB_DIR=$wandb_dir,WANDB_CACHE_DIR=$wandb_cache_dir,WANDB_CONFIG_DIR=$wandb_config_dir,WANDB_ARTIFACT_DIR=$wandb_artifact_dir"
-gpu_exports="ALL,A_CANARY_MANIFEST=$manifest,A_CANARY_OUTPUT_ROOT=$output_root,A_CANARY_CHECKPOINT=$output_root/train,A_CANARY_EXPORT=$output_root/export,A_CANARY_GPU_EVIDENCE=$output_root/control/GPU_ACTIVITY.json,A_CANARY_EVALUATION_RECEIPT=$output_root/evaluation/RESULT.json,A_CANARY_SUPERVISOR_COMPLETION=$output_root/control/SUPERVISOR_COMPLETION.json,A_CANARY_AUTHORIZATION=$authorization,A_CANARY_EVAL_OUTPUT=$output_root/evaluation/specdec,LAUNCHER_ROOT=$LAUNCHER_ROOT,REPO_ROOT=$repo_root,MODELOPT_RUNTIME=$modelopt_runtime,SPECULATORS_RUNTIME=$speculators_runtime,SPECULATORS_REPO=$speculators_repo,HF_HOME=$hf_home,EVAL_CONFIG_PATH=$eval_config,CONTAINER_IMAGE=$container_image,CONTAINER_IDENTITY_PATH=$container_identity,DATASET_MANIFEST_PATH=$dataset_manifest,MODELOPT_REPO=$repo_root,WANDB_NETRC_PATH=/run/secrets/wandb.netrc,WANDB_DIR=$wandb_dir,WANDB_CACHE_DIR=$wandb_cache_dir,WANDB_CONFIG_DIR=$wandb_config_dir,WANDB_ARTIFACT_DIR=$wandb_artifact_dir,A_CANARY_JOB_COMMENT=$slurm_comment,A_CANARY_SLURM_OUTPUT=$slurm_output"
+readonly CONTROLLER_SCRIPT="$LAUNCHER_ROOT/common/specdec/finalize_qwen4b_a_canary.sh"
+readonly job_completion="$output_root/control/A_JOB_COMPLETION.json"
+readonly scheduler_observation="$output_root/control/A_SCHEDULER_OBSERVATION.json"
+builder_exports="ALL,REPO_ROOT=$repo_root,SOURCE_COMMIT=$source_commit,TASK9_A_SELECTION=$task9_selection,TASK9_A_SELECTION_SHA256=$selection_sha,TASK8_PUBLICATION=$task8_publication,TASK8_PUBLICATION_SHA256=$publication_sha,A_CANARY_BUILD_ROOT=$build_root,A_CANARY_MANIFEST=$manifest,A_CANARY_ACCOUNT=$account,TARGET_REVISION=$target_revision,TARGET_PATH=$target_path,CONTAINER_IMAGE=$container_image,WANDB_NETRC_HOST_PATH=$wandb_netrc,WANDB_DIR=$wandb_dir,WANDB_CACHE_DIR=$wandb_cache_dir,WANDB_CONFIG_DIR=$wandb_config_dir,WANDB_ARTIFACT_DIR=$wandb_artifact_dir,MODELOPT_RUNTIME=$modelopt_runtime,SPECULATORS_RUNTIME=$speculators_runtime,SPECULATORS_REPO=$speculators_repo"
+gpu_exports="ALL,A_CANARY_MANIFEST=$manifest,A_CANARY_OUTPUT_ROOT=$output_root,A_CANARY_CHECKPOINT=$output_root/train,A_CANARY_EXPORT=$output_root/export,A_CANARY_INTERMEDIATE_EXPORT=$output_root/control/parent-export,A_CANARY_GPU_EVIDENCE=$output_root/control/GPU_ACTIVITY.json,A_CANARY_EVALUATION_RECEIPT=$output_root/evaluation/RESULT.json,A_CANARY_SUPERVISOR_COMPLETION=$output_root/control/SUPERVISOR_COMPLETION.json,A_CANARY_JOB_COMPLETION=$job_completion,A_CANARY_SUBMISSION_RECEIPT=$submission_receipt,A_CANARY_EVAL_OUTPUT=$output_root/evaluation/specdec,LAUNCHER_ROOT=$LAUNCHER_ROOT,REPO_ROOT=$repo_root,MODELOPT_RUNTIME=$modelopt_runtime,SPECULATORS_RUNTIME=$speculators_runtime,SPECULATORS_REPO=$speculators_repo,HF_HOME=$hf_home,EVAL_CONFIG_PATH=$eval_config,CONTAINER_IMAGE=$container_image,CONTAINER_IDENTITY_PATH=$container_identity,DATASET_MANIFEST_PATH=$dataset_manifest,MODELOPT_REPO=$repo_root,WANDB_NETRC_PATH=/run/secrets/wandb.netrc,WANDB_DIR=$wandb_dir,WANDB_CACHE_DIR=$wandb_cache_dir,WANDB_CONFIG_DIR=$wandb_config_dir,WANDB_ARTIFACT_DIR=$wandb_artifact_dir,A_CANARY_JOB_COMMENT=$slurm_comment,A_CANARY_SLURM_OUTPUT=$slurm_output"
 container_mounts="$wandb_netrc:/run/secrets/wandb.netrc:ro,$wandb_dir:$wandb_dir:rw,$wandb_cache_dir:$wandb_cache_dir:rw,$wandb_config_dir:$wandb_config_dir:rw,$wandb_artifact_dir:$wandb_artifact_dir:rw,$target_path:$target_path:ro,$container_image:$container_image:ro"
 
 # Validate both allocations before any scheduler mutation.
@@ -126,6 +131,12 @@ sbatch --account="$account" --partition=batch --nodes=16 --segment=16 --ntasks-p
     --container-mounts="$container_mounts" --job-name=q4b-a-repair-canary \
     --comment="$slurm_comment" --output="$slurm_output" \
     --export="$gpu_exports" --test-only --parsable "$GPU_SCRIPT" >/dev/null
+sbatch --account="$account" --partition=cpu_datamover --nodes=1 --ntasks=1 \
+    --cpus-per-task=2 --output="$output_root/control/controller-%j.out" \
+    --test-only --parsable "$CONTROLLER_SCRIPT" \
+    --repo-root "$repo_root" --submission-receipt "$submission_receipt" \
+    --job-completion "$job_completion" --scheduler-observation "$scheduler_observation" \
+    --authorization "$authorization" >/dev/null
 
 builder_job_id="" gpu_job_id=""
 if [[ "$mode" == --submit ]]; then
@@ -139,30 +150,26 @@ if [[ "$mode" == --submit ]]; then
         --container-mounts="$container_mounts" --job-name=q4b-a-repair-canary \
         --comment="$slurm_comment" --output="$slurm_output" \
         --export="$gpu_exports" "$GPU_SCRIPT")"
-fi
-
-mkdir -p "$(dirname "$submission_receipt")"
-PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
-    "$submission_receipt" "$source_commit" "$mode" "$builder_job_id" "$gpu_job_id" <<'PY'
-import json
+    gpu_id="${gpu_job_id%%[_;]*}"
+    [[ "$gpu_id" =~ ^[0-9]+$ ]] || exit 1
+    mkdir -p "$(dirname "$submission_receipt")"
+    PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+        "$submission_receipt" "$source_commit" "$dependency_id" "$gpu_id" "$account" \
+        "$slurm_comment" "$slurm_output" "$manifest" <<'PY'
 import sys
 from pathlib import Path
-from common.specdec.qwen4b_b_atomic import atomic_publish_bytes
-path = Path(sys.argv[1])
-body = {
-    "schema_version": 1,
-    "source_commit": sys.argv[2],
-    "mode": sys.argv[3],
-    "builder_job_id": sys.argv[4] or None,
-    "gpu_job_id": sys.argv[5] or None,
-    "dependency": None if not sys.argv[5] else f"afterok:{sys.argv[4].split(';')[0].split('_')[0]}",
-    "authorization": "B-balanced-canary",
-    "scientific_training_authorized": False,
-}
-atomic_publish_bytes(
-    path,
-    (json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n").encode(),
-    job_id="submit",
+from common.specdec.qwen4b_a_canary_manifest import publish_a_submission_receipt
+publish_a_submission_receipt(
+    Path(sys.argv[1]), source_commit=sys.argv[2], builder_job_id=sys.argv[3],
+    gpu_job_id=sys.argv[4], account=sys.argv[5], job_comment=sys.argv[6],
+    stdout_path=sys.argv[7], manifest_path=Path(sys.argv[8]),
 )
 PY
+    sbatch --parsable --account="$account" --partition=cpu_datamover \
+        --dependency="afterok:${gpu_id}" --nodes=1 --ntasks=1 --cpus-per-task=2 \
+        --output="$output_root/control/controller-%j.out" \
+        "$CONTROLLER_SCRIPT" --repo-root "$repo_root" \
+        --submission-receipt "$submission_receipt" --job-completion "$job_completion" \
+        --scheduler-observation "$scheduler_observation" --authorization "$authorization"
+fi
 # Stable literal retained for static authorization audits: scientific_training_authorized=false

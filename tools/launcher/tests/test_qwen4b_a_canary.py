@@ -22,11 +22,13 @@ from common.specdec.qwen4b_a_canary_manifest import (
     ACanaryManifest,
     ACanaryRuntimeIdentity,
     ACanaryTopology,
+    finalize_a_authorization,
     last_finite_training_loss,
     load_a_canary_manifest,
-    publish_a_authorization,
+    publish_a_job_completion,
     publish_a_supervisor_completion,
     snapshot_target_identity,
+    training_phase_boundaries,
     validate_evaluator_receipt,
     validate_supervisor_completion,
     write_a_canary_manifest,
@@ -214,18 +216,45 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
     connection.close()
     occurrence_shard = selection_files / "occurrences-000000.jsonl"
     occurrence_shard.write_text(canonical(occurrence) + "\n")
+    policy_path = selection_files / "policy.yaml"
+    policy = {
+        "balanced": {"multilingual_occurrences": dict.fromkeys(("de", "ja", "es", "fr", "it"), 0)},
+        "repair": {
+            "historical": {"occurrences": 0},
+            "complement": {"stem": 1, "ja": 0, "es": 0, "fr": 0, "it": 0, "de": 0},
+        },
+    }
+    import yaml
+
+    policy_path.write_text(yaml.safe_dump(policy, sort_keys=True))
     def descriptor(path: Path) -> dict[str, object]:
         return {
             "path": path.name,
             "bytes": path.stat().st_size,
             "sha256": digest(path.read_bytes()),
         }
+    policy_sha = digest(canonical(policy).encode())
+    trust_roots = {
+        "source_inventory_sha256": "4" * 64,
+        "held_out_receipt_sha256": "5" * 64,
+        "baseline_receipt_sha256": "6" * 64,
+        "complement_selection_sha256": "7" * 64,
+    }
     identity = {
         "strategy": "A-repair",
+        "policy_sha256": policy_sha,
         "occurrence_count": 1,
+        "unique_prompt_count": 1,
+        "cell_occurrence_counts": {"math": 0, "code": 0, "stem": 1, "chat": 0, "multilingual": 0},
+        "multilingual_occurrence_counts": dict.fromkeys(("de", "ja", "es", "fr", "it"), 0),
         "repair_complement_counts": {"stem": 1, "ja": 0, "es": 0, "fr": 0, "it": 0, "de": 0},
+        "uuid_multiplicity_histogram": {1: 1},
+        "source_occurrence_multiplicity_histogram": {1: 1},
         "ordered_occurrences_sha256": occurrence_root,
+        "ordered_prompt_uuids_sha256": digest((canonical(prompt_uuid) + "\n").encode()),
         "source_response_root_sha256": response_root,
+        "occurrence_multiplicity_sha256": digest((canonical([prompt_uuid, source_identity, 7, 1]) + "\n").encode()),
+        "trust_root_sha256": digest(canonical(trust_roots).encode()),
     }
     selection = {
         "schema_version": 3,
@@ -233,6 +262,16 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
         "occurrence_count": 1,
         "selection_sha256": digest(canonical(identity).encode()),
         "selection_identity": identity,
+        "policy_sha256": policy_sha,
+        "policy_file_sha256": digest(policy_path.read_bytes()),
+        "source_inventory_sha256": trust_roots["source_inventory_sha256"],
+        "held_out_receipt_sha256": trust_roots["held_out_receipt_sha256"],
+        "baseline_receipt_sha256": trust_roots["baseline_receipt_sha256"],
+        "complement_selection_sha256": trust_roots["complement_selection_sha256"],
+        "trust_roots": trust_roots,
+        "ordered_occurrences_sha256": occurrence_root,
+        "shard_semantic_sha256": occurrence_root,
+        "policy": descriptor(policy_path),
         "index": descriptor(index),
         "shards": [descriptor(occurrence_shard)],
     }
@@ -357,6 +396,45 @@ def test_task9_to_task8_replay_rejects_authenticated_corpus_substitution(tmp_pat
         )
 
 
+def test_task9_selection_rejects_invented_or_removed_schema_fields(tmp_path: Path) -> None:
+    """Only the genuine Task9 schema-v3 14-field identity is accepted."""
+    publication_sha, selection_sha = _write_task9_task8_replay_fixture(tmp_path)
+    receipt = tmp_path / "inputs/selection/receipt.json"
+    body = json.loads(receipt.read_text())
+    body["selection_identity"]["invented_self_hash"] = "f" * 64
+    body["selection_sha256"] = sha256(
+        json.dumps(body["selection_identity"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    unsigned = {key: value for key, value in body.items() if key != "root_sha256"}
+    body["root_sha256"] = sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
+    forged_sha = sha256(receipt.read_bytes()).hexdigest()
+    corpus_manifest = tmp_path / "CORPUS_MANIFEST.json"
+    corpus_body = json.loads(corpus_manifest.read_text())
+    corpus_body["selection_manifest_sha256"] = forged_sha
+    corpus_manifest.write_text(
+        json.dumps(corpus_body, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    publication = tmp_path / "PUBLICATION.json"
+    publication_body = json.loads(publication.read_text())
+    publication_body["selection_manifest_sha256"] = forged_sha
+    publication_body["corpus_manifest_sha256"] = sha256(corpus_manifest.read_bytes()).hexdigest()
+    publication.write_text(json.dumps(publication_body, sort_keys=True, separators=(",", ":")) + "\n")
+    forged_publication_sha = sha256(publication.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="exact schema"):
+        load_task8_a_publication(
+            tmp_path,
+            expected_publication_sha256=forged_publication_sha,
+            expected_selection_receipt_sha256=forged_sha,
+            source_commit="a" * 40,
+            _expected_occurrences=1,
+            _expected_shards=1,
+            _expected_repair={"stem": 1, "ja": 0, "es": 0, "fr": 0, "it": 0, "de": 0},
+        )
+
+
 def _manifest(tmp_path: Path) -> ACanaryManifest:
     target = tmp_path / "cache/snapshots" / ("b" * 40)
     target.mkdir(parents=True, exist_ok=True)
@@ -382,6 +460,7 @@ def _manifest(tmp_path: Path) -> ACanaryManifest:
         json.dumps({"chat_template": "{{ messages }}"}, separators=(",", ":"))
     )
     (target / "chat_template.jinja").write_text("{{ messages }}")
+    (target / "model.safetensors").write_bytes(b"weights")
     container = tmp_path / "image.sqsh"
     container.write_bytes(b"container")
     identity = snapshot_target_identity(target, container_path=container)
@@ -390,6 +469,7 @@ def _manifest(tmp_path: Path) -> ACanaryManifest:
         target_revision="b" * 40,
         target_path=str(target.resolve()),
         target_snapshot_sha256=identity["target_snapshot_sha256"],
+        target_weight_set_sha256=identity["target_weight_set_sha256"],
         target_config_sha256=identity["target_config_sha256"],
         tokenizer_sha256=identity["tokenizer_sha256"],
         chat_template_sha256=identity["chat_template_sha256"],
@@ -414,6 +494,14 @@ def _manifest(tmp_path: Path) -> ACanaryManifest:
         exporter_sha256="9" * 64,
         train_script_path="examples/speculative_decoding/launch_train.sh",
         train_script_sha256="0" * 64,
+        sequential_sampler_path="tools/launcher/common/specdec/qwen4b_a_site/sitecustomize.py",
+        sequential_sampler_sha256="d" * 64,
+        modelopt_runtime_path=str((tmp_path / "modelopt-runtime").resolve()),
+        modelopt_runtime_sha256="a" * 64,
+        speculators_runtime_path=str((tmp_path / "speculators-runtime").resolve()),
+        speculators_runtime_sha256="b" * 64,
+        speculators_repo_path=str((tmp_path / "speculators-repo").resolve()),
+        speculators_repo_sha256="c" * 64,
     )
     return ACanaryManifest(
         runtime=runtime,
@@ -568,6 +656,57 @@ def test_submitter_tests_both_jobs_before_cpu_then_afterok_gpu() -> None:
     assert "--wandb-config-dir" in submitter
     assert "--wandb-artifact-dir" in submitter
     assert '--container-mounts="$container_mounts"' in submitter
+    assert 'A_CANARY_JOB_COMPLETION=$job_completion' in submitter
+    assert '--dependency="afterok:${gpu_id}"' in submitter
+    controller = (_LAUNCHER_ROOT / "common/specdec/finalize_qwen4b_a_canary.sh").read_text()
+    assert 'sacct -X -j "$job_id"' in controller
+    assert "--sacct-output" not in controller
+
+
+def test_controller_rejects_locally_fabricated_scheduler_identity(tmp_path: Path) -> None:
+    """Self-hashed local JSON cannot replace exact submission/completion/sacct agreement."""
+    def write_receipt(path: Path, body: dict[str, object]) -> None:
+        body["receipt_sha256"] = sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        path.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
+
+    submission = tmp_path / "submission.json"
+    completion = tmp_path / "completion.json"
+    submit_body: dict[str, object] = {
+        "producer": "qwen4b-a-submit-v2",
+        "expected_gpu_job_id": "123",
+        "slurm_account": "nemotron_n4_post",
+        "slurm_job_name": "q4b-a-repair-canary",
+        "slurm_job_comment": "signed-run",
+        "slurm_output_path": "/lustre/logs/a.out",
+    }
+    write_receipt(submission, submit_body)
+    completion_body: dict[str, object] = {
+        "producer": "qwen4b-a-repair-job-completion-v1",
+        "slurm_job_id": "123",
+        "slurm_account": "nemotron_n4_post",
+        "slurm_job_name": "q4b-a-repair-canary",
+        "slurm_job_comment": "signed-run",
+        "slurm_output_path": "/lustre/logs/a.out",
+        "submission_receipt_path": str(submission),
+        "submission_receipt_sha256": sha256(submission.read_bytes()).hexdigest(),
+        "started_at": "2026-08-23T12:01:00Z",
+        "finished_at": "2026-08-23T12:05:00Z",
+    }
+    write_receipt(completion, completion_body)
+    forged_sacct = (
+        "999|COMPLETED|0:0|nemotron_n4_post|q4b-a-repair-canary|"
+        "2026-08-23T12:00:00Z|2026-08-23T12:06:00Z|signed-run|/lustre/logs/a.out"
+    )
+    with pytest.raises(ValueError, match="sacct identity"):
+        finalize_a_authorization(
+            tmp_path / "authorization.json",
+            tmp_path / "observation.json",
+            submission_receipt_path=submission,
+            job_completion_path=completion,
+            sacct_output=forged_sacct,
+        )
 
 
 def test_target_snapshot_binds_exact_q4_bytes_and_rejects_mutation(tmp_path: Path) -> None:
@@ -582,6 +721,65 @@ def test_target_snapshot_binds_exact_q4_bytes_and_rejects_mutation(tmp_path: Pat
             container_path=Path(manifest.runtime.container_path),
             expected=manifest.runtime,
         )
+
+
+def test_target_weight_set_rejects_missing_extra_and_mutated_shards(tmp_path: Path) -> None:
+    """A target is complete only when every and only declared model shard is bound."""
+    manifest = _manifest(tmp_path)
+    target = Path(manifest.runtime.target_path)
+    single = target / "model.safetensors"
+    single.unlink()
+    index = target / "model.safetensors.index.json"
+    index.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    first = target / "model-00001-of-00002.safetensors"
+    second = target / "model-00002-of-00002.safetensors"
+    first.write_bytes(b"one")
+    with pytest.raises(ValueError, match="weight shard"):
+        snapshot_target_identity(target, container_path=Path(manifest.runtime.container_path))
+    second.write_bytes(b"two")
+    identity = snapshot_target_identity(target, container_path=Path(manifest.runtime.container_path))
+    assert identity["target_weight_set_sha256"]
+    (target / "orphan.safetensors").write_bytes(b"orphan")
+    with pytest.raises(ValueError, match="extra model weight"):
+        snapshot_target_identity(target, container_path=Path(manifest.runtime.container_path))
+    (target / "orphan.safetensors").unlink()
+    previous = identity["target_weight_set_sha256"]
+    second.write_bytes(b"mutated")
+    assert snapshot_target_identity(
+        target, container_path=Path(manifest.runtime.container_path)
+    )["target_weight_set_sha256"] != previous
+
+
+def test_global_sequential_order_preserves_a_phase_boundary() -> None:
+    """The 64-rank trainer consumes 130 historical then 70 complement batches."""
+    assert training_phase_boundaries(ACanaryTopology()) == {
+        "historical_occurrences": 66_560,
+        "historical_steps": 130,
+        "complement_occurrences": 35_840,
+        "complement_steps": 70,
+        "total_steps": 200,
+    }
+    runner = (_LAUNCHER_ROOT / "common/specdec/run_qwen4b_a_canary.sbatch").read_text()
+    assert "QWEN4B_A_SEQUENTIAL_SAMPLER=1" in runner
+    assert "qwen4b_a_site" in runner
+
+
+def test_runner_exports_exact_checkpoint_200_not_parent() -> None:
+    """The final export and evaluator reload exact trained step 200 bytes."""
+    runner = (_LAUNCHER_ROOT / "common/specdec/run_qwen4b_a_canary.sbatch").read_text()
+    assert '--model_path "$A_CANARY_CHECKPOINT/checkpoint-200"' in runner
+    assert '--export_path "$A_CANARY_EXPORT"' in runner
+    assert 'EXPORT_PATH="$A_CANARY_INTERMEDIATE_EXPORT"' in runner
+    assert 'EXPORT_PATH="$A_CANARY_EXPORT"' not in runner
 
 
 def test_supervisor_completion_is_job_issued_and_step200_exact(tmp_path: Path) -> None:
@@ -658,10 +856,10 @@ def test_supervisor_completion_is_job_issued_and_step200_exact(tmp_path: Path) -
         )
 
 
-def test_publish_authorization_refuses_missing_real_evaluator(tmp_path: Path) -> None:
+def test_publish_job_completion_refuses_missing_real_evaluator(tmp_path: Path) -> None:
     """No authorization can be produced without genuine runtime artifacts."""
     with pytest.raises((FileNotFoundError, ValueError)):
-        publish_a_authorization(
+        publish_a_job_completion(
             tmp_path / "AUTHORIZATION.json",
             _manifest(tmp_path),
             job_id="123",
@@ -672,4 +870,5 @@ def test_publish_authorization_refuses_missing_real_evaluator(tmp_path: Path) ->
             supervisor_completion_path=tmp_path / "completion.json",
             manifest_path=tmp_path / "manifest.json",
             repository_root=tmp_path,
+            submission_receipt_path=tmp_path / "submission.json",
         )

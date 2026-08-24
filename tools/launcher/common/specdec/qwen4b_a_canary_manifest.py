@@ -82,6 +82,7 @@ class ACanaryRuntimeIdentity:
     target_revision: str
     target_path: str
     target_snapshot_sha256: str
+    target_weight_set_sha256: str
     target_config_sha256: str
     tokenizer_sha256: str
     chat_template_sha256: str
@@ -106,6 +107,14 @@ class ACanaryRuntimeIdentity:
     exporter_sha256: str
     train_script_path: str
     train_script_sha256: str
+    sequential_sampler_path: str
+    sequential_sampler_sha256: str
+    modelopt_runtime_path: str
+    modelopt_runtime_sha256: str
+    speculators_runtime_path: str
+    speculators_runtime_sha256: str
+    speculators_repo_path: str
+    speculators_repo_sha256: str
     target_model_id: str = "Qwen/Qwen3-4B"
     method: str = "dflash"
     block_size: int = 8
@@ -122,6 +131,7 @@ class ACanaryRuntimeIdentity:
             raise ValueError("A runtime commits must be exact")
         digests = (
             self.target_snapshot_sha256,
+            self.target_weight_set_sha256,
             self.target_config_sha256,
             self.tokenizer_sha256,
             self.chat_template_sha256,
@@ -134,6 +144,10 @@ class ACanaryRuntimeIdentity:
             self.evaluator_sha256,
             self.exporter_sha256,
             self.train_script_sha256,
+            self.sequential_sampler_sha256,
+            self.modelopt_runtime_sha256,
+            self.speculators_runtime_sha256,
+            self.speculators_repo_sha256,
         )
         if any(_SHA256.fullmatch(value) is None for value in digests):
             raise ValueError("A runtime digests must be exact")
@@ -154,6 +168,9 @@ class ACanaryRuntimeIdentity:
             self.wandb_cache_dir,
             self.wandb_config_dir,
             self.wandb_artifact_dir,
+            self.modelopt_runtime_path,
+            self.speculators_runtime_path,
+            self.speculators_repo_path,
         )
         if any(not Path(value).is_absolute() for value in absolute_paths):
             raise ValueError("A runtime host paths must be absolute")
@@ -236,6 +253,7 @@ def validate_bound_artifacts(manifest: ACanaryManifest, *, repository_root: Path
         (manifest.runtime.evaluator_path, manifest.runtime.evaluator_sha256),
         (manifest.runtime.exporter_path, manifest.runtime.exporter_sha256),
         (manifest.runtime.train_script_path, manifest.runtime.train_script_sha256),
+        (manifest.runtime.sequential_sampler_path, manifest.runtime.sequential_sampler_sha256),
     )
     for relative, digest in runtime_files:
         path = repository_root / relative
@@ -246,6 +264,13 @@ def validate_bound_artifacts(manifest: ACanaryManifest, *, repository_root: Path
         container_path=Path(manifest.runtime.container_path),
         expected=manifest.runtime,
     )
+    for path_value, expected_digest in (
+        (manifest.runtime.modelopt_runtime_path, manifest.runtime.modelopt_runtime_sha256),
+        (manifest.runtime.speculators_runtime_path, manifest.runtime.speculators_runtime_sha256),
+        (manifest.runtime.speculators_repo_path, manifest.runtime.speculators_repo_sha256),
+    ):
+        if _tree_sha256(Path(path_value)) != expected_digest:
+            raise ValueError("A bound runtime tree identity mismatch")
     for path_value, digest in (
         (manifest.task9_a_selection_path, manifest.task9_a_selection_sha256),
         (manifest.task8_publication_path, manifest.task8_publication_sha256),
@@ -302,6 +327,25 @@ def last_finite_training_loss(state: object, *, expected_step: int) -> float:
     if not candidates:
         raise ValueError(f"trainer state lacks finite training loss at step {expected_step}")
     return candidates[-1]
+
+
+def training_phase_boundaries(topology: ACanaryTopology) -> dict[str, int]:
+    """Return the exact source-order phase boundary for the 200-step A canary."""
+    historical_occurrences = 66_560
+    complement_occurrences = 35_840
+    if historical_occurrences % topology.global_batch_size or complement_occurrences % topology.global_batch_size:
+        raise ValueError("A phase quotas must align to global batches")
+    historical_steps = historical_occurrences // topology.global_batch_size
+    complement_steps = complement_occurrences // topology.global_batch_size
+    if historical_steps + complement_steps != topology.max_steps:
+        raise ValueError("A phase steps do not cover the canary")
+    return {
+        "historical_occurrences": historical_occurrences,
+        "historical_steps": historical_steps,
+        "complement_occurrences": complement_occurrences,
+        "complement_steps": complement_steps,
+        "total_steps": topology.max_steps,
+    }
 
 
 def snapshot_target_identity(
@@ -366,8 +410,10 @@ def snapshot_target_identity(
         tokenizer_digest.update(artifact.name.encode())
         tokenizer_digest.update(b"\0")
         tokenizer_digest.update(bytes.fromhex(hashlib.sha256(_stable_file_bytes(artifact)).hexdigest()))
+    weight_digest = _target_weight_set_sha256(target_path)
     actual = {
         "target_snapshot_sha256": _directory_sha256(target_path),
+        "target_weight_set_sha256": weight_digest,
         "target_config_sha256": hashlib.sha256(config_raw).hexdigest(),
         "tokenizer_sha256": tokenizer_digest.hexdigest(),
         "chat_template_sha256": hashlib.sha256(template_raw).hexdigest(),
@@ -376,6 +422,52 @@ def snapshot_target_identity(
     if expected is not None and any(getattr(expected, key) != value for key, value in actual.items()):
         raise ValueError("target snapshot or container identity mismatch")
     return actual
+
+
+def _target_weight_set_sha256(target_path: Path) -> str:
+    """Hash an exact single-file or indexed safetensors weight set."""
+    single = target_path / "model.safetensors"
+    index = target_path / "model.safetensors.index.json"
+    all_weights = {path.name for path in target_path.glob("*.safetensors") if path.is_file()}
+    if single.is_file() and not index.exists():
+        if all_weights != {single.name}:
+            raise ValueError("target snapshot has extra model weight files")
+        declared = [single]
+        index_raw = b""
+    elif index.is_file() and not single.exists():
+        index_raw = _stable_file_bytes(index)
+        try:
+            body = json.loads(index_raw)
+        except json.JSONDecodeError as error:
+            raise ValueError("target weight index is invalid") from error
+        weight_map = body.get("weight_map") if isinstance(body, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("target weight index is invalid")
+        shard_names = sorted(set(weight_map.values()))
+        if any(
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not name.endswith(".safetensors")
+            for name in shard_names
+        ):
+            raise ValueError("target weight shard declaration is invalid")
+        if any(not (target_path / name).is_file() for name in shard_names):
+            raise ValueError("target weight shard is missing")
+        if all_weights != set(shard_names):
+            raise ValueError("target snapshot has extra model weight files")
+        declared = [target_path / name for name in shard_names]
+    else:
+        raise ValueError("target snapshot must contain one exact safetensors weight set")
+    digest = hashlib.sha256()
+    if index_raw:
+        digest.update(index.name.encode())
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(hashlib.sha256(index_raw).hexdigest()))
+    for artifact in declared:
+        digest.update(artifact.name.encode())
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(hashlib.sha256(_stable_file_bytes(artifact)).hexdigest()))
+    return digest.hexdigest()
 
 
 def validate_runtime_mounts(
@@ -393,11 +485,22 @@ def validate_runtime_mounts(
         raise ValueError("W&B netrc identity mismatch")
     if not _path_on_read_only_mount(netrc_path):
         raise ValueError("W&B netrc mount must be read-only")
+    job_id = environment.get("SLURM_JOB_ID", "")
+    if not job_id.isdigit():
+        raise ValueError("W&B paths require the current Slurm job ID")
+    roots = {
+        "WANDB_DIR": (runtime.wandb_dir, "run"),
+        "WANDB_CACHE_DIR": (runtime.wandb_cache_dir, "cache"),
+        "WANDB_CONFIG_DIR": (runtime.wandb_config_dir, "config"),
+        "WANDB_ARTIFACT_DIR": (runtime.wandb_artifact_dir, "artifacts"),
+    }
+    if any(not Path(root).as_posix().startswith("/lustre/") for root, _ in roots.values()):
+        raise ValueError("W&B roots must be pinned to Lustre")
+    if "/scratch/" not in Path(runtime.wandb_cache_dir).as_posix():
+        raise ValueError("W&B cache must use the separately bound scratch root")
     expected_dirs = {
-        "WANDB_DIR": runtime.wandb_dir,
-        "WANDB_CACHE_DIR": runtime.wandb_cache_dir,
-        "WANDB_CONFIG_DIR": runtime.wandb_config_dir,
-        "WANDB_ARTIFACT_DIR": runtime.wandb_artifact_dir,
+        name: str(Path(root) / "jobs" / job_id / leaf)
+        for name, (root, leaf) in roots.items()
     }
     repo = repository_root.resolve()
     for name, expected_path in expected_dirs.items():
@@ -492,6 +595,7 @@ def publish_a_supervisor_completion(
         "last_finite_loss": loss,
         "export_path": str(export_path),
         "export_sha256": export_sha,
+        "export_model_path": str(checkpoint_path),
         "checkpoint_reloaded_by_exporter": True,
         "evaluation_receipt_path": str(evaluation_receipt_path),
         "evaluation_receipt_sha256": hashlib.sha256(evaluation_raw).hexdigest(),
@@ -536,6 +640,7 @@ def validate_supervisor_completion(
         "last_finite_loss": loss,
         "export_path": str(export_path),
         "export_sha256": _directory_sha256(export_path),
+        "export_model_path": str(checkpoint_path),
         "checkpoint_reloaded_by_exporter": True,
         "evaluation_receipt_path": str(evaluation_receipt_path),
         "evaluation_receipt_sha256": hashlib.sha256(_stable_file_bytes(evaluation_receipt_path)).hexdigest(),
@@ -619,7 +724,7 @@ def validate_evaluator_receipt(
     return body
 
 
-def publish_a_authorization(
+def publish_a_job_completion(
     path: Path,
     manifest: ACanaryManifest,
     *,
@@ -631,8 +736,9 @@ def publish_a_authorization(
     supervisor_completion_path: Path,
     manifest_path: Path,
     repository_root: Path,
+    submission_receipt_path: Path,
 ) -> None:
-    """Publish the only receipt allowed to authorize the B-balanced canary."""
+    """Publish current-job evidence; final authorization is controller-issued post-exit."""
     if not job_id.isdigit():
         raise ValueError("A authorization requires a numeric Slurm job ID")
     if os.environ.get("SLURM_JOB_ID") != job_id or os.environ.get("SLURM_NNODES") != "16":
@@ -653,6 +759,7 @@ def publish_a_authorization(
     if load_a_canary_manifest(manifest_path) != manifest:
         raise ValueError("A authorization manifest object mismatch")
     validate_bound_artifacts(manifest, repository_root=repository_root)
+    validate_runtime_mounts(manifest.runtime, repository_root=repository_root)
     trainer_state = json.loads(_stable_file_bytes(checkpoint_path / "trainer_state.json"))
     finite_loss = last_finite_training_loss(trainer_state, expected_step=200)
     checkpoint_sha = _directory_sha256(checkpoint_path)
@@ -683,11 +790,24 @@ def publish_a_authorization(
     ):
         raise ValueError("A GPU evidence does not cover all 64 ranks")
     runtime = manifest.runtime
+    submission_raw = _stable_file_bytes(submission_receipt_path)
+    submission = _load_self_hashed(submission_receipt_path, "A submission")
+    expected_submission = {
+        "producer": "qwen4b-a-submit-v2",
+        "expected_gpu_job_id": job_id,
+        "slurm_account": slurm_account,
+        "slurm_job_name": slurm_job_name,
+        "slurm_job_comment": slurm_job_comment,
+        "slurm_output_path": slurm_output_path,
+        "source_commit": runtime.source_commit,
+        "manifest_path": str(manifest_path),
+    }
+    if any(submission.get(key) != value for key, value in expected_submission.items()):
+        raise ValueError("A submission receipt does not authorize this GPU job")
     payload: dict[str, Any] = {
         "schema_version": 1,
-        "producer": "qwen4b-a-repair-canary-job-v1",
+        "producer": "qwen4b-a-repair-job-completion-v1",
         "arm": "A-repair",
-        "authorization": "B-balanced-canary",
         "complete": True,
         "canary_completed": True,
         "source_commit": runtime.source_commit,
@@ -736,11 +856,24 @@ def publish_a_authorization(
         "exporter_sha256": runtime.exporter_sha256,
         "train_script_path": runtime.train_script_path,
         "train_script_sha256": runtime.train_script_sha256,
+        "sequential_sampler_path": runtime.sequential_sampler_path,
+        "sequential_sampler_sha256": runtime.sequential_sampler_sha256,
+        "modelopt_runtime_path": runtime.modelopt_runtime_path,
+        "modelopt_runtime_sha256": runtime.modelopt_runtime_sha256,
+        "speculators_runtime_path": runtime.speculators_runtime_path,
+        "speculators_runtime_sha256": runtime.speculators_runtime_sha256,
+        "speculators_repo_path": runtime.speculators_repo_path,
+        "speculators_repo_sha256": runtime.speculators_repo_sha256,
         "target_path": runtime.target_path,
         "target_snapshot_sha256": runtime.target_snapshot_sha256,
+        "target_weight_set_sha256": runtime.target_weight_set_sha256,
         "target_config_sha256": runtime.target_config_sha256,
         "container_path": runtime.container_path,
         "wandb_netrc_sha256": runtime.wandb_netrc_sha256,
+        "wandb_dir": os.environ.get("WANDB_DIR"),
+        "wandb_cache_dir": os.environ.get("WANDB_CACHE_DIR"),
+        "wandb_config_dir": os.environ.get("WANDB_CONFIG_DIR"),
+        "wandb_artifact_dir": os.environ.get("WANDB_ARTIFACT_DIR"),
         "a_manifest_path": str(manifest_path),
         "a_manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
         "checkpoint_path": str(checkpoint_path),
@@ -753,9 +886,163 @@ def publish_a_authorization(
         "evaluation_receipt_sha256": hashlib.sha256(evaluation_raw).hexdigest(),
         "supervisor_completion_path": str(supervisor_completion_path),
         "supervisor_completion_sha256": hashlib.sha256(completion_raw).hexdigest(),
+        "export_model_path": str(checkpoint_path),
+        "checkpoint_step": 200,
+        "loss_step": 200,
     }
+    payload["submission_receipt_path"] = str(submission_receipt_path)
+    payload["submission_receipt_sha256"] = hashlib.sha256(submission_raw).hexdigest()
     payload["receipt_sha256"] = _sha256_json(payload)
     atomic_publish_bytes(path, (_canonical_json(payload) + "\n").encode(), job_id=job_id)
+
+
+def publish_a_submission_receipt(
+    path: Path,
+    *,
+    source_commit: str,
+    builder_job_id: str,
+    gpu_job_id: str,
+    account: str,
+    job_comment: str,
+    stdout_path: str,
+    manifest_path: Path,
+) -> None:
+    """Pin the scheduler-returned GPU identity before that job can emit evidence."""
+    if (
+        _COMMIT.fullmatch(source_commit) is None
+        or not builder_job_id.isdigit()
+        or not gpu_job_id.isdigit()
+        or account not in {"nemotron_sw_post", "nemotron_n4_post"}
+        or not job_comment
+        or not Path(stdout_path).is_absolute()
+        or not manifest_path.is_absolute()
+    ):
+        raise ValueError("A submission identity is invalid")
+    body: dict[str, Any] = {
+        "schema_version": 2,
+        "producer": "qwen4b-a-submit-v2",
+        "source_commit": source_commit,
+        "builder_job_id": builder_job_id,
+        "expected_gpu_job_id": gpu_job_id,
+        "dependency": f"afterok:{builder_job_id}",
+        "slurm_account": account,
+        "slurm_job_name": "q4b-a-repair-canary",
+        "slurm_job_comment": job_comment,
+        "slurm_output_path": stdout_path,
+        "manifest_path": str(manifest_path),
+        "scientific_training_authorized": False,
+    }
+    body["receipt_sha256"] = _sha256_json(body)
+    atomic_publish_bytes(path, (_canonical_json(body) + "\n").encode(), job_id="submit")
+
+
+def finalize_a_authorization(
+    authorization_path: Path,
+    observation_path: Path,
+    *,
+    submission_receipt_path: Path,
+    job_completion_path: Path,
+    sacct_output: str,
+) -> None:
+    """Issue final authorization only after exact parent-job sacct completion."""
+    submission_raw = _stable_file_bytes(submission_receipt_path)
+    completion_raw = _stable_file_bytes(job_completion_path)
+    submission = _load_self_hashed(submission_receipt_path, "A submission")
+    completion = _load_self_hashed(job_completion_path, "A job completion")
+    if completion.get("producer") != "qwen4b-a-repair-job-completion-v1":
+        raise ValueError("A controller requires genuine GPU job completion")
+    expected_job = submission.get("expected_gpu_job_id")
+    expected = {
+        "slurm_job_id": expected_job,
+        "slurm_account": submission.get("slurm_account"),
+        "slurm_job_name": submission.get("slurm_job_name"),
+        "slurm_job_comment": submission.get("slurm_job_comment"),
+        "slurm_output_path": submission.get("slurm_output_path"),
+        "submission_receipt_path": str(submission_receipt_path),
+        "submission_receipt_sha256": hashlib.sha256(submission_raw).hexdigest(),
+    }
+    if any(completion.get(key) != value for key, value in expected.items()):
+        raise ValueError("A completion and submission identities differ")
+    fields = sacct_output.strip().splitlines()
+    if len(fields) != 1:
+        raise ValueError("A controller requires one parent sacct row")
+    values = fields[0].split("|")
+    if len(values) != 9:
+        raise ValueError("A controller sacct row has an invalid schema")
+    job_id, state, exit_code, account, job_name, start, end, comment, stdout = values
+    if (job_id, state, exit_code, account, job_name, comment, stdout) != (
+        expected_job,
+        "COMPLETED",
+        "0:0",
+        submission.get("slurm_account"),
+        submission.get("slurm_job_name"),
+        submission.get("slurm_job_comment"),
+        submission.get("slurm_output_path"),
+    ):
+        raise ValueError("A controller sacct identity or terminal state mismatch")
+    _validate_enclosing_times(start, str(completion.get("started_at")), str(completion.get("finished_at")), end)
+    observation: dict[str, Any] = {
+        "schema_version": 2,
+        "producer": "sacct-a-repair-controller-v2",
+        "observed_at": datetime.now().astimezone().isoformat(),
+        "submission_receipt_sha256": hashlib.sha256(submission_raw).hexdigest(),
+        "a_job_completion_sha256": hashlib.sha256(completion_raw).hexdigest(),
+        "slurm_job_id": job_id,
+        "state": state,
+        "exit_code": exit_code,
+        "account": account,
+        "job_name": job_name,
+        "start": start,
+        "end": end,
+        "comment": comment,
+        "stdout": stdout,
+    }
+    observation["receipt_sha256"] = _sha256_json(observation)
+    atomic_publish_bytes(
+        observation_path,
+        (_canonical_json(observation) + "\n").encode(),
+        job_id="controller",
+    )
+    observation_raw = _stable_file_bytes(observation_path)
+    authorization = dict(completion)
+    authorization.update(
+        {
+            "schema_version": 2,
+            "producer": "qwen4b-a-repair-controller-authorization-v2",
+            "authorization": "B-balanced-canary",
+            "scheduler_observation_path": str(observation_path),
+            "scheduler_observation_sha256": hashlib.sha256(observation_raw).hexdigest(),
+            "job_completion_path": str(job_completion_path),
+            "job_completion_sha256": hashlib.sha256(completion_raw).hexdigest(),
+        }
+    )
+    authorization.pop("receipt_sha256", None)
+    authorization["receipt_sha256"] = _sha256_json(authorization)
+    atomic_publish_bytes(
+        authorization_path,
+        (_canonical_json(authorization) + "\n").encode(),
+        job_id="controller",
+    )
+
+
+def _load_self_hashed(path: Path, label: str) -> dict[str, Any]:
+    body = json.loads(_stable_file_bytes(path))
+    if not isinstance(body, dict):
+        raise ValueError(f"{label} receipt is invalid")
+    claim = body.pop("receipt_sha256", None)
+    if claim != _sha256_json(body):
+        raise ValueError(f"{label} receipt identity mismatch")
+    body["receipt_sha256"] = claim
+    return body
+
+
+def _validate_enclosing_times(start: str, work_start: str, work_end: str, end: str) -> None:
+    try:
+        values = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in (start, work_start, work_end, end)]
+    except ValueError as error:
+        raise ValueError("A controller timing is invalid") from error
+    if any(value.tzinfo is None for value in values) or values != sorted(values):
+        raise ValueError("A controller timing does not enclose GPU work")
 
 
 def publish_a_gpu_activity(log_root: Path, path: Path, *, job_id: str) -> None:
@@ -826,6 +1113,29 @@ def _directory_sha256(root: Path) -> str:
         digest.update(artifact.relative_to(root).as_posix().encode())
         digest.update(b"\0")
         digest.update(bytes.fromhex(hashlib.sha256(_stable_file_bytes(artifact)).hexdigest()))
+    return digest.hexdigest()
+
+
+def _tree_sha256(root: Path) -> str:
+    """Hash regular files and symlink texts without following runtime-tree links."""
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("runtime tree is invalid")
+    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    if not entries:
+        raise ValueError("runtime tree is empty")
+    digest = hashlib.sha256()
+    for artifact in entries:
+        relative = artifact.relative_to(root).as_posix().encode()
+        if artifact.is_symlink():
+            kind, payload = b"L", os.readlink(artifact).encode()
+        elif artifact.is_file():
+            kind = b"F"
+            payload = bytes.fromhex(hashlib.sha256(_stable_file_bytes(artifact)).hexdigest())
+        elif artifact.is_dir():
+            kind, payload = b"D", b""
+        else:
+            raise ValueError("runtime tree contains unsupported entries")
+        digest.update(relative + b"\0" + kind + b"\0" + payload)
     return digest.hexdigest()
 
 

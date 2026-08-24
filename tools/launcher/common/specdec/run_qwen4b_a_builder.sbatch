@@ -13,7 +13,8 @@ set -euo pipefail
 required=(REPO_ROOT SOURCE_COMMIT TASK9_A_SELECTION TASK9_A_SELECTION_SHA256
     TASK8_PUBLICATION TASK8_PUBLICATION_SHA256 A_CANARY_BUILD_ROOT A_CANARY_MANIFEST
     A_CANARY_ACCOUNT TARGET_REVISION TARGET_PATH CONTAINER_IMAGE WANDB_NETRC_HOST_PATH
-    WANDB_DIR WANDB_CACHE_DIR WANDB_CONFIG_DIR WANDB_ARTIFACT_DIR)
+    WANDB_DIR WANDB_CACHE_DIR WANDB_CONFIG_DIR WANDB_ARTIFACT_DIR MODELOPT_RUNTIME
+    SPECULATORS_RUNTIME SPECULATORS_REPO)
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
@@ -53,6 +54,7 @@ from common.specdec.qwen4b_a_canary_manifest import (
     ACanaryRuntimeIdentity,
     ACanaryTopology,
     snapshot_target_identity,
+    _tree_sha256,
     write_a_canary_manifest,
 )
 
@@ -66,6 +68,7 @@ recipe = repo / "modelopt_recipes/general/speculative_decoding/dflash.yaml"
 evaluator = launcher / "common/specdec/run_qwen4b_a_canary_eval.sh"
 exporter = repo / "examples/speculative_decoding/scripts/export_hf_checkpoint.py"
 train_script = repo / "examples/speculative_decoding/launch_train.sh"
+sequential_sampler = launcher / "common/specdec/qwen4b_a_site/sitecustomize.py"
 receipt = build_root / "BUILD_RECEIPT.json"
 output = build_root / "canary.jsonl"
 sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -85,6 +88,7 @@ runtime = ACanaryRuntimeIdentity(
     source_commit=os.environ["SOURCE_COMMIT"],
     target_revision=os.environ["TARGET_REVISION"],
     target_path=str(target), target_snapshot_sha256=target_identity["target_snapshot_sha256"],
+    target_weight_set_sha256=target_identity["target_weight_set_sha256"],
     target_config_sha256=target_identity["target_config_sha256"],
     tokenizer_sha256=target_identity["tokenizer_sha256"],
     chat_template_sha256=target_identity["chat_template_sha256"],
@@ -100,6 +104,14 @@ runtime = ACanaryRuntimeIdentity(
     evaluator_path=str(evaluator.relative_to(repo)), evaluator_sha256=sha(evaluator),
     exporter_path=str(exporter.relative_to(repo)), exporter_sha256=sha(exporter),
     train_script_path=str(train_script.relative_to(repo)), train_script_sha256=sha(train_script),
+    sequential_sampler_path=str(sequential_sampler.relative_to(repo)),
+    sequential_sampler_sha256=sha(sequential_sampler),
+    modelopt_runtime_path=os.environ["MODELOPT_RUNTIME"],
+    modelopt_runtime_sha256=_tree_sha256(Path(os.environ["MODELOPT_RUNTIME"])),
+    speculators_runtime_path=os.environ["SPECULATORS_RUNTIME"],
+    speculators_runtime_sha256=_tree_sha256(Path(os.environ["SPECULATORS_RUNTIME"])),
+    speculators_repo_path=os.environ["SPECULATORS_REPO"],
+    speculators_repo_sha256=_tree_sha256(Path(os.environ["SPECULATORS_REPO"])),
 )
 write_a_canary_manifest(
     manifest_path,

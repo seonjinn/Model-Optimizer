@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import yaml
 from common.specdec.qwen4b_b_atomic import atomic_publish_directory
 
 if TYPE_CHECKING:
@@ -44,6 +45,42 @@ A_COMPLEMENT_QUOTAS = {
 _A_TOTAL = A_HISTORICAL_QUOTA + sum(A_COMPLEMENT_QUOTAS.values())
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_PTV2_SELECTION_IDENTITY_KEYS = {
+    "strategy",
+    "policy_sha256",
+    "occurrence_count",
+    "unique_prompt_count",
+    "cell_occurrence_counts",
+    "multilingual_occurrence_counts",
+    "repair_complement_counts",
+    "uuid_multiplicity_histogram",
+    "source_occurrence_multiplicity_histogram",
+    "ordered_occurrences_sha256",
+    "ordered_prompt_uuids_sha256",
+    "source_response_root_sha256",
+    "occurrence_multiplicity_sha256",
+    "trust_root_sha256",
+}
+_PTV2_A_SELECTION_KEYS = {
+    "schema_version",
+    "strategy",
+    "occurrence_count",
+    "selection_sha256",
+    "selection_identity",
+    "policy_sha256",
+    "policy_file_sha256",
+    "source_inventory_sha256",
+    "held_out_receipt_sha256",
+    "baseline_receipt_sha256",
+    "complement_selection_sha256",
+    "trust_roots",
+    "ordered_occurrences_sha256",
+    "shard_semantic_sha256",
+    "policy",
+    "index",
+    "shards",
+    "root_sha256",
+}
 
 
 @dataclass(frozen=True)
@@ -211,6 +248,45 @@ def load_task8_a_publication(
         "it": 125_000,
         "de": 0,
     }
+    if set(selection) != _PTV2_A_SELECTION_KEYS:
+        raise ValueError("Task9 schema-v3 A selection does not have the exact schema")
+    if not isinstance(identity, dict) or set(identity) != _PTV2_SELECTION_IDENTITY_KEYS:
+        raise ValueError("Task9 schema-v3 A selection identity does not have the exact schema")
+    if selection.get("selection_sha256") != hashlib.sha256(
+        _canonical_json(identity).encode()
+    ).hexdigest():
+        raise ValueError("Task9 A selection semantic identity mismatch")
+    trust_roots = selection.get("trust_roots")
+    expected_trust_roots = {
+        "source_inventory_sha256": selection.get("source_inventory_sha256"),
+        "held_out_receipt_sha256": selection.get("held_out_receipt_sha256"),
+        "baseline_receipt_sha256": selection.get("baseline_receipt_sha256"),
+        "complement_selection_sha256": selection.get("complement_selection_sha256"),
+    }
+    if not isinstance(trust_roots, dict) or trust_roots != expected_trust_roots:
+        raise ValueError("Task9 A selection trust-root preimage is invalid")
+    for value in trust_roots.values():
+        if not isinstance(value, str) or _SHA256.fullmatch(value) is None or value == "0" * 64:
+            raise ValueError("Task9 A selection trust-root preimage is invalid")
+    if identity.get("trust_root_sha256") != hashlib.sha256(
+        _canonical_json(trust_roots).encode()
+    ).hexdigest():
+        raise ValueError("Task9 A selection trust-root identity mismatch")
+    policy_path, policy_file_sha = _authenticated_declared_file(
+        root / "inputs/selection/files", selection.get("policy"), "Task9 selection policy"
+    )
+    try:
+        policy = yaml.safe_load(_stable_file_bytes(policy_path))
+    except yaml.YAMLError as error:
+        raise ValueError("Task9 A selection policy is invalid") from error
+    if (
+        not isinstance(policy, dict)
+        or selection.get("policy_file_sha256") != policy_file_sha
+        or selection.get("policy_sha256")
+        != hashlib.sha256(_canonical_json(policy).encode()).hexdigest()
+        or identity.get("policy_sha256") != selection.get("policy_sha256")
+    ):
+        raise ValueError("Task9 A selection policy identity mismatch")
     if (
         selection.get("schema_version") != 3
         or selection.get("strategy") != "A-repair"
@@ -287,12 +363,29 @@ def _replay_task9_task8(
     index_path, index_sha = _authenticated_declared_file(
         selection_copy_root, selection.get("index"), "Task9 selection index"
     )
+    shard_digest = hashlib.sha256()
+    shard_count = 0
     for descriptor in selection.get("shards", ()):
-        _authenticated_declared_file(selection_copy_root, descriptor, "Task9 occurrence shard")
+        shard_path, _ = _authenticated_declared_file(
+            selection_copy_root, descriptor, "Task9 occurrence shard"
+        )
+        for raw_line in _stable_file_bytes(shard_path).splitlines():
+            row = json.loads(raw_line)
+            if not isinstance(row, list) or len(row) != 8:
+                raise ValueError("Task9 occurrence shard row is invalid")
+            shard_digest.update((_canonical_json(row) + "\n").encode())
+            shard_count += 1
     selection_without_root = dict(selection)
     root_claim = selection_without_root.pop("root_sha256", None)
     if root_claim != _sha256_json(selection_without_root):
         raise ValueError("Task9 A selection root identity mismatch")
+    if (
+        shard_count != expected_occurrences
+        or shard_digest.hexdigest() != selection.get("shard_semantic_sha256")
+        or selection.get("shard_semantic_sha256")
+        != selection.get("ordered_occurrences_sha256")
+    ):
+        raise ValueError("Task9 occurrence shards do not match selection semantics")
 
     tokenized_raw = _stable_file_bytes(root / "inputs/tokenized/receipt.json")
     tokenized_receipt = _canonical_object(tokenized_raw, "Task9 tokenized receipt")
@@ -334,7 +427,13 @@ def _replay_task9_task8(
     _require_digest(template_sha, "chat template")
 
     occurrence_digest = hashlib.sha256()
+    prompt_digest = hashlib.sha256()
     response_digest = hashlib.sha256()
+    cell_counts: dict[str, int] = {}
+    language_counts: dict[str, int] = {}
+    declared_repair_counts = identity.get("repair_complement_counts", {})
+    repair_counts = dict.fromkeys(declared_repair_counts, 0)
+    historical_count = expected_occurrences - sum(declared_repair_counts.values())
     selection_db = sqlite3.connect(f"file:{index_path}?mode=ro&immutable=1", uri=True)
     token_db = sqlite3.connect(f"file:{tokenized_path}?mode=ro&immutable=1", uri=True)
     try:
@@ -384,20 +483,78 @@ def _replay_task9_task8(
             ):
                 raise ValueError("Task8 row does not replay the exact Task9 occurrence")
             occurrence_digest.update((_canonical_json(occurrence_identity) + "\n").encode())
+            prompt_digest.update((_canonical_json(occurrence[1]) + "\n").encode())
             response_digest.update(
                 (_canonical_json([occurrence[2], occurrence[3], occurrence[6], occurrence[7]]) + "\n").encode()
             )
+            cell = str(occurrence[4])
+            language = str(occurrence[10])
+            cell_counts[cell] = cell_counts.get(cell, 0) + 1
+            if cell == "multilingual":
+                language_counts[language] = language_counts.get(language, 0) + 1
+            if ordinal >= historical_count:
+                repair_key = "stem" if cell == "stem" else language
+                if repair_key in repair_counts:
+                    repair_counts[repair_key] += 1
         if count != expected_occurrences:
             raise ValueError("Task9/Task8 replay occurrence count mismatch")
+        unique_count = int(
+            selection_db.execute(
+                "SELECT count(DISTINCT prompt_uuid) FROM occurrences WHERE strategy='A-repair'"
+            ).fetchone()[0]
+        )
+        multiplicity_digest = hashlib.sha256()
+        for row in selection_db.execute(
+            "SELECT prompt_uuid,source_identity_sha256,source_row,count(*) FROM occurrences "
+            "WHERE strategy='A-repair' GROUP BY prompt_uuid,source_identity_sha256,source_row "
+            "ORDER BY prompt_uuid,source_identity_sha256,source_row"
+        ):
+            multiplicity_digest.update((_canonical_json(list(row)) + "\n").encode())
+        uuid_histogram = {
+            int(multiplicity): int(row_count)
+            for multiplicity, row_count in selection_db.execute(
+                "SELECT multiplicity,count(*) FROM (SELECT prompt_uuid,count(*) AS multiplicity "
+                "FROM occurrences WHERE strategy='A-repair' GROUP BY prompt_uuid) "
+                "GROUP BY multiplicity ORDER BY multiplicity"
+            )
+        }
+        source_histogram = {
+            int(multiplicity): int(row_count)
+            for multiplicity, row_count in selection_db.execute(
+                "SELECT multiplicity,count(*) FROM (SELECT prompt_uuid,source_identity_sha256,"
+                "source_row,count(*) AS multiplicity FROM occurrences WHERE strategy='A-repair' "
+                "GROUP BY prompt_uuid,source_identity_sha256,source_row) "
+                "GROUP BY multiplicity ORDER BY multiplicity"
+            )
+        }
     except sqlite3.Error as error:
         raise ValueError("Task9/Task8 replay database is invalid") from error
     finally:
         selection_db.close()
         token_db.close()
-    if (
-        occurrence_digest.hexdigest() != identity.get("ordered_occurrences_sha256")
-        or response_digest.hexdigest() != identity.get("source_response_root_sha256")
-    ):
+    recomputed = {
+        "strategy": "A-repair",
+        "policy_sha256": selection.get("policy_sha256"),
+        "occurrence_count": count,
+        "unique_prompt_count": unique_count,
+        "cell_occurrence_counts": {
+            cell: cell_counts.get(cell, 0)
+            for cell in ("math", "code", "stem", "chat", "multilingual")
+        },
+        "multilingual_occurrence_counts": {
+            language: language_counts.get(language, 0)
+            for language in identity.get("multilingual_occurrence_counts", {})
+        },
+        "repair_complement_counts": repair_counts,
+        "uuid_multiplicity_histogram": uuid_histogram,
+        "source_occurrence_multiplicity_histogram": source_histogram,
+        "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
+        "ordered_prompt_uuids_sha256": prompt_digest.hexdigest(),
+        "source_response_root_sha256": response_digest.hexdigest(),
+        "occurrence_multiplicity_sha256": multiplicity_digest.hexdigest(),
+        "trust_root_sha256": identity.get("trust_root_sha256"),
+    }
+    if _canonical_json(recomputed) != _canonical_json(identity):
         raise ValueError("Task9/Task8 replay semantic root mismatch")
     return tokenizer_sha, template_sha, index_sha, tokenized_sha
 
