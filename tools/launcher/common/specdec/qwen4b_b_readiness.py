@@ -63,6 +63,7 @@ class Task9BalancedView:
     tokenizer_sha256: str
     chat_template_sha256: str
     assistant_loss_mask_sha256: str
+    projection_sha256: str
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,10 @@ class BReadinessInputs:
     builder_receipt_sha256: str
     builder_output_path: Path
     builder_output_sha256: str
+    task8_publication_sha256: str
+    corpus_manifest_sha256: str
+    selection_receipt_sha256: str
+    shard_inventory_sha256: str
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,11 @@ class BReadinessReceipt:
     destination_sha256: str
     builder_receipt_sha256: str
     builder_output_sha256: str
+    task9_projection_sha256: str
+    task8_publication_sha256: str
+    corpus_manifest_sha256: str
+    selection_receipt_sha256: str
+    shard_inventory_sha256: str
 
     def as_dict(self) -> dict[str, Any]:
         """Return the canonical JSON-compatible receipt body."""
@@ -103,12 +113,22 @@ class BReadinessReceipt:
             "destination_sha256": self.destination_sha256,
             "builder_receipt_sha256": self.builder_receipt_sha256,
             "builder_output_sha256": self.builder_output_sha256,
+            "task9_projection_sha256": self.task9_projection_sha256,
+            "task8_publication_sha256": self.task8_publication_sha256,
+            "corpus_manifest_sha256": self.corpus_manifest_sha256,
+            "selection_receipt_sha256": self.selection_receipt_sha256,
+            "shard_inventory_sha256": self.shard_inventory_sha256,
         }
 
 
-def load_task9_balanced_view(path: Path) -> Task9BalancedView:
+def load_task9_balanced_view(path: Path, expected_sha256: str) -> Task9BalancedView:
     """Load the documented Task9 JSON projection without importing Task9 internals."""
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    if _SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError("Task9 B projection SHA-256 must be exact")
+    raw_bytes = _stable_file_bytes(path)
+    if hashlib.sha256(raw_bytes).hexdigest() != expected_sha256:
+        raise ValueError("Task9 B projection identity mismatch")
+    raw = json.loads(raw_bytes)
     if not isinstance(raw, dict):
         raise ValueError("Task9 B projection must be a JSON object")
     try:
@@ -131,6 +151,7 @@ def load_task9_balanced_view(path: Path) -> Task9BalancedView:
             tokenizer_sha256=_string(raw, "tokenizer_sha256"),
             chat_template_sha256=_string(raw, "chat_template_sha256"),
             assistant_loss_mask_sha256=_string(raw, "assistant_loss_mask_sha256"),
+            projection_sha256=expected_sha256,
         )
     except KeyError as error:
         raise ValueError(f"Task9 B projection lacks {error.args[0]}") from error
@@ -168,6 +189,11 @@ def assess_b_readiness(inputs: BReadinessInputs) -> BReadinessReceipt:
                 view.tokenizer_sha256,
                 view.chat_template_sha256,
                 view.assistant_loss_mask_sha256,
+                view.projection_sha256,
+                inputs.task8_publication_sha256,
+                inputs.corpus_manifest_sha256,
+                inputs.selection_receipt_sha256,
+                inputs.shard_inventory_sha256,
             )
         ),
         "B_RECEIPT_IDENTITY",
@@ -185,6 +211,11 @@ def assess_b_readiness(inputs: BReadinessInputs) -> BReadinessReceipt:
         "B_BUILDER_OUTPUT_IDENTITY",
         blockers,
     )
+    _require(
+        view.publication_sha256 == inputs.task8_publication_sha256,
+        "B_TASK8_PUBLICATION_LINEAGE",
+        blockers,
+    )
     return BReadinessReceipt(
         ready=not blockers,
         blocker_codes=tuple(blockers),
@@ -194,6 +225,11 @@ def assess_b_readiness(inputs: BReadinessInputs) -> BReadinessReceipt:
         destination_sha256=view.destination_sha256,
         builder_receipt_sha256=inputs.builder_receipt_sha256,
         builder_output_sha256=inputs.builder_output_sha256,
+        task9_projection_sha256=view.projection_sha256,
+        task8_publication_sha256=inputs.task8_publication_sha256,
+        corpus_manifest_sha256=inputs.corpus_manifest_sha256,
+        selection_receipt_sha256=inputs.selection_receipt_sha256,
+        shard_inventory_sha256=inputs.shard_inventory_sha256,
     )
 
 
@@ -230,6 +266,11 @@ def _builder_receipt_is_authentic(inputs: BReadinessInputs) -> bool:
             output_path=inputs.builder_output_path,
             output_sha256=inputs.builder_output_sha256,
             source_commit=inputs.source_commit,
+            source_projection_sha256=inputs.task9_b_view.projection_sha256,
+            source_task8_publication_sha256=inputs.task8_publication_sha256,
+            source_corpus_manifest_sha256=inputs.corpus_manifest_sha256,
+            source_selection_receipt_sha256=inputs.selection_receipt_sha256,
+            source_shard_inventory_sha256=inputs.shard_inventory_sha256,
         )
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return False
@@ -243,6 +284,11 @@ def validate_builder_artifacts(
     output_path: Path,
     output_sha256: str,
     source_commit: str,
+    source_projection_sha256: str,
+    source_task8_publication_sha256: str,
+    source_corpus_manifest_sha256: str,
+    source_selection_receipt_sha256: str,
+    source_shard_inventory_sha256: str,
 ) -> None:
     """Revalidate the complete builder receipt/output chain at point of use."""
     raw = _stable_file_bytes(receipt_path)
@@ -257,6 +303,11 @@ def validate_builder_artifacts(
     if (
         payload.get("schema_version") != 1
         or payload.get("source_commit") != source_commit
+        or payload.get("source_projection_sha256") != source_projection_sha256
+        or payload.get("source_task8_publication_sha256") != source_task8_publication_sha256
+        or payload.get("source_corpus_manifest_sha256") != source_corpus_manifest_sha256
+        or payload.get("source_selection_receipt_sha256") != source_selection_receipt_sha256
+        or payload.get("source_shard_inventory_sha256") != source_shard_inventory_sha256
         or payload.get("occurrence_count") != _CANARY_OCCURRENCE_COUNT
         or payload.get("output_sha256") != output_sha256
         or payload.get("output_bytes") != output_path.stat().st_size

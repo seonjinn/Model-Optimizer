@@ -73,6 +73,7 @@ class Task8Shard:
     """One manifest-declared Task8 shard."""
 
     path: Path
+    relative_path: str
     rows: int
     bytes: int
     sha256: str
@@ -84,7 +85,9 @@ class Task8Publication:
 
     root: Path
     publication_sha256: str
+    corpus_manifest_sha256: str
     selection_receipt_sha256: str
+    shard_inventory_sha256: str
     source_commit: str
     shards: tuple[Task8Shard, ...]
 
@@ -207,7 +210,7 @@ def load_task8_publication(
             or declared_files.get(relative) != (size, digest)
         ):
             raise ValueError("Task8 shard descriptor is invalid")
-        shards.append(Task8Shard(root / relative, rows, size, digest))
+        shards.append(Task8Shard(root / relative, relative, rows, size, digest))
     if len({shard.path for shard in shards}) != len(shards):
         raise ValueError("Task8 shard descriptors are not unique")
     actual = set((root / "shards").glob("*"))
@@ -216,7 +219,21 @@ def load_task8_publication(
     return Task8Publication(
         root,
         expected_publication_sha256,
+        hashlib.sha256(manifest_raw).hexdigest(),
         expected_selection_receipt_sha256,
+        _sha256_json(
+            {
+                "shards": [
+                    {
+                        "path": shard.relative_path,
+                        "rows": shard.rows,
+                        "bytes": shard.bytes,
+                        "sha256": shard.sha256,
+                    }
+                    for shard in shards
+                ]
+            }
+        ),
         source_commit,
         tuple(shards),
     )
@@ -289,7 +306,10 @@ def materialize_canary_from_shards(
     environ: Mapping[str, str] | None = None,
     scratch_root: Path,
     source_projection_sha256: str,
+    source_task8_publication_sha256: str,
+    source_corpus_manifest_sha256: str,
     source_selection_receipt_sha256: str,
+    source_shard_inventory_sha256: str,
     source_commit: str,
     expected_shards: tuple[Task8Shard, ...],
 ) -> BCanaryBuildArtifact:
@@ -297,8 +317,16 @@ def materialize_canary_from_shards(
     shards = tuple(Path(path) for path in shard_paths)
     _validate_build_paths(shards, output_root, scratch_root)
     if (
-        _SHA256.fullmatch(source_projection_sha256) is None
-        or _SHA256.fullmatch(source_selection_receipt_sha256) is None
+        any(
+            _SHA256.fullmatch(value) is None
+            for value in (
+                source_projection_sha256,
+                source_task8_publication_sha256,
+                source_corpus_manifest_sha256,
+                source_selection_receipt_sha256,
+                source_shard_inventory_sha256,
+            )
+        )
         or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
     ):
         raise ValueError("B builder source identities must be exact")
@@ -346,7 +374,10 @@ def materialize_canary_from_shards(
             "seed": seed,
             "source_commit": source_commit,
             "source_projection_sha256": source_projection_sha256,
+            "source_task8_publication_sha256": source_task8_publication_sha256,
+            "source_corpus_manifest_sha256": source_corpus_manifest_sha256,
             "source_selection_receipt_sha256": source_selection_receipt_sha256,
+            "source_shard_inventory_sha256": source_shard_inventory_sha256,
             "declared_shard_count": len(shards),
             "source_row_count": sum(result.row_count for result in results),
             "occurrence_count": occurrence_count,
@@ -799,6 +830,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task8-publication", type=Path, required=True)
     parser.add_argument("--task9-view", type=Path, required=True)
+    parser.add_argument("--task9-view-sha256", required=True)
     parser.add_argument("--task8-publication-sha256", required=True)
     parser.add_argument("--task9-selection-receipt-sha256", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
@@ -810,10 +842,10 @@ def main() -> int:
     args = parser.parse_args()
     from common.specdec.qwen4b_b_readiness import load_task9_balanced_view
 
-    view = load_task9_balanced_view(args.task9_view)
+    view = load_task9_balanced_view(args.task9_view, args.task9_view_sha256)
     if view.strategy != "B-balanced" or view.occurrence_count != 2_000_000:
         raise ValueError("Task9 B projection does not describe the approved B-balanced arm")
-    source_projection_sha256 = hashlib.sha256(_read_nofollow_stable(args.task9_view)).hexdigest()
+    source_projection_sha256 = view.projection_sha256
     publication = load_task8_publication(
         args.task8_publication,
         expected_publication_sha256=args.task8_publication_sha256,
@@ -821,6 +853,12 @@ def main() -> int:
         source_commit=args.source_commit,
     )
     shards = tuple(item.path for item in publication.shards)
+    if view.publication_sha256 != publication.publication_sha256:
+        raise ValueError("Task9 projection and Task8 publication identities differ")
+    if tuple((view.shard_root / name).resolve() for name in view.declared_shards) != tuple(
+        item.path.resolve() for item in publication.shards
+    ):
+        raise ValueError("Task9 projection and Task8 shard inventories differ")
     materialize_canary_from_shards(
         shards,
         output_root=args.output_root,
@@ -829,7 +867,10 @@ def main() -> int:
         seed=args.seed,
         requested_workers=args.workers,
         source_projection_sha256=source_projection_sha256,
+        source_task8_publication_sha256=publication.publication_sha256,
+        source_corpus_manifest_sha256=publication.corpus_manifest_sha256,
         source_selection_receipt_sha256=publication.selection_receipt_sha256,
+        source_shard_inventory_sha256=publication.shard_inventory_sha256,
         source_commit=args.source_commit,
         expected_shards=publication.shards,
     )

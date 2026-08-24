@@ -6,8 +6,9 @@ Task10 prepares only the B-balanced data artifact and its bounded 200-step
 runtime canary. It does not authorize B as the first scientific training arm.
 The fixed execution order remains A-repair, B-balanced, B-balanced-target, then
 PTV3 SWE/agentic/tool. B artifact preparation may run concurrently, but the
-submission receipt records `b_preparation_only: true` and
-`scientific_training_authorized: false`.
+`--submit-prep` schedules only the CPU builder. `--submit-canary` is unavailable
+until a caller-pinned, job-generated A-repair authorization receipt passes.
+No Task10 receipt can mark the canary as a scientific milestone.
 
 ## Authenticated producer chain
 
@@ -23,6 +24,9 @@ The loader authenticates `PUBLICATION.json`, `CORPUS_MANIFEST.json`, the copied
 Task9 selection receipt, exactly 201 declared shard descriptors, the manifest
 file records, and missing/orphan shard state. Production semantics remain the
 2M `500K/400K/500K/400K/200K` B mix with DE/JA/ES/FR/IT at 40K each.
+The builder receipt, readiness receipt, and GPU manifest transitively bind the
+Task9 projection, Task8 publication, corpus manifest, Task9 selection receipt,
+and ordered Task8 shard-inventory SHA-256 identities.
 
 ## CPU materialization and durability
 
@@ -47,22 +51,30 @@ per-shard timing provenance mandatory. Readiness rehashes both builder receipt
 and output and binds their exact SHA-256 identities. The 16-node OCI-HSG GPU
 manifest binds those same identities plus readiness, source commit, GBS512,
 8 serve + 8 train nodes, 4 GPUs per node, PDB4, GA4, 200 steps, and
-`sna-qwen3-4b-dataset-study`.
+`sna-qwen3-4b-dataset-study`. The first one-factor A/B screen is fixed to the
+same Qwen3-4B parent, tokenizer, chat template, container, DFlash B8,
+thinking-off, seed 42, and sequence length 4096. Thinking-on remains a later
+winner-promotion experiment.
 
-The submitter schedules the 96-core builder first and submits only the bounded
-GPU canary with `afterok:<builder_job_id>`. The GPU runner revalidates readiness,
-builder receipt, and builder output immediately before any `srun`. Runtime
-evidence still requires finite loss, checkpoint reload, drafter export,
-evaluator completion, and all 64 GPU ranks; it cannot become a scientific
-milestone.
+The submitter validates the pinned A receipt before its first scheduler call.
+That receipt recomputes A's Task9/Task8/builder lineage, identical-parent facts,
+finite 200-step checkpoint, export tree, and 64-rank GPU evidence. Only then may
+the GPU canary be submitted with `afterok:<builder_job_id>`. The GPU runner
+revalidates A, readiness, builder bytes, canonical supervisor/config SHA and
+argv immediately before GPU work. It uses `train_eagle_streaming.sh`, whose
+owned server processes fail on early death and are explicitly terminated and
+waited after training. The runner creates current-job pmon evidence and derives
+an immutable final receipt from finite loss, checkpoint, export, evaluator, and
+all-64-rank artifacts; opaque commands and caller-prewritten booleans are not
+accepted.
 
 ## Verification
 
-- Task10 launcher suite: 17 passed, including a genuine Task9 writer → Task8
+- Task10 launcher suite: 20 passed, including a genuine Task9 writer → Task8
   201-shard publisher → CPU builder → readiness → GPU manifest/runner-preflight
   integration test, deterministic 1-worker/parallel bytes, shard namespace
   race rejection, typed fsync recovery, worker-failure propagation, and real
-  fake-Slurm `afterok` job wiring.
+  CPU-only pre-A submission, and pre-scheduler A gate.
 - Task9/Task8 regression suite (`qwen3_4b_ptv2_study`,
   `build_assistant_token_views`, and `specdec_publication`): 76 passed.
 - Ruff check/format, Pyright, Bash syntax, ShellCheck, diff check, and the final

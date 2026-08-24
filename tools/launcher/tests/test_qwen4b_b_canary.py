@@ -25,8 +25,12 @@ from common.specdec.build_qwen4b_b_canary import (
 )
 from common.specdec.qwen4b_b_canary_manifest import (
     BCanaryManifest,
+    BCanaryRuntimeIdentity,
     BCanaryTopology,
     load_b_canary_manifest,
+    publish_b_canary_evidence,
+    publish_b_export_evaluation,
+    validate_a_authorization_receipt,
     validate_bound_artifacts,
     write_b_canary_manifest,
 )
@@ -66,6 +70,7 @@ def _task9_view(shard_root: Path) -> Task9BalancedView:
         tokenizer_sha256="c" * 64,
         chat_template_sha256="d" * 64,
         assistant_loss_mask_sha256="e" * 64,
+        projection_sha256="9" * 64,
     )
 
 
@@ -77,8 +82,11 @@ def _builder_artifacts(root: Path) -> tuple[Path, str, Path, str]:
     body = {
         "schema_version": 1,
         "source_commit": "f" * 40,
-        "source_projection_sha256": "a" * 64,
+        "source_projection_sha256": "9" * 64,
+        "source_task8_publication_sha256": "a" * 64,
+        "source_corpus_manifest_sha256": "2" * 64,
         "source_selection_receipt_sha256": "b" * 64,
+        "source_shard_inventory_sha256": "3" * 64,
         "declared_shard_count": 201,
         "source_row_count": 2_000_000,
         "occurrence_count": 102_400,
@@ -106,6 +114,10 @@ def _readiness_inputs(tmp_path: Path, view: Task9BalancedView) -> BReadinessInpu
         builder_receipt_sha256=receipt_sha,
         builder_output_path=output,
         builder_output_sha256=output_sha,
+        task8_publication_sha256="a" * 64,
+        corpus_manifest_sha256="2" * 64,
+        selection_receipt_sha256="b" * 64,
+        shard_inventory_sha256="3" * 64,
     )
 
 
@@ -140,6 +152,7 @@ def _shard_descriptors(
     return tuple(
         b_builder.Task8Shard(
             path=path,
+            relative_path=f"shards/{path.name}",
             rows=sum(bool(line) for line in path.read_text().splitlines()),
             bytes=path.stat().st_size,
             sha256=sha256(path.read_bytes()).hexdigest(),
@@ -184,6 +197,10 @@ def test_b_readiness_rejects_renormalized_quota_and_wrong_schedule(tmp_path: Pat
         builder_receipt_sha256=artifacts[1],
         builder_output_path=artifacts[2],
         builder_output_sha256=artifacts[3],
+        task8_publication_sha256="a" * 64,
+        corpus_manifest_sha256="2" * 64,
+        selection_receipt_sha256="b" * 64,
+        shard_inventory_sha256="3" * 64,
     )
 
     receipt = assess_b_readiness(inputs)
@@ -450,6 +467,28 @@ def test_genuine_task9_task8_builder_readiness_runner_chain(
         expected_cell_counts=cell_counts,
         expected_language_counts=language_counts,
     )
+    production_policy = study.load_ptv2_study_policy(policy_path)
+    projection_view = replace(
+        view,
+        occurrence_count=2_000_000,
+        cell_occurrence_counts=production_policy.balanced_occurrences,
+        multilingual_occurrence_counts=production_policy.multilingual_occurrences,
+    )
+    projection_path = tmp_path / "TASK9_B_BALANCED.json"
+    study.write_task9_balanced_view_json(
+        projection_path,
+        projection_view,
+        policy=production_policy,
+        shard_root=published_root / "shards",
+        declared_shards=(item.path.name for item in authenticated.shards),
+        publication_sha256=authenticated.publication_sha256,
+        destination_sha256="b" * 64,
+        tokenizer_sha256=tokenizer,
+        chat_template_sha256=template,
+        assistant_loss_mask_sha256=loss_target,
+    )
+    projection_sha = sha256(projection_path.read_bytes()).hexdigest()
+    task9_view = b_readiness_module.load_task9_balanced_view(projection_path, projection_sha)
     build = b_builder.materialize_canary_from_shards(
         (item.path for item in authenticated.shards),
         output_root=tmp_path / "build",
@@ -458,21 +497,13 @@ def test_genuine_task9_task8_builder_readiness_runner_chain(
         requested_workers=4,
         environ={"SLURM_CPUS_PER_TASK": "96"},
         scratch_root=tmp_path / "scratch",
-        source_projection_sha256="9" * 64,
+        source_projection_sha256=projection_sha,
+        source_task8_publication_sha256=authenticated.publication_sha256,
+        source_corpus_manifest_sha256=authenticated.corpus_manifest_sha256,
         source_selection_receipt_sha256=selection_sha,
+        source_shard_inventory_sha256=authenticated.shard_inventory_sha256,
         source_commit="a" * 40,
         expected_shards=authenticated.shards,
-    )
-    shard_root = published_root / "shards"
-    projection_fixture = tmp_path / "projection-fixture"
-    projection_fixture.mkdir()
-    task9_view = _task9_view(projection_fixture)
-    task9_view = Task9BalancedView(
-        **{
-            **task9_view.__dict__,
-            "declared_shards": tuple(path.name for path in sorted(shard_root.iterdir())),
-            "shard_root": shard_root,
-        }
     )
     readiness = assess_b_readiness(
         BReadinessInputs(
@@ -482,6 +513,10 @@ def test_genuine_task9_task8_builder_readiness_runner_chain(
             builder_receipt_sha256=build.receipt_sha256,
             builder_output_path=build.output_path,
             builder_output_sha256=build.output_sha256,
+            task8_publication_sha256=authenticated.publication_sha256,
+            corpus_manifest_sha256=authenticated.corpus_manifest_sha256,
+            selection_receipt_sha256=authenticated.selection_receipt_sha256,
+            shard_inventory_sha256=authenticated.shard_inventory_sha256,
         )
     )
     assert readiness.ready
@@ -492,8 +527,14 @@ def test_genuine_task9_task8_builder_readiness_runner_chain(
         readiness_receipt_sha256=readiness_identity,
         builder_receipt_sha256=build.receipt_sha256,
         builder_output_sha256=build.output_sha256,
+        task9_projection_sha256=task9_view.projection_sha256,
+        task8_publication_sha256=authenticated.publication_sha256,
+        corpus_manifest_sha256=authenticated.corpus_manifest_sha256,
+        selection_receipt_sha256=authenticated.selection_receipt_sha256,
+        shard_inventory_sha256=authenticated.shard_inventory_sha256,
         canary_occurrence_count=19,
         topology=_topology(),
+        runtime=_runtime(tmp_path, build.output_path),
         source_commit="a" * 40,
     )
     manifest_path = tmp_path / "MANIFEST.json"
@@ -521,6 +562,61 @@ def _topology() -> BCanaryTopology:
         gradient_accumulation_steps=4,
         max_steps=200,
         wandb_project="sna-qwen3-4b-dataset-study",
+    )
+
+
+def _runtime(tmp_path: Path, corpus_path: Path) -> BCanaryRuntimeIdentity:
+    supervisor = tmp_path / "train_eagle_streaming.sh"
+    config = tmp_path / "dflash.yaml"
+    supervisor.write_text("supervisor\n")
+    config.write_text("config\n")
+    return BCanaryRuntimeIdentity(
+        target_model_id="Qwen/Qwen3-4B",
+        target_path=str(tmp_path / "target"),
+        target_revision="1" * 40,
+        tokenizer_sha256="2" * 64,
+        chat_template_sha256="3" * 64,
+        container_sha256="4" * 64,
+        thinking_mode="off",
+        method="dflash",
+        block_size=8,
+        training_seq_len=4096,
+        seed=42,
+        supervisor_path=str(supervisor),
+        supervisor_sha256=sha256(supervisor.read_bytes()).hexdigest(),
+        config_path=str(config),
+        config_sha256=sha256(config.read_bytes()).hexdigest(),
+        corpus_arm="B-balanced",
+        corpus_path=str(corpus_path),
+        output_root=str(tmp_path / "output"),
+        wandb_project="sna-qwen3-4b-dataset-study",
+        wandb_run_id="q4b-b-test",
+    )
+
+
+def _directory_digest(root: Path) -> str:
+    digest = sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(sha256(path.read_bytes()).hexdigest()))
+    return digest.hexdigest()
+
+
+def _manifest(tmp_path: Path, corpus_path: Path) -> BCanaryManifest:
+    return BCanaryManifest(
+        readiness_receipt_sha256="a" * 64,
+        builder_receipt_sha256="b" * 64,
+        builder_output_sha256="c" * 64,
+        task9_projection_sha256="d" * 64,
+        task8_publication_sha256="e" * 64,
+        corpus_manifest_sha256="f" * 64,
+        selection_receipt_sha256="1" * 64,
+        shard_inventory_sha256="2" * 64,
+        canary_occurrence_count=102_400,
+        topology=_topology(),
+        runtime=_runtime(tmp_path, corpus_path),
+        source_commit="f" * 40,
     )
 
 
@@ -567,7 +663,10 @@ def test_parallel_b_builder_is_byte_identical_to_one_worker_and_records_provenan
         environ={"SLURM_CPUS_PER_TASK": "96"},
         scratch_root=tmp_path / "single-scratch",
         source_projection_sha256="a" * 64,
+        source_task8_publication_sha256="d" * 64,
+        source_corpus_manifest_sha256="e" * 64,
         source_selection_receipt_sha256="b" * 64,
+        source_shard_inventory_sha256="f" * 64,
         source_commit="c" * 40,
         expected_shards=descriptors,
     )
@@ -580,7 +679,10 @@ def test_parallel_b_builder_is_byte_identical_to_one_worker_and_records_provenan
         environ={"SLURM_CPUS_PER_TASK": "96"},
         scratch_root=tmp_path / "parallel-scratch",
         source_projection_sha256="a" * 64,
+        source_task8_publication_sha256="d" * 64,
+        source_corpus_manifest_sha256="e" * 64,
         source_selection_receipt_sha256="b" * 64,
+        source_shard_inventory_sha256="f" * 64,
         source_commit="c" * 40,
         expected_shards=descriptors,
     )
@@ -623,7 +725,10 @@ def test_parallel_b_builder_propagates_worker_failure_without_publication(tmp_pa
             environ={"SLURM_CPUS_PER_TASK": "2"},
             scratch_root=scratch,
             source_projection_sha256="a" * 64,
+            source_task8_publication_sha256="d" * 64,
+            source_corpus_manifest_sha256="e" * 64,
             source_selection_receipt_sha256="b" * 64,
+            source_shard_inventory_sha256="f" * 64,
             source_commit="c" * 40,
             expected_shards=descriptors,
         )
@@ -715,6 +820,7 @@ def test_cpu_datamover_runner_passes_all_96_cpus_as_builder_workers(tmp_path: Pa
         "REPO_ROOT": str(repo_root),
         "SOURCE_COMMIT": "a" * 40,
         "TASK9_B_VIEW": str(task9_view),
+        "TASK9_B_VIEW_SHA256": "d" * 64,
         "TASK8_PUBLICATION": str(task8_publication),
         "TASK8_PUBLICATION_SHA256": "b" * 64,
         "TASK9_SELECTION_RECEIPT_SHA256": "c" * 64,
@@ -723,6 +829,11 @@ def test_cpu_datamover_runner_passes_all_96_cpus_as_builder_workers(tmp_path: Pa
         "B_CANARY_MANIFEST": str(tmp_path / "manifest.json"),
         "B_CANARY_SEED": "17",
         "B_CANARY_ACCOUNT": "nemotron_sw_post",
+        "TARGET_PATH": str(tmp_path / "target"),
+        "TARGET_REVISION": "e" * 40,
+        "CONTAINER_SHA256": "f" * 64,
+        "B_CANARY_OUTPUT_ROOT": str(tmp_path / "output"),
+        "B_CANARY_WANDB_RUN_ID": "q4b-b-test",
         "SLURM_JOB_ID": "123",
         "SLURM_JOB_PARTITION": "cpu_datamover",
         "SLURM_CPUS_PER_TASK": "96",
@@ -754,6 +865,11 @@ def test_manifest_binds_oci_16_node_200_step_runtime_contract(tmp_path: Path) ->
         readiness_receipt_sha256="a" * 64,
         builder_receipt_sha256="b" * 64,
         builder_output_sha256="c" * 64,
+        task9_projection_sha256="d" * 64,
+        task8_publication_sha256="e" * 64,
+        corpus_manifest_sha256="f" * 64,
+        selection_receipt_sha256="1" * 64,
+        shard_inventory_sha256="2" * 64,
         canary_occurrence_count=102_400,
         topology=BCanaryTopology(
             cluster="oci-hsg",
@@ -770,6 +886,7 @@ def test_manifest_binds_oci_16_node_200_step_runtime_contract(tmp_path: Path) ->
             max_steps=200,
             wandb_project="sna-qwen3-4b-dataset-study",
         ),
+        runtime=_runtime(tmp_path, tmp_path / "canary.jsonl"),
         source_commit="f" * 40,
     )
     path = tmp_path / "b-canary.json"
@@ -783,6 +900,170 @@ def test_manifest_binds_oci_16_node_200_step_runtime_contract(tmp_path: Path) ->
     assert json.loads(path.read_text())["topology"]["cpu_datamover"] == 96
 
 
+def test_a_authorization_is_caller_pinned_job_evidence(tmp_path: Path) -> None:
+    """A authorization recomputes self, file, checkpoint, export, and GPU identities."""
+    checkpoint = tmp_path / "a-checkpoint"
+    export = tmp_path / "a-export"
+    checkpoint.mkdir()
+    export.mkdir()
+    lineage_paths = {
+        "task9_a_selection": tmp_path / "A_SELECTION.json",
+        "task8_publication": tmp_path / "A_PUBLICATION.json",
+        "builder_receipt": tmp_path / "A_BUILD_RECEIPT.json",
+        "builder_output": tmp_path / "A_CANARY.jsonl",
+    }
+    selection_body = {
+        "schema_version": 3,
+        "strategy": "A-repair",
+        "selection_identity": {"strategy": "A-repair"},
+    }
+    lineage_paths["task9_a_selection"].write_text(
+        json.dumps(selection_body, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    selection_sha = sha256(lineage_paths["task9_a_selection"].read_bytes()).hexdigest()
+    publication_body = {
+        "selection_manifest_sha256": selection_sha,
+        "artifact_source_commit": "f" * 40,
+    }
+    lineage_paths["task8_publication"].write_text(
+        json.dumps(publication_body, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    publication_sha = sha256(lineage_paths["task8_publication"].read_bytes()).hexdigest()
+    lineage_paths["builder_output"].write_text("A-repair-canary\n")
+    builder_output_sha = sha256(lineage_paths["builder_output"].read_bytes()).hexdigest()
+    builder_body = {
+        "source_commit": "f" * 40,
+        "source_projection_sha256": selection_sha,
+        "source_task8_publication_sha256": publication_sha,
+        "output_sha256": builder_output_sha,
+    }
+    builder_body["receipt_sha256"] = sha256(
+        json.dumps(builder_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    lineage_paths["builder_receipt"].write_text(
+        json.dumps(builder_body, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 200, "loss_history": [1.5, 1.25]}) + "\n"
+    )
+    (export / "config.json").write_text("{}\n")
+    gpu = tmp_path / "a-gpu.json"
+    gpu.write_text(json.dumps({"slurm_job_id": "42", "active_gpu_ranks": list(range(64))}))
+    body = {
+        "schema_version": 1,
+        "producer": "qwen4b-a-repair-canary-job-v1",
+        "arm": "A-repair",
+        "authorization": "B-balanced-canary",
+        "complete": True,
+        "canary_completed": True,
+        "source_commit": "f" * 40,
+        "task9_a_selection_path": str(lineage_paths["task9_a_selection"]),
+        "task9_a_selection_sha256": selection_sha,
+        "task8_publication_path": str(lineage_paths["task8_publication"]),
+        "task8_publication_sha256": publication_sha,
+        "builder_receipt_path": str(lineage_paths["builder_receipt"]),
+        "builder_receipt_sha256": sha256(lineage_paths["builder_receipt"].read_bytes()).hexdigest(),
+        "builder_output_path": str(lineage_paths["builder_output"]),
+        "builder_output_sha256": builder_output_sha,
+        "target_model_id": "Qwen/Qwen3-4B",
+        "target_revision": "5" * 40,
+        "tokenizer_sha256": "6" * 64,
+        "chat_template_sha256": "7" * 64,
+        "container_sha256": "8" * 64,
+        "thinking_mode": "off",
+        "method": "dflash",
+        "block_size": 8,
+        "seed": 42,
+        "global_batch_size": 512,
+        "max_steps": 200,
+        "finite_loss": 1.25,
+        "checkpoint_reloaded": True,
+        "drafter_exported": True,
+        "all_gpus_active": True,
+        "slurm_job_id": "42",
+        "checkpoint_path": str(checkpoint),
+        "checkpoint_sha256": _directory_digest(checkpoint),
+        "export_path": str(export),
+        "export_sha256": _directory_digest(export),
+        "gpu_evidence_path": str(gpu),
+        "gpu_evidence_sha256": sha256(gpu.read_bytes()).hexdigest(),
+    }
+    body["receipt_sha256"] = sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt = tmp_path / "A_AUTHORIZATION.json"
+    receipt.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
+    pinned = sha256(receipt.read_bytes()).hexdigest()
+
+    authorization = validate_a_authorization_receipt(
+        receipt,
+        pinned,
+        source_commit="f" * 40,
+        target_revision="5" * 40,
+        tokenizer_sha256="6" * 64,
+        chat_template_sha256="7" * 64,
+        container_sha256="8" * 64,
+    )
+    assert authorization.receipt_sha256 == pinned
+    (checkpoint / "trainer_state.json").write_text('{"tampered":true}\n')
+    with pytest.raises(ValueError, match="artifact identity"):
+        validate_a_authorization_receipt(
+            receipt,
+            pinned,
+            source_commit="f" * 40,
+            target_revision="5" * 40,
+            tokenizer_sha256="6" * 64,
+            chat_template_sha256="7" * 64,
+            container_sha256="8" * 64,
+        )
+
+
+def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path: Path) -> None:
+    """Caller booleans cannot replace the canonical job-output evidence chain."""
+    corpus = tmp_path / "canary.jsonl"
+    corpus.write_text("{}\n")
+    manifest = _manifest(tmp_path, corpus)
+    checkpoint = tmp_path / "checkpoint"
+    export = tmp_path / "export"
+    checkpoint.mkdir()
+    export.mkdir()
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 200, "loss_history": [1.5, 1.25]}) + "\n"
+    )
+    (export / "config.json").write_text(
+        json.dumps({"draft_model_type": "dflash", "draft_block_size": 8}) + "\n"
+    )
+    (export / "model.safetensors").write_bytes(b"weights")
+    evaluation = tmp_path / "evaluation.json"
+    publish_b_export_evaluation(evaluation, manifest, job_id="42", export_path=export)
+    gpu = tmp_path / "gpu.json"
+    gpu.write_text(json.dumps({"slurm_job_id": "42", "active_gpu_ranks": list(range(64))}) + "\n")
+    evidence = tmp_path / "B_EVIDENCE.json"
+
+    publish_b_canary_evidence(
+        evidence,
+        manifest,
+        job_id="42",
+        checkpoint_path=checkpoint,
+        export_path=export,
+        evaluation_receipt_path=evaluation,
+        gpu_evidence_path=gpu,
+    )
+    payload = json.loads(evidence.read_bytes())
+    assert payload["finite_loss"] is True
+    assert payload["all_64_gpus_active"] is True
+    with pytest.raises(FileExistsError):
+        publish_b_canary_evidence(
+            evidence,
+            manifest,
+            job_id="42",
+            checkpoint_path=checkpoint,
+            export_path=export,
+            evaluation_receipt_path=evaluation,
+            gpu_evidence_path=gpu,
+        )
+
+
 def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None:
     """The launch surface chains CPU build to a bounded B-preparation canary."""
     root = Path(__file__).resolve().parents[1] / "common/specdec"
@@ -792,28 +1073,28 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "#SBATCH --nodes=16" in runner
     assert "#SBATCH --gpus-per-node=4" in runner
     assert "--cpus-per-task=96" in runner
-    assert "--nodes=8" in runner
-    assert "finite_loss" in runner
-    assert "checkpoint_reloaded" in runner
-    assert "drafter_exported" in runner
-    assert "evaluator_completed" in runner
-    assert "all_64_gpus_active" in runner
-    assert 'payload["scientific_milestone"] = False' in runner
+    assert "train_eagle_streaming.sh" in runner
+    assert "dflash.yaml" in runner
+    assert "B_CANARY_SERVE_COMMAND" not in runner
+    assert "B_CANARY_TRAIN_COMMAND" not in runner
+    assert "publish_b_canary_evidence" in runner
     assert "sbatch --test-only" in submitter
     assert "sbatch --parsable" in submitter
     assert "run_qwen4b_b_builder.sbatch" in submitter
-    assert "--dependency=afterok:" in submitter
+    assert "--submit-prep" in submitter
+    assert "--a-authorization-receipt" in submitter
+    assert "--a-authorization-receipt-sha256" in submitter
     assert "B_CANARY_BUILD_RECEIPT" in runner
     assert "validate_bound_artifacts" in runner
     assert "--test-only" in submitter
     assert "nemotron_sw_post" in submitter
     assert "nemotron_n4_post" in submitter
     assert '"required_training_order": "A-repair-first"' in submitter
-    assert '"b_preparation_only": True' in submitter
+    assert '"b_preparation_only": sys.argv[3] != "--submit-canary"' in submitter
 
 
-def test_submitter_wires_real_builder_job_as_canary_afterok_dependency(tmp_path: Path) -> None:
-    """Production-mode bounded submission schedules CPU build before the GPU canary."""
+def test_submit_prep_schedules_only_cpu_builder(tmp_path: Path) -> None:
+    """B preparation is allowed before A, but cannot schedule a GPU canary."""
     repo_root = Path(__file__).resolve().parents[3]
     submitter = repo_root / "tools/launcher/common/specdec/submit_qwen4b_b_canary.sh"
     fake_bin = tmp_path / "bin"
@@ -831,6 +1112,7 @@ def test_submitter_wires_real_builder_job_as_canary_afterok_dependency(tmp_path:
     fake_sbatch.chmod(0o755)
     task9_view = tmp_path / "TASK9.json"
     task9_view.write_text("{}\n")
+    task9_view_sha = sha256(task9_view.read_bytes()).hexdigest()
     task8 = tmp_path / "task8"
     task8.mkdir()
     receipt = tmp_path / "SUBMISSION.json"
@@ -839,14 +1121,12 @@ def test_submitter_wires_real_builder_job_as_canary_afterok_dependency(tmp_path:
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "SBATCH_CALLS": str(calls),
         "SBATCH_COUNTER": str(counter),
-        "B_CANARY_SERVE_COMMAND": "true",
-        "B_CANARY_TRAIN_COMMAND": "true",
     }
     result = subprocess.run(
         [
             "bash",
             str(submitter),
-            "--submit-canary",
+            "--submit-prep",
             "--account",
             "nemotron_sw_post",
             "--repo-root",
@@ -855,6 +1135,8 @@ def test_submitter_wires_real_builder_job_as_canary_afterok_dependency(tmp_path:
             "a" * 40,
             "--task9-view",
             str(task9_view),
+            "--task9-view-sha256",
+            task9_view_sha,
             "--task8-publication",
             str(task8),
             "--task8-publication-sha256",
@@ -871,6 +1153,18 @@ def test_submitter_wires_real_builder_job_as_canary_afterok_dependency(tmp_path:
             str(tmp_path / "evidence.json"),
             "--receipt",
             str(receipt),
+            "--target-path",
+            str(tmp_path / "target"),
+            "--target-revision",
+            "d" * 40,
+            "--container-image",
+            str(tmp_path / "container.sqsh"),
+            "--container-sha256",
+            "e" * 64,
+            "--modelopt-runtime",
+            str(tmp_path / "runtime"),
+            "--output-root",
+            str(tmp_path / "output"),
         ],
         check=False,
         capture_output=True,
@@ -880,17 +1174,84 @@ def test_submitter_wires_real_builder_job_as_canary_afterok_dependency(tmp_path:
 
     assert result.returncode == 0, result.stderr
     submitted = calls.read_text().splitlines()
-    assert len(submitted) == 4
+    assert len(submitted) == 2
     assert "--partition=cpu_datamover" in submitted[0]
     assert "run_qwen4b_b_builder.sbatch" in submitted[0]
     assert "--test-only" in submitted[0]
-    assert "--test-only" in submitted[1]
-    assert "--partition=cpu_datamover" in submitted[2]
-    assert "run_qwen4b_b_builder.sbatch" in submitted[2]
-    assert "--dependency=afterok:701" in submitted[3]
-    assert "run_qwen4b_b_canary.sbatch" in submitted[3]
+    assert "--parsable" in submitted[1]
+    assert "--partition=cpu_datamover" in submitted[1]
+    assert "run_qwen4b_b_builder.sbatch" in submitted[1]
     payload = json.loads(receipt.read_bytes())
     assert payload["builder_job_id"] == "701"
-    assert payload["canary_job_id"] == "702"
+    assert payload["canary_job_id"] is None
     assert payload["required_training_order"] == "A-repair-first"
     assert payload["b_preparation_only"] is True
+
+
+def test_submit_canary_rejects_missing_a_authorization_before_sbatch(tmp_path: Path) -> None:
+    """The A-repair trust root must be authenticated before any scheduler call."""
+    repo_root = Path(__file__).resolve().parents[3]
+    submitter = repo_root / "tools/launcher/common/specdec/submit_qwen4b_b_canary.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "sbatch.calls"
+    fake_sbatch = fake_bin / "sbatch"
+    fake_sbatch.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$SBATCH_CALLS"\n')
+    fake_sbatch.chmod(0o755)
+    task9_view = tmp_path / "TASK9.json"
+    task9_view.write_text("{}\n")
+    task9_view_sha = sha256(task9_view.read_bytes()).hexdigest()
+    task8 = tmp_path / "task8"
+    task8.mkdir()
+    result = subprocess.run(
+        [
+            "bash",
+            str(submitter),
+            "--submit-canary",
+            "--account",
+            "nemotron_sw_post",
+            "--repo-root",
+            str(repo_root),
+            "--source-commit",
+            "a" * 40,
+            "--task9-view",
+            str(task9_view),
+            "--task9-view-sha256",
+            task9_view_sha,
+            "--task8-publication",
+            str(task8),
+            "--task8-publication-sha256",
+            "b" * 64,
+            "--task9-selection-receipt-sha256",
+            "c" * 64,
+            "--build-root",
+            str(tmp_path / "build"),
+            "--readiness",
+            str(tmp_path / "readiness.json"),
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--evidence",
+            str(tmp_path / "evidence.json"),
+            "--receipt",
+            str(tmp_path / "submission.json"),
+            "--target-path",
+            str(tmp_path / "target"),
+            "--target-revision",
+            "d" * 40,
+            "--container-image",
+            str(tmp_path / "container.sqsh"),
+            "--container-sha256",
+            "e" * 64,
+            "--modelopt-runtime",
+            str(tmp_path / "runtime"),
+            "--output-root",
+            str(tmp_path / "output"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "SBATCH_CALLS": str(calls)},
+    )
+
+    assert result.returncode != 0
+    assert not calls.exists()

@@ -11,10 +11,11 @@
 set -euo pipefail
 
 required=(
-    REPO_ROOT SOURCE_COMMIT TASK9_B_VIEW TASK8_PUBLICATION
+    REPO_ROOT SOURCE_COMMIT TASK9_B_VIEW TASK9_B_VIEW_SHA256 TASK8_PUBLICATION
     TASK8_PUBLICATION_SHA256 TASK9_SELECTION_RECEIPT_SHA256
     B_CANARY_BUILD_ROOT B_CANARY_READINESS B_CANARY_MANIFEST
-    B_CANARY_SEED B_CANARY_ACCOUNT
+    B_CANARY_SEED B_CANARY_ACCOUNT TARGET_PATH TARGET_REVISION CONTAINER_SHA256
+    B_CANARY_OUTPUT_ROOT B_CANARY_WANDB_RUN_ID
 )
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
@@ -44,6 +45,7 @@ done
 [[ "$B_CANARY_MANIFEST" == /* && "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || exit 2
 [[ "$TASK8_PUBLICATION_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
 [[ "$TASK9_SELECTION_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
+[[ "$TASK9_B_VIEW_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
 case "$B_CANARY_ACCOUNT" in nemotron_sw_post|nemotron_n4_post) ;; *) exit 2 ;; esac
 [[ "$B_CANARY_SEED" =~ ^[0-9]+$ ]] || { echo "B builder seed must be non-negative" >&2; exit 2; }
 [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || {
@@ -84,6 +86,7 @@ PYTHONPATH="$launcher_root${PYTHONPATH:+:$PYTHONPATH}" python3 \
     --task8-publication-sha256 "$TASK8_PUBLICATION_SHA256" \
     --task9-selection-receipt-sha256 "$TASK9_SELECTION_RECEIPT_SHA256" \
     --task9-view "$TASK9_B_VIEW" \
+    --task9-view-sha256 "$TASK9_B_VIEW_SHA256" \
     --output-root "$B_CANARY_BUILD_ROOT" \
     --scratch-root "$scratch_root" \
     --seed "$B_CANARY_SEED" \
@@ -93,66 +96,97 @@ PYTHONPATH="$launcher_root${PYTHONPATH:+:$PYTHONPATH}" python3 \
 
 PYTHONPATH="$launcher_root${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$TASK9_B_VIEW" "$B_CANARY_BUILD_ROOT" "$B_CANARY_READINESS" \
-    "$B_CANARY_MANIFEST" "$SOURCE_COMMIT" "$B_CANARY_ACCOUNT" <<'PY'
+    "$B_CANARY_MANIFEST" "$SOURCE_COMMIT" "$B_CANARY_ACCOUNT" \
+    "$TASK9_B_VIEW_SHA256" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-from common.specdec.qwen4b_b_canary_manifest import (
-    BCanaryManifest,
-    BCanaryTopology,
-    write_b_canary_manifest,
-)
 from common.specdec.qwen4b_b_readiness import (
     BReadinessInputs,
     assess_b_readiness,
     load_task9_balanced_view,
     write_b_readiness_receipt,
 )
+from common.specdec.qwen4b_b_canary_manifest import (
+    BCanaryManifest,
+    BCanaryRuntimeIdentity,
+    BCanaryTopology,
+    write_b_canary_manifest,
+)
 
 view_path, build_root, readiness_path, manifest_path = map(Path, sys.argv[1:5])
 source_commit, account = sys.argv[5:7]
+view_sha = sys.argv[7]
 receipt_path = build_root / "BUILD_RECEIPT.json"
 output_path = build_root / "canary.jsonl"
 receipt_sha = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
 output_sha = hashlib.sha256(output_path.read_bytes()).hexdigest()
+build_payload = json.loads(receipt_path.read_bytes())
+view = load_task9_balanced_view(view_path, view_sha)
 readiness = assess_b_readiness(
     BReadinessInputs(
-        task9_b_view=load_task9_balanced_view(view_path),
+        task9_b_view=view,
         source_commit=source_commit,
         builder_receipt_path=receipt_path,
         builder_receipt_sha256=receipt_sha,
         builder_output_path=output_path,
         builder_output_sha256=output_sha,
+        task8_publication_sha256=build_payload["source_task8_publication_sha256"],
+        corpus_manifest_sha256=build_payload["source_corpus_manifest_sha256"],
+        selection_receipt_sha256=build_payload["source_selection_receipt_sha256"],
+        shard_inventory_sha256=build_payload["source_shard_inventory_sha256"],
     )
 )
 if not readiness.ready:
     raise SystemExit("B builder readiness blocked: " + ",".join(readiness.blocker_codes))
 write_b_readiness_receipt(readiness_path, readiness)
 readiness_payload = json.loads(readiness_path.read_bytes())
+repo_root = Path(__import__("os").environ["REPO_ROOT"])
+supervisor = repo_root / "tools/launcher/common/eagle3/train_eagle_streaming.sh"
+config = repo_root / "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/dflash.yaml"
+runtime = BCanaryRuntimeIdentity(
+    target_model_id="Qwen/Qwen3-4B",
+    target_path=__import__("os").environ["TARGET_PATH"],
+    target_revision=__import__("os").environ["TARGET_REVISION"],
+    tokenizer_sha256=view.tokenizer_sha256,
+    chat_template_sha256=view.chat_template_sha256,
+    container_sha256=__import__("os").environ["CONTAINER_SHA256"],
+    thinking_mode="off",
+    method="dflash",
+    block_size=8,
+    training_seq_len=4096,
+    seed=42,
+    supervisor_path=str(supervisor),
+    supervisor_sha256=hashlib.sha256(supervisor.read_bytes()).hexdigest(),
+    config_path=str(config),
+    config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+    corpus_arm="B-balanced",
+    corpus_path=str(output_path),
+    output_root=__import__("os").environ["B_CANARY_OUTPUT_ROOT"],
+    wandb_project="sna-qwen3-4b-dataset-study",
+    wandb_run_id=__import__("os").environ["B_CANARY_WANDB_RUN_ID"],
+)
 write_b_canary_manifest(
     manifest_path,
     BCanaryManifest(
         readiness_receipt_sha256=readiness_payload["receipt_sha256"],
         builder_receipt_sha256=receipt_sha,
         builder_output_sha256=output_sha,
+        task9_projection_sha256=readiness.task9_projection_sha256,
+        task8_publication_sha256=readiness.task8_publication_sha256,
+        corpus_manifest_sha256=readiness.corpus_manifest_sha256,
+        selection_receipt_sha256=readiness.selection_receipt_sha256,
+        shard_inventory_sha256=readiness.shard_inventory_sha256,
         canary_occurrence_count=102_400,
         topology=BCanaryTopology(
-            cluster="oci-hsg",
-            account=account,
-            partition="batch",
-            nodes=16,
-            segment=16,
-            serve_nodes=8,
-            train_nodes=8,
-            gpus_per_node=4,
-            cpu_datamover=96,
-            per_device_batch_size=4,
-            gradient_accumulation_steps=4,
-            max_steps=200,
+            cluster="oci-hsg", account=account, partition="batch", nodes=16, segment=16,
+            serve_nodes=8, train_nodes=8, gpus_per_node=4, cpu_datamover=96,
+            per_device_batch_size=4, gradient_accumulation_steps=4, max_steps=200,
             wandb_project="sna-qwen3-4b-dataset-study",
         ),
+        runtime=runtime,
         source_commit=source_commit,
     ),
 )
