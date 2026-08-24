@@ -735,7 +735,7 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
         "${CLUSTER_PROFILE}:${CLUSTER_PROFILE}",
         "${CLUSTER_READINESS_RECEIPT}:${CLUSTER_READINESS_RECEIPT}",
         'MARS_SCRATCH_ROOT="${MARS_SCRATCH_ROOT}"',
-        'local resolved_config="${cell_root}/resolved.yaml"',
+        'local resolved_config="${output_root}/resolved-launcher.yaml"',
         "container: %s",
         'EVAL_CONFIG_PATH="${resolved_config}"',
         'validate_label "${PAIR_LABEL}"',

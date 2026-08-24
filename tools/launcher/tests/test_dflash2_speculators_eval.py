@@ -12,26 +12,89 @@ import os
 import subprocess
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
+from common.specdec.dflash2_runtime_contract import artifact_tree_sha256, write_artifact_receipt
 from common.specdec.dflash2_speculators_eval import (
     DATASET_REVISION,
     STANDARD_SUBSETS,
+    build_artifact_identity,
+    build_target_control_allocation_receipt,
+    build_target_control_receipt,
+    capture_outputs,
     compute_prompt_set,
     materialize_prompt_set,
     summarize_pair,
+    summarize_target_control,
     validate_milestone_export,
     validate_output_equivalence,
+    validate_target_control_allocation_receipt,
+    validate_target_control_receipt,
 )
+from common.specdec.dflash2_target_contract import dflash2_target_spec
 
 _LAUNCHER = Path(__file__).resolve().parents[1]
 _WRAPPER = _LAUNCHER / "common/specdec/run_speculators_eval.sh"
 _PAIR = _LAUNCHER / "common/specdec/run_speculators_eval_pair.sbatch"
 _SERVER_STAGER = _LAUNCHER / "common/specdec/stage_speculators_eval_server_runtime.sh"
+_HELPER = _LAUNCHER / "common/specdec/dflash2_speculators_eval.py"
+
+
+def test_target_control_allocation_receipt_rejects_spoofed_topology(tmp_path: Path) -> None:
+    """The diagnostic receipt rejects a self-rehashed non-four-GPU allocation."""
+    receipt = tmp_path / "allocation.json"
+    payload = build_target_control_allocation_receipt(
+        receipt,
+        slurm_job_id="12345",
+        slurm_job_num_nodes=1,
+        slurm_job_nodelist="lyris0092",
+        gpu_count=4,
+    )
+
+    assert payload["cell_visible_devices"] == {"left": "0,1", "right": "2,3"}
+    forged = json.loads(receipt.read_text())
+    forged["gpu_count"] = 8
+    unsigned = {key: value for key, value in forged.items() if key != "receipt_sha256"}
+    forged["receipt_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    receipt.write_text(json.dumps(forged) + "\n")
+    with pytest.raises(ValueError, match="allocation"):
+        validate_target_control_allocation_receipt(receipt)
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _init_git_repo(path: Path) -> str:
+    path.mkdir()
+    (path / "tracked.txt").write_text("tracked\n")
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def _write_prompt_snapshot(tmp_path: Path, *, rows: int = 200) -> tuple[Path, Path]:
@@ -81,6 +144,12 @@ def _write_ledger(path: Path, *, mutate: tuple[str, int] | None = None) -> None:
                         f"{subset} prompt {index}".encode()
                     ).hexdigest(),
                     "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+                    "output_text": output,
+                    "output_tokens": list(output),
+                    "request_sha256": hashlib.sha256(
+                        f"request:{subset}:{index}".encode()
+                    ).hexdigest(),
+                    "seed": 42,
                     "finish_reason": "stop",
                 }
                 stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -307,6 +376,517 @@ def test_output_equivalence_is_a_fail_closed_gate(tmp_path: Path) -> None:
     baseline.write_text("\n".join(rows) + "\n")
     with pytest.raises(ValueError, match="ledger row schema"):
         validate_output_equivalence(baseline, draft, requests_per_subset=200)
+
+
+def test_capture_outputs_records_seed_text_and_selected_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The diagnostic ledger preserves replayable request and token evidence."""
+    manifest, hf_home = _write_prompt_snapshot(tmp_path)
+    requests: list[dict[str, object]] = []
+
+    class _Response:
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "text": "answer",
+                            "finish_reason": "stop",
+                            "logprobs": {"tokens": ["ans", "wer"]},
+                        }
+                    ]
+                }
+            ).encode()
+
+    def _urlopen(request: Any, *, timeout: int) -> _Response:
+        assert timeout == 600
+        body = json.loads(request.data)
+        requests.append(body)
+        return _Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+    output = tmp_path / "ledger.jsonl"
+
+    capture_outputs(manifest, hf_home, output, endpoint="http://server/v1", model="target")
+
+    first = json.loads(output.open().readline())
+    assert first["seed"] == 42
+    assert first["output_text"] == "answer"
+    assert first["output_tokens"] == ["ans", "wer"]
+    assert requests[0]["seed"] == 42
+    assert requests[0]["logprobs"] == 0
+    assert requests[0]["return_tokens_as_token_ids"] is True
+    assert requests[0]["request_id"] == "specdec-correctness-HumanEval-0"
+
+
+def test_target_control_quantifies_cross_and_repeat_divergence(tmp_path: Path) -> None:
+    """A target-only control reports nondeterminism without weakening the production gate."""
+    left = tmp_path / "left.jsonl"
+    right = tmp_path / "right.jsonl"
+    _write_ledger(left)
+    _write_ledger(right)
+    right_rows = right.read_text().splitlines()
+    changed = json.loads(right_rows[1])
+    changed["output_text"] = "answer:changed"
+    changed["output_tokens"] = ["answer", ":", "changed"]
+    changed["output_sha256"] = hashlib.sha256(changed["output_text"].encode()).hexdigest()
+    right_rows[1] = json.dumps(changed, sort_keys=True)
+    right.write_text("\n".join(right_rows) + "\n")
+
+    report = summarize_target_control(left, right, requests_per_subset=200)
+
+    assert report["status"] == "diagnostic-only"
+    assert report["requests"] == 1800
+    assert report["cross_server"]["exact_text_matches"] == 1799
+    assert report["cross_server"]["exact_token_matches"] == 1799
+    assert report["cross_server"]["mean_common_token_prefix"] >= 0
+    assert report["within_server"]["left"]["repeat_groups"] == 0
+    assert report["claim_scope"] == "no training-quality or speedup claim"
+
+    repeated_left = tmp_path / "repeated-left.jsonl"
+    repeated_right = tmp_path / "repeated-right.jsonl"
+    _write_ledger(repeated_left)
+    rows = [json.loads(line) for line in repeated_left.read_text().splitlines()]
+    for subset_offset in range(0, len(rows), 200):
+        for index in range(100, 200):
+            source = rows[subset_offset + index - 100]
+            repeated = rows[subset_offset + index]
+            for key in ("source_row", "prompt_sha256", "output_sha256", "output_text", "output_tokens"):
+                repeated[key] = source[key]
+    rows[100]["output_text"] = "different"
+    rows[100]["output_tokens"] = ["different"]
+    rows[100]["output_sha256"] = hashlib.sha256(b"different").hexdigest()
+    repeated_left.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n")
+    repeated_right.write_text(repeated_left.read_text())
+
+    repeated = summarize_target_control(repeated_left, repeated_right)
+
+    assert repeated["within_server"]["left"]["repeat_groups"] == 900
+    assert repeated["within_server"]["left"]["divergent_text_repeat_groups"] == 1
+    assert repeated["within_server"]["left"]["mean_common_token_prefix"] >= 0
+
+
+def test_target_control_receipt_rejects_minimal_fabricated_provenance(tmp_path: Path) -> None:
+    """Self-hashed ledgers cannot substitute for authenticated job provenance."""
+    left = tmp_path / "left.jsonl"
+    right = tmp_path / "right.jsonl"
+    _write_ledger(left)
+    _write_ledger(right)
+    manifest_payload = {
+        "method": "baseline",
+        "config_sha256": {"launcher": "a" * 64, "target": "b" * 64},
+        "evaluation": {
+            "max_concurrency": 1,
+            "max_requests": 200,
+            "temperature": 0,
+            "top_p": 1,
+            "tensor_parallel_size": 2,
+        },
+        "server_args": ["serve", "target", "--tensor-parallel-size", "2"],
+    }
+    manifests = [tmp_path / "left-manifest.json", tmp_path / "right-manifest.json"]
+    for manifest in manifests:
+        manifest.write_text(json.dumps(manifest_payload, sort_keys=True) + "\n")
+    identity = tmp_path / "identity.json"
+    identity.write_text(
+        json.dumps(
+            {
+                "dataset": {
+                    "ordered_prompts": [
+                        {
+                            "subset": subset,
+                            "index": index,
+                            "source_row": index,
+                            "prompt_sha256": hashlib.sha256(
+                                f"{subset} prompt {index}".encode()
+                            ).hexdigest(),
+                        }
+                        for subset in STANDARD_SUBSETS
+                        for index in range(200)
+                    ]
+                }
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="artifact identity"):
+        build_target_control_receipt(
+            left,
+            right,
+            manifests[0],
+            manifests[1],
+            identity,
+            tmp_path / "allocation.json",
+            tmp_path / "control.json",
+        )
+
+
+def test_target_control_receipt_replays_authenticated_job_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A genuine target/runtime/dataset/job closure replays and detects ledger tamper."""
+    target = tmp_path / "target"
+    target.mkdir()
+    spec = dflash2_target_spec("q30-base")
+    (target / "snapshot-manifest.json").write_text(
+        json.dumps({"source_identity": spec.revision}) + "\n"
+    )
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "num_attention_heads": spec.num_attention_heads,
+                "num_key_value_heads": spec.num_key_value_heads,
+                "head_dim": spec.head_dim,
+                "intermediate_size": spec.intermediate_size,
+            }
+        )
+        + "\n"
+    )
+    target_receipt = tmp_path / "target-receipt.json"
+    write_artifact_receipt(target_receipt, target, kind="target")
+
+    export = tmp_path / "export"
+    export.mkdir()
+    (export / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DFlash2DraftModel"],
+                "block_size": 8,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "intermediate_size": 6144,
+                "dflash_config": {"projector_type": "dflash2"},
+            }
+        )
+        + "\n"
+    )
+    (export / "model.safetensors").write_bytes(b"weights")
+    milestone = tmp_path / "milestone"
+    milestone.mkdir()
+    (milestone / "exact-model").symlink_to(export)
+    milestone_manifest = milestone / "manifest.json"
+    milestone_manifest.write_text(
+        json.dumps(
+            {
+                "exact_model_path": str(export),
+                "exact_model_step": 4166,
+                "exact_model_sha256": {
+                    str(path.relative_to(export)): _sha256(path)
+                    for path in sorted(export.iterdir())
+                },
+                "resume_checkpoint_path": "checkpoint-4166",
+                "resume_checkpoint_step": 4166,
+                "resume_checkpoint_sha256": {"trainer_state.json": "f" * 64},
+            }
+        )
+        + "\n"
+    )
+    dataset_manifest, hf_home = _write_prompt_snapshot(tmp_path / "prompts")
+    client_runtime = tmp_path / "client.tar"
+    server_runtime = tmp_path / "server.tar"
+    client_runtime.write_bytes(b"client")
+    server_runtime.write_bytes(b"server")
+    identity_payload = build_artifact_identity(
+        target_path=target,
+        target_sha256=artifact_tree_sha256(target),
+        target_receipt_path=target_receipt,
+        target_receipt_sha256=_sha256(target_receipt),
+        export_path=export,
+        milestone_manifest_path=milestone_manifest,
+        dataset_manifest_path=dataset_manifest,
+        hf_home=hf_home,
+        client_runtime_archive=client_runtime,
+        client_runtime_archive_sha256=_sha256(client_runtime),
+        server_runtime_archive=server_runtime,
+        server_runtime_archive_sha256=_sha256(server_runtime),
+        server_runtime_receipt_sha256="e" * 64,
+    )
+    identity = tmp_path / "identity.json"
+    identity.write_text(json.dumps(identity_payload, indent=2, sort_keys=True) + "\n")
+
+    image = tmp_path / "image.sqsh"
+    image.write_bytes(b"image")
+    image_identity = tmp_path / "image-identity.json"
+    image_identity.write_text(
+        json.dumps(
+            {"path": str(image), "sha256": _sha256(image), "size_bytes": image.stat().st_size}
+        )
+        + "\n"
+    )
+    dataset = identity_payload["dataset"]
+    container = {
+        "identity_path": str(image_identity),
+        "identity_sha256": _sha256(image_identity),
+        "path": str(image),
+        "sha256": _sha256(image),
+        "size_bytes": image.stat().st_size,
+    }
+    modelopt_repo = tmp_path / "modelopt-repo"
+    speculators_repo = tmp_path / "speculators-repo"
+    source = {
+        "modelopt_sha": _init_git_repo(modelopt_repo),
+        "speculators_sha": _init_git_repo(speculators_repo),
+    }
+    runtimes = {"client": "/scratch/client", "server": "/scratch/server"}
+    manifests: list[Path] = []
+    for label, port in (("left", "8000"), ("right", "8010")):
+        run = tmp_path / label
+        run.mkdir()
+        launcher_config = run / "resolved-launcher.yaml"
+        launcher_config.write_text(
+            "pipeline:\n  task_0:\n    slurm_config:\n"
+            f"      container: {image.resolve()}\n"
+        )
+        config_sha256 = {
+            "launcher": _sha256(launcher_config),
+            "target": _sha256(target / "config.json"),
+        }
+        manifest = run / "manifest.json"
+        server_args = [
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            str(target),
+            "--tensor-parallel-size",
+            "2",
+            "--port",
+            port,
+        ]
+        producer = _LAUNCHER / "common/specdec/speculators_eval_artifacts.py"
+        subprocess.run(
+            [
+                "python3",
+                str(producer),
+                "manifest",
+                "--output",
+                str(manifest),
+                "--status",
+                "success",
+                "--method",
+                "baseline",
+                "--block-size",
+                "0",
+                "--num-speculative-tokens",
+                "0",
+                "--target-model",
+                str(target),
+                "--draft-model",
+                "",
+                "--speculators-repo",
+                str(speculators_repo),
+                "--speculators-sha",
+                source["speculators_sha"],
+                "--modelopt-repo",
+                str(modelopt_repo),
+                "--modelopt-sha",
+                source["modelopt_sha"],
+                "--modelopt-dirty",
+                "false",
+                "--client-runtime",
+                runtimes["client"],
+                "--server-runtime",
+                runtimes["server"],
+                "--artifact-identity",
+                str(identity),
+                "--artifact-identity-sha256",
+                _sha256(identity),
+                "--container-image",
+                str(image),
+                "--container-identity",
+                str(image_identity),
+                "--dataset-manifest",
+                str(dataset_manifest),
+                "--hf-home",
+                str(hf_home),
+                "--slurm-job-id",
+                "12345",
+                "--launcher-config",
+                str(launcher_config),
+                "--python-version",
+                "3.12.0",
+                "--vllm-version",
+                "0.27.1",
+                "--guidellm-version",
+                "0.4.0",
+                "--max-concurrency",
+                "1",
+                "--max-requests",
+                "200",
+                "--evaluation-mode",
+                "throughput",
+                "--tensor-parallel-size",
+                "2",
+                *[f"--server-arg={value}" for value in server_args],
+            ],
+            check=True,
+        )
+        inputs = {
+            "target_config_sha256": config_sha256["target"],
+            "draft_config_sha256": None,
+            "dataset": {
+                "revision": dataset["revision"],
+                "manifest_sha256": dataset["manifest_sha256"],
+            },
+            "image": {
+                "sha256": container["sha256"],
+                "identity_sha256": container["identity_sha256"],
+            },
+            "runtimes": {
+                "client": {"sha256": _sha256(client_runtime)},
+                "server": {"sha256": _sha256(server_runtime), "receipt_sha256": "e" * 64},
+            },
+            "artifact_identity_sha256": _sha256(identity),
+            "source": source,
+            "launcher_config_sha256": config_sha256["launcher"],
+            "evaluation": {
+                "method": "baseline",
+                "block_size": 0,
+                "num_speculative_tokens": 0,
+                "max_concurrency": 1,
+                "max_requests": 200,
+                "mode": "throughput",
+                "tensor_parallel_size": 2,
+            },
+        }
+        (run / "input-fingerprint.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "sha256": hashlib.sha256(
+                        json.dumps(inputs, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "inputs": inputs,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        manifests.append(manifest)
+
+    ledgers: list[Path] = []
+    for label in ("left", "right"):
+        ledger = tmp_path / f"{label}.jsonl"
+        with ledger.open("w") as stream:
+            for subset in STANDARD_SUBSETS:
+                for index in range(200):
+                    prompt = f"{subset} prompt {index}"
+                    body = json.dumps(
+                        {
+                            "model": str(target),
+                            "prompt": prompt,
+                            "max_tokens": 64,
+                            "temperature": 0,
+                            "top_p": 1,
+                            "seed": 42,
+                            "logprobs": 0,
+                            "return_tokens_as_token_ids": True,
+                            "request_id": f"specdec-correctness-{subset}-{index}",
+                        }
+                    ).encode()
+                    output = f"answer:{subset}:{index}"
+                    stream.write(
+                        json.dumps(
+                            {
+                                "subset": subset,
+                                "index": index,
+                                "source_row": index,
+                                "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                                "output_sha256": hashlib.sha256(output.encode()).hexdigest(),
+                                "output_text": output,
+                                "output_tokens": list(output),
+                                "request_sha256": hashlib.sha256(body).hexdigest(),
+                                "seed": 42,
+                                "finish_reason": "stop",
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+        ledgers.append(ledger)
+    receipt = tmp_path / "control.json"
+    allocation = tmp_path / "allocation.json"
+    current_allocation = {
+        "slurm_job_id": "12345",
+        "slurm_job_num_nodes": 1,
+        "slurm_job_nodelist": "lyris0092",
+        "gpu_count": 4,
+        "cell_visible_devices": {"left": "0,1", "right": "2,3"},
+    }
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._query_current_allocation",
+        lambda: current_allocation,
+    )
+    build_target_control_allocation_receipt(
+        allocation,
+        slurm_job_id="12345",
+        slurm_job_num_nodes=1,
+        slurm_job_nodelist="lyris0092",
+        gpu_count=4,
+    )
+    build_target_control_receipt(
+        ledgers[0], ledgers[1], manifests[0], manifests[1], identity, allocation, receipt
+    )
+
+    assert validate_target_control_receipt(receipt)["status"] == "diagnostic-only"
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._query_current_allocation",
+        lambda: {**current_allocation, "slurm_job_id": "99999"},
+    )
+    with pytest.raises(ValueError, match="live allocation mismatch"):
+        build_target_control_receipt(
+            ledgers[0],
+            ledgers[1],
+            manifests[0],
+            manifests[1],
+            identity,
+            allocation,
+            tmp_path / "forged-control.json",
+        )
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._query_current_allocation",
+        lambda: current_allocation,
+    )
+    (modelopt_repo / "untracked.txt").write_text("dirty\n")
+    with pytest.raises(ValueError, match="ModelOpt source checkout mismatch"):
+        validate_target_control_receipt(receipt)
+    (modelopt_repo / "untracked.txt").unlink()
+    image.write_bytes(b"mutated")
+    with pytest.raises(ValueError, match="container"):
+        validate_target_control_receipt(receipt)
+    image.write_bytes(b"image")
+    ledgers[1].write_text(ledgers[1].read_text().replace("answer:HumanEval:0", "tampered", 1))
+    with pytest.raises(ValueError, match="descriptor"):
+        validate_target_control_receipt(receipt)
+
+
+def test_target_control_phase_is_baseline_only_and_never_runs_speed_cells() -> None:
+    """The diagnostic phase is isolated from the production correctness/performance path."""
+    pair = _PAIR.read_text()
+
+    assert "diagnostic:1:200:2" in pair
+    assert '"${method_a}:${method_b}" == baseline:baseline' in pair
+    diagnostic = pair.index('if [[ "${PAIR_PHASE}" == diagnostic ]]')
+    capture = pair.index("run_pair_cells 1", diagnostic)
+    analyze = pair.index("analyze-control", capture)
+    verify = pair.index("verify-control", analyze)
+    stop = pair.index("exit 0", verify)
+    performance = pair.index("run_pair_cells 0", stop)
+    assert diagnostic < capture < analyze < verify < stop < performance
+    assert 'readonly MATCHED_HF_HOME="${RESULT_ROOT}/matched-hf"' in pair
+    assert '"${STUDY_HELPER}" allocation-receipt' in pair
+    assert '--allocation-receipt "${ALLOCATION_RECEIPT_PATH}"' in pair
+    assert '"SLURM_JOB_NUM_NODES"' in _HELPER.read_text()
+    assert '"nvidia-smi", "--query-gpu=index", "--format=csv,noheader"' in _HELPER.read_text()
 
 
 def test_pair_summary_reports_per_gpu_speed_latency_and_acceptance(tmp_path: Path) -> None:

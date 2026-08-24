@@ -51,8 +51,8 @@ readonly STUDY_HELPER="${MODELOPT_REPO}/tools/launcher/common/specdec/dflash2_sp
 readonly RESULT_ROOT="${EVAL_OUTPUT_ROOT%/}/${PAIR_LABEL}"
 readonly SOURCE_DATASET_MANIFEST_PATH="${DATASET_MANIFEST_PATH}"
 readonly SOURCE_HF_HOME_DURABLE="${HF_HOME_DURABLE}"
-readonly MATCHED_HF_HOME="${JOB_ROOT}/matched-hf"
-readonly MATCHED_DATASET_MANIFEST_PATH="${JOB_ROOT}/matched-dataset-manifest.json"
+readonly MATCHED_HF_HOME="${RESULT_ROOT}/matched-hf"
+readonly MATCHED_DATASET_MANIFEST_PATH="${RESULT_ROOT}/matched-dataset-manifest.json"
 ARTIFACT_IDENTITY_PATH=""
 ARTIFACT_IDENTITY_SHA256=""
 EQUIVALENCE_ONLY_MODE=0
@@ -122,7 +122,7 @@ run_cell() {
 
     local cell_root="${JOB_ROOT}/${label}"
     local output_root="${RESULT_ROOT}/${label}"
-    local resolved_config="${cell_root}/resolved.yaml"
+    local resolved_config="${output_root}/resolved-launcher.yaml"
     mkdir -p "${cell_root}/hf-datasets" "${cell_root}/triton" \
         "${cell_root}/torchinductor" "${cell_root}/xdg" "${output_root}"
     printf 'pipeline:\n  task_0:\n    slurm_config:\n      container: %s\n' \
@@ -250,22 +250,34 @@ validate_cell "${CELL_A}"
 validate_cell "${CELL_B}"
 method_a="${CELL_A%%|*}"
 method_b="${CELL_B%%|*}"
-if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 ]]; then
+if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
+    || "${PAIR_PHASE}" == diagnostic ]]; then
     for name in SERVER_RUNTIME_RECEIPT_SHA256 \
         DRAFT_MILESTONE_MANIFEST_PATH DRAFT_MILESTONE_MANIFEST_SHA256 \
         TARGET_RECEIPT_PATH TARGET_RECEIPT_SHA256 TARGET_SHA256; do
         [[ -n "${!name:-}" ]] || { echo "ERROR: ${name} is required for DFlash2" >&2; exit 2; }
     done
-    [[ "${method_a}:${method_b}" == baseline:dflash2 \
-        || "${method_a}:${method_b}" == dflash2:baseline ]] || {
-        echo "ERROR: matched DFlash2 pair must contain exactly baseline and dflash2" >&2
-        exit 2
-    }
+    if [[ "${PAIR_PHASE}" == diagnostic ]]; then
+        [[ "${method_a}:${method_b}" == baseline:baseline ]] || {
+            echo "ERROR: target control must contain exactly two baseline cells" >&2
+            exit 2
+        }
+        [[ -n "${CONTROL_DRAFT_EXPORT_PATH:-}" ]] || {
+            echo "ERROR: CONTROL_DRAFT_EXPORT_PATH is required for diagnostic identity" >&2
+            exit 2
+        }
+    else
+        [[ "${method_a}:${method_b}" == baseline:dflash2 \
+            || "${method_a}:${method_b}" == dflash2:baseline ]] || {
+            echo "ERROR: matched DFlash2 pair must contain exactly baseline and dflash2" >&2
+            exit 2
+        }
+    fi
     for descriptor in "${CELL_A}" "${CELL_B}"; do
         IFS='|' read -r _ _ _ concurrency max_requests _ _ tp_size <<<"${descriptor}"
         tp_size="${tp_size:-2}"
         case "${PAIR_PHASE}:${concurrency}:${max_requests}:${tp_size}" in
-            correctness:1:200:2|performance:32:200:2) ;;
+            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2) ;;
             *) echo "ERROR: matched DFlash2 cells require C1/C32, 200 requests, and TP2" >&2; exit 2 ;;
         esac
     done
@@ -276,9 +288,12 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 ]]; then
         --output-manifest "${MATCHED_DATASET_MANIFEST_PATH}"
     DATASET_MANIFEST_PATH="${MATCHED_DATASET_MANIFEST_PATH}"
     HF_HOME_DURABLE="${MATCHED_HF_HOME}"
-    dflash2_descriptor="${CELL_A}"
-    [[ "${method_a}" == dflash2 ]] || dflash2_descriptor="${CELL_B}"
-    IFS='|' read -r _ _ _ _ _ dflash2_export _ _ <<<"${dflash2_descriptor}"
+    dflash2_export="${CONTROL_DRAFT_EXPORT_PATH:-}"
+    if [[ "${PAIR_PHASE}" != diagnostic ]]; then
+        dflash2_descriptor="${CELL_A}"
+        [[ "${method_a}" == dflash2 ]] || dflash2_descriptor="${CELL_B}"
+        IFS='|' read -r _ _ _ _ _ dflash2_export _ _ <<<"${dflash2_descriptor}"
+    fi
     [[ "$(sha256sum "${DRAFT_MILESTONE_MANIFEST_PATH}" | cut -d' ' -f1)" == "${DRAFT_MILESTONE_MANIFEST_SHA256}" ]]
     ARTIFACT_IDENTITY_PATH="${RESULT_ROOT}/artifact-identity.json"
     PYTHONPATH="${MODELOPT_REPO}/tools/launcher${PYTHONPATH:+:${PYTHONPATH}}" \
@@ -342,6 +357,28 @@ run_pair_cells() {
     fi
     CHILD_PIDS=()
 }
+
+if [[ "${PAIR_PHASE}" == diagnostic ]]; then
+    readonly ALLOCATION_RECEIPT_PATH="${RESULT_ROOT}/allocation-receipt.json"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" allocation-receipt \
+        --output "${ALLOCATION_RECEIPT_PATH}"
+    run_pair_cells 1
+    left_label="$(cell_label "${CELL_A}")"
+    right_label="$(cell_label "${CELL_B}")"
+    left_run="${RESULT_ROOT}/${left_label}/${left_label}"
+    right_run="${RESULT_ROOT}/${right_label}/${right_label}"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" analyze-control \
+        --left "${left_run}/output-equivalence.jsonl" \
+        --right "${right_run}/output-equivalence.jsonl" \
+        --left-manifest "${left_run}/manifest.json" \
+        --right-manifest "${right_run}/manifest.json" \
+        --artifact-identity "${ARTIFACT_IDENTITY_PATH}" \
+        --allocation-receipt "${ALLOCATION_RECEIPT_PATH}" \
+        --output "${RESULT_ROOT}/target-target-control-receipt.json"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-control \
+        --receipt "${RESULT_ROOT}/target-target-control-receipt.json" >/dev/null
+    exit 0
+fi
 
 if [[ "${PAIR_PHASE}" == correctness && ( "${method_a}" == dflash2 || "${method_b}" == dflash2 ) ]]; then
     run_pair_cells 1

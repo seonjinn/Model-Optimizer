@@ -6,14 +6,17 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import csv
 import hashlib
 import json
 import math
 import os
 import re
+import subprocess
 import tempfile
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +49,34 @@ EVALUATION_STEP = 4166
 DFLASH2_BLOCK_SIZE = 8
 DFLASH2_SPECULATIVE_TOKENS = 7
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_GIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+_CONTROL_MANIFEST_KEYS = {
+    "status",
+    "recorded_at",
+    "method",
+    "block_size",
+    "num_speculative_tokens",
+    "target_model",
+    "draft_model",
+    "speculators_repo",
+    "speculators_sha",
+    "modelopt_repo",
+    "modelopt_sha",
+    "modelopt_dirty",
+    "runtime",
+    "runtimes",
+    "artifact_identity",
+    "container",
+    "dataset",
+    "provenance_error",
+    "slurm_job_id",
+    "launcher_config",
+    "config_sha256",
+    "versions",
+    "server_args",
+    "evaluator_args",
+    "evaluation",
+}
 
 
 def _sha256(path: Path) -> str:
@@ -393,7 +424,16 @@ def build_artifact_identity(
                 "flashmla_commit": "a8f794d1251cbfd88a5011445dd5582289c727e4",
             },
         },
-        "sampling": {"temperature": 0, "top_p": 1},
+        "sampling": {
+            "temperature": 0,
+            "top_p": 1,
+            "correctness": {
+                "seed": 42,
+                "max_tokens": 64,
+                "logprobs": 0,
+                "return_tokens_as_token_ids": True,
+            },
+        },
         "matrix": {
             "concurrencies": [1, 32],
             "requests_per_subset": 200,
@@ -429,16 +469,178 @@ def _load_ledger(path: Path, requests_per_subset: int) -> list[dict[str, Any]]:
                 "source_row",
                 "prompt_sha256",
                 "output_sha256",
+                "output_text",
+                "output_tokens",
+                "request_sha256",
+                "seed",
                 "finish_reason",
             }
-            or not all(_is_sha256(row.get(name)) for name in ("prompt_sha256", "output_sha256"))
+            or not all(
+                _is_sha256(row.get(name))
+                for name in ("prompt_sha256", "output_sha256", "request_sha256")
+            )
             or isinstance(row.get("source_row"), bool)
             or not isinstance(row.get("source_row"), int)
             or row["source_row"] < 0
+            or not isinstance(row.get("output_text"), str)
+            or not isinstance(row.get("output_tokens"), list)
+            or not all(isinstance(token, str) for token in row["output_tokens"])
+            or row.get("seed") != 42
+            or hashlib.sha256(row["output_text"].encode()).hexdigest()
+            != row["output_sha256"]
             or row.get("finish_reason") not in {"stop", "length"}
         ):
             raise ValueError("output ledger row schema mismatch")
     return records
+
+
+def _common_prefix_length(left: list[str], right: list[str]) -> int:
+    length = 0
+    for expected, actual in zip(left, right):
+        if expected != actual:
+            break
+        length += 1
+    return length
+
+
+def _within_server_repeat_metrics(rows: list[dict[str, Any]]) -> dict[str, int | float]:
+    groups: dict[tuple[str, int, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in rows:
+        groups[(row["subset"], row["source_row"], row["prompt_sha256"])].append(row)
+    repeats = [values for values in groups.values() if len(values) > 1]
+    token_prefixes = [
+        _common_prefix_length(values[0]["output_tokens"], row["output_tokens"])
+        for values in repeats
+        for row in values[1:]
+    ]
+    character_prefixes = [
+        _common_prefix_length(list(values[0]["output_text"]), list(row["output_text"]))
+        for values in repeats
+        for row in values[1:]
+    ]
+    return {
+        "repeat_groups": len(repeats),
+        "divergent_text_repeat_groups": sum(
+            len({row["output_sha256"] for row in values}) > 1 for values in repeats
+        ),
+        "divergent_token_repeat_groups": sum(
+            len({_canonical(row["output_tokens"]) for row in values}) > 1 for values in repeats
+        ),
+        "mean_common_token_prefix": (
+            sum(token_prefixes) / len(token_prefixes) if token_prefixes else 0
+        ),
+        "mean_common_character_prefix": (
+            sum(character_prefixes) / len(character_prefixes) if character_prefixes else 0
+        ),
+    }
+
+
+def summarize_target_control(
+    left_path: Path,
+    right_path: Path,
+    *,
+    requests_per_subset: int = CORRECTNESS_REQUESTS_PER_SUBSET,
+    expected_prompt_schedule: list[dict[str, object]] | None = None,
+    expected_request_sha256: list[str] | None = None,
+) -> dict[str, Any]:
+    """Quantify target-only runtime nondeterminism without authorizing speed metrics."""
+    left = _load_ledger(left_path, requests_per_subset)
+    right = _load_ledger(right_path, requests_per_subset)
+    left_schedule = [
+        {
+            "subset": row["subset"],
+            "index": row["index"],
+            "source_row": row["source_row"],
+            "prompt_sha256": row["prompt_sha256"],
+        }
+        for row in left
+    ]
+    right_schedule = [
+        {
+            "subset": row["subset"],
+            "index": row["index"],
+            "source_row": row["source_row"],
+            "prompt_sha256": row["prompt_sha256"],
+        }
+        for row in right
+    ]
+    if left_schedule != right_schedule or (
+        expected_prompt_schedule is not None and left_schedule != expected_prompt_schedule
+    ):
+        raise ValueError("target control prompt schedule mismatch")
+    left_request_sha256 = [row["request_sha256"] for row in left]
+    if left_request_sha256 != [row["request_sha256"] for row in right] or (
+        expected_request_sha256 is not None
+        and left_request_sha256 != expected_request_sha256
+    ):
+        raise ValueError("target control request fingerprint mismatch")
+
+    subset_metrics: dict[str, dict[str, object]] = {}
+    token_prefixes: list[int] = []
+    text_prefixes: list[int] = []
+    exact_text_total = 0
+    exact_token_total = 0
+    for subset in STANDARD_SUBSETS:
+        pairs = [
+            (expected, actual)
+            for expected, actual in zip(left, right, strict=True)
+            if expected["subset"] == subset
+        ]
+        exact_text = sum(
+            expected["output_text"] == actual["output_text"] for expected, actual in pairs
+        )
+        exact_tokens = sum(
+            expected["output_tokens"] == actual["output_tokens"]
+            for expected, actual in pairs
+        )
+        prefixes = [
+            _common_prefix_length(expected["output_tokens"], actual["output_tokens"])
+            for expected, actual in pairs
+        ]
+        char_prefixes = [
+            _common_prefix_length(list(expected["output_text"]), list(actual["output_text"]))
+            for expected, actual in pairs
+        ]
+        exact_text_total += exact_text
+        exact_token_total += exact_tokens
+        token_prefixes.extend(prefixes)
+        text_prefixes.extend(char_prefixes)
+        subset_metrics[subset] = {
+            "requests": len(pairs),
+            "exact_text_matches": exact_text,
+            "exact_token_matches": exact_tokens,
+            "mean_common_token_prefix": sum(prefixes) / len(prefixes),
+            "mean_common_character_prefix": sum(char_prefixes) / len(char_prefixes),
+        }
+    return {
+        "schema_version": 1,
+        "producer": "q30-target-target-runtime-control-v1",
+        "status": "diagnostic-only",
+        "claim_scope": "no training-quality or speedup claim",
+        "allocation_evidence_scope": (
+            "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+        ),
+        "requests": len(left),
+        "sampling": {"temperature": 0, "top_p": 1, "seed": 42},
+        "request_set_sha256": _sha_json(left_request_sha256),
+        "left_ledger_sha256": _sha256(left_path),
+        "right_ledger_sha256": _sha256(right_path),
+        "cross_server": {
+            "exact_text_matches": exact_text_total,
+            "exact_token_matches": exact_token_total,
+            "mean_common_token_prefix": sum(token_prefixes) / len(token_prefixes),
+            "mean_common_character_prefix": sum(text_prefixes) / len(text_prefixes),
+            "subsets": subset_metrics,
+        },
+        "within_server": {
+            "left": _within_server_repeat_metrics(left),
+            "right": _within_server_repeat_metrics(right),
+        },
+        "task_correctness": {
+            "status": "not-claimed",
+            "reason": "performance prompts do not provide a safe uniform semantic scorer",
+        },
+    }
 
 
 def validate_output_equivalence(
@@ -530,6 +732,508 @@ def _validate_file_descriptor(value: object) -> Path:
     ):
         raise ValueError("evidence file descriptor mismatch")
     return path
+
+
+def build_target_control_allocation_receipt(
+    output_path: Path,
+    *,
+    slurm_job_id: str,
+    slurm_job_num_nodes: int,
+    slurm_job_nodelist: str,
+    gpu_count: int,
+) -> dict[str, Any]:
+    """Publish job-local proof of the intended one-node disjoint TP2+TP2 allocation."""
+    if (
+        re.fullmatch(r"[1-9][0-9]*", slurm_job_id) is None
+        or slurm_job_num_nodes != 1
+        or not slurm_job_nodelist
+        or gpu_count != 4
+    ):
+        raise ValueError("target control allocation must be one node with exactly four GPUs")
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "producer": "q30-target-control-allocation-v1",
+        "slurm_job_id": slurm_job_id,
+        "slurm_job_num_nodes": slurm_job_num_nodes,
+        "slurm_job_nodelist": slurm_job_nodelist,
+        "gpu_count": gpu_count,
+        "cell_visible_devices": {"left": "0,1", "right": "2,3"},
+    }
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def validate_target_control_allocation_receipt(path: Path) -> dict[str, Any]:
+    """Replay the exact one-node, four-GPU allocation claim."""
+    payload = _load_json(path)
+    expected_keys = {
+        "schema_version",
+        "producer",
+        "slurm_job_id",
+        "slurm_job_num_nodes",
+        "slurm_job_nodelist",
+        "gpu_count",
+        "cell_visible_devices",
+        "receipt_sha256",
+    }
+    unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    if (
+        set(payload) != expected_keys
+        or payload.get("schema_version") != 1
+        or payload.get("producer") != "q30-target-control-allocation-v1"
+        or payload.get("receipt_sha256") != _sha_json(unsigned)
+        or re.fullmatch(r"[1-9][0-9]*", str(payload.get("slurm_job_id", ""))) is None
+        or payload.get("slurm_job_num_nodes") != 1
+        or not isinstance(payload.get("slurm_job_nodelist"), str)
+        or not payload.get("slurm_job_nodelist")
+        or payload.get("gpu_count") != 4
+        or payload.get("cell_visible_devices") != {"left": "0,1", "right": "2,3"}
+    ):
+        raise ValueError("invalid target control allocation receipt")
+    return payload
+
+
+def _query_current_allocation() -> dict[str, Any]:
+    try:
+        gpu_lines = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        node_count = int(os.environ["SLURM_JOB_NUM_NODES"])
+        job_id = os.environ["SLURM_JOB_ID"]
+        nodelist = os.environ["SLURM_JOB_NODELIST"]
+    except (KeyError, ValueError, subprocess.CalledProcessError) as error:
+        raise ValueError("allocation receipt must be produced inside the active GPU job") from error
+    return {
+        "slurm_job_id": job_id,
+        "slurm_job_num_nodes": node_count,
+        "slurm_job_nodelist": nodelist,
+        "gpu_count": len(gpu_lines),
+        "cell_visible_devices": {"left": "0,1", "right": "2,3"},
+    }
+
+
+def _publish_current_allocation_receipt(output_path: Path) -> dict[str, Any]:
+    current = _query_current_allocation()
+    return build_target_control_allocation_receipt(
+        output_path,
+        slurm_job_id=str(current["slurm_job_id"]),
+        slurm_job_num_nodes=int(current["slurm_job_num_nodes"]),
+        slurm_job_nodelist=str(current["slurm_job_nodelist"]),
+        gpu_count=int(current["gpu_count"]),
+    )
+
+
+def _git_output(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _validate_clean_repo(path_value: object, sha_value: object, name: str) -> Path:
+    path = Path(str(path_value)).resolve(strict=True)
+    if (
+        not path.is_dir()
+        or not isinstance(sha_value, str)
+        or _GIT_SHA_PATTERN.fullmatch(sha_value) is None
+    ):
+        raise ValueError(f"invalid {name} source checkout")
+    try:
+        head = _git_output(path, "rev-parse", "HEAD")
+        dirty = _git_output(path, "status", "--porcelain")
+    except subprocess.CalledProcessError as error:
+        raise ValueError(f"invalid {name} source checkout") from error
+    if head != sha_value or dirty:
+        raise ValueError(f"{name} source checkout mismatch")
+    return path
+
+
+def _validate_control_launcher(path_value: object, image: Path, expected_sha: object) -> Path:
+    path = Path(str(path_value)).resolve(strict=True)
+    if not _is_sha256(expected_sha) or _sha256(path) != expected_sha:
+        raise ValueError("target control launcher config mismatch")
+    expected = (
+        "pipeline:\n  task_0:\n    slurm_config:\n"
+        f"      container: {image.resolve(strict=True)}\n"
+    )
+    if path.read_text() != expected:
+        raise ValueError("target control launcher config is not canonical")
+    return path
+
+
+def _validate_artifact_identity(path: Path) -> dict[str, Any]:
+    identity = _load_json(path)
+    if (
+        identity.get("producer") != "q30-dflash2-s4166-speculators-inputs-v1"
+        or identity.get("schema_version") != 1
+        or identity.get("receipt_sha256") != _sha_json(
+            {key: value for key, value in identity.items() if key != "receipt_sha256"}
+        )
+    ):
+        raise ValueError("artifact identity receipt mismatch")
+    target = identity.get("target")
+    draft = identity.get("draft")
+    dataset = identity.get("dataset")
+    runtimes = identity.get("runtimes")
+    if not all(isinstance(value, dict) for value in (target, draft, dataset, runtimes)):
+        raise ValueError("artifact identity schema mismatch")
+    assert isinstance(target, dict)
+    assert isinstance(draft, dict)
+    assert isinstance(dataset, dict)
+    assert isinstance(runtimes, dict)
+    client = runtimes.get("client")
+    server = runtimes.get("server")
+    if not isinstance(client, dict) or not isinstance(server, dict):
+        raise ValueError("artifact identity runtime schema mismatch")
+    dataset_manifest_path = Path(str(dataset.get("manifest_path", "")))
+    dataset_manifest = _load_json(dataset_manifest_path)
+    rebuilt = build_artifact_identity(
+        target_path=Path(str(target.get("path", ""))),
+        target_sha256=str(target.get("artifact_sha256", "")),
+        target_receipt_path=Path(str(target.get("receipt_path", ""))),
+        target_receipt_sha256=str(target.get("receipt_sha256", "")),
+        export_path=Path(str(draft.get("export_path", ""))),
+        milestone_manifest_path=Path(str(draft.get("milestone_manifest_path", ""))),
+        dataset_manifest_path=dataset_manifest_path,
+        hf_home=Path(str(dataset_manifest.get("hf_home", ""))),
+        client_runtime_archive=Path(str(client.get("archive_path", ""))),
+        client_runtime_archive_sha256=str(client.get("archive_sha256", "")),
+        server_runtime_archive=Path(str(server.get("archive_path", ""))),
+        server_runtime_archive_sha256=str(server.get("archive_sha256", "")),
+        server_runtime_receipt_sha256=str(server.get("receipt_sha256", "")),
+    )
+    if identity != rebuilt:
+        raise ValueError("artifact identity replay mismatch")
+    return identity
+
+
+def _validate_target_control_manifest(
+    path: Path, artifact_identity_path: Path, identity: dict[str, Any]
+) -> tuple[dict[str, Any], Path, dict[str, Any], Path]:
+    manifest = _load_json(path)
+    evaluation = manifest.get("evaluation")
+    server_args = manifest.get("server_args")
+    target = identity["target"]
+    dataset = identity["dataset"]
+    runtimes = identity["runtimes"]
+    artifact_sha256 = _sha256(artifact_identity_path)
+    config_sha256 = manifest.get("config_sha256")
+    artifact_binding = manifest.get("artifact_identity")
+    container = manifest.get("container")
+    manifest_dataset = manifest.get("dataset")
+    runtimes_value = manifest.get("runtimes")
+    versions = manifest.get("versions")
+    evaluation_expected = {
+        "dataset": DATASET_ID,
+        "subsets": list(STANDARD_SUBSETS),
+        "temperature": 0,
+        "top_p": 1,
+        "mode": "throughput",
+        "max_concurrency": 1,
+        "max_requests": 200,
+        "tensor_parallel_size": 2,
+    }
+    try:
+        recorded_at = datetime.fromisoformat(str(manifest.get("recorded_at", "")))
+    except ValueError as error:
+        raise ValueError("target control recorded_at is invalid") from error
+    if (
+        set(manifest) != _CONTROL_MANIFEST_KEYS
+        or manifest.get("method") != "baseline"
+        or manifest.get("status") != "success"
+        or manifest.get("block_size") != 0
+        or manifest.get("num_speculative_tokens") != 0
+        or manifest.get("draft_model") is not None
+        or manifest.get("target_model") != target["path"]
+        or manifest.get("modelopt_dirty") is not False
+        or manifest.get("provenance_error") is not None
+        or manifest.get("evaluator_args") != []
+        or recorded_at.tzinfo is None
+        or not isinstance(evaluation, dict)
+        or evaluation != evaluation_expected
+        or not isinstance(server_args, list)
+        or not all(isinstance(value, str) for value in server_args)
+        or any(value == "--speculative-config" or value.startswith("--speculative-config=") for value in server_args)
+        or server_args[:6]
+        != [
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            target["path"],
+            "--tensor-parallel-size",
+            "2",
+        ]
+        or len(server_args) != 8
+        or server_args[6] != "--port"
+        or server_args[7] not in {"8000", "8010"}
+        or not isinstance(config_sha256, dict)
+        or set(config_sha256) != {"launcher", "target"}
+        or not all(_is_sha256(value) for value in config_sha256.values())
+        or config_sha256["target"] != _sha256(Path(target["path"]) / "config.json")
+        or artifact_binding
+        != {"path": str(artifact_identity_path.resolve(strict=True)), "sha256": artifact_sha256}
+        or not isinstance(container, dict)
+        or not isinstance(manifest_dataset, dict)
+        or not isinstance(runtimes_value, dict)
+        or set(runtimes_value) != {"client", "server"}
+        or manifest.get("runtime") != runtimes_value.get("client")
+        or not all(isinstance(value, str) and value for value in runtimes_value.values())
+        or not isinstance(versions, dict)
+        or set(versions) != {"python", "vllm", "guidellm"}
+        or not all(isinstance(value, str) and value for value in versions.values())
+        or re.fullmatch(r"[1-9][0-9]*", str(manifest.get("slurm_job_id", ""))) is None
+    ):
+        raise ValueError("target control manifest is not exact baseline C1")
+
+    _validate_clean_repo(manifest.get("modelopt_repo"), manifest.get("modelopt_sha"), "ModelOpt")
+    _validate_clean_repo(
+        manifest.get("speculators_repo"), manifest.get("speculators_sha"), "Speculators"
+    )
+
+    container_identity_path = Path(str(container.get("identity_path", "")))
+    container_identity = _load_json(container_identity_path)
+    container_path = Path(str(container.get("path", ""))).resolve(strict=True)
+    if (
+        container.get("identity_sha256") != _sha256(container_identity_path)
+        or container_identity
+        != {
+            "path": container.get("path"),
+            "sha256": container.get("sha256"),
+            "size_bytes": container.get("size_bytes"),
+        }
+        or not _is_sha256(container.get("sha256"))
+        or not isinstance(container.get("size_bytes"), int)
+        or isinstance(container.get("size_bytes"), bool)
+        or not container_path.is_file()
+        or container_path.stat().st_size != container.get("size_bytes")
+        or _sha256(container_path) != container.get("sha256")
+    ):
+        raise ValueError("target control container identity mismatch")
+    launcher_path = _validate_control_launcher(
+        manifest.get("launcher_config"), container_path, config_sha256["launcher"]
+    )
+    expected_dataset_files = {
+        subset: {
+            "path": dataset["files"][subset]["path"],
+            "sha256": dataset["files"][subset]["sha256"],
+        }
+        for subset in STANDARD_SUBSETS
+    }
+    dataset_manifest = _load_json(Path(dataset["manifest_path"]))
+    if manifest_dataset != {
+        "dataset_id": dataset["dataset_id"],
+        "revision": dataset["revision"],
+        "hf_home": dataset_manifest["hf_home"],
+        "manifest_path": dataset["manifest_path"],
+        "manifest_sha256": dataset["manifest_sha256"],
+        "files": expected_dataset_files,
+    }:
+        raise ValueError("target control dataset provenance mismatch")
+
+    fingerprint_path = path.parent / "input-fingerprint.json"
+    fingerprint = _load_json(fingerprint_path)
+    inputs = fingerprint.get("inputs")
+    if (
+        fingerprint.get("schema_version") != 1
+        or not isinstance(inputs, dict)
+        or fingerprint.get("sha256") != _sha_json(inputs)
+    ):
+        raise ValueError("target control input fingerprint self-hash mismatch")
+    expected_inputs = {
+        "target_config_sha256": config_sha256["target"],
+        "draft_config_sha256": None,
+        "dataset": {
+            "revision": dataset["revision"],
+            "manifest_sha256": dataset["manifest_sha256"],
+        },
+        "image": {
+            "sha256": container["sha256"],
+            "identity_sha256": container["identity_sha256"],
+        },
+        "runtimes": {
+            "client": {"sha256": runtimes["client"]["archive_sha256"]},
+            "server": {
+                "sha256": runtimes["server"]["archive_sha256"],
+                "receipt_sha256": runtimes["server"]["receipt_sha256"],
+            },
+        },
+        "artifact_identity_sha256": artifact_sha256,
+        "source": {
+            "modelopt_sha": manifest.get("modelopt_sha"),
+            "speculators_sha": manifest.get("speculators_sha"),
+        },
+        "launcher_config_sha256": config_sha256["launcher"],
+        "evaluation": {
+            "method": "baseline",
+            "block_size": 0,
+            "num_speculative_tokens": 0,
+            "max_concurrency": 1,
+            "max_requests": 200,
+            "mode": "throughput",
+            "tensor_parallel_size": 2,
+        },
+    }
+    if (
+        inputs != expected_inputs
+    ):
+        raise ValueError("target control input fingerprint mismatch")
+    return manifest, fingerprint_path, fingerprint, launcher_path
+
+
+def build_target_control_receipt(
+    left_path: Path,
+    right_path: Path,
+    left_manifest_path: Path,
+    right_manifest_path: Path,
+    artifact_identity_path: Path,
+    allocation_receipt_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Publish a self-hashed, replayable target-only nondeterminism receipt."""
+    identity = _validate_artifact_identity(artifact_identity_path)
+    dataset = identity.get("dataset")
+    if not isinstance(dataset, dict) or not isinstance(dataset.get("ordered_prompts"), list):
+        raise ValueError("artifact identity has no ordered prompt schedule")
+    manifests = [left_manifest_path, right_manifest_path]
+    manifest_evidence = [
+        _validate_target_control_manifest(path, artifact_identity_path, identity)
+        for path in manifests
+    ]
+    manifest_payloads = [evidence[0] for evidence in manifest_evidence]
+    fingerprint_paths = [evidence[1] for evidence in manifest_evidence]
+    fingerprint_payloads = [evidence[2] for evidence in manifest_evidence]
+    launcher_paths = [evidence[3] for evidence in manifest_evidence]
+    for name in (
+        "config_sha256",
+        "container",
+        "dataset",
+        "modelopt_sha",
+        "speculators_sha",
+        "target_model",
+        "versions",
+        "artifact_identity",
+        "runtimes",
+    ):
+        if manifest_payloads[0].get(name) != manifest_payloads[1].get(name):
+            raise ValueError(f"target control manifest mismatch: {name}")
+    if fingerprint_payloads[0].get("inputs") != fingerprint_payloads[1].get("inputs"):
+        raise ValueError("target control input fingerprint mismatch between cells")
+    allocation = validate_target_control_allocation_receipt(allocation_receipt_path)
+    current_allocation = _query_current_allocation()
+    for name in (
+        "slurm_job_id",
+        "slurm_job_num_nodes",
+        "slurm_job_nodelist",
+        "gpu_count",
+        "cell_visible_devices",
+    ):
+        if allocation.get(name) != current_allocation.get(name):
+            raise ValueError(f"target control live allocation mismatch: {name}")
+    if any(manifest.get("slurm_job_id") != allocation["slurm_job_id"] for manifest in manifest_payloads):
+        raise ValueError("target control allocation job mismatch")
+    ports = {manifest["server_args"][-1] for manifest in manifest_payloads}
+    if ports != {"8000", "8010"}:
+        raise ValueError("target control server ports are not isolated")
+    payload = summarize_target_control(
+        left_path,
+        right_path,
+        expected_prompt_schedule=dataset["ordered_prompts"],
+        expected_request_sha256=_expected_request_hashes(identity),
+    )
+    payload["artifact_identity"] = _file_descriptor(artifact_identity_path)
+    payload["manifests"] = [_file_descriptor(path) for path in manifests]
+    payload["input_fingerprints"] = [
+        _file_descriptor(path) for path in fingerprint_paths
+    ]
+    payload["launcher_configs"] = [_file_descriptor(path) for path in launcher_paths]
+    payload["allocation_receipt"] = _file_descriptor(allocation_receipt_path)
+    payload["ledgers"] = [_file_descriptor(left_path), _file_descriptor(right_path)]
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def validate_target_control_receipt(path: Path) -> dict[str, Any]:
+    """Rehash all target-control evidence and replay every reported metric."""
+    payload = _load_json(path)
+    claim = payload.pop("receipt_sha256", None)
+    if claim != _sha_json(payload):
+        raise ValueError("target control receipt self-hash mismatch")
+    artifact_path = _validate_file_descriptor(payload.get("artifact_identity"))
+    manifest_values = payload.get("manifests")
+    ledger_values = payload.get("ledgers")
+    if (
+        not isinstance(manifest_values, list)
+        or len(manifest_values) != 2
+        or not isinstance(ledger_values, list)
+        or len(ledger_values) != 2
+    ):
+        raise ValueError("target control evidence descriptor mismatch")
+    manifests = [_validate_file_descriptor(value) for value in manifest_values]
+    ledgers = [_validate_file_descriptor(value) for value in ledger_values]
+    identity = _validate_artifact_identity(artifact_path)
+    dataset = identity.get("dataset")
+    if not isinstance(dataset, dict) or not isinstance(dataset.get("ordered_prompts"), list):
+        raise ValueError("artifact identity has no ordered prompt schedule")
+    fingerprint_values = payload.get("input_fingerprints")
+    if not isinstance(fingerprint_values, list) or len(fingerprint_values) != 2:
+        raise ValueError("target control input fingerprint descriptor mismatch")
+    fingerprint_paths = [_validate_file_descriptor(value) for value in fingerprint_values]
+    launcher_values = payload.get("launcher_configs")
+    if not isinstance(launcher_values, list) or len(launcher_values) != 2:
+        raise ValueError("target control launcher config descriptor mismatch")
+    launcher_paths = [_validate_file_descriptor(value) for value in launcher_values]
+    allocation_path = _validate_file_descriptor(payload.get("allocation_receipt"))
+    allocation = validate_target_control_allocation_receipt(allocation_path)
+    manifest_evidence = [
+        _validate_target_control_manifest(item, artifact_path, identity) for item in manifests
+    ]
+    manifest_payloads = [evidence[0] for evidence in manifest_evidence]
+    if [evidence[1] for evidence in manifest_evidence] != fingerprint_paths:
+        raise ValueError("target control input fingerprint path mismatch")
+    if [evidence[3] for evidence in manifest_evidence] != launcher_paths:
+        raise ValueError("target control launcher config path mismatch")
+    for name in (
+        "config_sha256",
+        "container",
+        "dataset",
+        "modelopt_sha",
+        "speculators_sha",
+        "target_model",
+        "versions",
+        "artifact_identity",
+        "runtimes",
+    ):
+        if manifest_payloads[0].get(name) != manifest_payloads[1].get(name):
+            raise ValueError(f"target control manifest mismatch: {name}")
+    if manifest_evidence[0][2].get("inputs") != manifest_evidence[1][2].get("inputs"):
+        raise ValueError("target control input fingerprint mismatch between cells")
+    if {manifest["server_args"][-1] for manifest in manifest_payloads} != {"8000", "8010"}:
+        raise ValueError("target control server ports are not isolated")
+    if any(manifest.get("slurm_job_id") != allocation["slurm_job_id"] for manifest in manifest_payloads):
+        raise ValueError("target control allocation job mismatch")
+    replayed = summarize_target_control(
+        ledgers[0],
+        ledgers[1],
+        expected_prompt_schedule=dataset["ordered_prompts"],
+        expected_request_sha256=_expected_request_hashes(identity),
+    )
+    replayed["artifact_identity"] = payload["artifact_identity"]
+    replayed["manifests"] = payload["manifests"]
+    replayed["input_fingerprints"] = payload["input_fingerprints"]
+    replayed["launcher_configs"] = payload["launcher_configs"]
+    replayed["allocation_receipt"] = payload["allocation_receipt"]
+    replayed["ledgers"] = payload["ledgers"]
+    if payload != replayed:
+        raise ValueError("target control receipt replay mismatch")
+    return {**payload, "receipt_sha256": claim}
 
 
 def _metric_evidence(
@@ -687,6 +1391,44 @@ def validate_report_receipt(path: Path) -> dict[str, Any]:
     return {**payload, "receipt_sha256": claim}
 
 
+def _completion_request_body(model: str, subset: str, index: int, prompt: str) -> bytes:
+    return json.dumps(
+        {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": 64,
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 42,
+            "logprobs": 0,
+            "return_tokens_as_token_ids": True,
+            "request_id": f"specdec-correctness-{subset}-{index}",
+        }
+    ).encode()
+
+
+def _expected_request_hashes(identity: dict[str, Any]) -> list[str]:
+    target = identity.get("target")
+    dataset = identity.get("dataset")
+    if not isinstance(target, dict) or not isinstance(dataset, dict):
+        raise ValueError("artifact identity target/dataset mismatch")
+    model = target.get("path")
+    files = dataset.get("files")
+    if not isinstance(model, str) or not isinstance(files, dict):
+        raise ValueError("artifact identity request inputs mismatch")
+    hashes: list[str] = []
+    for subset in STANDARD_SUBSETS:
+        entry = files.get(subset)
+        if not isinstance(entry, dict):
+            raise ValueError("artifact identity request dataset mismatch")
+        prompts = _read_prompt_prefix(Path(str(entry.get("path", ""))), 200)
+        if len(prompts) != 200:
+            raise ValueError("target control requires durable exact-200 prompt files")
+        for index, (_, prompt) in enumerate(prompts):
+            hashes.append(hashlib.sha256(_completion_request_body(model, subset, index, prompt)).hexdigest())
+    return hashes
+
+
 def capture_outputs(
     dataset_manifest_path: Path,
     hf_home: Path,
@@ -720,15 +1462,7 @@ def capture_outputs(
                 prompts = _read_prompt_prefix(Path(str(entry["path"])), requests_per_subset)
                 for index in range(requests_per_subset):
                     source_row, prompt = prompts[index % len(prompts)]
-                    body = json.dumps(
-                        {
-                            "model": model,
-                            "prompt": prompt,
-                            "max_tokens": max_tokens,
-                            "temperature": 0,
-                            "top_p": 1,
-                        }
-                    ).encode()
+                    body = _completion_request_body(model, subset, index, prompt)
                     request = urllib.request.Request(
                         endpoint.rstrip("/") + "/completions",
                         data=body,
@@ -740,7 +1474,14 @@ def capture_outputs(
                     choice = result["choices"][0]
                     text = choice["text"]
                     finish = choice["finish_reason"]
-                    if not isinstance(text, str) or finish not in {"stop", "length"}:
+                    logprobs = choice.get("logprobs")
+                    tokens = logprobs.get("tokens") if isinstance(logprobs, dict) else None
+                    if (
+                        not isinstance(text, str)
+                        or not isinstance(tokens, list)
+                        or not all(isinstance(token, str) for token in tokens)
+                        or finish not in {"stop", "length"}
+                    ):
                         raise ValueError("invalid completion response")
                     record = {
                         "subset": subset,
@@ -748,6 +1489,10 @@ def capture_outputs(
                         "source_row": source_row,
                         "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
                         "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                        "output_text": text,
+                        "output_tokens": tokens,
+                        "request_sha256": hashlib.sha256(body).hexdigest(),
+                        "seed": 42,
                         "finish_reason": finish,
                     }
                     stream.write(_canonical(record) + "\n")
@@ -788,6 +1533,18 @@ def main() -> None:
     compare.add_argument("--output", required=True)
     compare.add_argument("--artifact-identity", required=True)
 
+    control = commands.add_parser("analyze-control")
+    control.add_argument("--left", required=True)
+    control.add_argument("--right", required=True)
+    control.add_argument("--left-manifest", required=True)
+    control.add_argument("--right-manifest", required=True)
+    control.add_argument("--artifact-identity", required=True)
+    control.add_argument("--allocation-receipt", required=True)
+    control.add_argument("--output", required=True)
+
+    allocation = commands.add_parser("allocation-receipt")
+    allocation.add_argument("--output", required=True)
+
     summary = commands.add_parser("summarize")
     summary.add_argument("--baseline-run", required=True)
     summary.add_argument("--dflash2-run", required=True)
@@ -818,6 +1575,9 @@ def main() -> None:
 
     verify_report = commands.add_parser("verify-report")
     verify_report.add_argument("--report", required=True)
+
+    verify_control = commands.add_parser("verify-control")
+    verify_control.add_argument("--receipt", required=True)
 
     args = parser.parse_args()
     if args.command == "prompt-set":
@@ -853,6 +1613,18 @@ def main() -> None:
         )
         payload["receipt_sha256"] = _sha_json(payload)
         _atomic_json(Path(args.output), payload, no_replace=True)
+    elif args.command == "analyze-control":
+        build_target_control_receipt(
+            Path(args.left),
+            Path(args.right),
+            Path(args.left_manifest),
+            Path(args.right_manifest),
+            Path(args.artifact_identity),
+            Path(args.allocation_receipt),
+            Path(args.output),
+        )
+    elif args.command == "allocation-receipt":
+        _publish_current_allocation_receipt(Path(args.output))
     elif args.command == "summarize":
         correctness = _load_json(Path(args.correctness_receipt))
         claim = correctness.pop("receipt_sha256", None)
@@ -895,8 +1667,10 @@ def main() -> None:
         _atomic_json(Path(args.output), payload, no_replace=True)
     elif args.command == "verify-milestone":
         print(_canonical(validate_milestone_export(Path(args.manifest), Path(args.export))))
-    else:
+    elif args.command == "verify-report":
         print(_canonical(validate_report_receipt(Path(args.report))))
+    else:
+        print(_canonical(validate_target_control_receipt(Path(args.receipt))))
 
 
 if __name__ == "__main__":
