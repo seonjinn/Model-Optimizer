@@ -76,12 +76,23 @@ from common.specdec.cluster_profile import (
     validate_scratch_root,
 )
 from common.specdec.drafter_job_manifest import load_manifest
+from common.specdec.dflash2_runtime_contract import validate_dflash2_source_checkout
 
 profile = load_cluster_profile(Path(sys.argv[1]))
 receipt_path = Path(sys.argv[2]) if sys.argv[2] else None
 experiments = load_manifest(Path(sys.argv[3]))
-if any(experiment.paths.source_sha != profile.modelopt_commit for experiment in experiments):
-    raise SystemExit("manifest source SHA does not match the cluster profile")
+if profile.modelopt_feature_base is None:
+    if any(experiment.paths.source_sha != profile.modelopt_commit for experiment in experiments):
+        raise SystemExit("manifest source SHA does not match the cluster profile")
+else:
+    if any(experiment.method != "dflash2" for experiment in experiments):
+        raise SystemExit("feature-base profiles are restricted to DFlash2 manifests")
+    for source_path, source_sha in {
+        (experiment.paths.source_path, experiment.paths.source_sha) for experiment in experiments
+    }:
+        validate_dflash2_source_checkout(
+            Path(source_path), source_sha, profile.modelopt_feature_base
+        )
 if any(
     experiment.slurm.nodes > profile.training_nodes
     or profile.training_nodes % experiment.slurm.nodes

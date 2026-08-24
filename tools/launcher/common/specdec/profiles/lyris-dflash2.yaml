@@ -3,6 +3,7 @@
 
 name: lyris
 modelopt_commit: 6eda6bbf54455086a54660fe7a7b06c415b87da5
+modelopt_feature_base: 6eda6bbf54455086a54660fe7a7b06c415b87da5
 ssh_host: login-lyris
 account: coreai_dlalgo_llm
 partition: gb200

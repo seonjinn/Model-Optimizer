@@ -47,6 +47,7 @@ _REQUIRED_FIELDS = frozenset(
         "walltime",
     }
 )
+_OPTIONAL_FIELDS = frozenset({"modelopt_feature_base"})
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class ClusterProfile:
     gpus_per_node: int
     explicit_gpu_flag: bool
     walltime: str
+    modelopt_feature_base: str | None = None
 
     def __post_init__(self) -> None:
         for field in ("name", "ssh_host", "account", "partition", "walltime"):
@@ -75,6 +77,10 @@ class ClusterProfile:
                 raise ValueError(f"{field} must be non-empty")
         if not _COMMIT_SHA.fullmatch(self.modelopt_commit):
             raise ValueError("modelopt_commit must be an exact 40-character lowercase commit SHA")
+        if self.modelopt_feature_base is not None and not _COMMIT_SHA.fullmatch(
+            self.modelopt_feature_base
+        ):
+            raise ValueError("modelopt_feature_base must be an exact lowercase commit SHA")
         if self.fallback_partition is not None and not self.fallback_partition.strip():
             raise ValueError("fallback_partition must be non-empty when provided")
         if not self.durable_root.is_absolute():
@@ -99,8 +105,14 @@ def load_cluster_profile(path: Path) -> ClusterProfile:
     """Load one complete cluster profile from a YAML mapping."""
     with path.open() as file:
         values = yaml.safe_load(file)
-    if not isinstance(values, dict) or set(values) != _REQUIRED_FIELDS:
-        raise ValueError(f"profile must contain exactly {sorted(_REQUIRED_FIELDS)}")
+    if (
+        not isinstance(values, dict)
+        or not _REQUIRED_FIELDS.issubset(values)
+        or set(values) - _REQUIRED_FIELDS - _OPTIONAL_FIELDS
+    ):
+        raise ValueError(
+            f"profile must contain {sorted(_REQUIRED_FIELDS)} and only {sorted(_OPTIONAL_FIELDS)} optionally"
+        )
     return ClusterProfile(
         name=_string(values, "name"),
         modelopt_commit=_string(values, "modelopt_commit"),
@@ -117,6 +129,11 @@ def load_cluster_profile(path: Path) -> ClusterProfile:
         gpus_per_node=_positive_integer(values, "gpus_per_node"),
         explicit_gpu_flag=_boolean(values, "explicit_gpu_flag"),
         walltime=_string(values, "walltime"),
+        modelopt_feature_base=(
+            _optional_string(values, "modelopt_feature_base")
+            if "modelopt_feature_base" in values
+            else None
+        ),
     )
 
 

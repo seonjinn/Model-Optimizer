@@ -22,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from common.specdec.cluster_profile import load_cluster_profile
+from common.specdec.dflash2_runtime_contract import validate_dflash2_source_checkout
 from common.specdec.drafter_job_manifest import (
     DFlash2RuntimeContract,
     DrafterExperiment,
@@ -49,8 +50,13 @@ def build_dflash2_nemotron_manifest(
     if q30_nodes != 16 or q235_nodes != 16:
         raise ValueError("DFlash2 production requires native 16-node/segment-16 jobs")
     profile = load_cluster_profile(cluster_profile)
-    if profile.modelopt_commit != source_sha:
-        raise ValueError("DFlash2 profile source commit does not match the manifest")
+    if profile.modelopt_feature_base is None:
+        if profile.modelopt_commit != source_sha:
+            raise ValueError("DFlash2 profile source commit does not match the manifest")
+    else:
+        validate_dflash2_source_checkout(
+            Path(source_path), source_sha, profile.modelopt_feature_base
+        )
     if profile.training_nodes != 16 or profile.training_segment != 16 or profile.gpus_per_node != 4:
         raise ValueError("DFlash2 profile must expose native 16-node/segment-16 training")
 

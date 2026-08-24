@@ -19,6 +19,17 @@ from typing import Any
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT = shutil.which("git")
+_DFLASH2_FEATURE_PATHS = (
+    "modelopt/torch/export/plugins/hf_spec_export.py",
+    "modelopt/torch/speculative/config.py",
+    "modelopt/torch/speculative/dflash/conversion.py",
+    "modelopt/torch/speculative/plugins/__init__.py",
+    "modelopt/torch/speculative/plugins/hf_dflash.py",
+    "modelopt/torch/speculative/plugins/hf_dflash2.py",
+    "modelopt/torch/speculative/plugins/modeling_dflash.py",
+    "modelopt/torch/speculative/plugins/modeling_dflash2.py",
+    "modelopt_recipes/general/speculative_decoding/dflash2.yaml",
+)
 
 
 def _stable_bytes(path: Path) -> bytes:
@@ -197,6 +208,38 @@ def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=10,
     )
+
+
+def validate_dflash2_source_checkout(
+    source_path: Path,
+    expected_head: str,
+    feature_base: str,
+) -> str:
+    """Bind a clean launcher HEAD to unchanged DFlash2 feature blobs from its ancestor."""
+    if not _FULL_SHA.fullmatch(expected_head) or not _FULL_SHA.fullmatch(feature_base):
+        raise ValueError("DFlash2 source commits must be exact lowercase SHAs")
+    source = source_path.resolve(strict=True)
+    top_level = _git(source, "rev-parse", "--show-toplevel")
+    if top_level.returncode or Path(top_level.stdout.strip()).resolve() != source:
+        raise ValueError("DFlash2 source path must be the Git top-level")
+    if _git(source, "rev-parse", "HEAD").stdout.strip() != expected_head:
+        raise ValueError("DFlash2 launcher checkout HEAD mismatch")
+    status = _git(source, "status", "--porcelain", "--untracked-files=all")
+    if status.returncode or status.stdout:
+        raise ValueError("DFlash2 launcher checkout must be clean")
+    if _git(source, "merge-base", "--is-ancestor", feature_base, expected_head).returncode:
+        raise ValueError("DFlash2 feature base is not an ancestor of launcher HEAD")
+    if _git(
+        source, "diff", "--quiet", feature_base, expected_head, "--", *_DFLASH2_FEATURE_PATHS
+    ).returncode:
+        raise ValueError("DFlash2 feature files differ from the pinned feature base")
+    descriptors = []
+    for relative in _DFLASH2_FEATURE_PATHS:
+        blob = _git(source, "rev-parse", f"{expected_head}:{relative}")
+        if blob.returncode or not _FULL_SHA.fullmatch(blob.stdout.strip()):
+            raise ValueError(f"DFlash2 feature file is missing: {relative}")
+        descriptors.append({"path": relative, "blob": blob.stdout.strip()})
+    return _sha_json(descriptors)
 
 
 def _verified_checkout(package_path: Path, expected_commit: str, required_ancestor: str) -> Path:

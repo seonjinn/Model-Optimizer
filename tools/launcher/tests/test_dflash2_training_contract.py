@@ -27,6 +27,7 @@ from common.specdec.build_dflash2_nemotron_manifest import build_dflash2_nemotro
 from common.specdec.dflash2_runtime_contract import (
     artifact_tree_sha256,
     validate_artifact_receipt,
+    validate_dflash2_source_checkout,
     verify_vllm_runtime,
     write_artifact_receipt,
     write_vllm_runtime_receipt,
@@ -42,6 +43,17 @@ from common.specdec.drafter_job_manifest import (
 
 _SHA256 = "d" * 64
 _SOURCE_SHA = "c" * 40
+_FEATURE_PATHS = (
+    "modelopt/torch/export/plugins/hf_spec_export.py",
+    "modelopt/torch/speculative/config.py",
+    "modelopt/torch/speculative/dflash/conversion.py",
+    "modelopt/torch/speculative/plugins/__init__.py",
+    "modelopt/torch/speculative/plugins/hf_dflash.py",
+    "modelopt/torch/speculative/plugins/hf_dflash2.py",
+    "modelopt/torch/speculative/plugins/modeling_dflash.py",
+    "modelopt/torch/speculative/plugins/modeling_dflash2.py",
+    "modelopt_recipes/general/speculative_decoding/dflash2.yaml",
+)
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -70,6 +82,53 @@ def _vllm_checkout(tmp_path: Path) -> tuple[Path, str, str]:
     _git(repo, "add", "vllm/runtime.py")
     _git(repo, "commit", "-q", "-m", "verified descendant")
     return package, required, _git(repo, "rev-parse", "HEAD")
+
+
+def _dflash2_source_checkout(tmp_path: Path) -> tuple[Path, str, str]:
+    repo = tmp_path / "modelopt"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    for relative in _FEATURE_PATHS:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"feature: {relative}\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "DFlash2 feature base")
+    feature_base = _git(repo, "rev-parse", "HEAD")
+    launcher = repo / "tools/launcher/common/specdec/launcher.py"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("DESCENDANT = True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "launcher-only descendant")
+    return repo, feature_base, _git(repo, "rev-parse", "HEAD")
+
+
+def test_feature_base_accepts_clean_launcher_descendant_and_rejects_feature_drift(
+    tmp_path: Path,
+) -> None:
+    """A stable profile base permits launcher fixes but freezes every DFlash2 feature blob."""
+    repo, feature_base, launcher_head = _dflash2_source_checkout(tmp_path)
+    assert len(validate_dflash2_source_checkout(repo, launcher_head, feature_base)) == 64
+
+    feature = repo / "modelopt/torch/speculative/plugins/modeling_dflash2.py"
+    feature.write_text("MUTATED = True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "unsafe feature mutation")
+    mutated_head = _git(repo, "rev-parse", "HEAD")
+    with pytest.raises(ValueError, match="feature files differ"):
+        validate_dflash2_source_checkout(repo, mutated_head, feature_base)
+    with pytest.raises(ValueError, match="not an ancestor"):
+        validate_dflash2_source_checkout(repo, mutated_head, "a" * 40)
+
+
+def test_feature_base_rejects_a_dirty_launcher_checkout(tmp_path: Path) -> None:
+    """Uncommitted launcher changes cannot bypass the exact manifest HEAD."""
+    repo, feature_base, launcher_head = _dflash2_source_checkout(tmp_path)
+    (repo / "untracked.py").write_text("DIRTY = True\n")
+    with pytest.raises(ValueError, match="must be clean"):
+        validate_dflash2_source_checkout(repo, launcher_head, feature_base)
 
 
 def test_vllm_runtime_receipt_survives_archive_staging_without_git(tmp_path: Path) -> None:
@@ -414,6 +473,7 @@ def test_dflash2_cluster_profiles_are_dedicated_native_16_node_profiles() -> Non
         assert profile.name == name
         assert profile.partition == partition
         assert profile.modelopt_commit == "6eda6bbf54455086a54660fe7a7b06c415b87da5"
+        assert profile.modelopt_feature_base == "6eda6bbf54455086a54660fe7a7b06c415b87da5"
         assert (profile.training_nodes, profile.training_segment) == (16, 16)
     assert load_cluster_profile(profile_root / "lyris.yaml").training_nodes == 4
     assert load_cluster_profile(profile_root / "ptyche.yaml").training_nodes == 4

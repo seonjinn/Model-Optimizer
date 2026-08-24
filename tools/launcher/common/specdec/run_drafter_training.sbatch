@@ -73,15 +73,29 @@ from common.specdec.drafter_job_manifest import (
     load_manifest,
     topology_v2_training_fingerprint,
 )
-from common.specdec.dflash2_runtime_contract import validate_artifact_receipt
+from common.specdec.dflash2_runtime_contract import (
+    validate_artifact_receipt,
+    validate_dflash2_source_checkout,
+)
 
 experiment = load_manifest(manifest)[int(sys.argv[2])]
 profile = load_cluster_profile(Path(sys.argv[3]))
 receipt_path = Path(sys.argv[4]) if sys.argv[4] else None
 cluster_name = sys.argv[5]
 scratch_root = Path(sys.argv[6])
-if profile.name != cluster_name or experiment.paths.source_sha != profile.modelopt_commit:
+if profile.name != cluster_name:
     raise SystemExit("cluster profile identity mismatch")
+if profile.modelopt_feature_base is None:
+    if experiment.paths.source_sha != profile.modelopt_commit:
+        raise SystemExit("cluster profile source identity mismatch")
+else:
+    if experiment.method != "dflash2":
+        raise SystemExit("feature-base profiles are restricted to DFlash2")
+    validate_dflash2_source_checkout(
+        Path(experiment.paths.source_path),
+        experiment.paths.source_sha,
+        profile.modelopt_feature_base,
+    )
 if (
     experiment.slurm.nodes > profile.training_nodes
     or profile.training_nodes % experiment.slurm.nodes
