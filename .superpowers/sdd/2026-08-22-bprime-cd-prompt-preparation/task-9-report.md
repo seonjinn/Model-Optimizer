@@ -288,3 +288,12 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
   assistant-response hashes before accepting the selection index. The
   schema-v3 integration fixture exercises these content bindings, and the
   connection is initialized safely for malformed/unopenable indexes.
+
+## Task10 B-balanced integration seam
+
+- Added `write_task9_balanced_view_json()`, the immutable B-only projection
+  consumed by Task10 without importing Task9 implementation types. It writes
+  exact cell/language quotas, 201 declared JSONL/Parquet shard names and root,
+  one-pass schedule, source-native flag, and publication/tokenizer/template/
+  loss-mask identities. The direct regression verifies Task10's exact field
+  names and that no A-repair field is emitted.

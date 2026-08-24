@@ -33,6 +33,7 @@ try:
         select_authenticated_b_balanced_view,
         select_ptv2_b_balanced_view,
         select_ptv2_study_views,
+        write_task9_balanced_view_json,
     )
     from specdec_corpus_contracts import canonical_json
     from specdec_identity import prompt_uuid
@@ -346,6 +347,45 @@ def test_authenticated_b_selection_rejects_untyped_exclusion_root(tmp_path: Path
             policy=load_ptv2_study_policy(POLICY),
             exclusions=object(),  # type: ignore[arg-type]
         )
+
+
+def test_task10_balanced_projection_is_a_stable_b_only_json_contract(tmp_path: Path) -> None:
+    """Task9 publishes the documented projection consumed by Task10 without A fields."""
+    policy = load_ptv2_study_policy(POLICY)
+    shards = tuple(f"shard-{index:03d}.jsonl" for index in range(201))
+    view = SimpleNamespace(
+        strategy="B-balanced",
+        occurrence_count=2_000_000,
+        cell_occurrence_counts={
+            "math": 500_000,
+            "code": 400_000,
+            "stem": 500_000,
+            "chat": 400_000,
+            "multilingual": 200_000,
+        },
+        multilingual_occurrence_counts=dict.fromkeys(("de", "ja", "es", "fr", "it"), 40000),
+        trainer_epochs=1,
+    )
+    projection = tmp_path / "TASK9_B_BALANCED.json"
+
+    write_task9_balanced_view_json(
+        projection,
+        view,
+        policy=policy,
+        shard_root=tmp_path / "shards",
+        declared_shards=shards,
+        publication_sha256="1" * 64,
+        destination_sha256="2" * 64,
+        tokenizer_sha256="3" * 64,
+        chat_template_sha256="4" * 64,
+        assistant_loss_mask_sha256="5" * 64,
+    )
+
+    payload = json.loads(projection.read_bytes())
+    assert payload["strategy"] == "B-balanced"
+    assert payload["declared_shards"] == list(shards)
+    assert payload["segment_steps"] == [2540, 1368]
+    assert "a_repair" not in payload
 
 
 def test_b_index_publication_is_no_replace_and_preserves_prior_receipt(tmp_path: Path) -> None:

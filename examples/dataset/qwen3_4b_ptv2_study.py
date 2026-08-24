@@ -46,6 +46,7 @@ __all__ = [
     "select_authenticated_ptv2_study_views",
     "select_ptv2_b_balanced_view",
     "select_ptv2_study_views",
+    "write_task9_balanced_view_json",
 ]
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -856,6 +857,77 @@ def iter_ptv2_study_occurrences(view: PTV2StudyView) -> Iterator[StudyOccurrence
             yield StudyOccurrence(*row)
     finally:
         connection.close()
+
+
+def write_task9_balanced_view_json(
+    path: Path,
+    view: PTV2StudyView,
+    *,
+    policy: PTV2StudyPolicy,
+    shard_root: Path,
+    declared_shards: Iterable[str],
+    publication_sha256: str,
+    destination_sha256: str,
+    tokenizer_sha256: str,
+    chat_template_sha256: str,
+    assistant_loss_mask_sha256: str,
+) -> None:
+    """Publish Task10's B-only JSON projection without coupling launch code to Task9 types."""
+    if view.strategy != "B-balanced" or view.occurrence_count != 2_000_000:
+        raise PTV2StudyError("Task10 projection requires the complete B-balanced view")
+    names = tuple(declared_shards)
+    if len(names) != _DECLARED_PTV2_PARQUET_SHARDS or len(set(names)) != len(names):
+        raise PTV2StudyError("Task10 projection requires exactly 201 unique declared shards")
+    if any(
+        not name
+        or Path(name).is_absolute()
+        or ".." in Path(name).parts
+        or Path(name).suffix not in {".jsonl", ".parquet"}
+        for name in names
+    ):
+        raise PTV2StudyError("Task10 projection has unsafe declared shard paths")
+    for label, digest in (
+        ("publication", publication_sha256),
+        ("destination", destination_sha256),
+        ("tokenizer", tokenizer_sha256),
+        ("chat template", chat_template_sha256),
+        ("assistant loss mask", assistant_loss_mask_sha256),
+    ):
+        _require_digest(digest, label)
+    if path.is_symlink() or path.exists():
+        raise FileExistsError(f"immutable Task9 B projection already exists: {path}")
+    payload = {
+        "strategy": view.strategy,
+        "occurrence_count": view.occurrence_count,
+        "cell_occurrence_counts": dict(view.cell_occurrence_counts),
+        "multilingual_occurrence_counts": dict(view.multilingual_occurrence_counts),
+        "declared_shards": list(names),
+        "shard_root": str(shard_root),
+        "trainer_epochs": view.trainer_epochs,
+        "global_batch_size": policy.global_batch_size,
+        "segment_occurrences": list(policy.segment_occurrences),
+        "segment_steps": list(policy.segment_steps),
+        "cumulative_steps": list(policy.cumulative_steps),
+        "segment_final_valid_occurrences": list(policy.segment_final_valid_occurrences),
+        "source_native_responses": policy.assistant_responses == "source-native",
+        "publication_sha256": publication_sha256,
+        "destination_sha256": destination_sha256,
+        "tokenizer_sha256": tokenizer_sha256,
+        "chat_template_sha256": chat_template_sha256,
+        "assistant_loss_mask_sha256": assistant_loss_mask_sha256,
+    }
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(canonical_json(payload) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        _fsync_directory(path.parent)
 
 
 def _require_approved_policy(
