@@ -531,6 +531,20 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         assert required in script
 
 
+def test_dflash2_artifact_receipt_builder_creates_scratch_before_pyxis() -> None:
+    """Pyxis must never receive a mount source that the host job has not created."""
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "common/specdec/build_dflash2_artifact_receipt.sbatch"
+    ).read_text()
+    mkdir = script.index('mkdir -p "$work_root/runtime"')
+    launch = script.index("srun --nodes=1")
+    assert mkdir < launch
+    assert 'mounts="${work_root}:${work_root}' in script
+    assert '"$work_root/runtime/bin/python"' in script
+    assert "--occurrence-count 1300000" in script
+
+
 def test_shared_runner_enforces_and_consumes_the_dflash2_contract() -> None:
     """The manifest contract reaches runtime verification and the training recipe."""
     runner = (
