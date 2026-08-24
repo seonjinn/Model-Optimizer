@@ -1046,6 +1046,29 @@ def test_dflash2_zero_init_serve_gate_is_runtime_only_and_receipt_bound() -> Non
         assert required in script
 
 
+def test_dflash2_serve_gate_has_a_bounded_selector_diagnostic_mode() -> None:
+    """A one-node retry must identify the exact selector index before any patch."""
+    root = Path(__file__).resolve().parents[1] / "common/specdec"
+    script = (root / "run_dflash2_zero_init_serve_gate.sbatch").read_text()
+    script += (root / "dflash2_selector_diagnostic/sitecustomize.py").read_text()
+    for required in (
+        "DFLASH2_SELECTOR_DIAGNOSTIC",
+        "CUDA_LAUNCH_BLOCKING=1",
+        "--enforce-eager",
+        "DFLASH2_SELECTOR_RANGES",
+        "candidate_min",
+        "candidate_max",
+        "anchor_min",
+        "anchor_max",
+        "predecessor_min",
+        "predecessor_max",
+        "successor_rows",
+        "predecessor_rows",
+        "sitecustomize.INSTALLED",
+    ):
+        assert required in script
+
+
 def test_dflash2_artifact_receipt_builder_creates_scratch_before_pyxis() -> None:
     """Pyxis must never receive a mount source that the host job has not created."""
     script = (

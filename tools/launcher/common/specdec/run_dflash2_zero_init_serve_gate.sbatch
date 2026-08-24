@@ -21,8 +21,10 @@ SOURCE_SHA="$8"
 OUTPUT_ROOT="$(realpath -m "$9")"
 SCRATCH_ROOT="$(realpath -m "${10}")"
 PORT="${11}"
+DFLASH2_SELECTOR_DIAGNOSTIC="${DFLASH2_SELECTOR_DIAGNOSTIC:-0}"
 [[ "$RUNTIME_ARCHIVE_SHA" =~ ^[0-9a-f]{64}$ && "$TARGET_RECEIPT_SHA" =~ ^[0-9a-f]{64}$ ]]
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$PORT" =~ ^[0-9]+$ ]]
+[[ "$DFLASH2_SELECTOR_DIAGNOSTIC" =~ ^[01]$ ]]
 [[ ! -e "$OUTPUT_ROOT" ]] || {
     echo "refusing to replace existing serve-gate output" >&2
     exit 2
@@ -79,7 +81,8 @@ srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     bash -s -- "$runtime" "$runtime_package" "$TARGET" "$TARGET_RECEIPT" \
     "$TARGET_RECEIPT_SHA" "$RUNTIME_ARCHIVE" "$RUNTIME_ARCHIVE_SHA" \
     "$runtime_receipt" "$runtime_receipt_sha" "$LAUNCHER" "$SOURCE_SHA" \
-    "$attempt" "$OUTPUT_ROOT" "$PORT" "$SLURM_JOB_ID" <<'INNER'
+    "$attempt" "$OUTPUT_ROOT" "$PORT" "$SLURM_JOB_ID" \
+    "$DFLASH2_SELECTOR_DIAGNOSTIC" <<'INNER'
 set -euo pipefail
 runtime="$1"
 runtime_package="$2"
@@ -96,6 +99,7 @@ attempt="${12}"
 output_root="${13}"
 port="${14}"
 slurm_job_id="${15}"
+diagnostic_mode="${16}"
 started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export_dir="$attempt/checkpoint-0-runtime-only"
 server_log="$attempt/vllm-serve.log"
@@ -190,9 +194,25 @@ import sys
 print(json.dumps({"method": "dflash", "model": sys.argv[1], "num_speculative_tokens": 7}))
 PY
 )"
-"$runtime/bin/python" -m vllm.entrypoints.cli.main serve "$target" \
+serve_prefix=("$runtime/bin/python")
+serve_extra=()
+if [[ "$diagnostic_mode" == 1 ]]; then
+    diagnostic_dir="$launcher/tools/launcher/common/specdec/dflash2_selector_diagnostic"
+    [[ -f "$diagnostic_dir/sitecustomize.py" ]]
+    serve_prefix=(
+        env
+        CUDA_LAUNCH_BLOCKING=1
+        DFLASH2_SELECTOR_DIAGNOSTIC=1
+        "PYTHONPATH=$diagnostic_dir:$PYTHONPATH"
+        "$runtime/bin/python"
+    )
+    serve_extra=(--enforce-eager)
+    "${serve_prefix[@]}" -c 'import sitecustomize; assert sitecustomize.INSTALLED'
+fi
+"${serve_prefix[@]}" -m vllm.entrypoints.cli.main serve "$target" \
     --tensor-parallel-size 2 --max-model-len 4096 --max-num-batched-tokens 4096 \
     --gpu-memory-utilization 0.85 --port "$port" --speculative-config "$SPEC_CONFIG" \
+    "${serve_extra[@]}" \
     > >(tee "$server_log") 2>&1 &
 server_pid=$!
 cleanup() {
@@ -230,7 +250,8 @@ finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "$runtime/bin/python" - "$attempt" "$target" "$target_receipt" "$target_receipt_sha" \
     "$runtime_archive" "$runtime_archive_sha" "$runtime_receipt" "$runtime_receipt_sha" \
     "$launcher" "$source_sha" "$runtime_package" "$slurm_job_id" "$started_at" \
-    "$finished_at" "$port" <<'PY'
+    "$finished_at" "$port" "$diagnostic_mode" \
+    "$launcher/tools/launcher/common/specdec/dflash2_selector_diagnostic/sitecustomize.py" <<'PY'
 import hashlib
 import json
 import sys
@@ -252,6 +273,8 @@ from pathlib import Path
     started_at,
     finished_at,
     port,
+    diagnostic_mode_s,
+    diagnostic_module_s,
 ) = sys.argv[1:]
 attempt = Path(attempt_s)
 launcher = Path(launcher_s)
@@ -269,7 +292,7 @@ body = {
     "producer": "dflash2-zero-init-serve-gate-v1",
     "scientific_training_authorized": False,
     "training_quality_claim": False,
-    "purpose": "checkpoint-0-runtime-only",
+    "purpose": "checkpoint-0-selector-diagnostic" if diagnostic_mode_s == "1" else "checkpoint-0-runtime-only",
     "slurm_job_id": slurm_job_id,
     "started_at": started_at,
     "finished_at": finished_at,
@@ -304,6 +327,7 @@ body = {
         "max_model_len": 4096,
         "health_passed": True,
         "completed_requests": 1,
+        "enforce_eager": diagnostic_mode_s == "1",
     },
     "exported_config": config,
     "exported_config_file": descriptor(attempt / "checkpoint-0-runtime-only/config.json", "checkpoint-0-runtime-only/config.json"),
@@ -312,6 +336,7 @@ body = {
     "reload_loader_sha256": descriptor(runtime_package / "model_executor/models/qwen3_dflash2.py", "vllm/model_executor/models/qwen3_dflash2.py")["sha256"],
     "speculator_sha256": descriptor(runtime_package / "v1/worker/gpu/spec_decode/dflash2/speculator.py", "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py")["sha256"],
     "runner": descriptor(launcher / "tools/launcher/common/specdec/run_dflash2_zero_init_serve_gate.sbatch", "tools/launcher/common/specdec/run_dflash2_zero_init_serve_gate.sbatch"),
+    "selector_diagnostic": descriptor(Path(diagnostic_module_s), "tools/launcher/common/specdec/dflash2_selector_diagnostic/sitecustomize.py") if diagnostic_mode_s == "1" else None,
     "server_log": descriptor(attempt / "vllm-serve.log", "vllm-serve.log"),
     "request": descriptor(attempt / "request.json", "request.json"),
     "response": descriptor(attempt / "response.json", "response.json"),
