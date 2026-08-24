@@ -13,6 +13,7 @@ required=(
     REPO_ROOT SOURCE_COMMIT SOURCE_INVENTORY TOKENIZER_RECEIPT
     TOKENIZER_RECEIPT_SHA256 BASELINE_AUDIT BASELINE_AUDIT_SHA256
     HELD_OUT_UUIDS HELD_OUT_FILE_SHA256 POLICY POLICY_FILE_SHA256 OUTPUT_DIR
+    IMAGE_PATH IMAGE_SHA256
 )
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
@@ -28,9 +29,11 @@ done
 [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || exit 2
 [[ -z "$(git -C "$REPO_ROOT" status --porcelain)" ]] || exit 2
 for path in "$SOURCE_INVENTORY" "$TOKENIZER_RECEIPT" "$BASELINE_AUDIT" \
-    "$HELD_OUT_UUIDS" "$POLICY"; do
+    "$HELD_OUT_UUIDS" "$POLICY" "$IMAGE_PATH"; do
     [[ "$path" == /* && -f "$path" && ! -L "$path" ]] || exit 2
 done
+[[ "$IMAGE_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$(sha256sum "$IMAGE_PATH" | cut -d' ' -f1)" == "$IMAGE_SHA256" ]] || exit 2
 [[ "$OUTPUT_DIR" == /* && ! -e "$OUTPUT_DIR" && ! -L "$OUTPUT_DIR" ]] || exit 2
 for pair in "$TOKENIZER_RECEIPT:$TOKENIZER_RECEIPT_SHA256" \
     "$BASELINE_AUDIT:$BASELINE_AUDIT_SHA256" "$HELD_OUT_UUIDS:$HELD_OUT_FILE_SHA256" \
@@ -46,14 +49,17 @@ scratch="$job_local_parent/qwen4b-task5-bprime-${SLURM_JOB_ID}"
 mkdir -p "$scratch"
 trap 'find "$scratch" -depth -delete 2>/dev/null || true' EXIT
 
-python3 "$REPO_ROOT/examples/dataset/build_qwen4b_bprime.py" \
-    --source-inventory "$SOURCE_INVENTORY" \
-    --tokenizer-receipt "$TOKENIZER_RECEIPT" \
-    --tokenizer-receipt-sha256 "$TOKENIZER_RECEIPT_SHA256" \
-    --baseline-audit "$BASELINE_AUDIT" \
-    --held-out-uuids "$HELD_OUT_UUIDS" \
-    --policy "$POLICY" \
-    --storage-dir "$scratch" \
-    --output-dir "$OUTPUT_DIR"
+srun --nodes=1 --ntasks=1 --cpus-per-task=96 --kill-on-bad-exit=1 \
+    --no-container-mount-home --container-image="$IMAGE_PATH" \
+    --container-mounts="/lustre:/lustre,$REPO_ROOT:$REPO_ROOT,$scratch:$scratch" \
+    python3 "$REPO_ROOT/examples/dataset/build_qwen4b_bprime.py" \
+        --source-inventory "$SOURCE_INVENTORY" \
+        --tokenizer-receipt "$TOKENIZER_RECEIPT" \
+        --tokenizer-receipt-sha256 "$TOKENIZER_RECEIPT_SHA256" \
+        --baseline-audit "$BASELINE_AUDIT" \
+        --held-out-uuids "$HELD_OUT_UUIDS" \
+        --policy "$POLICY" \
+        --storage-dir "$scratch" \
+        --output-dir "$OUTPUT_DIR"
 [[ -f "$OUTPUT_DIR/SELECTION_MANIFEST.json" && ! -L "$OUTPUT_DIR/SELECTION_MANIFEST.json" ]] || exit 1
 sha256sum "$OUTPUT_DIR/SELECTION_MANIFEST.json"

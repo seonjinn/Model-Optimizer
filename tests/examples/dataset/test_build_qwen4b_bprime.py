@@ -97,3 +97,20 @@ def test_baseline_exclusion_rejects_forged_genuine_fields(
 
     with pytest.raises(ValueError, match="baseline audit"):
         baseline_exclusion_from_audit(path, expected=expected)
+
+
+def test_task5_runner_uses_an_authenticated_container_runtime() -> None:
+    root = Path(__file__).resolve().parents[3]
+    runner = (
+        root / "tools/launcher/common/specdec/run_qwen4b_task5_bprime.sbatch"
+    ).read_text()
+    submitter = (
+        root / "tools/launcher/common/specdec/submit_qwen4b_task5_bprime.sh"
+    ).read_text()
+
+    assert "IMAGE_PATH IMAGE_SHA256" in runner
+    assert 'sha256sum "$IMAGE_PATH"' in runner
+    assert '--no-container-mount-home --container-image="$IMAGE_PATH"' in runner
+    assert "--container-mounts=" in runner
+    assert "--image PATH --image-sha256 SHA256" in submitter
+    assert "IMAGE_PATH=$IMAGE_PATH,IMAGE_SHA256=$IMAGE_SHA256" in submitter
