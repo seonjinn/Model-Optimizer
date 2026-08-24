@@ -169,15 +169,13 @@ DATASET_LOCAL_NAME="$(basename "$DATASET_PATH")"
 OUTPUT_ROOT="${manifest_values[8]}"
 TARGET_SHA256="${manifest_values[9]}"
 DATASET_SHA256="${manifest_values[12]}"
+METHOD="${manifest_values[15]}"
 STAGE_TARGET_IDENTITY="$TARGET_PATH"
 STAGE_DATASET_IDENTITY="$DATASET_PATH"
-if [[ "$TARGET_SHA256" != - ]]; then
+if [[ "$METHOD" == dflash2 ]]; then
     STAGE_TARGET_IDENTITY="$TARGET_SHA256"
-fi
-if [[ "$DATASET_SHA256" != - ]]; then
     STAGE_DATASET_IDENTITY="$DATASET_SHA256"
 fi
-METHOD="${manifest_values[15]}"
 BLOCK_SIZE="${manifest_values[16]}"
 RUN_NAME="${manifest_values[17]}"
 SAMPLE_SIZE="${manifest_values[18]}"
@@ -284,7 +282,7 @@ esac
 export SERVE_NODES NUM_SPEC_TOKENS
 export SERVE_REPLICAS_PER_NODE
 
-export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH TARGET_SHA256 STAGE_TARGET_IDENTITY DATASET_PATH DATASET_SHA256 STAGE_DATASET_IDENTITY DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES TRAINING_IDENTITY TRAINING_FINGERPRINT
+export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH TARGET_SHA256 STAGE_TARGET_IDENTITY DATASET_PATH DATASET_SHA256 STAGE_DATASET_IDENTITY DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES TRAINING_IDENTITY TRAINING_FINGERPRINT METHOD
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     # shellcheck source=tools/launcher/common/specdec/drafter_requeue_lifecycle.sh
     source "$LAUNCHER_ROOT/common/specdec/drafter_requeue_lifecycle.sh"
@@ -350,9 +348,10 @@ staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntas
     if (( SLURM_NODEID >= SERVE_NODES )); then
         cp -rL --no-preserve=all -- "$DATASET_PATH" "$node_root/input/$DATASET_LOCAL_NAME"
     fi
-    PYTHONPATH="$node_root/source/tools/launcher" "$node_root/runtime/bin/python" - \
-        "$node_root/input/target" "$TARGET_SHA256" \
-        "$node_root/input/$DATASET_LOCAL_NAME" "$DATASET_SHA256" "$stage_role" <<'PY'
+    if [[ "$METHOD" == dflash2 ]]; then
+        PYTHONPATH="$node_root/source/tools/launcher" "$node_root/runtime/bin/python" - \
+            "$node_root/input/target" "$TARGET_SHA256" \
+            "$node_root/input/$DATASET_LOCAL_NAME" "$DATASET_SHA256" "$stage_role" <<'PY'
 import sys
 from pathlib import Path
 from common.specdec.dflash2_runtime_contract import artifact_tree_sha256
@@ -362,6 +361,7 @@ if artifact_tree_sha256(Path(sys.argv[1])) != sys.argv[2]:
 if sys.argv[5] == "trainer" and artifact_tree_sha256(Path(sys.argv[3])) != sys.argv[4]:
     raise SystemExit("staged Nemotron dataset bytes mismatch")
 PY
+    fi
     stage_marker_tmp="${stage_marker}.tmp.$$"
     printf "%s\n" "$stage_fingerprint" >"$stage_marker_tmp"
     mv "$stage_marker_tmp" "$stage_marker"

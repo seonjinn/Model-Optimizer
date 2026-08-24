@@ -63,26 +63,47 @@ def artifact_tree_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _dataset_occurrence_count(path: Path) -> int:
+def _dataset_layout(
+    path: Path, admitted_prefix_count: int
+) -> tuple[int, str, list[dict[str, Any]]]:
     root = path.resolve(strict=True)
     candidates = (
-        [root] if root.is_file() else sorted(item for item in root.rglob("*") if item.is_file())
+        [root] if root.is_file() else sorted(item for item in root.glob("*") if item.is_file())
     )
-    data_files = [item for item in candidates if item.suffix in {".jsonl", ".parquet"}]
+    jsonl_files = [item for item in candidates if item.suffix == ".jsonl"]
+    parquet_files = [item for item in candidates if item.suffix == ".parquet"]
+    if jsonl_files and parquet_files:
+        raise ValueError("Nemotron dataset cannot mix JSONL and Parquet shards")
+    data_files = jsonl_files or parquet_files
     if not data_files:
         raise ValueError("Nemotron dataset has no supported JSONL or Parquet shards")
     total = 0
+    remaining = admitted_prefix_count
+    sources: list[dict[str, Any]] = []
     for item in data_files:
         if item.suffix == ".jsonl":
             with item.open("rb") as stream:
-                total += sum(bool(line.strip()) for line in stream)
-            continue
-        try:
-            import pyarrow.parquet as parquet
-        except ImportError as error:
-            raise ValueError("PyArrow is required to attest Parquet row counts") from error
-        total += parquet.ParquetFile(item).metadata.num_rows
-    return total
+                physical = sum(bool(line.strip()) for line in stream)
+        else:
+            try:
+                import pyarrow.parquet as parquet
+            except ImportError as error:
+                raise ValueError("PyArrow is required to attest Parquet row counts") from error
+            physical = parquet.ParquetFile(item).metadata.num_rows
+        admitted = min(remaining, physical)
+        remaining -= admitted
+        total += physical
+        sources.append(
+            {
+                "path": item.name if root.is_file() else item.relative_to(root).as_posix(),
+                "sha256": hashlib.sha256(_stable_bytes(item)).hexdigest(),
+                "physical_occurrences": physical,
+                "admitted_occurrences": admitted,
+            }
+        )
+    if remaining:
+        raise ValueError("Nemotron dataset occurrence count is smaller than the admitted prefix")
+    return total, _sha_json(sources), sources
 
 
 def write_artifact_receipt(
@@ -99,16 +120,28 @@ def write_artifact_receipt(
         raise ValueError("Nemotron dataset receipt must attest exactly 1,300,000 occurrences")
     if kind == "target" and occurrence_count is not None:
         raise ValueError("target receipt cannot contain an occurrence count")
-    if kind == "dataset" and _dataset_occurrence_count(artifact_path) != occurrence_count:
-        raise ValueError("Nemotron dataset occurrence count does not match the claimed 1,300,000")
+    dataset_layout = None
+    if kind == "dataset":
+        dataset_layout = _dataset_layout(artifact_path, occurrence_count)
+    schema_version = 2 if kind == "dataset" else 1
     body: dict[str, Any] = {
-        "schema_version": 1,
-        "producer": "dflash2-artifact-receipt-v1",
+        "schema_version": schema_version,
+        "producer": f"dflash2-artifact-receipt-v{schema_version}",
         "kind": kind,
         "artifact_path": str(artifact_path.resolve(strict=True)),
         "artifact_sha256": artifact_tree_sha256(artifact_path),
-        "occurrence_count": occurrence_count,
     }
+    if dataset_layout is None:
+        body["occurrence_count"] = None
+    else:
+        physical, admitted_order_sha256, ordered_sources = dataset_layout
+        body.update(
+            physical_occurrence_count=physical,
+            admitted_prefix_count=occurrence_count,
+            admitted_order_policy="huggingface-streaming-take-prefix-v1",
+            admitted_order_sha256=admitted_order_sha256,
+            ordered_sources=ordered_sources,
+        )
     body["receipt_sha256"] = _sha_json(body)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as stream:
@@ -130,14 +163,24 @@ def validate_artifact_receipt(
         raise ValueError("artifact receipt bytes mismatch")
     body = json.loads(raw)
     claim = body.pop("receipt_sha256", None) if isinstance(body, dict) else None
-    expected = {
-        "schema_version": 1,
-        "producer": "dflash2-artifact-receipt-v1",
+    expected: dict[str, Any] = {
+        "schema_version": 2 if kind == "dataset" else 1,
+        "producer": f"dflash2-artifact-receipt-v{2 if kind == 'dataset' else 1}",
         "kind": kind,
         "artifact_path": str(artifact_path.resolve(strict=True)),
         "artifact_sha256": expected_artifact_sha256,
-        "occurrence_count": 1_300_000 if kind == "dataset" else None,
     }
+    if kind == "dataset":
+        physical, admitted_order_sha256, ordered_sources = _dataset_layout(artifact_path, 1_300_000)
+        expected.update(
+            physical_occurrence_count=physical,
+            admitted_prefix_count=1_300_000,
+            admitted_order_policy="huggingface-streaming-take-prefix-v1",
+            admitted_order_sha256=admitted_order_sha256,
+            ordered_sources=ordered_sources,
+        )
+    else:
+        expected["occurrence_count"] = None
     if claim != _sha_json(body) or body != expected:
         raise ValueError("artifact receipt identity mismatch")
     if artifact_tree_sha256(artifact_path) != expected_artifact_sha256:

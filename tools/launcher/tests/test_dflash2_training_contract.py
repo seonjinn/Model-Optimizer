@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -328,12 +329,19 @@ def test_target_and_dataset_receipts_bind_exact_bytes(tmp_path: Path) -> None:
     target.mkdir()
     (target / "config.json").write_text("{}\n")
     dataset = tmp_path / "nemotron.jsonl"
-    dataset.write_bytes(b'{"messages":[]}\n' * 1_300_000)
+    dataset.write_bytes(b'{"messages":[]}\n' * 1_309_377)
     target_receipt = tmp_path / "target.json"
     dataset_receipt = tmp_path / "dataset.json"
     write_artifact_receipt(target_receipt, target, kind="target")
     write_artifact_receipt(dataset_receipt, dataset, kind="dataset", occurrence_count=1_300_000)
+    dataset_claim = json.loads(dataset_receipt.read_text())
+    assert dataset_claim["physical_occurrence_count"] == 1_309_377
+    assert dataset_claim["admitted_prefix_count"] == 1_300_000
+    assert dataset_claim["admitted_order_policy"] == "huggingface-streaming-take-prefix-v1"
+    assert len(dataset_claim["admitted_order_sha256"]) == 64
+    assert dataset_claim["ordered_sources"][0]["admitted_occurrences"] == 1_300_000
     target_sha256 = artifact_tree_sha256(target)
+    dataset_sha256 = artifact_tree_sha256(dataset)
     validate_artifact_receipt(
         target_receipt,
         expected_receipt_sha256=__import__("hashlib")
@@ -342,6 +350,15 @@ def test_target_and_dataset_receipts_bind_exact_bytes(tmp_path: Path) -> None:
         artifact_path=target,
         expected_artifact_sha256=target_sha256,
         kind="target",
+    )
+    validate_artifact_receipt(
+        dataset_receipt,
+        expected_receipt_sha256=__import__("hashlib")
+        .sha256(dataset_receipt.read_bytes())
+        .hexdigest(),
+        artifact_path=dataset,
+        expected_artifact_sha256=dataset_sha256,
+        kind="dataset",
     )
     (target / "config.json").write_text("forged\n")
     with pytest.raises(ValueError, match="artifact bytes"):
@@ -383,6 +400,42 @@ def test_dflash2_submitter_serializes_canary_and_cumulative_writers() -> None:
     assert "experiment.target != sys.argv[2]" in script
 
 
+def test_dflash2_cluster_profiles_are_dedicated_native_16_node_profiles() -> None:
+    """Legacy four-node profiles stay unchanged while DFlash2 gets pinned 16-node profiles."""
+    from common.specdec.cluster_profile import load_cluster_profile
+
+    profile_root = Path(__file__).resolve().parents[1] / "common/specdec/profiles"
+    expected = {
+        "lyris-dflash2.yaml": ("lyris", "gb200"),
+        "ptyche-dflash2.yaml": ("ptyche", "36x2-a01r"),
+    }
+    for filename, (name, partition) in expected.items():
+        profile = load_cluster_profile(profile_root / filename)
+        assert profile.name == name
+        assert profile.partition == partition
+        assert profile.modelopt_commit == "6eda6bbf54455086a54660fe7a7b06c415b87da5"
+        assert (profile.training_nodes, profile.training_segment) == (16, 16)
+    assert load_cluster_profile(profile_root / "lyris.yaml").training_nodes == 4
+    assert load_cluster_profile(profile_root / "ptyche.yaml").training_nodes == 4
+
+
+def test_dflash2_runtime_stager_inserts_and_verifies_the_receipt() -> None:
+    """The archive builder must place the attestation into the staged venv before tar."""
+    script = (
+        Path(__file__).resolve().parents[1] / "common/specdec/stage_relocatable_runtime_archive.sh"
+    ).read_text()
+    for required in (
+        "--dflash2-vllm-package",
+        "--dflash2-vllm-expected-commit",
+        "--dflash2-vllm-required-ancestor",
+        "dflash2-vllm-runtime-receipt.json",
+        "write_vllm_runtime_receipt",
+        "verify_vllm_runtime",
+        'SOURCE_FOR_ARCHIVE="$prepared_runtime"',
+    ):
+        assert required in script
+
+
 def test_shared_runner_enforces_and_consumes_the_dflash2_contract() -> None:
     """The manifest contract reaches runtime verification and the training recipe."""
     runner = (
@@ -400,5 +453,8 @@ def test_shared_runner_enforces_and_consumes_the_dflash2_contract() -> None:
         '"dflash.dflash_architecture_config.conv_group_size=${DFLASH2_CONV_GROUP_SIZE}"',
         '"dflash.dflash_architecture_config.selector_rank=${DFLASH2_SELECTOR_RANK}"',
         '"dflash.dflash_architecture_config.selector_top_k=${DFLASH2_SELECTOR_TOP_K}"',
+        'if [[ "$METHOD" == dflash2 ]]; then',
+        'STAGE_TARGET_IDENTITY="$TARGET_PATH"',
+        'STAGE_DATASET_IDENTITY="$DATASET_PATH"',
     ):
         assert required in runner

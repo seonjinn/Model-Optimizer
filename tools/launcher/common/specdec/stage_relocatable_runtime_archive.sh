@@ -15,9 +15,12 @@ ACCOUNT="nemotron_n3_post"
 PARTITION="batch"
 CLUSTER_PROFILE=""
 READINESS_RECEIPT=""
+DFLASH2_VLLM_PACKAGE=""
+DFLASH2_VLLM_EXPECTED_COMMIT=""
+DFLASH2_VLLM_REQUIRED_ANCESTOR=""
 
 usage() {
-    echo "usage: $0 --source-runtime /lustre/... --output-archive /lustre/... [--cluster-profile PATH --readiness-receipt PATH] [--scratch-root PATH] [--account ACCOUNT] [--partition PARTITION]" >&2
+    echo "usage: $0 --source-runtime /lustre/... --output-archive /lustre/... [--cluster-profile PATH --readiness-receipt PATH] [--scratch-root PATH] [--account ACCOUNT] [--partition PARTITION] [--dflash2-vllm-package /home/.../vllm --dflash2-vllm-expected-commit SHA --dflash2-vllm-required-ancestor SHA]" >&2
     exit 2
 }
 
@@ -30,10 +33,21 @@ while [[ $# -gt 0 ]]; do
         --partition) PARTITION="$2"; shift 2 ;;
         --cluster-profile) CLUSTER_PROFILE="$2"; shift 2 ;;
         --readiness-receipt) READINESS_RECEIPT="$2"; shift 2 ;;
+        --dflash2-vllm-package) DFLASH2_VLLM_PACKAGE="$2"; shift 2 ;;
+        --dflash2-vllm-expected-commit) DFLASH2_VLLM_EXPECTED_COMMIT="$2"; shift 2 ;;
+        --dflash2-vllm-required-ancestor) DFLASH2_VLLM_REQUIRED_ANCESTOR="$2"; shift 2 ;;
         --run-stage) MODE="run"; shift ;;
         *) usage ;;
     esac
 done
+
+DFLASH2_MODE=0
+if [[ -n "$DFLASH2_VLLM_PACKAGE$DFLASH2_VLLM_EXPECTED_COMMIT$DFLASH2_VLLM_REQUIRED_ANCESTOR" ]]; then
+    [[ "$DFLASH2_VLLM_PACKAGE" == /home/* && -d "$DFLASH2_VLLM_PACKAGE" ]] || usage
+    [[ "$DFLASH2_VLLM_EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || usage
+    [[ "$DFLASH2_VLLM_REQUIRED_ANCESTOR" =~ ^[0-9a-f]{40}$ ]] || usage
+    DFLASH2_MODE=1
+fi
 
 PROFILE_DURABLE_ROOT=""
 PROFILE_GPU_ARGS=(--gpus-per-node=4)
@@ -92,6 +106,23 @@ if [[ "$MODE" == "submit" ]]; then
     [[ "${BASH_SOURCE[0]}" == /home/* ]] || { echo "staging script must run from /home source" >&2; exit 2; }
     if [[ -f "$OUTPUT_ARCHIVE" && -f "${OUTPUT_ARCHIVE}.sha256" && -f "${OUTPUT_ARCHIVE}.provenance.json" ]]; then
         (cd "$(dirname "$OUTPUT_ARCHIVE")" && sha256sum -c "$(basename "${OUTPUT_ARCHIVE}.sha256")")
+        if (( DFLASH2_MODE )); then
+            python3 - "${OUTPUT_ARCHIVE}.provenance.json" "$DFLASH2_VLLM_EXPECTED_COMMIT" "$DFLASH2_VLLM_REQUIRED_ANCESTOR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+receipt = json.loads(Path(sys.argv[1]).read_text())
+if (
+    receipt.get("vllm_commit") != sys.argv[2]
+    or receipt.get("vllm_required_ancestor") != sys.argv[3]
+    or not isinstance(receipt.get("vllm_receipt_sha256"), str)
+):
+    raise SystemExit("existing archive lacks matching DFlash2 provenance")
+PY
+            tar --list --use-compress-program=zstd --file="$OUTPUT_ARCHIVE" \
+                | grep -qx './dflash2-vllm-runtime-receipt.json'
+        fi
         echo "runtime archive already verified: $OUTPUT_ARCHIVE"
         exit 0
     fi
@@ -105,6 +136,11 @@ if [[ "$MODE" == "submit" ]]; then
     args+=(--time=00:30:00 --job-name=modelopt-runtime-archive
         --output="${OUTPUT_ARCHIVE}.stage-%j.out")
     command=("$0" --run-stage --source-runtime "$SOURCE_RUNTIME" --output-archive "$OUTPUT_ARCHIVE" --scratch-root "$SCRATCH_ROOT")
+    if (( DFLASH2_MODE )); then
+        command+=(--dflash2-vllm-package "$DFLASH2_VLLM_PACKAGE"
+            --dflash2-vllm-expected-commit "$DFLASH2_VLLM_EXPECTED_COMMIT"
+            --dflash2-vllm-required-ancestor "$DFLASH2_VLLM_REQUIRED_ANCESTOR")
+    fi
     if [[ -n "$CLUSTER_PROFILE" ]]; then
         args+=("--export=ALL,DRAFTER_LAUNCHER_ROOT=$LAUNCHER_ROOT")
         command+=(--cluster-profile "$CLUSTER_PROFILE" --readiness-receipt "$READINESS_RECEIPT")
@@ -121,12 +157,55 @@ checksum="${archive}.sha256"
 provenance="${archive}.provenance.json"
 listing="${work_root}/runtime.list"
 mkdir -p "$work_root" "$(dirname "$OUTPUT_ARCHIVE")"
-tar --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_RUNTIME" .
+SOURCE_FOR_ARCHIVE="$SOURCE_RUNTIME"
+DFLASH2_VLLM_RECEIPT_SHA256=""
+if (( DFLASH2_MODE )); then
+    prepared_runtime="${work_root}/prepared-runtime"
+    mkdir "$prepared_runtime"
+    cp -a --reflink=auto "$SOURCE_RUNTIME/." "$prepared_runtime/"
+    receipt_path="${prepared_runtime}/dflash2-vllm-runtime-receipt.json"
+    DFLASH2_VLLM_RECEIPT_SHA256="$(PYTHONPATH="${LAUNCHER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" python3 - \
+        "$receipt_path" "$DFLASH2_VLLM_PACKAGE" "$DFLASH2_VLLM_EXPECTED_COMMIT" \
+        "$DFLASH2_VLLM_REQUIRED_ANCESTOR" <<'PY'
+import sys
+from pathlib import Path
+from common.specdec.dflash2_runtime_contract import write_vllm_runtime_receipt
+
+print(write_vllm_runtime_receipt(Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]))
+PY
+)"
+    PYTHONPATH="${LAUNCHER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" "$prepared_runtime/bin/python" - \
+        "$receipt_path" "$DFLASH2_VLLM_RECEIPT_SHA256" "$DFLASH2_VLLM_EXPECTED_COMMIT" \
+        "$DFLASH2_VLLM_REQUIRED_ANCESTOR" <<'PY'
+import sys
+from pathlib import Path
+import vllm
+from common.specdec.dflash2_runtime_contract import verify_vllm_runtime
+
+verify_vllm_runtime(Path(vllm.__file__).resolve().parent, Path(sys.argv[1]), *sys.argv[2:])
+PY
+    SOURCE_FOR_ARCHIVE="$prepared_runtime"
+fi
+tar --create --use-compress-program=zstd --file="$archive" -C "$SOURCE_FOR_ARCHIVE" .
 tar --list --use-compress-program=zstd --file="$archive" >"$listing"
 grep -q '/bin/activate$' "$listing"
 archive_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
 printf '%s  %s\n' "$archive_sha" "$(basename "$OUTPUT_ARCHIVE")" >"$checksum"
-printf '{"source_runtime":"%s","sha256":"%s"}\n' "$SOURCE_RUNTIME" "$archive_sha" >"$provenance"
+python3 - "$provenance" "$SOURCE_RUNTIME" "$archive_sha" "$DFLASH2_VLLM_EXPECTED_COMMIT" \
+    "$DFLASH2_VLLM_REQUIRED_ANCESTOR" "$DFLASH2_VLLM_RECEIPT_SHA256" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+body = {"source_runtime": sys.argv[2], "sha256": sys.argv[3]}
+if sys.argv[4]:
+    body.update(
+        vllm_commit=sys.argv[4],
+        vllm_required_ancestor=sys.argv[5],
+        vllm_receipt_sha256=sys.argv[6],
+    )
+Path(sys.argv[1]).write_text(json.dumps(body, sort_keys=True) + "\n")
+PY
 temporary="${OUTPUT_ARCHIVE}.partial-${SLURM_JOB_ID}"
 cp "$archive" "$temporary"
 mv "$temporary" "$OUTPUT_ARCHIVE"

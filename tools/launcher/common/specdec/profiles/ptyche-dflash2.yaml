@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: ptyche
+modelopt_commit: 6eda6bbf54455086a54660fe7a7b06c415b87da5
+ssh_host: login-ptyche
+account: coreai_dlalgo_llm
+partition: 36x2-a01r
+fallback_partition: batch
+durable_root: /lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training
+scratch_candidates:
+  - $SLURM_TMPDIR
+  - /raid/scratch
+  - /tmp
+training_nodes: 16
+training_segment: 16
+evaluation_nodes: 1
+evaluation_segment: 1
+gpus_per_node: 4
+explicit_gpu_flag: false
+walltime: "05:00:00"
