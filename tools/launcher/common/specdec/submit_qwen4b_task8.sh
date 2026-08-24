@@ -11,9 +11,10 @@ RESPONSE_RECEIPT="" RESPONSE_RECEIPT_SHA256="" REJECTION_RECEIPT="" REJECTION_RE
 TOKENIZER_RECEIPT="" TOKENIZER_RECEIPT_SHA256="" ASSISTANT_LOSS_TARGET_SHA256=""
 TRAINING_CONFIG_SHA256="" PUBLICATION_ROOT="" ACCOUNT="" PARTITION="" WALLTIME="" DRY_RUN=0
 IMAGE_PATH="" IMAGE_SHA256=""
+TASK9_SOURCE_COMMIT=""
 
 usage() {
-    echo "usage: $0 --source-receipt PATH --source-receipt-sha256 SHA256 --selection-receipt PATH --selection-receipt-sha256 SHA256 --response-receipt PATH --response-receipt-sha256 SHA256 --rejection-receipt PATH --rejection-receipt-sha256 SHA256 --tokenizer-receipt PATH --tokenizer-receipt-sha256 SHA256 --assistant-loss-target-sha256 SHA256 --training-config-sha256 SHA256 --image-path PATH --image-sha256 SHA256 --publication-root PATH --account NAME --partition cpu_datamover --time HH:MM:SS [--dry-run]" >&2
+    echo "usage: $0 --source-receipt PATH --source-receipt-sha256 SHA256 --selection-receipt PATH --selection-receipt-sha256 SHA256 --response-receipt PATH --response-receipt-sha256 SHA256 --rejection-receipt PATH --rejection-receipt-sha256 SHA256 --tokenizer-receipt PATH --tokenizer-receipt-sha256 SHA256 --assistant-loss-target-sha256 SHA256 --training-config-sha256 SHA256 --task9-source-commit COMMIT --image-path PATH --image-sha256 SHA256 --publication-root PATH --account NAME --partition cpu_datamover --time HH:MM:SS [--dry-run]" >&2
     exit 2
 }
 
@@ -31,6 +32,7 @@ while (( $# )); do
         --tokenizer-receipt-sha256) TOKENIZER_RECEIPT_SHA256="${2:-}"; shift 2 ;;
         --assistant-loss-target-sha256) ASSISTANT_LOSS_TARGET_SHA256="${2:-}"; shift 2 ;;
         --training-config-sha256) TRAINING_CONFIG_SHA256="${2:-}"; shift 2 ;;
+        --task9-source-commit) TASK9_SOURCE_COMMIT="${2:-}"; shift 2 ;;
         --image-path) IMAGE_PATH="${2:-}"; shift 2 ;;
         --image-sha256) IMAGE_SHA256="${2:-}"; shift 2 ;;
         --publication-root) PUBLICATION_ROOT="${2:-}"; shift 2 ;;
@@ -44,7 +46,7 @@ done
 for name in SOURCE_RECEIPT SOURCE_RECEIPT_SHA256 SELECTION_RECEIPT SELECTION_RECEIPT_SHA256 \
     RESPONSE_RECEIPT RESPONSE_RECEIPT_SHA256 REJECTION_RECEIPT REJECTION_RECEIPT_SHA256 \
     TOKENIZER_RECEIPT TOKENIZER_RECEIPT_SHA256 ASSISTANT_LOSS_TARGET_SHA256 \
-    TRAINING_CONFIG_SHA256 IMAGE_PATH IMAGE_SHA256 PUBLICATION_ROOT ACCOUNT PARTITION WALLTIME; do
+    TRAINING_CONFIG_SHA256 TASK9_SOURCE_COMMIT IMAGE_PATH IMAGE_SHA256 PUBLICATION_ROOT ACCOUNT PARTITION WALLTIME; do
     [[ -n "${!name}" ]] || usage
 done
 [[ "$PARTITION" == cpu_datamover ]] || usage
@@ -55,6 +57,7 @@ for name in SOURCE_RECEIPT_SHA256 SELECTION_RECEIPT_SHA256 RESPONSE_RECEIPT_SHA2
     [[ "${!name}" =~ ^[0-9a-f]{64}$ ]] || usage
 done
 [[ "$IMAGE_SHA256" =~ ^[0-9a-f]{64}$ ]] || usage
+[[ "$TASK9_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || usage
 for path in "$SOURCE_RECEIPT" "$SELECTION_RECEIPT" "$RESPONSE_RECEIPT" \
     "$REJECTION_RECEIPT" "$TOKENIZER_RECEIPT"; do
     [[ "$path" == /* && -f "$path" && ! -L "$path" ]] || usage
@@ -65,6 +68,12 @@ durable_prefix="/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/user
     echo "Task8 publication must use the durable dataset-study root" >&2
     exit 2
 }
+case "$PUBLICATION_ROOT" in
+    *//*|*/./*|*/../*|*/.|*/..)
+        echo "Task8 publication root must be canonical without traversal" >&2
+        exit 2
+        ;;
+esac
 [[ "$IMAGE_PATH" == /* && -f "$IMAGE_PATH" && ! -L "$IMAGE_PATH" ]] || usage
 [[ -x "$RUNNER" ]] || usage
 
@@ -98,12 +107,16 @@ for value in "$SOURCE_RECEIPT" "$SELECTION_RECEIPT" "$RESPONSE_RECEIPT" \
     "$REJECTION_RECEIPT" "$TOKENIZER_RECEIPT" "$IMAGE_PATH" "$PUBLICATION_ROOT" "$ACCOUNT"; do
     [[ "$value" != *","* && "$value" != *$'\n'* ]] || exit 2
 done
+PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 python3 -P \
+    "$REPO_ROOT/tools/launcher/common/specdec/build_qwen4b_task8.py" \
+    --validate-publication-root "$PUBLICATION_ROOT" "$durable_prefix"
 
 LOG_DIR="$PUBLICATION_ROOT-logs"
 mkdir -p "$LOG_DIR"
-exports="ALL,REPO_ROOT=$REPO_ROOT,SOURCE_COMMIT=$SOURCE_COMMIT,SOURCE_RECEIPT=$SOURCE_RECEIPT,SOURCE_RECEIPT_SHA256=$SOURCE_RECEIPT_SHA256,SELECTION_RECEIPT=$SELECTION_RECEIPT,SELECTION_RECEIPT_SHA256=$SELECTION_RECEIPT_SHA256,RESPONSE_RECEIPT=$RESPONSE_RECEIPT,RESPONSE_RECEIPT_SHA256=$RESPONSE_RECEIPT_SHA256,REJECTION_RECEIPT=$REJECTION_RECEIPT,REJECTION_RECEIPT_SHA256=$REJECTION_RECEIPT_SHA256,TOKENIZER_RECEIPT=$TOKENIZER_RECEIPT,TOKENIZER_RECEIPT_SHA256=$TOKENIZER_RECEIPT_SHA256,ASSISTANT_LOSS_TARGET_SHA256=$ASSISTANT_LOSS_TARGET_SHA256,TRAINING_CONFIG_SHA256=$TRAINING_CONFIG_SHA256,IMAGE_PATH=$IMAGE_PATH,IMAGE_SHA256=$IMAGE_SHA256,PUBLICATION_ROOT=$PUBLICATION_ROOT"
+exports="ALL,REPO_ROOT=$REPO_ROOT,SOURCE_COMMIT=$SOURCE_COMMIT,TASK9_SOURCE_COMMIT=$TASK9_SOURCE_COMMIT,SOURCE_RECEIPT=$SOURCE_RECEIPT,SOURCE_RECEIPT_SHA256=$SOURCE_RECEIPT_SHA256,SELECTION_RECEIPT=$SELECTION_RECEIPT,SELECTION_RECEIPT_SHA256=$SELECTION_RECEIPT_SHA256,RESPONSE_RECEIPT=$RESPONSE_RECEIPT,RESPONSE_RECEIPT_SHA256=$RESPONSE_RECEIPT_SHA256,REJECTION_RECEIPT=$REJECTION_RECEIPT,REJECTION_RECEIPT_SHA256=$REJECTION_RECEIPT_SHA256,TOKENIZER_RECEIPT=$TOKENIZER_RECEIPT,TOKENIZER_RECEIPT_SHA256=$TOKENIZER_RECEIPT_SHA256,ASSISTANT_LOSS_TARGET_SHA256=$ASSISTANT_LOSS_TARGET_SHA256,TRAINING_CONFIG_SHA256=$TRAINING_CONFIG_SHA256,IMAGE_PATH=$IMAGE_PATH,IMAGE_SHA256=$IMAGE_SHA256,PUBLICATION_ROOT=$PUBLICATION_ROOT"
 args=(--account="$ACCOUNT" --partition=cpu_datamover --nodes=1 --ntasks=1
     --cpus-per-task=96 --mem=0 --time="$WALLTIME"
+    --chdir="$REPO_ROOT"
     --job-name="q4-task8-${SELECTION_RECEIPT_SHA256:0:12}"
     --comment="q4-task8:$SELECTION_RECEIPT_SHA256"
     --output="$LOG_DIR/%x-%j.out" --error="$LOG_DIR/%x-%j.err" --export="$exports")

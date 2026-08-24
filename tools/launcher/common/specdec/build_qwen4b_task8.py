@@ -12,6 +12,8 @@ import os
 import re
 import sqlite3
 import stat
+import sys
+from collections import Counter
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from itertools import zip_longest
@@ -23,6 +25,10 @@ import yaml
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_MAX_ROLE_FILES = 201
+_MAX_RECEIPT_BYTES = 1024 * 1024
+_MAX_RECORD_BYTES = 4096
+_MAX_LABEL_LENGTH = 128
 _RESPONSE_KEYS = frozenset(
     {
         "schema_version",
@@ -48,15 +54,48 @@ _REJECTION_KEYS = frozenset(
         "receipt_sha256",
     }
 )
+_RESPONSE_RECORD_KEYS = frozenset(
+    {
+        "ordinal",
+        "prompt_uuid",
+        "source_identity_sha256",
+        "source_row",
+        "conversation_sha256",
+        "assistant_response_sha256",
+    }
+)
+_REJECTION_RECORD_KEYS = frozenset(
+    {
+        "ordinal",
+        "prompt_uuid",
+        "domain",
+        "lane",
+        "context_bucket",
+        "source_identity_sha256",
+        "source_row",
+        "rejection_reason",
+    }
+)
 
 
 class Task8BuildError(ValueError):
     """A Task8 input or publication contract is incomplete or invalid."""
 
 
+@dataclass(frozen=True)
+class _RoleEvidence:
+    rejection_count: int
+    rejection_reason_counts: Mapping[str, int]
+    rejection_files: tuple[Path, ...]
+
+
 def publication_rows_per_shard(occurrence_count: int) -> int:
     """Return the stable row width that yields at most 201 source-order shards."""
-    if isinstance(occurrence_count, bool) or not isinstance(occurrence_count, int) or occurrence_count < 1:
+    if (
+        isinstance(occurrence_count, bool)
+        or not isinstance(occurrence_count, int)
+        or occurrence_count < 1
+    ):
         raise Task8BuildError("publication occurrence count must be positive")
     return (occurrence_count + 200) // 201
 
@@ -89,11 +128,81 @@ def _require_digest(value: str, label: str) -> None:
         raise Task8BuildError(f"{label} must be a lowercase SHA-256")
 
 
+def _canonical_absolute_path(value: os.PathLike[str] | str, label: str) -> Path:
+    raw = os.fspath(value)
+    if not raw.startswith("/") or raw == "/" or "//" in raw:
+        raise Task8BuildError(f"{label} must be a canonical absolute path")
+    components = raw.split("/")[1:]
+    if not components or any(component in {"", ".", ".."} for component in components):
+        raise Task8BuildError(f"{label} must be a canonical absolute path")
+    canonical = PurePosixPath(raw).as_posix()
+    if raw != canonical:
+        raise Task8BuildError(f"{label} must be a canonical absolute path")
+    return Path(raw)
+
+
+def _open_directory_nofollow(path: Path, label: str) -> int:
+    canonical = _canonical_absolute_path(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open("/", flags)
+    try:
+        for component in canonical.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except OSError as error:
+        os.close(descriptor)
+        raise Task8BuildError(f"{label} contains a symlink or unsafe ancestor") from error
+    return descriptor
+
+
+def _open_regular_nofollow(path: Path, label: str) -> int:
+    canonical = _canonical_absolute_path(path, label)
+    parent = _open_directory_nofollow(canonical.parent, f"{label} parent")
+    try:
+        descriptor = os.open(
+            canonical.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
+    except OSError as error:
+        raise Task8BuildError(f"{label} is missing or unsafe") from error
+    finally:
+        os.close(parent)
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise Task8BuildError(f"{label} must be a no-follow regular file")
+    return descriptor
+
+
+def _read_regular_nofollow(path: Path, label: str, *, max_bytes: int | None = None) -> bytes:
+    descriptor = _open_regular_nofollow(path, label)
+    if max_bytes is not None and os.fstat(descriptor).st_size > max_bytes:
+        os.close(descriptor)
+        raise Task8BuildError(f"{label} exceeds its bounded size")
+    with os.fdopen(descriptor, "rb") as stream:
+        return stream.read()
+
+
+def validate_durable_publication_root(
+    publication_root: os.PathLike[str] | str,
+    durable_prefix: os.PathLike[str] | str,
+) -> Path:
+    """Validate a missing canonical destination below a no-follow durable parent."""
+    destination = _canonical_absolute_path(publication_root, "publication root")
+    prefix = _canonical_absolute_path(durable_prefix, "durable prefix")
+    if destination == prefix or destination.parts[: len(prefix.parts)] != prefix.parts:
+        raise Task8BuildError("publication root is outside the durable dataset-study root")
+    descriptor = _open_directory_nofollow(destination.parent, "publication root parent")
+    os.close(descriptor)
+    if os.path.lexists(destination):
+        raise Task8BuildError("publication root must be an immutable missing destination")
+    return destination
+
+
 def _read_receipt(path: Path, expected_sha256: str, label: str) -> dict[str, Any]:
     _require_digest(expected_sha256, f"{label} receipt SHA-256")
-    if path.is_symlink() or not path.is_file():
-        raise Task8BuildError(f"{label} receipt must be a no-follow regular file")
-    raw = path.read_bytes()
+    raw = _read_regular_nofollow(path, f"{label} receipt", max_bytes=_MAX_RECEIPT_BYTES)
     if hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise Task8BuildError(f"{label} receipt SHA-256 mismatch")
     try:
@@ -107,40 +216,35 @@ def _read_receipt(path: Path, expected_sha256: str, label: str) -> dict[str, Any
 
 def _authenticate_declared_files(
     receipt_path: Path, payload: Mapping[str, Any], label: str
-) -> None:
+) -> tuple[Path, ...]:
     descriptors = payload.get("files")
-    if not isinstance(descriptors, list) or not descriptors:
+    if not isinstance(descriptors, list) or not descriptors or len(descriptors) > _MAX_ROLE_FILES:
         raise Task8BuildError(f"{label} receipt has no declared files")
+    authenticated: list[Path] = []
     for descriptor in descriptors:
         if not isinstance(descriptor, Mapping):
             raise Task8BuildError(f"{label} declared file descriptor is malformed")
-        _authenticate_descriptor(receipt_path, descriptor, f"{label} declared file")
+        authenticated.append(
+            _authenticate_descriptor(receipt_path, descriptor, f"{label} declared file")
+        )
+    return tuple(authenticated)
 
 
-def _authenticate_descriptor(
-    receipt_path: Path, descriptor: Mapping[str, Any], label: str
-) -> Path:
+def _authenticate_descriptor(receipt_path: Path, descriptor: Mapping[str, Any], label: str) -> Path:
     raw_relative = descriptor.get("path", descriptor.get("staged_path"))
     relative = PurePosixPath(str(raw_relative or ""))
     if relative.is_absolute() or ".." in relative.parts or not relative.parts:
         raise Task8BuildError(f"{label} path is unsafe")
-    directory_flags = (
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    )
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        parent_descriptor = os.open(receipt_path.parent, directory_flags)
-    except OSError as error:
-        raise Task8BuildError(f"{label} parent is unsafe") from error
+    parent_descriptor = _open_directory_nofollow(receipt_path.parent, f"{label} parent")
     file_descriptor = -1
     try:
         for component in relative.parts[:-1]:
             try:
                 child = os.open(component, directory_flags, dir_fd=parent_descriptor)
             except OSError as error:
-                raise Task8BuildError(
-                    f"{label} contains a symlink or non-directory"
-                ) from error
+                raise Task8BuildError(f"{label} contains a symlink or non-directory") from error
             os.close(parent_descriptor)
             parent_descriptor = child
         try:
@@ -173,24 +277,136 @@ def _identity(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return nested if isinstance(nested, Mapping) else payload
 
 
+def _canonical_records(paths: tuple[Path, ...], label: str) -> Iterator[dict[str, Any]]:
+    for path in paths:
+        descriptor = _open_regular_nofollow(path, f"{label} records")
+        with os.fdopen(descriptor, "rb") as stream:
+            for line_number, raw in enumerate(stream, start=1):
+                if len(raw) > _MAX_RECORD_BYTES:
+                    raise Task8BuildError(f"{label} record exceeds its bounded size")
+                try:
+                    record = json.loads(raw)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise Task8BuildError(
+                        f"{label} record {line_number} is not canonical JSON"
+                    ) from error
+                if not isinstance(record, dict) or raw != _canonical_json(record) + b"\n":
+                    raise Task8BuildError(f"{label} record schema is invalid")
+                yield record
+
+
+def _response_record_identity(record: Mapping[str, Any], ordinal: int) -> tuple[Any, ...]:
+    if (
+        set(record) != _RESPONSE_RECORD_KEYS
+        or record.get("ordinal") != ordinal
+        or isinstance(record.get("source_row"), bool)
+        or not isinstance(record.get("source_row"), int)
+        or record["source_row"] < 0
+        or any(
+            not isinstance(record.get(key), str) or _SHA256.fullmatch(record[key]) is None
+            for key in (
+                "prompt_uuid",
+                "source_identity_sha256",
+                "conversation_sha256",
+                "assistant_response_sha256",
+            )
+        )
+    ):
+        raise Task8BuildError("response record schema is invalid")
+    return (
+        record["ordinal"],
+        record["prompt_uuid"],
+        record["source_identity_sha256"],
+        record["source_row"],
+        record["conversation_sha256"],
+        record["assistant_response_sha256"],
+    )
+
+
+def _validate_response_records(view: Any, paths: tuple[Path, ...]) -> tuple[int, str]:
+    selection = sqlite3.connect(f"file:{Path(view.index_path)}?mode=ro", uri=True)
+    digest = hashlib.sha256()
+    count = 0
+    try:
+        expected_rows = selection.execute(
+            "SELECT ordinal,prompt_uuid,source_identity_sha256,source_row,"
+            "conversation_sha256,assistant_response_sha256 FROM occurrences "
+            "WHERE strategy=? ORDER BY ordinal",
+            (view.strategy,),
+        )
+        sentinel = object()
+        for record, expected in zip_longest(
+            _canonical_records(paths, "response"), expected_rows, fillvalue=sentinel
+        ):
+            if record is sentinel or expected is sentinel:
+                raise Task8BuildError("response record count does not match Task9 selection")
+            assert isinstance(record, Mapping) and isinstance(expected, tuple)
+            identity = _response_record_identity(record, count)
+            if identity != expected:
+                raise Task8BuildError("response record identity does not match Task9 selection")
+            digest.update(
+                _canonical_json([identity[2], identity[3], identity[4], identity[5]]) + b"\n"
+            )
+            count += 1
+    finally:
+        selection.close()
+    return count, digest.hexdigest()
+
+
+def _validated_rejection_record(record: Mapping[str, Any], ordinal: int) -> dict[str, Any]:
+    if (
+        set(record) != _REJECTION_RECORD_KEYS
+        or record.get("ordinal") != ordinal
+        or isinstance(record.get("source_row"), bool)
+        or not isinstance(record.get("source_row"), int)
+        or record["source_row"] < 0
+        or any(
+            not isinstance(record.get(key), str)
+            or not record[key]
+            or len(record[key]) > _MAX_LABEL_LENGTH
+            for key in ("domain", "lane", "context_bucket", "rejection_reason")
+        )
+        or any(
+            not isinstance(record.get(key), str) or _SHA256.fullmatch(record[key]) is None
+            for key in ("prompt_uuid", "source_identity_sha256")
+        )
+    ):
+        raise Task8BuildError("rejection record schema is invalid")
+    return dict(record)
+
+
+def _validate_rejection_records(
+    paths: tuple[Path, ...],
+) -> tuple[int, dict[str, int]]:
+    counts: Counter[str] = Counter()
+    count = 0
+    for record in _canonical_records(paths, "rejection"):
+        validated = _validated_rejection_record(record, count)
+        counts[validated["rejection_reason"]] += 1
+        count += 1
+    return count, dict(sorted(counts.items()))
+
+
 def validate_required_role_receipts(
     *,
     view: Any,
-    source_commit: str,
+    task9_source_commit: str,
     response_receipt: Path,
     response_receipt_sha256: str,
     rejection_receipt: Path,
     rejection_receipt_sha256: str,
-) -> None:
+) -> _RoleEvidence:
     """Fail before tokenization unless genuine response and rejection roots are pinned."""
-    response_payload = _read_receipt(
-        Path(response_receipt), response_receipt_sha256, "response"
-    )
+    response_payload = _read_receipt(Path(response_receipt), response_receipt_sha256, "response")
     rejection_payload = _read_receipt(
         Path(rejection_receipt), rejection_receipt_sha256, "rejection"
     )
-    _authenticate_declared_files(Path(response_receipt), response_payload, "response")
-    _authenticate_declared_files(Path(rejection_receipt), rejection_payload, "rejection")
+    response_files = _authenticate_declared_files(
+        Path(response_receipt), response_payload, "response"
+    )
+    rejection_files = _authenticate_declared_files(
+        Path(rejection_receipt), rejection_payload, "rejection"
+    )
     response = _identity(response_payload)
     rejection = _identity(rejection_payload)
     selection_sha256 = getattr(view, "selection_sha256", None)
@@ -209,8 +425,8 @@ def validate_required_role_receipts(
         set(response_payload) != _RESPONSE_KEYS
         or response.get("schema_version") != 1
         or response.get("role") != "response"
-        or response.get("source_commit") != source_commit
-        or _COMMIT.fullmatch(source_commit) is None
+        or response.get("source_commit") != task9_source_commit
+        or _COMMIT.fullmatch(task9_source_commit) is None
         or response.get("occurrence_count") != getattr(view, "occurrence_count", None)
         or response_claimed != hashlib.sha256(_canonical_json(response_without_claim)).hexdigest()
     ):
@@ -219,23 +435,25 @@ def validate_required_role_receipts(
         set(rejection_payload) != _REJECTION_KEYS
         or rejection.get("schema_version") != 1
         or rejection.get("role") != "rejection"
-        or rejection.get("source_commit") != source_commit
+        or rejection.get("source_commit") != task9_source_commit
         or rejection.get("occurrence_count") != getattr(view, "occurrence_count", None)
         or isinstance(rejection_count, bool)
         or not isinstance(rejection_count, int)
         or rejection_count < 0
+        or rejection_count > getattr(view, "occurrence_count", -1)
         or not isinstance(reason_counts, Mapping)
+        or len(reason_counts) > _MAX_LABEL_LENGTH
         or any(
             not isinstance(reason, str)
             or not reason
+            or len(reason) > _MAX_LABEL_LENGTH
             or isinstance(count, bool)
             or not isinstance(count, int)
             or count < 1
             for reason, count in reason_counts.items()
         )
         or sum(reason_counts.values()) != rejection_count
-        or rejection_claimed
-        != hashlib.sha256(_canonical_json(rejection_without_claim)).hexdigest()
+        or rejection_claimed != hashlib.sha256(_canonical_json(rejection_without_claim)).hexdigest()
     ):
         raise Task8BuildError("rejection receipt schema or identity is invalid")
     if response.get("selection_sha256") != selection_sha256:
@@ -244,9 +462,22 @@ def validate_required_role_receipts(
         raise Task8BuildError("response receipt does not bind Task9 source-native responses")
     if rejection.get("selection_sha256") != selection_sha256:
         raise Task8BuildError("rejection receipt is not bound to the Task9 selection")
+    response_count, computed_response_root = _validate_response_records(view, response_files)
+    if response_count != response.get("occurrence_count"):
+        raise Task8BuildError("response record count does not reconcile with its receipt")
+    if computed_response_root != response_root:
+        raise Task8BuildError("response records do not reproduce the Task9 response root")
+    observed_rejections, observed_reasons = _validate_rejection_records(rejection_files)
+    if observed_rejections != rejection_count or observed_reasons != dict(reason_counts):
+        raise Task8BuildError("rejection records do not reconcile with their receipt")
+    return _RoleEvidence(observed_rejections, observed_reasons, rejection_files)
 
 
-def _publication_rows(view: Any, tokenized_database: Path) -> Iterator[dict[str, Any]]:
+def _publication_rows(
+    view: Any,
+    tokenized_database: Path,
+    rejection_files: tuple[Path, ...],
+) -> Iterator[dict[str, Any]]:
     selection = sqlite3.connect(f"file:{Path(view.index_path)}?mode=ro", uri=True)
     tokenized = sqlite3.connect(f"file:{tokenized_database}?mode=ro", uri=True)
     try:
@@ -291,11 +522,25 @@ def _publication_rows(view: Any, tokenized_database: Path) -> Iterator[dict[str,
     finally:
         tokenized.close()
         selection.close()
+    for ordinal, record in enumerate(_canonical_records(rejection_files, "rejection")):
+        rejected = _validated_rejection_record(record, ordinal)
+        yield {
+            "prompt_uuid": rejected["prompt_uuid"],
+            "domain": rejected["domain"],
+            "lane": rejected["lane"],
+            "context_bucket": rejected["context_bucket"],
+            "language": "",
+            "input_ids": [],
+            "loss_mask": [],
+            "assistant_tokens": 0,
+            "rejection_reason": rejected["rejection_reason"],
+        }
 
 
 def materialize_task8_publication(
     *,
     view: Any,
+    task9_source_commit: str,
     tokenizer: Any,
     tokenizer_sha256: str,
     chat_template_sha256: str,
@@ -330,9 +575,9 @@ def materialize_task8_publication(
     source_payload = _read_receipt(Path(source_receipt), source_receipt_sha256, "source")
     _authenticate_declared_files(Path(source_receipt), source_payload, "source")
     _read_receipt(Path(selection_receipt), selection_receipt_sha256, "selection")
-    validate_required_role_receipts(
+    role_evidence = validate_required_role_receipts(
         view=view,
-        source_commit=source_commit,
+        task9_source_commit=task9_source_commit,
         response_receipt=response_receipt,
         response_receipt_sha256=response_receipt_sha256,
         rejection_receipt=rejection_receipt,
@@ -349,6 +594,8 @@ def materialize_task8_publication(
         _require_digest(digest, label)
     if _COMMIT.fullmatch(source_commit) is None:
         raise Task8BuildError("source commit must be exact")
+    if _COMMIT.fullmatch(task9_source_commit) is None:
+        raise Task8BuildError("Task9 source commit must be exact")
     if workers < 1:
         raise Task8BuildError("Task8 workers must be positive")
     work_root.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -383,21 +630,25 @@ def materialize_task8_publication(
     return publish_bundle(
         CorpusBundle(
             artifacts=artifacts,
-            rows=lambda: _publication_rows(view, Path(corpus.tokenized_path)),
+            rows=lambda: _publication_rows(
+                view, Path(corpus.tokenized_path), role_evidence.rejection_files
+            ),
             prompt_count=corpus.occurrence_count,
             assistant_token_count=corpus.assistant_tokens,
-            quarantine_count=0,
+            quarantine_count=role_evidence.rejection_count,
             selection_manifest_sha256=selection_receipt_sha256,
             artifact_source_commit=source_commit,
         ),
         publication_root,
         job_id,
-        rows_per_shard=publication_rows_per_shard(corpus.occurrence_count),
+        rows_per_shard=publication_rows_per_shard(
+            corpus.occurrence_count + role_evidence.rejection_count
+        ),
     )
 
 
 def _validate_typed_task9_receipt(
-    receipt_path: Path, payload: Mapping[str, Any], source_commit: str
+    receipt_path: Path, payload: Mapping[str, Any], task9_source_commit: str
 ) -> None:
     from specdec_publication import (  # pyright: ignore[reportMissingImports]
         PublicationError,
@@ -434,11 +685,11 @@ def _validate_typed_task9_receipt(
         str(descriptor["sha256"]),
         "Task9 execution",
     )
-    if execution.get("source_commit") != source_commit:
-        raise Task8BuildError("Task9 execution source commit does not match Task8")
+    if execution.get("source_commit") != task9_source_commit:
+        raise Task8BuildError("Task9 execution source commit does not match its pinned producer")
 
 
-def load_task9_selection(receipt_path: Path, receipt_sha256: str, source_commit: str) -> Any:
+def load_task9_selection(receipt_path: Path, receipt_sha256: str, task9_source_commit: str) -> Any:
     """Authenticate an exact schema-v3 Task9 selection and reconstruct its materialized view."""
     payload = _read_receipt(receipt_path, receipt_sha256, "selection")
     identity = payload.get("selection_identity")
@@ -458,12 +709,12 @@ def load_task9_selection(receipt_path: Path, receipt_sha256: str, source_commit:
         raise Task8BuildError("Task9 selection policy descriptor is missing")
     policy_path = _authenticate_descriptor(receipt_path, policy_descriptor, "Task9 policy")
     try:
-        policy = yaml.safe_load(policy_path.read_bytes())
+        policy = yaml.safe_load(_read_regular_nofollow(policy_path, "Task9 policy"))
     except (OSError, yaml.YAMLError) as error:
         raise Task8BuildError("Task9 selection policy is unreadable") from error
     if not isinstance(policy, dict) or policy.get("trainer_epochs") != 1:
         raise Task8BuildError("Task9 selection must bind one trainer epoch")
-    _validate_typed_task9_receipt(receipt_path, payload, source_commit)
+    _validate_typed_task9_receipt(receipt_path, payload, task9_source_commit)
     connection = sqlite3.connect(f"file:{index_path}?mode=ro", uri=True)
     try:
         constructed = int(
@@ -538,6 +789,7 @@ def _parser() -> argparse.ArgumentParser:
         "work-root",
         "materialization-root",
         "publication-root",
+        "task9-source-commit",
         "source-commit",
         "job-id",
     ):
@@ -548,14 +800,20 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the fail-closed Task8 producer from command-line arguments."""
-    args = _parser().parse_args(argv)
+    effective_argv = sys.argv[1:] if argv is None else argv
+    if effective_argv and effective_argv[0] == "--validate-publication-root":
+        if len(effective_argv) != 3:
+            raise Task8BuildError("publication root validation requires path and prefix")
+        validate_durable_publication_root(effective_argv[1], effective_argv[2])
+        return 0
+    args = _parser().parse_args(effective_argv)
     selection_receipt = Path(args.selection_receipt)
     view = load_task9_selection(
-        selection_receipt, args.selection_receipt_sha256, args.source_commit
+        selection_receipt, args.selection_receipt_sha256, args.task9_source_commit
     )
     validate_required_role_receipts(
         view=view,
-        source_commit=args.source_commit,
+        task9_source_commit=args.task9_source_commit,
         response_receipt=Path(args.response_receipt),
         response_receipt_sha256=args.response_receipt_sha256,
         rejection_receipt=Path(args.rejection_receipt),
@@ -568,6 +826,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     receipt = materialize_task8_publication(
         view=view,
+        task9_source_commit=args.task9_source_commit,
         tokenizer=tokenizer,
         tokenizer_sha256=tokenizer_sha256,
         chat_template_sha256=template_sha256,
