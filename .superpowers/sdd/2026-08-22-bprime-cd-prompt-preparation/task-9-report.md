@@ -253,3 +253,22 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
 - Focused Task 9 suite: PASS, `66 passed` (336 pre-existing macOS pytest
   cleanup warnings).
 - Ruff check/format and `git diff --check`: PASS.
+
+## Round 4 in-progress corrective evidence
+
+- Replaced the self-issued complement format with the existing Task 5
+  `load_prompt_view()` producer. A-repair's production adapter now receives a
+  Task 5 manifest/root and arm, verifies Task 5's manifest/index/shards, then
+  uses a disk SQLite join to reconcile each selected repository/configuration/
+  split/revision/file/row/UUID reference against the streamed Task 3 physical
+  row before accepting its conversation or response.
+- Task 7 token SQLite plus receipt are now published as one sibling bundle via
+  Task 3's portable Darwin/Linux atomic no-replace primitive. The bundle check
+  no longer relies on directory `st_nlink`, which is not portable to APFS.
+  Private partials retain typed recovery behavior.
+- Direct macOS probes: token bundle no-replace publication and typed partial
+  recovery both pass (`2 passed`).
+- PTV token/exposure receipts now carry the selection root and Task 8 accepts
+  their role-specific declared database/records descriptors; the full genuine
+  schema-v3 `publish_bundle()` integration remains to be completed before
+  submission authorization.

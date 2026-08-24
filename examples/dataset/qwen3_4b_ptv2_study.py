@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import yaml
 from audit_ptv2_baseline import BaselineAudit
 from build_specdec_inventory import ExclusionReceipt, make_exclusion_receipt
+from promote_synthesis_reserve import ResponsePromotionError, load_prompt_view
 from specdec_corpus_contracts import canonical_json
 from specdec_identity import ExclusionIndex, prompt_uuid
 from stage_ptv23_sources import SourceInventory, load_source_inventory, stage_source_inventory
@@ -37,11 +38,9 @@ __all__ = [
     "PTV2StudySourceRow",
     "PTV2StudyView",
     "StudyOccurrence",
-    "Task5ComplementArtifact",
     "iter_ptv2_staged_source_rows",
     "iter_ptv2_study_occurrences",
     "load_ptv2_study_policy",
-    "load_task5_complement_artifact",
     "select_a_repair_view",
     "select_authenticated_b_balanced_view",
     "select_authenticated_ptv2_study_views",
@@ -142,15 +141,6 @@ class PTV2StudySourceRow:
     canonical_conversation: str
     assistant_response: str
     language: str = ""
-
-
-@dataclass(frozen=True)
-class Task5ComplementArtifact:
-    """A receipt-authenticated ordered A-repair complement artifact."""
-
-    selection_sha256: str
-    source_inventory_sha256: str
-    rows_path: Path
 
 
 @dataclass(frozen=True)
@@ -288,55 +278,6 @@ def load_ptv2_study_policy(path: Path) -> PTV2StudyPolicy:
         global_batch_size=int(root["global_batch_size"]),
         sequence_length=int(root["sequence_length"]),
         policy_sha256=policy_sha256,
-    )
-
-
-def load_task5_complement_artifact(path: Path) -> Task5ComplementArtifact:
-    """Authenticate the immutable Task 5 complement receipt and its row stream."""
-    if path.is_symlink() or not path.is_file():
-        raise PTV2StudyError("Task 5 complement receipt is not a regular file")
-    try:
-        payload = json.loads(path.read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
-        raise PTV2StudyError("Task 5 complement receipt is invalid JSON") from error
-    if not isinstance(payload, dict) or canonical_json(payload) + b"\n" != path.read_bytes():
-        raise PTV2StudyError("Task 5 complement receipt is not canonical JSON")
-    required = {
-        "schema_version",
-        "selection_sha256",
-        "source_inventory_sha256",
-        "rows",
-        "root_sha256",
-    }
-    if set(payload) != required or payload["schema_version"] != 1:
-        raise PTV2StudyError("Task 5 complement receipt schema is invalid")
-    root_payload = {key: value for key, value in payload.items() if key != "root_sha256"}
-    if payload["root_sha256"] != sha256(canonical_json(root_payload)).hexdigest():
-        raise PTV2StudyError("Task 5 complement receipt root mismatch")
-    for key in ("selection_sha256", "source_inventory_sha256"):
-        _require_digest(payload[key], f"Task 5 complement {key}")
-    descriptor = payload["rows"]
-    if not isinstance(descriptor, dict) or set(descriptor) != {"path", "bytes", "sha256"}:
-        raise PTV2StudyError("Task 5 complement row descriptor is invalid")
-    relative = descriptor["path"]
-    if (
-        not isinstance(relative, str)
-        or Path(relative).is_absolute()
-        or ".." in Path(relative).parts
-    ):
-        raise PTV2StudyError("Task 5 complement row path is unsafe")
-    rows = (path.parent / relative).resolve(strict=False)
-    if (
-        not rows.is_relative_to(path.parent.resolve())
-        or rows.is_symlink()
-        or not rows.is_file()
-        or not isinstance(descriptor["bytes"], int)
-        or rows.stat().st_size != descriptor["bytes"]
-        or _sha256_file(rows) != descriptor["sha256"]
-    ):
-        raise PTV2StudyError("Task 5 complement rows do not match their receipt")
-    return Task5ComplementArtifact(
-        payload["selection_sha256"], payload["source_inventory_sha256"], rows
     )
 
 
@@ -532,7 +473,9 @@ def select_authenticated_ptv2_study_views(
     exclusions: ExclusionIndex,
     baseline_receipt: ExclusionReceipt,
     held_out_receipt: ExclusionReceipt,
-    complement_artifact: Path,
+    task5_manifest: Path,
+    task5_manifest_sha256: str,
+    task5_arm: str,
     output_root: Path | None = None,
 ) -> PTV2StudyBundle:
     """Build paired A/B views from the authenticated Task 3 stream only.
@@ -551,15 +494,23 @@ def select_authenticated_ptv2_study_views(
         raise PTV2StudyError("authenticated paired selection requires staged SourceInventory")
     _validate_exclusion_receipt(baseline_receipt, "baseline", baseline.exclusion_prompt_ids)
     _validate_exclusion_receipt(held_out_receipt, "held-out", exclusions.held_out)
-    artifact = load_task5_complement_artifact(complement_artifact)
-    if artifact.source_inventory_sha256 != inventory.manifest_sha256:
-        raise PTV2StudyError("Task 5 complement is not bound to this SourceInventory")
+    try:
+        task5 = load_prompt_view(
+            task5_manifest, expected_manifest_sha256=task5_manifest_sha256, arm=task5_arm
+        )
+    except (OSError, ValueError, ResponsePromotionError) as error:
+        raise PTV2StudyError(
+            "A-repair requires an authenticated Task 5 selection artifact"
+        ) from error
+    if getattr(task5, "selection_sha256", None) != task5_manifest_sha256:
+        # Task 5 has distinct selection-content and manifest-file identities.
+        _require_digest(str(getattr(task5, "selection_sha256", "")), "Task 5 selection")
     source = iter_ptv2_staged_source_rows(inventory_receipt, policy=policy)
 
     root = _selection_root(output_root)
     a_repair = select_a_repair_view(
         islice(source, policy.historical_occurrences),
-        _iter_task5_complement_rows(artifact.rows_path),
+        _iter_task5_selected_rows(task5, inventory_receipt, policy),
         policy=policy,
         baseline=baseline,
         held_out_prompt_uuids=exclusions.held_out,
@@ -567,7 +518,7 @@ def select_authenticated_ptv2_study_views(
         source_inventory=inventory,
         baseline_receipt=baseline_receipt,
         held_out_receipt=held_out_receipt,
-        complement_selection_sha256=artifact.selection_sha256,
+        complement_selection_sha256=str(task5.selection_sha256),
     )
     b_balanced = select_authenticated_b_balanced_view(
         inventory_receipt, policy=policy, exclusions=exclusions, output_root=root
@@ -728,31 +679,83 @@ def iter_ptv2_staged_source_rows(
             source_row += batch.num_rows
 
 
-def _iter_task5_complement_rows(path: Path) -> Iterator[PTV2StudySourceRow]:
-    """Decode the receipt-authenticated Task 5 stream without accepting caller rows."""
-    with path.open("rb") as stream:
-        for line_number, line in enumerate(stream, start=1):
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise PTV2StudyError("Task 5 complement row is invalid JSON") from error
-            expected = {
-                "prompt_uuid",
-                "source_identity_sha256",
-                "source_row",
-                "cell",
-                "language",
-                "canonical_conversation",
-                "assistant_response",
-            }
-            if not isinstance(payload, dict) or set(payload) != expected:
-                raise PTV2StudyError(f"Task 5 complement row {line_number} has an invalid schema")
-            try:
-                row = PTV2StudySourceRow(**payload)
-            except TypeError as error:
-                raise PTV2StudyError(f"Task 5 complement row {line_number} is malformed") from error
-            _validate_source_row(row)
-            yield row
+def _iter_task5_selected_rows(
+    task5: Any, inventory_receipt: Path, policy: PTV2StudyPolicy
+) -> Iterator[PTV2StudySourceRow]:
+    """Join Task 5 source references to the authenticated Task 3 physical rows."""
+    inventory = load_source_inventory(inventory_receipt)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="ptv2-task5-join-", suffix=".sqlite3")
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    connection = sqlite3.connect(temporary)
+    try:
+        connection.executescript(
+            "CREATE TABLE wanted(ordinal INTEGER UNIQUE,identity_sha256 TEXT,source_row INTEGER,"
+            "prompt_uuid TEXT,PRIMARY KEY(identity_sha256,source_row));"
+            "CREATE TABLE joined(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT,identity_sha256 TEXT,"
+            "source_row INTEGER,cell TEXT,language TEXT,conversation TEXT,response TEXT);"
+        )
+        for ordinal, selected in enumerate(task5.primary_rows):
+            if (
+                selected.source_family != "ptv2"
+                or selected.source_manifest_sha256 != inventory.manifest_sha256
+            ):
+                raise PTV2StudyError(
+                    "Task 5 complement row is not bound to this PTV2 SourceInventory"
+                )
+            identity = sha256(
+                canonical_json(
+                    [
+                        selected.source_repository_id,
+                        selected.source_configuration,
+                        selected.source_split,
+                        selected.source_revision,
+                        selected.source_file_path,
+                    ]
+                )
+            ).hexdigest()
+            connection.execute(
+                "INSERT INTO wanted VALUES(?,?,?,?)",
+                (ordinal, identity, selected.source_row_index, selected.prompt_uuid),
+            )
+        connection.commit()
+        for row in iter_ptv2_staged_source_rows(inventory_receipt, policy=policy):
+            wanted = connection.execute(
+                "SELECT ordinal,prompt_uuid FROM wanted WHERE identity_sha256=? AND source_row=?",
+                (row.source_identity_sha256, row.source_row),
+            ).fetchone()
+            if wanted is None:
+                continue
+            if wanted[1] != row.prompt_uuid:
+                raise PTV2StudyError("Task 5 prompt UUID does not match Task 3 physical source row")
+            connection.execute(
+                "INSERT INTO joined VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    wanted[0],
+                    row.prompt_uuid,
+                    row.source_identity_sha256,
+                    row.source_row,
+                    row.cell,
+                    row.language,
+                    row.canonical_conversation,
+                    row.assistant_response,
+                ),
+            )
+        connection.commit()
+        wanted_count = int(connection.execute("SELECT count(*) FROM wanted").fetchone()[0])
+        joined_count = int(connection.execute("SELECT count(*) FROM joined").fetchone()[0])
+        if wanted_count != joined_count:
+            raise PTV2StudyError(
+                "Task 5 complement has rows absent from authenticated Task 3 sources"
+            )
+        for values in connection.execute(
+            "SELECT prompt_uuid,identity_sha256,source_row,cell,conversation,response,language "
+            "FROM joined ORDER BY ordinal"
+        ):
+            yield PTV2StudySourceRow(*values)
+    finally:
+        connection.close()
+        temporary.unlink(missing_ok=True)
 
 
 def _verify_file(path: Path, expected_bytes: int, expected_sha256: str) -> None:

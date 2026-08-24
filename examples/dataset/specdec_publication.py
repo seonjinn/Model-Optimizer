@@ -516,6 +516,29 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
                 raise PublicationError(f"PTV2 selection receipt {key} is not a SHA-256")
         return [*shards, index, policy]
     if role == "tokenized" and payload.get("schema_version") == 1:
+        if payload.get("strategy") in {"A-repair", "B-balanced"}:
+            required = {
+                "strategy",
+                "occurrence_count",
+                "assistant_tokens",
+                "database_path",
+                "database_bytes",
+                "database_sha256",
+                "selection_sha256",
+                "source_response_root_sha256",
+                "tokenizer_sha256",
+                "chat_template_sha256",
+                "assistant_loss_target_sha256",
+            }
+            if not required.issubset(payload):
+                raise PublicationError("PTV2 tokenized receipt schema is incomplete")
+            return [
+                {
+                    "path": payload["database_path"],
+                    "bytes": payload["database_bytes"],
+                    "sha256": payload["database_sha256"],
+                }
+            ]
         required = {
             "database_path",
             "database_bytes",
@@ -535,6 +558,33 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             }
         ]
     if role == "exposure" and payload.get("schema_version") == 1:
+        if payload.get("strategy") in {"A-repair", "B-balanced"}:
+            required = {
+                "strategy",
+                "target_assistant_tokens",
+                "records_path",
+                "records_bytes",
+                "records_sha256",
+                "row_count",
+                "tokenized_sha256",
+                "selection_sha256",
+                "source_response_root_sha256",
+                "tokenizer_sha256",
+                "chat_template_sha256",
+                "assistant_loss_target_sha256",
+            }
+            if not required.issubset(payload):
+                raise PublicationError("PTV2 exposure receipt schema is incomplete")
+            records_path = payload["records_path"]
+            if not isinstance(records_path, str):
+                raise PublicationError("PTV2 exposure records path is malformed")
+            return [
+                {
+                    "path": records_path,
+                    "bytes": payload["records_bytes"],
+                    "sha256": payload["records_sha256"],
+                }
+            ]
         required = {
             "records_path",
             "records_bytes",

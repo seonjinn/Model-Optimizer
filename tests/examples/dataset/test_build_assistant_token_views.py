@@ -249,6 +249,7 @@ def test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation(
         index_path=index,
         occurrence_count=1,
         ordered_occurrences_sha256=ordered,
+        selection_sha256="c" * 64,
         source_response_root_sha256=response_root,
         unique_prompt_count=1,
         natural_duplicate_count=0,
@@ -266,6 +267,29 @@ def test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation(
             tokenizer=_Tokenizer(),
             output_root=tmp_path / "tokenized",
         )
+
+
+def test_ptv2_token_bundle_publish_is_atomic_no_replace_and_apfs_safe(tmp_path: Path) -> None:
+    """The Task 7 bundle path must not rely on POSIX directory link counts."""
+    module = _load_module()
+    destination = tmp_path / "b-balanced-tokenized"
+    temporary = module._prepare_ptv2_tokenized_bundle(tmp_path, destination)
+    (temporary / "records.sqlite3").write_bytes(b"sqlite")
+    (temporary / "TOKENIZED.json").write_bytes(b"{}\n")
+    module._publish_ptv2_tokenized_bundle(temporary, destination)
+
+    assert (destination / "records.sqlite3").read_bytes() == b"sqlite"
+    with pytest.raises(module.ExposureViewError, match="immutable"):
+        module._prepare_ptv2_tokenized_bundle(tmp_path, destination)
+
+
+def test_ptv2_token_bundle_partial_requires_typed_recovery(tmp_path: Path) -> None:
+    """A poisoned retry preserves the private namespace for explicit recovery."""
+    module = _load_module()
+    (tmp_path / ".b-balanced-tokenized.partial-poisoned").mkdir()
+
+    with pytest.raises(module.PTV2TokenizedRecoveryError, match="typed recovery"):
+        module._prepare_ptv2_tokenized_bundle(tmp_path, tmp_path / "b-balanced-tokenized")
 
 
 def _digest_lines(seed: object, rows: list[list[object]]) -> str:

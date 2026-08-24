@@ -32,6 +32,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 from specdec_corpus_contracts import canonical_json
+from stage_ptv23_sources import _rename_no_replace
 from trajectory_schema import TrajectoryValidationError, validate_trajectory
 
 __all__ = [
@@ -140,6 +141,7 @@ class PTV2OnePassCorpus:
     training_config_sha256: str
     source_response_root_sha256: str
     ordered_occurrences_sha256: str
+    selection_sha256: str = "0" * 64
     unique_prompt_count: int = 2_000_000
     natural_duplicate_count: int = 0
     constructed_repeat_count: int = 0
@@ -207,6 +209,8 @@ def derive_ptv2_one_pass_corpus(
     if strategy not in {"A-repair", "B-balanced"}:
         raise ExposureViewError("PTV2 materialized view strategy is invalid")
     index_path = Path(getattr(view, "index_path", ""))
+    selection_sha256 = getattr(view, "selection_sha256", None)
+    _require_digest("PTV2 selection", selection_sha256)
     if not index_path.is_file() or index_path.is_symlink():
         raise ExposureViewError("PTV2 selection SQLite index is missing or unsafe")
     if (
@@ -369,6 +373,7 @@ def derive_ptv2_one_pass_corpus(
         "training_config_sha256": training_config_sha256,
         "source_response_root_sha256": response_digest.hexdigest(),
         "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
+        "selection_sha256": selection_sha256,
         "database_path": "records.sqlite3",
         "database_sha256": database_sha256,
         "database_bytes": temporary_database.stat().st_size,
@@ -391,6 +396,7 @@ def derive_ptv2_one_pass_corpus(
         training_config_sha256=training_config_sha256,
         source_response_root_sha256=response_digest.hexdigest(),
         ordered_occurrences_sha256=occurrence_digest.hexdigest(),
+        selection_sha256=selection_sha256,
         unique_prompt_count=unique,
         natural_duplicate_count=natural,
         constructed_repeat_count=constructed,
@@ -502,10 +508,12 @@ def _materialize_ptv2_exposure(corpus: PTV2OnePassCorpus, target_tokens: int) ->
         "schema_version": 1,
         "strategy": corpus.strategy,
         "target_assistant_tokens": target_tokens,
-        "records_path": str(records_path),
+        "records_path": records_path.name,
+        "records_bytes": records_path.stat().st_size,
         "records_sha256": digest.hexdigest(),
         "row_count": rows,
         "tokenized_sha256": corpus.tokenized_sha256,
+        "selection_sha256": corpus.selection_sha256,
         "source_response_root_sha256": corpus.source_response_root_sha256,
         "tokenizer_sha256": corpus.tokenizer_sha256,
         "chat_template_sha256": corpus.chat_template_sha256,
@@ -594,6 +602,7 @@ def _validate_ptv2_one_pass(corpus: PTV2OnePassCorpus, strategy: str) -> None:
         "assistant_tokens": corpus.assistant_tokens,
         "database_sha256": corpus.tokenized_sha256,
         "ordered_occurrences_sha256": corpus.ordered_occurrences_sha256,
+        "selection_sha256": corpus.selection_sha256,
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
         raise ExposureViewError("PTV2 one-pass receipt does not match the claimed corpus")
@@ -719,7 +728,7 @@ def _prepare_ptv2_tokenized_bundle(root: Path, destination: Path) -> Path:
     temporary = root / f".{destination.name}.partial-{uuid.uuid4().hex}"
     temporary.mkdir(mode=0o700)
     metadata = os.lstat(temporary)
-    if temporary.is_symlink() or not stat.S_ISDIR(metadata.st_mode) or metadata.st_nlink != 2:
+    if temporary.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
         raise ExposureViewError("PTV2 tokenized partial is not a private directory")
     descriptor = os.open(temporary, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -736,18 +745,15 @@ def _publish_ptv2_tokenized_bundle(temporary: Path, destination: Path) -> None:
         not temporary.is_dir()
         or temporary.is_symlink()
         or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_nlink != 2
         or any(
             (temporary / name).is_symlink() or not (temporary / name).is_file()
             for name in ("records.sqlite3", "TOKENIZED.json")
         )
     ):
         raise ExposureViewError("PTV2 tokenized partial is not a private bundle")
-    if os.path.lexists(destination):
-        raise ExposureViewError("PTV2 tokenized output is immutable and already exists")
     try:
-        os.rename(temporary, destination)
-    except FileExistsError as error:
+        _rename_no_replace(temporary, destination)
+    except Exception as error:
         raise ExposureViewError("PTV2 tokenized output is immutable and already exists") from error
     if not destination.is_dir() or destination.is_symlink():
         raise ExposureViewError("PTV2 published tokenized bundle is unsafe")
