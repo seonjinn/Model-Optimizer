@@ -5,12 +5,15 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -312,6 +315,106 @@ def test_publication_is_byte_idempotent_and_refuses_changed_input(tmp_path: Path
             counts=counts,
         )
     assert (first.manifest_path.read_bytes(), first.completion_path.read_bytes()) == before
+
+
+def test_lustre_einval_uses_atomic_directory_reservation_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_module()
+    counts = {"chat": 1}
+    symlink_root, approved, readme, _ = _fixture(tmp_path, counts)
+    output = tmp_path / "published"
+
+    def unsupported(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(module, "_native_rename_no_replace", unsupported)
+    result = _bootstrap(
+        module,
+        symlink_root=symlink_root,
+        approved=approved,
+        readme=readme,
+        output=output,
+        workers=1,
+        counts=counts,
+    )
+
+    assert result.output_root == output
+    assert result.manifest_path.is_file()
+    assert result.completion_path.is_file()
+
+
+def test_lustre_fallback_never_replaces_a_concurrent_winner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_module()
+    destination = tmp_path / "published"
+    sources = [tmp_path / "partial-a", tmp_path / "partial-b"]
+    for index, source in enumerate(sources):
+        source.mkdir()
+        (source / "winner").write_text(str(index), encoding="utf-8")
+    barrier = threading.Barrier(2)
+
+    def unsupported(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    def publish(source: Path) -> str:
+        barrier.wait()
+        try:
+            module._rename_no_replace(source, destination)
+        except FileExistsError:
+            return "collision"
+        return "installed"
+
+    monkeypatch.setattr(module, "_native_rename_no_replace", unsupported)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(publish, sources))
+
+    assert sorted(results) == ["collision", "installed"]
+    assert (destination / "winner").read_text(encoding="utf-8") in {"0", "1"}
+    loser = sources[results.index("collision")]
+    assert (loser / "winner").is_file()
+
+
+def test_parent_fsync_ambiguity_preserves_typed_recovery_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _load_module()
+    counts = {"chat": 1}
+    symlink_root, approved, readme, _ = _fixture(tmp_path, counts)
+    output = tmp_path / "published"
+    real_fsync = module._fsync_directory
+    parent_fsyncs = 0
+
+    def unsupported(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    def ambiguous_parent_fsync(path: Path) -> None:
+        nonlocal parent_fsyncs
+        if path == tmp_path:
+            parent_fsyncs += 1
+            if parent_fsyncs == 2:
+                raise OSError("durability acknowledgement lost")
+        real_fsync(path)
+
+    monkeypatch.setattr(module, "_native_rename_no_replace", unsupported)
+    monkeypatch.setattr(module, "_fsync_directory", ambiguous_parent_fsync)
+    with pytest.raises(module.PTV2SourceManifestError) as captured:
+        _bootstrap(
+            module,
+            symlink_root=symlink_root,
+            approved=approved,
+            readme=readme,
+            output=output,
+            workers=1,
+            counts=counts,
+        )
+
+    state = module.source_manifest_recovery_state(captured.value)
+    assert state.phase is module.SourceManifestPublicationPhase.PARENT_FSYNC
+    assert state.partial_observation.status == "absent"
+    assert state.destination_observation.identity == state.expected_partial_identity
+    assert (output / "SOURCE_MANIFEST_COMPLETION.json").is_file()
 
 
 def test_cpu_datamover_runner_and_submitter_contracts() -> None:

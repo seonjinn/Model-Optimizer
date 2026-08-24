@@ -20,8 +20,9 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -31,7 +32,10 @@ __all__ = [
     "PRODUCTION_SPLIT_COUNTS",
     "PTV2SourceManifestError",
     "SourceManifestBootstrapResult",
+    "SourceManifestPublicationPhase",
+    "SourceManifestRecoveryState",
     "bootstrap_ptv2_source_manifest",
+    "source_manifest_recovery_state",
 ]
 
 APPROVED_REPOSITORY = "nvidia/Nemotron-Post-Training-Dataset-v2"
@@ -55,6 +59,57 @@ _CHUNK_BYTES = 1024 * 1024
 
 class PTV2SourceManifestError(RuntimeError):
     """The immutable source view or its publication fails the approved contract."""
+
+
+class SourceManifestPublicationPhase(str, Enum):
+    """Last attempted operation when bootstrap publication became ambiguous."""
+
+    PARTIAL_SETUP = "partial_setup"
+    WRITE = "write"
+    DIRECTORY_FSYNC = "directory_fsync"
+    RENAME = "rename"
+    PARENT_FSYNC = "parent_fsync"
+
+
+@dataclass(frozen=True)
+class SourceManifestPathObservation:
+    """A no-follow point-in-time observation used for recovery."""
+
+    path: Path
+    status: Literal["present", "absent", "unavailable"]
+    device: int | None
+    inode: int | None
+    mode: int | None
+    error: str | None
+
+    @property
+    def identity(self) -> tuple[int, int] | None:
+        if self.device is None or self.inode is None:
+            return None
+        return self.device, self.inode
+
+
+@dataclass(frozen=True)
+class SourceManifestRecoveryState:
+    """Typed evidence for a preserved or ambiguously installed bootstrap bundle."""
+
+    phase: SourceManifestPublicationPhase
+    partial_path: Path
+    destination_path: Path
+    expected_parent_identity: tuple[int, int]
+    expected_partial_identity: tuple[int, int] | None
+    parent_observation: SourceManifestPathObservation
+    partial_observation: SourceManifestPathObservation
+    destination_observation: SourceManifestPathObservation
+    recovery_required: Literal[True] = True
+
+
+def source_manifest_recovery_state(error: BaseException) -> SourceManifestRecoveryState:
+    """Return typed bootstrap recovery evidence carried by an exception."""
+    state = getattr(error, "recovery_state", None)
+    if not isinstance(state, SourceManifestRecoveryState):
+        raise ValueError("exception does not carry source-manifest recovery state")
+    return state
 
 
 @dataclass(frozen=True)
@@ -323,7 +378,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _rename_no_replace(source: Path, destination: Path) -> None:
+def _native_rename_no_replace(source: Path, destination: Path) -> None:
     library = ctypes.CDLL(None, use_errno=True)
     source_bytes = os.fsencode(source)
     destination_bytes = os.fsencode(destination)
@@ -331,7 +386,7 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
         try:
             rename = library.renameat2
         except AttributeError as error:
-            raise PTV2SourceManifestError("atomic no-replace rename is unavailable") from error
+            raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable") from error
         rename.argtypes = [
             ctypes.c_int,
             ctypes.c_char_p,
@@ -347,13 +402,95 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
         rename.restype = ctypes.c_int
         result = rename(source_bytes, destination_bytes, 0x00000004)
     else:
-        raise PTV2SourceManifestError("atomic no-replace rename is unsupported")
+        raise OSError(errno.ENOSYS, "atomic no-replace rename is unsupported")
     if result == 0:
         return
     error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise FileExistsError(error_number, os.strerror(error_number), destination)
-    raise PTV2SourceManifestError(f"atomic no-replace rename failed: {os.strerror(error_number)}")
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _observe(path: Path) -> SourceManifestPathObservation:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return SourceManifestPathObservation(path, "absent", None, None, None, None)
+    except OSError as error:
+        return SourceManifestPathObservation(path, "unavailable", None, None, None, str(error))
+    return SourceManifestPathObservation(
+        path, "present", metadata.st_dev, metadata.st_ino, metadata.st_mode, None
+    )
+
+
+def _rename_with_directory_reservation(source: Path, destination: Path) -> None:
+    """Reserve an absent sibling pathname before a portable directory rename."""
+    if source.parent.absolute() != destination.parent.absolute():
+        raise PTV2SourceManifestError("publication partial must be a destination sibling")
+    parent = source.parent
+    parent_observation = _observe(parent)
+    source_observation = _observe(source)
+    if (
+        parent_observation.identity is None
+        or parent_observation.mode is None
+        or stat.S_ISLNK(parent_observation.mode)
+        or not stat.S_ISDIR(parent_observation.mode)
+    ):
+        raise PTV2SourceManifestError("publication parent is not a no-follow directory")
+    if (
+        source_observation.identity is None
+        or source_observation.mode is None
+        or stat.S_ISLNK(source_observation.mode)
+        or not stat.S_ISDIR(source_observation.mode)
+    ):
+        raise PTV2SourceManifestError("publication partial is not a no-follow directory")
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError:
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from None
+    reservation = _observe(destination)
+    if (
+        reservation.identity is None
+        or reservation.mode is None
+        or stat.S_ISLNK(reservation.mode)
+        or not stat.S_ISDIR(reservation.mode)
+    ):
+        raise PTV2SourceManifestError("publication reservation is not a no-follow directory")
+    _fsync_directory(parent)
+    if _observe(parent).identity != parent_observation.identity:
+        raise PTV2SourceManifestError("publication parent inode changed after reservation")
+    if _observe(destination).identity != reservation.identity:
+        raise PTV2SourceManifestError("publication reservation inode changed before rename")
+    with os.scandir(destination) as entries:
+        if next(entries, None) is not None:
+            raise PTV2SourceManifestError("publication reservation changed before rename")
+    try:
+        os.rename(source, destination)
+    except OSError as error:
+        collision_numbers = {errno.EEXIST, errno.ENOTEMPTY}
+        if error.errno in collision_numbers:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
+        raise
+    if _observe(destination).identity != source_observation.identity:
+        raise PTV2SourceManifestError("reserved destination inode differs from its partial")
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    try:
+        _native_rename_no_replace(source, destination)
+        return
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
+        unsupported = {errno.EINVAL, errno.ENOSYS}
+        unsupported.update(
+            number
+            for number in (getattr(errno, "EOPNOTSUPP", None), getattr(errno, "ENOTSUP", None))
+            if number is not None
+        )
+        if error.errno not in unsupported:
+            raise PTV2SourceManifestError(
+                f"atomic no-replace rename failed: {os.strerror(error.errno or errno.EIO)}"
+            ) from error
+    _rename_with_directory_reservation(source, destination)
 
 
 def _result(output_root: Path, manifest_sha256: str) -> SourceManifestBootstrapResult:
@@ -479,37 +616,66 @@ def _bootstrap_source_manifest(
             output_root, manifest_bytes=manifest_bytes, stable_receipt=stable_receipt
         )
     output_root.parent.mkdir(parents=True, exist_ok=True)
+    parent_observation = _observe(output_root.parent)
+    if (
+        parent_observation.identity is None
+        or parent_observation.mode is None
+        or stat.S_ISLNK(parent_observation.mode)
+        or not stat.S_ISDIR(parent_observation.mode)
+    ):
+        raise PTV2SourceManifestError("publication parent must be a no-follow directory")
+    expected_parent_identity = parent_observation.identity
     partial = output_root.with_name(f".{output_root.name}.partial-{os.getpid()}-{uuid.uuid4().hex}")
-    partial.mkdir(mode=0o700)
-    partial_metadata = os.lstat(partial)
-    partial_identity = partial_metadata.st_dev, partial_metadata.st_ino
-    receipt = {
-        **stable_receipt,
-        "workers": {"requested": workers, "effective": effective_workers},
-        "timing": {
-            "started_at_utc": started_wall.isoformat(),
-            "completed_at_utc": datetime.now(UTC).isoformat(),
-            "duration_seconds": round(time.monotonic() - started, 6),
-        },
-    }
-    _write_durable(partial / "SOURCE_PLAN.json", manifest_bytes)
-    _write_durable(partial / "SOURCE_MANIFEST_COMPLETION.json", _canonical_json(receipt))
-    _fsync_directory(partial)
-    observed_partial = os.lstat(partial)
-    if (observed_partial.st_dev, observed_partial.st_ino) != partial_identity:
-        raise PTV2SourceManifestError(
-            f"publication partial changed before rename; retained partial: {partial}"
-        )
+    phase = SourceManifestPublicationPhase.PARTIAL_SETUP
+    partial_identity: tuple[int, int] | None = None
     try:
+        partial.mkdir(mode=0o700)
+        partial_metadata = os.lstat(partial)
+        if stat.S_ISLNK(partial_metadata.st_mode) or not stat.S_ISDIR(partial_metadata.st_mode):
+            raise PTV2SourceManifestError("publication partial is not a no-follow directory")
+        partial_identity = partial_metadata.st_dev, partial_metadata.st_ino
+        receipt = {
+            **stable_receipt,
+            "workers": {"requested": workers, "effective": effective_workers},
+            "timing": {
+                "started_at_utc": started_wall.isoformat(),
+                "completed_at_utc": datetime.now(UTC).isoformat(),
+                "duration_seconds": round(time.monotonic() - started, 6),
+            },
+        }
+        phase = SourceManifestPublicationPhase.WRITE
+        _write_durable(partial / "SOURCE_PLAN.json", manifest_bytes)
+        _write_durable(partial / "SOURCE_MANIFEST_COMPLETION.json", _canonical_json(receipt))
+        phase = SourceManifestPublicationPhase.DIRECTORY_FSYNC
+        _fsync_directory(partial)
+        if _observe(output_root.parent).identity != expected_parent_identity:
+            raise PTV2SourceManifestError("publication parent inode changed before rename")
+        if _observe(partial).identity != partial_identity:
+            raise PTV2SourceManifestError("publication partial inode changed before rename")
+        phase = SourceManifestPublicationPhase.RENAME
         _rename_no_replace(partial, output_root)
-    except FileExistsError:
-        raise PTV2SourceManifestError(
-            f"concurrent publication requires recovery; retained partial: {partial}"
-        ) from None
-    installed = os.lstat(output_root)
-    if (installed.st_dev, installed.st_ino) != partial_identity:
-        raise PTV2SourceManifestError("published directory inode does not match its partial")
-    _fsync_directory(output_root.parent)
+        if _observe(output_root).identity != partial_identity:
+            raise PTV2SourceManifestError("published directory inode does not match its partial")
+        phase = SourceManifestPublicationPhase.PARENT_FSYNC
+        _fsync_directory(output_root.parent)
+    except BaseException as error:
+        state = SourceManifestRecoveryState(
+            phase=phase,
+            partial_path=partial,
+            destination_path=output_root,
+            expected_parent_identity=expected_parent_identity,
+            expected_partial_identity=partial_identity,
+            parent_observation=_observe(output_root.parent),
+            partial_observation=_observe(partial),
+            destination_observation=_observe(output_root),
+        )
+        if isinstance(error, FileExistsError):
+            message = f"concurrent publication requires recovery; retained partial: {partial}"
+        else:
+            message = f"source-manifest publication requires recovery; retained partial: {partial}"
+        recovery_error = PTV2SourceManifestError(message)
+        setattr(recovery_error, "recovery_state", state)
+        raise recovery_error from error
     return _result(output_root, manifest_sha256)
 
 
