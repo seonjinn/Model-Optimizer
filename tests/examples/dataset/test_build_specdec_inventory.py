@@ -204,6 +204,91 @@ def test_tokenizer_digest_binds_exact_serialization_files(tmp_path: Path) -> Non
     assert module.tokenizer_snapshot_sha256(tmp_path) != first
 
 
+def test_tokenizer_snapshot_receipt_authenticates_exact_files_and_template(tmp_path: Path) -> None:
+    module = _load_module()
+    snapshot = tmp_path / "tokenizer"
+    snapshot.mkdir()
+    (snapshot / "tokenizer.json").write_text('{"version":"1.0"}', encoding="utf-8")
+    (snapshot / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    receipt_path = tmp_path / "TOKENIZER_SNAPSHOT.json"
+
+    written = module.write_tokenizer_snapshot_receipt(snapshot, receipt_path)
+    loaded = module.load_tokenizer_snapshot(receipt_path, written.receipt_sha256)
+
+    assert loaded == written
+    assert loaded.tokenizer_sha256 == module.tokenizer_snapshot_sha256(snapshot)
+    assert (
+        loaded.chat_template_sha256
+        == hashlib.sha256(module.canonical_json("{{ messages }}")).hexdigest()
+    )
+
+
+def test_authenticated_tiny_tokenizer_snapshot_loads_without_caller_adapter(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    snapshot_root = tmp_path / "tiny-tokenizer"
+    snapshot_root.mkdir()
+    Tokenizer(WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]")).save(
+        str(snapshot_root / "tokenizer.json")
+    )
+    (snapshot_root / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "unk_token": "[UNK]",
+                "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    receipt = tmp_path / "TINY_TOKENIZER_SNAPSHOT.json"
+    written = module.write_tokenizer_snapshot_receipt(snapshot_root, receipt)
+
+    loaded, tokenizer = module._authenticated_snapshot_tokenizer(receipt, written.receipt_sha256)
+
+    assert loaded == written
+    encoded = tokenizer.apply_chat_template([{"role": "user", "content": "hello"}], tokenize=True)
+    assert encoded["input_ids"] == [1]
+
+
+@pytest.mark.parametrize(
+    "mutation", ["file", "template", "extra", "directory", "symlink", "receipt"]
+)
+def test_tokenizer_snapshot_receipt_rejects_forgery(tmp_path: Path, mutation: str) -> None:
+    module = _load_module()
+    snapshot = tmp_path / "tokenizer"
+    snapshot.mkdir()
+    tokenizer_json = snapshot / "tokenizer.json"
+    tokenizer_json.write_text('{"version":"1.0"}', encoding="utf-8")
+    config = snapshot / "tokenizer_config.json"
+    config.write_text(json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8")
+    receipt_path = tmp_path / "TOKENIZER_SNAPSHOT.json"
+    written = module.write_tokenizer_snapshot_receipt(snapshot, receipt_path)
+
+    expected = written.receipt_sha256
+    if mutation == "file":
+        tokenizer_json.write_text('{"version":"forged"}', encoding="utf-8")
+    elif mutation == "template":
+        config.write_text(json.dumps({"chat_template": "forged"}), encoding="utf-8")
+    elif mutation == "extra":
+        (snapshot / "undeclared.txt").write_text("extra", encoding="utf-8")
+    elif mutation == "directory":
+        (snapshot / "undeclared").mkdir()
+    elif mutation == "symlink":
+        (snapshot / "alias.json").symlink_to("tokenizer.json")
+    else:
+        expected = "f" * 64
+
+    with pytest.raises(ValueError, match=r"tokenizer snapshot|receipt"):
+        module.load_tokenizer_snapshot(receipt_path, expected)
+
+
 def test_inventory_reads_explicit_raw_json_parquet_shards(tmp_path: Path) -> None:
     module = _load_module()
     import pyarrow as pa  # pyright: ignore[reportMissingImports]
@@ -300,7 +385,7 @@ def test_candidate_inventory_verifies_every_source_before_parsing_rows(tmp_path:
 
 
 def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A full Task3 PTV2 inventory reaches the genuine B-prime publisher."""
     module = _load_module()
@@ -399,10 +484,22 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
         local_source_root=tmp_path / "local",
     )
 
+    tokenizer_root = tmp_path / "tokenizer"
+    tokenizer_root.mkdir()
+    (tokenizer_root / "tokenizer.json").write_text('{"version":"fixture"}', encoding="utf-8")
+    (tokenizer_root / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    tokenizer_receipt = tmp_path / "TOKENIZER_SNAPSHOT.json"
+    snapshot = module.write_tokenizer_snapshot_receipt(tokenizer_root, tokenizer_receipt)
+    monkeypatch.setattr(
+        module, "_load_tokenizer_from_snapshot", lambda _snapshot: CandidateTokenizer()
+    )
     candidates = module.build_candidate_inventory(
         inventory,
         tokenizer=CandidateTokenizer(),
-        tokenizer_sha256="f" * 64,
+        tokenizer_sha256=snapshot.tokenizer_sha256,
+        chat_template_sha256=snapshot.chat_template_sha256,
         baseline_exclusion=module.make_exclusion_receipt("baseline", ()),
         held_out_exclusion=module.make_exclusion_receipt("held-out", ()),
     )
@@ -439,8 +536,8 @@ def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
             candidates,
             policy,
             source_inventory=inventory,
-            tokenizer=CandidateTokenizer(),
-            tokenizer_sha256="f" * 64,
+            tokenizer_snapshot_receipt=tokenizer_receipt,
+            tokenizer_snapshot_receipt_sha256=snapshot.receipt_sha256,
             baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
             held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
         )

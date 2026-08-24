@@ -21,9 +21,14 @@ POLICY = MODULE_DIR / "qwen3_4b_ptv2_study.yaml"
 
 sys.path.insert(0, str(MODULE_DIR))
 try:
+    import build_specdec_inventory as inventory_module
     import qwen3_4b_ptv2_study as study_module
     from bprime_cd_policy import ArmPolicy, PromptCell, PromptPolicy
-    from build_specdec_inventory import build_candidate_inventory, make_exclusion_receipt
+    from build_specdec_inventory import (
+        build_candidate_inventory,
+        make_exclusion_receipt,
+        write_tokenizer_snapshot_receipt,
+    )
     from qwen3_4b_ptv2_study import (
         PTV2StudyError,
         PTV2StudyRecoveryError,
@@ -172,7 +177,9 @@ def _write_authenticated_staged_parquet(
     return receipt, staged_file
 
 
-def _genuine_scaled_task5_bundle(tmp_path: Path) -> BPrimePromptViewBundle:
+def _genuine_scaled_task5_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> BPrimePromptViewBundle:
     approved_ptv2_revision = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
     b_cells = {name: PromptCell(1) for name in ("stem", "japanese", "spanish", "french", "italian")}
     task5_policy = PromptPolicy(
@@ -260,16 +267,26 @@ def _genuine_scaled_task5_bundle(tmp_path: Path) -> BPrimePromptViewBundle:
     )
 
     class _Tokenizer:
-        tokenizer_sha256 = "d" * 64
-
         def apply_chat_template(self, messages, **kwargs):
             assert kwargs["add_generation_prompt"] is True
             return {"input_ids": list(range(1, len(messages) + 1))}
 
+    tokenizer_root = tmp_path / "task5-tokenizer"
+    tokenizer_root.mkdir()
+    (tokenizer_root / "tokenizer.json").write_text('{"version":"fixture"}', encoding="utf-8")
+    (tokenizer_root / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    tokenizer_receipt = tmp_path / "TASK5_TOKENIZER_SNAPSHOT.json"
+    snapshot = write_tokenizer_snapshot_receipt(tokenizer_root, tokenizer_receipt)
+    monkeypatch.setattr(
+        inventory_module, "_load_tokenizer_from_snapshot", lambda _snapshot: _Tokenizer()
+    )
     candidates = build_candidate_inventory(
         source_inventory,
         tokenizer=_Tokenizer(),
-        tokenizer_sha256="d" * 64,
+        tokenizer_sha256=snapshot.tokenizer_sha256,
+        chat_template_sha256=snapshot.chat_template_sha256,
         baseline_exclusion=make_exclusion_receipt("baseline", ()),
         held_out_exclusion=make_exclusion_receipt("held-out", ()),
         storage_dir=tmp_path / "task5-candidates",
@@ -279,8 +296,8 @@ def _genuine_scaled_task5_bundle(tmp_path: Path) -> BPrimePromptViewBundle:
             candidates,
             task5_policy,
             source_inventory=source_inventory,
-            tokenizer=_Tokenizer(),
-            tokenizer_sha256="d" * 64,
+            tokenizer_snapshot_receipt=tokenizer_receipt,
+            tokenizer_snapshot_receipt_sha256=snapshot.receipt_sha256,
             baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
             held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
         )
@@ -904,7 +921,66 @@ def test_staged_inventory_rejects_undeclared_orphan_parquet(
     orphan.write_bytes(staged_file.read_bytes())
 
     monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
-    with pytest.raises(PTV2StudyError, match="undeclared or missing Parquet"):
+    with pytest.raises(PTV2StudyError, match="physical shard set"):
+        tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))
+
+
+@pytest.mark.parametrize("entry_kind", ["file", "directory"])
+def test_staged_inventory_rejects_every_undeclared_lexical_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_kind: str
+) -> None:
+    """The authenticated sources tree is exact, not merely its Parquet suffix subset."""
+    receipt, staged_file = _write_authenticated_staged_parquet(tmp_path)
+    undeclared = staged_file.parent / "undeclared"
+    if entry_kind == "file":
+        undeclared.write_text("not in Task3", encoding="utf-8")
+    else:
+        undeclared.mkdir()
+
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+    with pytest.raises(PTV2StudyError, match="physical shard set"):
+        tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))
+
+
+def test_staged_inventory_rejects_path_swap_after_parquet_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pathname replacement during iteration cannot escape stable-FD authentication."""
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    receipt, staged_file = _write_authenticated_staged_parquet(tmp_path)
+    replacement = tmp_path / "replacement.parquet"
+    messages = [
+        json.dumps(
+            [
+                {"role": "user", "content": "mutated"},
+                {"role": "assistant", "content": "mutated-answer"},
+            ]
+        )
+    ] * 2
+    tools = [json.dumps([{"type": "function", "function": {"name": "tool"}}])] * 2
+    pq.write_table(pa.table({"messages": messages, "tools": tools}), replacement)
+    real_parquet_file = pq.ParquetFile
+
+    class _SwappingParquetFile:
+        def __init__(self, source):
+            self._inner = real_parquet_file(source)
+
+        @property
+        def schema_arrow(self):
+            return self._inner.schema_arrow
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def iter_batches(self, *args, **kwargs):
+            replacement.replace(staged_file)
+            yield from self._inner.iter_batches(*args, **kwargs)
+
+    monkeypatch.setattr(pq, "ParquetFile", _SwappingParquetFile)
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+
+    with pytest.raises(PTV2StudyError, match="changed during authentication"):
         tuple(iter_ptv2_staged_source_rows(receipt, policy=_fixture_policy()))
 
 
@@ -1011,7 +1087,13 @@ def test_task5_published_complement_joins_the_task3_physical_row_stream(
 
 
 @pytest.mark.parametrize(
-    "forged_field", ["source_conversation_sha256", "source_response_sha256"]
+    "forged_field",
+    [
+        "source_conversation_sha256",
+        "source_response_sha256",
+        "tokenizer_sha256",
+        "chat_template_sha256",
+    ],
 )
 def test_task5_join_rejects_forged_conversation_or_response_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forged_field: str
@@ -1049,13 +1131,25 @@ def test_task5_join_rejects_forged_conversation_or_response_identity(
             physical.canonical_conversation.encode("utf-8")
         ).hexdigest(),
         source_response_sha256=sha256(physical.assistant_response.encode("utf-8")).hexdigest(),
+        tokenizer_sha256="e" * 64,
+        chat_template_sha256="f" * 64,
     )
-    selected = replace(selected, **{forged_field: "f" * 64})
+    selected = replace(selected, **{forged_field: "0" * 64})
     view = PromptView(
-        "B-prime", (selected,), (), {"math": 1}, {"target-synth": 1}, {}, {}, {}, "d" * 64
+        "B-prime",
+        (selected,),
+        (),
+        {"math": 1},
+        {"target-synth": 1},
+        {},
+        {},
+        {},
+        "d" * 64,
+        "e" * 64,
+        "f" * 64,
     )
 
-    with pytest.raises(PTV2StudyError, match=r"conversation|response"):
+    with pytest.raises(PTV2StudyError, match=r"conversation|response|bound"):
         tuple(study_module._iter_task5_selected_rows(view, inventory_receipt, policy))
 
 
@@ -1080,10 +1174,10 @@ def test_ptv2_physical_stream_requires_a_terminal_assistant_response(
 
 
 def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A genuine Task5 selector/publication is replayed; a forged selection root is rejected."""
-    task5_bundle = _genuine_scaled_task5_bundle(tmp_path)
+    task5_bundle = _genuine_scaled_task5_bundle(tmp_path, monkeypatch)
     try:
         published = publish_bprime_prompt_view_bundle(
             task5_bundle, tmp_path / "task5", rows_per_shard=4

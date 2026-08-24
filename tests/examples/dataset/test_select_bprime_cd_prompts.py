@@ -47,6 +47,7 @@ try:
         build_candidate_inventory,
         candidate_inventory_sha256,
         make_exclusion_receipt,
+        write_tokenizer_snapshot_receipt,
     )
     from select_bprime_cd_prompts import (
         DiskBackedSelectedRows,
@@ -84,19 +85,37 @@ PTV2_SPLITS = (
 
 
 class _CandidateTokenizer:
-    tokenizer_sha256 = "d" * 64
-
     def apply_chat_template(self, messages, **kwargs):
         assert kwargs["add_generation_prompt"] is True
         return {"input_ids": list(range(1, len(messages) + 1))}
 
 
+def _authenticated_tokenizer_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "tokenizer"
+    root.mkdir(exist_ok=True)
+    (root / "tokenizer.json").write_text('{"version":"fixture"}', encoding="utf-8")
+    (root / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    receipt = tmp_path / "TOKENIZER_SNAPSHOT.json"
+    snapshot = write_tokenizer_snapshot_receipt(root, receipt)
+    monkeypatch.setattr(
+        inventory_module, "_load_tokenizer_from_snapshot", lambda _snapshot: _CandidateTokenizer()
+    )
+    return snapshot, {
+        "tokenizer_snapshot_receipt": receipt,
+        "tokenizer_snapshot_receipt_sha256": snapshot.receipt_sha256,
+    }
+
+
 def _genuine_task3_ptv2(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     *,
     splits: tuple[str, ...] = PTV2_SPLITS,
     omit_first_assistant: bool = False,
-) -> tuple[SourceInventory, CandidateInventory]:
+) -> tuple[SourceInventory, CandidateInventory, dict[str, object]]:
+    snapshot, tokenizer_arguments = _authenticated_tokenizer_snapshot(tmp_path, monkeypatch)
     local = tmp_path / "local"
     sources = []
     remaining = 201
@@ -158,12 +177,13 @@ def _genuine_task3_ptv2(
     candidates = build_candidate_inventory(
         staged,
         tokenizer=_CandidateTokenizer(),
-        tokenizer_sha256="d" * 64,
+        tokenizer_sha256=snapshot.tokenizer_sha256,
+        chat_template_sha256=snapshot.chat_template_sha256,
         baseline_exclusion=make_exclusion_receipt("baseline", ()),
         held_out_exclusion=make_exclusion_receipt("held-out", ()),
         storage_dir=tmp_path / "candidate-storage",
     )
-    return staged, candidates
+    return staged, candidates, tokenizer_arguments
 
 
 def _policy() -> PromptPolicy:
@@ -388,32 +408,33 @@ def _task3_ptv2_inventory(
     return source_inventory, _rehash(replace(candidates, rows=rows))
 
 
-def test_bprime_only_producer_rejects_self_hashed_unstaged_task3_inventory() -> None:
+def test_bprime_only_producer_rejects_self_hashed_unstaged_task3_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An in-memory descriptor graph is not an authenticated Task3 receipt."""
     source_inventory, candidates = _task3_ptv2_inventory(_ptv2_only_inventory())
+    _snapshot, tokenizer_arguments = _authenticated_tokenizer_snapshot(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="staged Task 3"):
         select_bprime_prompt_view(
             candidates,
             _policy(),
             source_inventory=source_inventory,
-            tokenizer=_CandidateTokenizer(),
-            tokenizer_sha256="d" * 64,
+            **tokenizer_arguments,
             baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
             held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
         )
 
 
 def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bprime(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The genuine 201-shard stage/build/select/publish path is executable."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     bundle = select_bprime_prompt_view(
         candidates,
         _policy(),
         source_inventory=source_inventory,
-        tokenizer=_CandidateTokenizer(),
-        tokenizer_sha256="d" * 64,
+        **tokenizer_arguments,
         baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
         held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
     )
@@ -434,22 +455,27 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         }
 
 
-def test_bprime_selection_preserves_source_response_identities(tmp_path: Path) -> None:
+def test_bprime_selection_preserves_source_response_identities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Task5 rows and their published reload bind the physical PTV2 response."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     bundle = select_bprime_prompt_view(
         candidates,
         _policy(),
         source_inventory=source_inventory,
-        tokenizer=_CandidateTokenizer(),
-        tokenizer_sha256="d" * 64,
+        **tokenizer_arguments,
         baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
         held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
     )
     try:
         selected = bundle.B_prime.primary_rows[0]
+        assert bundle.B_prime.tokenizer_sha256 == bundle.tokenizer_sha256
+        assert bundle.B_prime.chat_template_sha256 == bundle.chat_template_sha256
         assert selected.source_conversation_sha256 is not None
         assert selected.source_response_sha256 is not None
+        assert selected.tokenizer_sha256 == bundle.tokenizer_sha256
+        assert selected.chat_template_sha256 == bundle.chat_template_sha256
         published = publish_bprime_prompt_view_bundle(
             bundle, tmp_path / "response-bound", rows_per_shard=17
         )
@@ -468,11 +494,15 @@ def test_bprime_selection_preserves_source_response_identities(tmp_path: Path) -
     )
     assert loaded.primary_rows[0].source_conversation_sha256 is not None
     assert loaded.primary_rows[0].source_response_sha256 is not None
+    assert loaded.primary_rows[0].tokenizer_sha256 == loaded.tokenizer_sha256
+    assert loaded.primary_rows[0].chat_template_sha256 == loaded.chat_template_sha256
 
 
-def test_bprime_only_producer_rejects_ptv3_candidate_contamination(tmp_path: Path) -> None:
+def test_bprime_only_producer_rejects_ptv3_candidate_contamination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No PTV3 candidate can enter the physical PTV2-only producer."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     ptv3_row = next(row for row in _candidate_rows(_inventory()) if row.source_family == "ptv3")
     rows = (*_candidate_rows(candidates), ptv3_row)
     capacity = Counter(
@@ -485,8 +515,7 @@ def test_bprime_only_producer_rejects_ptv3_candidate_contamination(tmp_path: Pat
                 mixed,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -494,17 +523,20 @@ def test_bprime_only_producer_rejects_ptv3_candidate_contamination(tmp_path: Pat
         candidates.rows.close()
 
 
-def test_bprime_only_producer_rejects_wrong_task3_split_topology(tmp_path: Path) -> None:
+def test_bprime_only_producer_rejects_wrong_task3_split_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A staged 201-shard receipt must contain every approved split exactly once."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path, splits=PTV2_SPLITS[:-1])
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(
+        tmp_path, monkeypatch, splits=PTV2_SPLITS[:-1]
+    )
     try:
         with pytest.raises(ValueError, match="exactly 201"):
             select_bprime_prompt_view(
                 candidates,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -514,10 +546,10 @@ def test_bprime_only_producer_rejects_wrong_task3_split_topology(tmp_path: Path)
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "modified"])
 def test_bprime_only_producer_rejects_changed_physical_task3_shards(
-    tmp_path: Path, mutation: str
+    tmp_path: Path, mutation: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Physical staged shards remain an authenticated producer input."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     assert source_inventory.staged_root is not None
     first = next(
         path
@@ -537,8 +569,7 @@ def test_bprime_only_producer_rejects_changed_physical_task3_shards(
                 candidates,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -546,9 +577,11 @@ def test_bprime_only_producer_rejects_changed_physical_task3_shards(
         candidates.rows.close()
 
 
-def test_bprime_only_producer_rejects_undeclared_symlink_alias(tmp_path: Path) -> None:
+def test_bprime_only_producer_rejects_undeclared_symlink_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Resolved-path set equality must not hide an extra staged directory entry."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     assert source_inventory.staged_root is not None
     first = next(
         path
@@ -562,8 +595,7 @@ def test_bprime_only_producer_rejects_undeclared_symlink_alias(tmp_path: Path) -
                 candidates,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -575,7 +607,7 @@ def test_bprime_only_producer_rejects_source_mutation_during_stable_fd_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A shard changed after open cannot pass using its earlier authenticated digest."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     assert source_inventory.staged_root is not None
     source = source_inventory.sources[0]
     source_file = source.files[0]
@@ -604,8 +636,7 @@ def test_bprime_only_producer_rejects_source_mutation_during_stable_fd_scan(
                 candidates,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -613,13 +644,13 @@ def test_bprime_only_producer_rejects_source_mutation_during_stable_fd_scan(
         candidates.rows.close()
 
 
-def test_bprime_only_producer_rejects_rehashed_tokenization_and_capacity(tmp_path: Path) -> None:
+def test_bprime_only_producer_rejects_rehashed_tokenization_and_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Bucket capacity is derived from the pinned tokenizer, not candidate metadata."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     rows = list(_candidate_rows(candidates))
-    rows[0] = replace(
-        rows[0], context_bucket="16k_32k", full_token_count=20_000, input_ids=(999,)
-    )
+    rows[0] = replace(rows[0], context_bucket="16k_32k", full_token_count=20_000, input_ids=(999,))
     capacity = Counter(
         CandidateCell(row.domain, row.lane, row.language, row.context_bucket) for row in rows
     )
@@ -632,8 +663,7 @@ def test_bprime_only_producer_rejects_rehashed_tokenization_and_capacity(tmp_pat
                 forged,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -641,17 +671,19 @@ def test_bprime_only_producer_rejects_rehashed_tokenization_and_capacity(tmp_pat
         candidates.rows.close()
 
 
-def test_bprime_only_producer_rejects_mislabeled_tokenizer_adapter(tmp_path: Path) -> None:
-    """The digest argument cannot relabel a different tokenizer/template adapter."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+def test_bprime_only_producer_rejects_wrong_tokenizer_snapshot_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller cannot relabel a different tokenizer/template snapshot."""
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
+    tokenizer_arguments["tokenizer_snapshot_receipt_sha256"] = "e" * 64
     try:
-        with pytest.raises(ValueError, match="tokenizer adapter identity"):
+        with pytest.raises(ValueError, match="receipt SHA-256 mismatch"):
             select_bprime_prompt_view(
                 candidates,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="e" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -659,18 +691,34 @@ def test_bprime_only_producer_rejects_mislabeled_tokenizer_adapter(tmp_path: Pat
         candidates.rows.close()
 
 
-def test_bprime_only_producer_rejects_missing_source_native_response(tmp_path: Path) -> None:
+def test_bprime_only_producer_has_no_caller_adapter_surface() -> None:
+    """A lying caller adapter cannot be supplied to production verification."""
+    with pytest.raises(TypeError, match="unexpected keyword argument 'tokenizer'"):
+        select_bprime_prompt_view(  # type: ignore[call-arg]
+            _ptv2_only_inventory(),
+            _policy(),
+            source_inventory=cast("SourceInventory", object()),
+            tokenizer=_CandidateTokenizer(),
+            tokenizer_sha256="d" * 64,
+            baseline_receipt_sha256=BASELINE_RECEIPT_SHA256,
+            held_out_receipt_sha256=HELD_OUT_RECEIPT_SHA256,
+        )
+
+
+def test_bprime_only_producer_rejects_missing_source_native_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Every PTV2 target-synthesis candidate must bind a terminal assistant response."""
     with pytest.raises(ValueError, match="source-native assistant response"):
-        _genuine_task3_ptv2(tmp_path, omit_first_assistant=True)
+        _genuine_task3_ptv2(tmp_path, monkeypatch, omit_first_assistant=True)
 
 
 @pytest.mark.parametrize("mutation", ["row", "uuid", "canonical"])
 def test_bprime_only_producer_rejects_candidate_not_on_its_physical_row(
-    tmp_path: Path, mutation: str
+    tmp_path: Path, mutation: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rehashing forged candidate metadata cannot create physical membership."""
-    source_inventory, candidates = _genuine_task3_ptv2(tmp_path)
+    source_inventory, candidates, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     rows = list(_candidate_rows(candidates))
     if mutation == "row":
         rows[0] = replace(rows[0], source_row_index=100_000)
@@ -685,8 +733,7 @@ def test_bprime_only_producer_rejects_candidate_not_on_its_physical_row(
                 forged,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
             )
@@ -702,10 +749,13 @@ def test_bprime_only_producer_rejects_candidate_not_on_its_physical_row(
     ],
 )
 def test_bprime_only_producer_rejects_wrong_ptv2_cell_or_language(
-    tmp_path: Path, replacement: dict[str, str], message: str
+    tmp_path: Path,
+    replacement: dict[str, str],
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Noncanonical Task3-to-Task5 cell mappings cannot enter the complement."""
-    source_inventory, inventory = _genuine_task3_ptv2(tmp_path)
+    source_inventory, inventory, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     rows = list(_candidate_rows(inventory))
     rows[0] = replace(rows[0], **replacement)
     capacity = Counter(
@@ -720,8 +770,7 @@ def test_bprime_only_producer_rejects_wrong_ptv2_cell_or_language(
                 forged,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=inventory.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=inventory.held_out_exclusion.receipt_sha256,
             )
@@ -729,9 +778,11 @@ def test_bprime_only_producer_rejects_wrong_ptv2_cell_or_language(
         inventory.rows.close()
 
 
-def test_bprime_only_producer_rejects_wrong_source_digest(tmp_path: Path) -> None:
+def test_bprime_only_producer_rejects_wrong_source_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The dedicated producer authenticates the full Task3 shard and row identities."""
-    source_inventory, inventory = _genuine_task3_ptv2(tmp_path)
+    source_inventory, inventory, tokenizer_arguments = _genuine_task3_ptv2(tmp_path, monkeypatch)
     forged_rows = list(_candidate_rows(inventory))
     forged_rows[0] = replace(forged_rows[0], source_file_sha256="f" * 64)
     forged = _rehash(replace(inventory, rows=tuple(forged_rows)))
@@ -741,8 +792,7 @@ def test_bprime_only_producer_rejects_wrong_source_digest(tmp_path: Path) -> Non
                 forged,
                 _policy(),
                 source_inventory=source_inventory,
-                tokenizer=_CandidateTokenizer(),
-                tokenizer_sha256="d" * 64,
+                **tokenizer_arguments,
                 baseline_receipt_sha256=inventory.baseline_exclusion.receipt_sha256,
                 held_out_receipt_sha256=inventory.held_out_exclusion.receipt_sha256,
             )

@@ -826,6 +826,16 @@ def load_prompt_view(
         non_agentic_bucket_floors=_freeze_nested(arm_record["non_agentic_bucket_floors"]),
         lane_bucket_floors=_freeze_nested(arm_record["lane_bucket_floors"]),
         count_proof_sha256=str(arm_record["count_proof_sha256"]),
+        tokenizer_sha256=(
+            str(manifest["identity"]["tokenizer_sha256"])
+            if "tokenizer_sha256" in manifest.get("identity", {})
+            else None
+        ),
+        chat_template_sha256=(
+            str(manifest["identity"]["chat_template_sha256"])
+            if "chat_template_sha256" in manifest.get("identity", {})
+            else None
+        ),
     )
     object.__setattr__(view, "selection_sha256", str(manifest["selection_sha256"]))
     object.__setattr__(view, "paired_cd_sha256", str(manifest["paired_cd_sha256"]))

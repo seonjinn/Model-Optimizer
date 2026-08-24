@@ -25,7 +25,7 @@ import tempfile
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
@@ -37,7 +37,6 @@ from build_specdec_inventory import (
     APPROVED_PTV2_REVISION,
     CandidateInventory,
     CandidatePrompt,
-    CandidateTokenizer,
     candidate_inventory_sha256,
     is_approved_ptv2_source,
     verify_candidate_inventory_membership,
@@ -123,6 +122,8 @@ class SelectedPrompt:
     canonical_prompt_json: str
     source_conversation_sha256: str | None = None
     source_response_sha256: str | None = None
+    tokenizer_sha256: str | None = None
+    chat_template_sha256: str | None = None
 
     @property
     def canonical_prompt(self) -> Any:
@@ -143,6 +144,8 @@ class PromptView:
     non_agentic_bucket_floors: Mapping[str, Mapping[str, int]]
     lane_bucket_floors: Mapping[str, Mapping[str, int]]
     count_proof_sha256: str
+    tokenizer_sha256: str | None = None
+    chat_template_sha256: str | None = None
 
     @property
     def primary_prompt_ids(self) -> Sequence[str]:
@@ -236,6 +239,8 @@ class BPrimePromptViewBundle:
     paired_cd_sha256: str
     selection_sha256: str
     _storage: _SelectionStorage
+    tokenizer_sha256: str
+    chat_template_sha256: str
 
     @property
     def selection_digest(self) -> str:
@@ -597,8 +602,8 @@ def select_bprime_prompt_view(
     policy: PromptPolicy,
     *,
     source_inventory: SourceInventory,
-    tokenizer: CandidateTokenizer,
-    tokenizer_sha256: str,
+    tokenizer_snapshot_receipt: Path,
+    tokenizer_snapshot_receipt_sha256: str,
     baseline_receipt_sha256: str,
     held_out_receipt_sha256: str,
 ) -> BPrimePromptViewBundle:
@@ -620,9 +625,14 @@ def select_bprime_prompt_view(
         verify_candidate_inventory_membership(
             inventory,
             authenticated_source_inventory,
-            tokenizer=tokenizer,
-            tokenizer_sha256=tokenizer_sha256,
+            tokenizer_snapshot_receipt=tokenizer_snapshot_receipt,
+            tokenizer_snapshot_receipt_sha256=tokenizer_snapshot_receipt_sha256,
         )
+        first = inventory.rows[0]
+        if not isinstance(first, CandidatePrompt) or first.chat_template_sha256 is None:
+            raise ValueError("B-prime candidates lack authenticated tokenizer/template identity")
+        tokenizer_sha256 = first.tokenizer_sha256
+        chat_template_sha256 = first.chat_template_sha256
         connection = storage.open_working_connection()
         _create_selection_schema(connection)
         _spool_candidates(connection, inventory.rows, policy)
@@ -646,7 +656,11 @@ def select_bprime_prompt_view(
             )
         _assign_selection_indexes(connection)
         connection.commit()
-        view = _build_disk_view(storage, "B-prime", floors_by_cell, policy, (), {})
+        view = replace(
+            _build_disk_view(storage, "B-prime", floors_by_cell, policy, (), {}),
+            tokenizer_sha256=tokenizer_sha256,
+            chat_template_sha256=chat_template_sha256,
+        )
         paired_cd_sha256 = "0" * 64
         metadata = {
             "schema_version": 2,
@@ -659,6 +673,8 @@ def select_bprime_prompt_view(
             "ptv2_revision": inventory.ptv2_revision,
             "ptv2_allowlist_sha256": inventory.ptv2_allowlist_sha256,
             "paired_cd_sha256": paired_cd_sha256,
+            "tokenizer_sha256": tokenizer_sha256,
+            "chat_template_sha256": chat_template_sha256,
             "arms": {view.arm: _compact_view_record(view)},
         }
         selection_sha256 = _stream_selection_digest(connection, metadata)
@@ -677,6 +693,8 @@ def select_bprime_prompt_view(
             paired_cd_sha256=paired_cd_sha256,
             selection_sha256=selection_sha256,
             _storage=storage,
+            tokenizer_sha256=tokenizer_sha256,
+            chat_template_sha256=chat_template_sha256,
         )
     except BaseException:
         storage.close()
@@ -953,27 +971,31 @@ def _create_selection_schema(connection: sqlite3.Connection) -> None:
 
 
 def _candidate_payload(candidate: CandidatePrompt) -> str:
+    payload: dict[str, Any] = {
+        "prompt_uuid": candidate.prompt_uuid,
+        "domain": candidate.domain,
+        "lane": candidate.lane,
+        "language": candidate.language,
+        "context_bucket": candidate.context_bucket,
+        "source_id": candidate.source_id,
+        "source_family": candidate.source_family,
+        "source_repository_id": candidate.source_repository_id,
+        "source_configuration": candidate.source_configuration,
+        "source_split": candidate.source_split,
+        "source_revision": candidate.source_revision,
+        "source_file_sha256": candidate.source_file_sha256,
+        "source_manifest_sha256": candidate.source_manifest_sha256,
+        "source_file_path": candidate.source_file_path,
+        "source_row_index": candidate.source_row_index,
+        "source_conversation_sha256": candidate.source_conversation_sha256,
+        "source_response_sha256": candidate.source_response_sha256,
+        "canonical_prompt_json": candidate.canonical_bytes.decode("utf-8"),
+    }
+    if candidate.chat_template_sha256 is not None:
+        payload["tokenizer_sha256"] = candidate.tokenizer_sha256
+        payload["chat_template_sha256"] = candidate.chat_template_sha256
     return json.dumps(
-        {
-            "prompt_uuid": candidate.prompt_uuid,
-            "domain": candidate.domain,
-            "lane": candidate.lane,
-            "language": candidate.language,
-            "context_bucket": candidate.context_bucket,
-            "source_id": candidate.source_id,
-            "source_family": candidate.source_family,
-            "source_repository_id": candidate.source_repository_id,
-            "source_configuration": candidate.source_configuration,
-            "source_split": candidate.source_split,
-            "source_revision": candidate.source_revision,
-            "source_file_sha256": candidate.source_file_sha256,
-            "source_manifest_sha256": candidate.source_manifest_sha256,
-            "source_file_path": candidate.source_file_path,
-            "source_row_index": candidate.source_row_index,
-            "source_conversation_sha256": candidate.source_conversation_sha256,
-            "source_response_sha256": candidate.source_response_sha256,
-            "canonical_prompt_json": candidate.canonical_bytes.decode("utf-8"),
-        },
+        payload,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -1490,6 +1512,9 @@ def _publish_prompt_view_bundle(
             "shards": shards,
             "index": {"path": "selection-index.sqlite3", "sha256": index_sha256},
         }
+        if isinstance(bundle, BPrimePromptViewBundle):
+            manifest["identity"]["tokenizer_sha256"] = bundle.tokenizer_sha256
+            manifest["identity"]["chat_template_sha256"] = bundle.chat_template_sha256
         if selection_mode is not None:
             manifest["selection_mode"] = selection_mode
         root_sha256 = sha256_bytes(canonical_json(manifest))
@@ -1720,7 +1745,7 @@ def _plain_floors(floors: Mapping[str, Mapping[str, int]]) -> dict[str, dict[str
 
 
 def _selected_manifest_record(row: SelectedPrompt) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "prompt_uuid": row.prompt_uuid,
         "arm": row.arm,
         "domain": row.domain,
@@ -1745,3 +1770,7 @@ def _selected_manifest_record(row: SelectedPrompt) -> dict[str, Any]:
         "source_response_sha256": row.source_response_sha256,
         "canonical_prompt": row.canonical_prompt,
     }
+    if row.chat_template_sha256 is not None:
+        record["tokenizer_sha256"] = row.tokenizer_sha256
+        record["chat_template_sha256"] = row.chat_template_sha256
+    return record

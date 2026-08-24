@@ -57,17 +57,22 @@ __all__ = [
     "SourceFile",
     "SourceIdentity",
     "SourceInventory",
+    "TokenizerSnapshot",
+    "TokenizerSnapshotFile",
     "UUIDCollisionError",
     "build_candidate_inventory",
+    "build_candidate_inventory_from_snapshot",
     "build_inventory_rows",
     "candidate_inventory_bytes",
     "candidate_inventory_sha256",
     "is_approved_ptv2_source",
     "iter_candidate_inventory_bytes",
+    "load_tokenizer_snapshot",
     "make_exclusion_receipt",
     "sha256_file",
     "tokenizer_snapshot_sha256",
     "verify_candidate_inventory_membership",
+    "write_tokenizer_snapshot_receipt",
 ]
 
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -127,6 +132,41 @@ _CANDIDATE_QUARANTINE_CODES = frozenset(
         "wrong_lane",
     }
 )
+_TOKENIZER_FILE_NAMES = frozenset(
+    {
+        "added_tokens.json",
+        "chat_template.jinja",
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "vocab.json",
+        "vocab.txt",
+    }
+)
+
+
+@dataclass(frozen=True)
+class TokenizerSnapshotFile:
+    """One exact regular file in an immutable tokenizer snapshot."""
+
+    path: str
+    bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class TokenizerSnapshot:
+    """Authenticated tokenizer files plus the effective chat-template identity."""
+
+    root: Path
+    files: tuple[TokenizerSnapshotFile, ...]
+    tokenizer_sha256: str
+    chat_template_sha256: str
+    chat_template_canonical_json: str
+    root_sha256: str
+    receipt_sha256: str
 
 
 @dataclass(frozen=True)
@@ -140,9 +180,7 @@ class CandidateCell:
 
 
 class CandidateTokenizer(Protocol):
-    """Exact pinned chat-template adapter used to authenticate candidate tokenization."""
-
-    tokenizer_sha256: str
+    """Tokenizer loaded from an authenticated local snapshot."""
 
     def apply_chat_template(self, messages: Any, **kwargs: Any) -> Any:
         """Return token IDs for the supplied canonical prompt."""
@@ -245,6 +283,7 @@ class CandidatePrompt(CanonicalPrompt):
     source_split: str
     source_conversation_sha256: str | None = None
     source_response_sha256: str | None = None
+    chat_template_sha256: str | None = None
 
     @property
     def arm_domain(self) -> str:
@@ -274,6 +313,7 @@ _CANDIDATE_COLUMNS = (
     "source_split",
     "source_conversation_sha256",
     "source_response_sha256",
+    "chat_template_sha256",
 )
 
 
@@ -337,6 +377,7 @@ class DiskBackedCandidateRows(Sequence[CandidatePrompt]):
             source_split=values["source_split"],
             source_conversation_sha256=values["source_conversation_sha256"],
             source_response_sha256=values["source_response_sha256"],
+            chat_template_sha256=values["chat_template_sha256"],
         )
 
     def __iter__(self):
@@ -425,18 +466,9 @@ def sha256_file(path: Path) -> str:
 
 def tokenizer_snapshot_sha256(root: Path) -> str:
     """Hash tokenizer serialization files without hashing model weights."""
-    names = {
-        "added_tokens.json",
-        "chat_template.jinja",
-        "merges.txt",
-        "special_tokens_map.json",
-        "tokenizer.json",
-        "tokenizer.model",
-        "tokenizer_config.json",
-        "vocab.json",
-        "vocab.txt",
-    }
-    files = sorted(path for path in root.iterdir() if path.is_file() and path.name in names)
+    files = sorted(
+        path for path in root.iterdir() if path.is_file() and path.name in _TOKENIZER_FILE_NAMES
+    )
     if not files:
         raise ValueError("tokenizer snapshot contains no serialization files")
     digest = hashlib.sha256()
@@ -445,6 +477,202 @@ def tokenizer_snapshot_sha256(root: Path) -> str:
         digest.update(b"\0")
         digest.update(bytes.fromhex(sha256_file(path)))
     return digest.hexdigest()
+
+
+def _tokenizer_chat_template(root: Path) -> Any:
+    template_path = root / "chat_template.jinja"
+    if template_path.is_file():
+        return template_path.read_text(encoding="utf-8")
+    config_path = root / "tokenizer_config.json"
+    if not config_path.is_file():
+        raise ValueError("tokenizer snapshot has no chat template")
+    try:
+        config = json.loads(config_path.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("tokenizer snapshot config is invalid") from error
+    template = config.get("chat_template") if isinstance(config, dict) else None
+    if template is None:
+        raise ValueError("tokenizer snapshot has no chat template")
+    return template
+
+
+def _snapshot_file_records(root: Path) -> tuple[TokenizerSnapshotFile, ...]:
+    try:
+        tree = _staged_tree_snapshot(root)
+    except (OSError, ValueError) as error:
+        raise ValueError("tokenizer snapshot physical file set is invalid") from error
+    actual_files = {
+        relative
+        for relative, identity in tree.items()
+        if relative != "." and stat.S_ISREG(identity[0])
+    }
+    if (
+        set(tree) != {".", *actual_files}
+        or not actual_files
+        or any(
+            "/" in relative or relative not in _TOKENIZER_FILE_NAMES for relative in actual_files
+        )
+    ):
+        raise ValueError("tokenizer snapshot has an unsupported physical file set")
+    records: list[TokenizerSnapshotFile] = []
+    for relative in sorted(actual_files):
+        path = root / relative
+        observed = os.lstat(path)
+        descriptor = SourceFile(relative, observed.st_size, sha256_file(path))
+        file_descriptor, initial = _open_verified_source_fd(path, descriptor)
+        try:
+            _verify_source_fd_stable(file_descriptor, initial, path, descriptor)
+        finally:
+            os.close(file_descriptor)
+        records.append(TokenizerSnapshotFile(relative, descriptor.bytes, descriptor.sha256))
+    try:
+        final_tree = _staged_tree_snapshot(root)
+    except (OSError, ValueError) as error:
+        raise ValueError("tokenizer snapshot physical file set is invalid") from error
+    if final_tree != tree:
+        raise ValueError("tokenizer snapshot changed during authentication")
+    return tuple(records)
+
+
+def _tokenizer_snapshot_payload(root_name: str, root: Path) -> dict[str, Any]:
+    try:
+        initial_tree = _staged_tree_snapshot(root)
+    except (OSError, ValueError) as error:
+        raise ValueError("tokenizer snapshot physical file set is invalid") from error
+    files = _snapshot_file_records(root)
+    canonical_template = canonical_json(_tokenizer_chat_template(root)).decode("utf-8")
+    payload = {
+        "schema_version": 1,
+        "kind": "specdec-tokenizer-snapshot",
+        "snapshot_path": root_name,
+        "files": [asdict(record) for record in files],
+        "tokenizer_sha256": tokenizer_snapshot_sha256(root),
+        "chat_template_canonical_json": canonical_template,
+        "chat_template_sha256": sha256_bytes(canonical_template.encode("utf-8")),
+    }
+    try:
+        final_tree = _staged_tree_snapshot(root)
+    except (OSError, ValueError) as error:
+        raise ValueError("tokenizer snapshot physical file set is invalid") from error
+    if final_tree != initial_tree:
+        raise ValueError("tokenizer snapshot changed during authentication")
+    return payload
+
+
+def write_tokenizer_snapshot_receipt(root: Path, receipt_path: Path) -> TokenizerSnapshot:
+    """Publish a typed immutable receipt for a dedicated local tokenizer snapshot."""
+    receipt_parent = receipt_path.parent.resolve(strict=True)
+    lexical_root = root.absolute()
+    try:
+        root_name = lexical_root.relative_to(receipt_parent).as_posix()
+    except ValueError as error:
+        raise ValueError("tokenizer snapshot must be below its receipt directory") from error
+    payload = _tokenizer_snapshot_payload(root_name, lexical_root)
+    payload["root_sha256"] = sha256_bytes(canonical_json(payload))
+    encoded = canonical_json(payload) + b"\n"
+    try:
+        with receipt_path.open("xb") as receipt:
+            receipt.write(encoded)
+            receipt.flush()
+            os.fsync(receipt.fileno())
+    except FileExistsError as error:
+        raise ValueError("tokenizer snapshot receipt already exists") from error
+    return load_tokenizer_snapshot(receipt_path, sha256_bytes(encoded))
+
+
+def load_tokenizer_snapshot(receipt_path: Path, expected_receipt_sha256: str) -> TokenizerSnapshot:
+    """Load and independently authenticate a caller-pinned tokenizer snapshot receipt."""
+    if _SHA256.fullmatch(expected_receipt_sha256) is None:
+        raise ValueError("tokenizer snapshot receipt SHA-256 is invalid")
+    try:
+        observed = os.lstat(receipt_path)
+        receipt_descriptor = SourceFile(
+            receipt_path.name, observed.st_size, expected_receipt_sha256
+        )
+        descriptor, initial = _open_verified_source_fd(receipt_path, receipt_descriptor)
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(descriptor), "rb") as stream:
+                raw = stream.read()
+            _verify_source_fd_stable(descriptor, initial, receipt_path, receipt_descriptor)
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError) as error:
+        raise ValueError("tokenizer snapshot receipt SHA-256 mismatch") from error
+    receipt_sha256 = sha256_bytes(raw)
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("tokenizer snapshot receipt is invalid") from error
+    if raw != canonical_json(payload) + b"\n" or not isinstance(payload, dict):
+        raise ValueError("tokenizer snapshot receipt is not canonical")
+    required = {
+        "schema_version",
+        "kind",
+        "snapshot_path",
+        "files",
+        "tokenizer_sha256",
+        "chat_template_canonical_json",
+        "chat_template_sha256",
+        "root_sha256",
+    }
+    if (
+        set(payload) != required
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "specdec-tokenizer-snapshot"
+    ):
+        raise ValueError("tokenizer snapshot receipt schema mismatch")
+    root_record = {key: value for key, value in payload.items() if key != "root_sha256"}
+    if payload["root_sha256"] != sha256_bytes(canonical_json(root_record)):
+        raise ValueError("tokenizer snapshot receipt root mismatch")
+    relative = Path(str(payload["snapshot_path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("tokenizer snapshot path is not lexical and relative")
+    root = receipt_path.parent.resolve(strict=True) / relative
+    expected_payload = _tokenizer_snapshot_payload(relative.as_posix(), root)
+    if expected_payload != root_record:
+        raise ValueError("tokenizer snapshot physical identity mismatch")
+    records = tuple(TokenizerSnapshotFile(**record) for record in payload["files"])
+    return TokenizerSnapshot(
+        root,
+        records,
+        str(payload["tokenizer_sha256"]),
+        str(payload["chat_template_sha256"]),
+        str(payload["chat_template_canonical_json"]),
+        str(payload["root_sha256"]),
+        receipt_sha256,
+    )
+
+
+def _load_tokenizer_from_snapshot(snapshot: TokenizerSnapshot) -> CandidateTokenizer:
+    """Load only the locally authenticated serialization represented by ``snapshot``."""
+    try:
+        from transformers import AutoTokenizer  # pyright: ignore[reportMissingImports]
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            snapshot.root,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+    except Exception as error:
+        raise ValueError("authenticated tokenizer snapshot cannot be loaded locally") from error
+    try:
+        loaded_template = canonical_json(getattr(tokenizer, "chat_template"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("loaded tokenizer chat template is invalid") from error
+    if sha256_bytes(loaded_template) != snapshot.chat_template_sha256:
+        raise ValueError("loaded tokenizer chat template identity mismatch")
+    return tokenizer
+
+
+def _authenticated_snapshot_tokenizer(
+    receipt_path: Path, expected_receipt_sha256: str
+) -> tuple[TokenizerSnapshot, CandidateTokenizer]:
+    snapshot = load_tokenizer_snapshot(receipt_path, expected_receipt_sha256)
+    tokenizer = _load_tokenizer_from_snapshot(snapshot)
+    if load_tokenizer_snapshot(receipt_path, expected_receipt_sha256) != snapshot:
+        raise ValueError("tokenizer snapshot changed while loading")
+    return snapshot, tokenizer
 
 
 @dataclass(frozen=True)
@@ -564,7 +792,9 @@ def _iter_candidate_rows_fd(descriptor: int, suffix: str):
                     if isinstance(raw_row, dict) and set(raw_row) == {"raw_json"}:
                         encoded = raw_row["raw_json"]
                         try:
-                            value = json.loads(encoded) if isinstance(encoded, str | bytes) else None
+                            value = (
+                                json.loads(encoded) if isinstance(encoded, str | bytes) else None
+                            )
                         except (UnicodeDecodeError, json.JSONDecodeError):
                             value = None
                     yield row_index, value if isinstance(value, dict) else None
@@ -599,7 +829,7 @@ def _staged_tree_snapshot(root: Path) -> dict[str, tuple[int, int, int, int, int
     """Capture lexical staged-tree identities while rejecting links and special files."""
     root_stat = os.lstat(root)
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
-        raise ValueError("staged Task 3 sources root is not a no-follow directory")
+        raise ValueError("authenticated physical shard root is not a no-follow directory")
     snapshot = {
         ".": (root_stat.st_mode, *_stable_stat_identity(root_stat)),
     }
@@ -607,11 +837,21 @@ def _staged_tree_snapshot(root: Path) -> dict[str, tuple[int, int, int, int, int
         observed = os.lstat(path)
         relative = path.relative_to(root).as_posix()
         if stat.S_ISLNK(observed.st_mode):
-            raise ValueError("staged Task 3 physical shard set contains a symlink")
+            raise ValueError("authenticated physical shard set contains a symlink")
         if not stat.S_ISREG(observed.st_mode) and not stat.S_ISDIR(observed.st_mode):
-            raise ValueError("staged Task 3 physical shard set contains a non-regular entry")
+            raise ValueError("authenticated physical shard set contains a non-regular entry")
         snapshot[relative] = (observed.st_mode, *_stable_stat_identity(observed))
     return snapshot
+
+
+def _expected_staged_tree_entries(root: Path, files: Sequence[Path]) -> frozenset[str]:
+    """Return every lexical file and ancestor directory permitted below ``root``."""
+    entries = {"."}
+    for path in files:
+        relative = path.relative_to(root)
+        entries.add(relative.as_posix())
+        entries.update(parent.as_posix() for parent in relative.parents if parent != Path("."))
+    return frozenset(entries)
 
 
 def _open_verified_source_fd(path: Path, source_file: SourceFile) -> tuple[int, os.stat_result]:
@@ -622,7 +862,9 @@ def _open_verified_source_fd(path: Path, source_file: SourceFile) -> tuple[int, 
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ValueError(f"source file is not a no-follow regular file: {source_file.path}") from error
+        raise ValueError(
+            f"source file is not a no-follow regular file: {source_file.path}"
+        ) from error
     initial = os.fstat(descriptor)
     if (
         not stat.S_ISREG(initial.st_mode)
@@ -641,7 +883,9 @@ def _verify_source_fd_stable(
     try:
         pathname = os.lstat(path)
     except OSError as error:
-        raise ValueError(f"source file changed during authentication: {source_file.path}") from error
+        raise ValueError(
+            f"source file changed during authentication: {source_file.path}"
+        ) from error
     if (
         _stable_stat_identity(final) != _stable_stat_identity(initial)
         or stat.S_ISLNK(pathname.st_mode)
@@ -798,8 +1042,7 @@ def _ptv2_target_prompt_identity(
     if not prompt_messages:
         raise ValueError("missing_messages")
     has_tool_exchange = bool(tools) or any(
-        message.get("role") == "tool" or message.get("tool_calls")
-        for message in prompt_messages
+        message.get("role") == "tool" or message.get("tool_calls") for message in prompt_messages
     )
     if has_tool_exchange:
         raise ValueError("wrong_lane")
@@ -865,7 +1108,8 @@ def _create_candidate_database(path: Path) -> sqlite3.Connection:
             source_configuration TEXT NOT NULL,
             source_split TEXT NOT NULL,
             source_conversation_sha256 TEXT,
-            source_response_sha256 TEXT
+            source_response_sha256 TEXT,
+            chat_template_sha256 TEXT
         ) WITHOUT ROWID
         """
     )
@@ -899,12 +1143,13 @@ def _insert_candidate(connection: sqlite3.Connection, candidate: CandidatePrompt
             candidate.source_split,
             candidate.source_conversation_sha256,
             candidate.source_response_sha256,
+            candidate.chat_template_sha256,
         ),
     )
 
 
 def _candidate_record(prompt: CandidatePrompt) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "type": "candidate",
         "prompt_uuid": prompt.prompt_uuid,
         "canonical_prompt": json.loads(prompt.canonical_bytes),
@@ -929,6 +1174,9 @@ def _candidate_record(prompt: CandidatePrompt) -> dict[str, Any]:
         "source_conversation_sha256": prompt.source_conversation_sha256,
         "source_response_sha256": prompt.source_response_sha256,
     }
+    if prompt.chat_template_sha256 is not None:
+        record["chat_template_sha256"] = prompt.chat_template_sha256
+    return record
 
 
 def _capacity_records(capacity: Mapping[CandidateCell, int]) -> list[dict[str, Any]]:
@@ -981,13 +1229,18 @@ def build_candidate_inventory(
     *,
     tokenizer: Any,
     tokenizer_sha256: str,
+    chat_template_sha256: str | None = None,
     baseline_exclusion: ExclusionReceipt,
     held_out_exclusion: ExclusionReceipt,
     training_seq_len: int = 4_096,
     storage_dir: Path | None = None,
 ) -> CandidateInventory:
     """Build canonical B-prime/C/D candidates from one verified staged inventory."""
-    if _SHA256.fullmatch(tokenizer_sha256) is None or training_seq_len < 1:
+    if (
+        _SHA256.fullmatch(tokenizer_sha256) is None
+        or (chat_template_sha256 is not None and _SHA256.fullmatch(chat_template_sha256) is None)
+        or training_seq_len < 1
+    ):
         raise ValueError("tokenizer and training sequence length must be pinned")
     historical_prompt_ids = _validate_exclusion_receipt(baseline_exclusion, "baseline")
     held_out_prompt_ids = _validate_exclusion_receipt(held_out_exclusion, "held-out")
@@ -1095,12 +1348,15 @@ def build_candidate_inventory(
                     source_split=source.split,
                     source_conversation_sha256=source_conversation_sha256,
                     source_response_sha256=source_response_sha256,
+                    chat_template_sha256=chat_template_sha256,
                 )
                 _insert_candidate(connection, candidate)
                 accepted_count += 1
                 if accepted_count % 10_000 == 0:
                     connection.commit()
-                cell = CandidateCell(_candidate_domain(source), source.lane, language, context_bucket)
+                cell = CandidateCell(
+                    _candidate_domain(source), source.lane, language, context_bucket
+                )
                 capacity[cell] = capacity.get(cell, 0) + 1
         connection.commit()
     except BaseException:
@@ -1164,38 +1420,60 @@ def build_candidate_inventory(
     )
 
 
+def build_candidate_inventory_from_snapshot(
+    source_inventory: SourceInventory,
+    *,
+    tokenizer_snapshot_receipt: Path,
+    tokenizer_snapshot_receipt_sha256: str,
+    baseline_exclusion: ExclusionReceipt,
+    held_out_exclusion: ExclusionReceipt,
+    training_seq_len: int = 4_096,
+    storage_dir: Path | None = None,
+) -> CandidateInventory:
+    """Build candidates with a tokenizer loaded from a caller-pinned local snapshot."""
+    snapshot, tokenizer = _authenticated_snapshot_tokenizer(
+        tokenizer_snapshot_receipt, tokenizer_snapshot_receipt_sha256
+    )
+    inventory = build_candidate_inventory(
+        source_inventory,
+        tokenizer=tokenizer,
+        tokenizer_sha256=snapshot.tokenizer_sha256,
+        chat_template_sha256=snapshot.chat_template_sha256,
+        baseline_exclusion=baseline_exclusion,
+        held_out_exclusion=held_out_exclusion,
+        training_seq_len=training_seq_len,
+        storage_dir=storage_dir,
+    )
+    if (
+        load_tokenizer_snapshot(tokenizer_snapshot_receipt, tokenizer_snapshot_receipt_sha256)
+        != snapshot
+    ):
+        inventory.close()
+        raise ValueError("tokenizer snapshot changed while building candidates")
+    return inventory
+
+
 def verify_candidate_inventory_membership(
     inventory: CandidateInventory,
     source_inventory: SourceInventory,
     *,
-    tokenizer: CandidateTokenizer,
-    tokenizer_sha256: str,
+    tokenizer_snapshot_receipt: Path,
+    tokenizer_snapshot_receipt_sha256: str,
 ) -> None:
     """Rejoin every candidate to its authenticated staged physical source row."""
-    if _SHA256.fullmatch(tokenizer_sha256) is None:
-        raise ValueError("physical membership requires an exact tokenizer digest")
-    if getattr(tokenizer, "tokenizer_sha256", None) != tokenizer_sha256:
-        raise ValueError("physical membership tokenizer adapter identity mismatch")
+    snapshot, tokenizer = _authenticated_snapshot_tokenizer(
+        tokenizer_snapshot_receipt, tokenizer_snapshot_receipt_sha256
+    )
+    tokenizer_sha256 = snapshot.tokenizer_sha256
     files = _verified_candidate_files(source_inventory)
     assert source_inventory.staged_root is not None
     staged_root = source_inventory.staged_root.resolve(strict=True)
     sources_root = staged_root / "sources"
-    expected_paths = {
-        (
-            Path("sources")
-            / source.repository_id
-            / source.revision
-            / source_file.path
-        ).as_posix()
-        for source, source_file, _path in files
-    }
     initial_tree = _staged_tree_snapshot(sources_root)
-    actual_paths = {
-        (Path("sources") / relative).as_posix()
-        for relative, identity in initial_tree.items()
-        if relative != "." and stat.S_ISREG(identity[0])
-    }
-    if actual_paths != expected_paths:
+    expected_tree = _expected_staged_tree_entries(
+        sources_root, [path for _source, _source_file, path in files]
+    )
+    if set(initial_tree) != expected_tree:
         raise ValueError("staged Task 3 physical shard set does not match its receipt")
 
     descriptor, temporary_name = tempfile.mkstemp(prefix="bprime-membership-", suffix=".sqlite3")
@@ -1208,7 +1486,8 @@ def verify_candidate_inventory_membership(
             "repository_id TEXT,configuration TEXT,split TEXT,revision TEXT,file_path TEXT,"
             "source_row INTEGER,prompt_uuid TEXT,canonical_bytes BLOB,source_id TEXT,language TEXT,"
             "domain TEXT,lane TEXT,context_bucket TEXT,full_token_count INTEGER,input_ids TEXT,"
-            "tokenizer_sha256 TEXT,source_conversation_sha256 TEXT,source_response_sha256 TEXT,"
+            "tokenizer_sha256 TEXT,chat_template_sha256 TEXT,source_conversation_sha256 TEXT,"
+            "source_response_sha256 TEXT,"
             "PRIMARY KEY(repository_id,configuration,split,revision,file_path,source_row));"
         )
         observed_capacity: dict[CandidateCell, int] = {}
@@ -1219,8 +1498,9 @@ def verify_candidate_inventory_membership(
             inserted = connection.execute(
                 "INSERT OR IGNORE INTO wanted(repository_id,configuration,split,revision,file_path,"
                 "source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane,context_bucket,"
-                "full_token_count,input_ids,tokenizer_sha256,source_conversation_sha256,"
-                "source_response_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "full_token_count,input_ids,tokenizer_sha256,chat_template_sha256,"
+                "source_conversation_sha256,source_response_sha256) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     row.source_repository_id,
                     row.source_configuration,
@@ -1238,6 +1518,7 @@ def verify_candidate_inventory_membership(
                     row.full_token_count,
                     json.dumps(row.input_ids, separators=(",", ":")),
                     row.tokenizer_sha256,
+                    row.chat_template_sha256,
                     row.source_conversation_sha256,
                     row.source_response_sha256,
                 ),
@@ -1256,6 +1537,7 @@ def verify_candidate_inventory_membership(
                 connection.execute(
                     "SELECT source_row,prompt_uuid,canonical_bytes,source_id,language,domain,lane,"
                     "context_bucket,full_token_count,input_ids,tokenizer_sha256,"
+                    "chat_template_sha256,"
                     "source_conversation_sha256,source_response_sha256 "
                     "FROM wanted WHERE repository_id=? AND configuration=? AND split=? "
                     "AND revision=? AND file_path=? ORDER BY source_row",
@@ -1272,9 +1554,7 @@ def verify_candidate_inventory_membership(
             file_descriptor, initial_stat = _open_verified_source_fd(path, _file)
             try:
                 if wanted is not None:
-                    for row_index, raw_row in _iter_candidate_rows_fd(
-                        file_descriptor, path.suffix
-                    ):
+                    for row_index, raw_row in _iter_candidate_rows_fd(file_descriptor, path.suffix):
                         if row_index < wanted[0]:
                             continue
                         if row_index != wanted[0] or raw_row is None:
@@ -1308,6 +1588,7 @@ def verify_candidate_inventory_membership(
                             len(input_ids),
                             json.dumps(input_ids, separators=(",", ":")),
                             tokenizer_sha256,
+                            snapshot.chat_template_sha256,
                             source_conversation_sha256,
                             source_response_sha256,
                         )
@@ -1329,6 +1610,11 @@ def verify_candidate_inventory_membership(
             raise ValueError("candidate is absent from its physical Task 3 row")
         if _staged_tree_snapshot(sources_root) != initial_tree:
             raise ValueError("staged Task 3 source tree changed during authentication")
+        if (
+            load_tokenizer_snapshot(tokenizer_snapshot_receipt, tokenizer_snapshot_receipt_sha256)
+            != snapshot
+        ):
+            raise ValueError("tokenizer snapshot changed during physical membership verification")
     finally:
         connection.close()
         database.unlink(missing_ok=True)

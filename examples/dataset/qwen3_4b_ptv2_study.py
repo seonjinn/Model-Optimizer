@@ -23,7 +23,14 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 from audit_ptv2_baseline import BaselineAudit
-from build_specdec_inventory import ExclusionReceipt, make_exclusion_receipt
+from build_specdec_inventory import (
+    ExclusionReceipt,
+    _expected_staged_tree_entries,
+    _open_verified_source_fd,
+    _staged_tree_snapshot,
+    _verify_source_fd_stable,
+    make_exclusion_receipt,
+)
 from promote_synthesis_reserve import ResponsePromotionError, load_prompt_view
 from specdec_corpus_contracts import canonical_json
 from specdec_identity import ExclusionIndex, prompt_uuid
@@ -675,6 +682,7 @@ def iter_ptv2_staged_source_rows(
     inventory = load_source_inventory(inventory_path)
     if inventory.staged_root is None:
         raise PTV2StudyError("B study requires an authenticated staged SourceInventory receipt")
+    sources_root = inventory.staged_root / "sources"
     expected: dict[Path, Any] = {}
     ordered_paths: list[Path] = []
     for source in inventory.sources:
@@ -695,16 +703,18 @@ def iter_ptv2_staged_source_rows(
         )
     if any(source.revision != policy.ptv2_revision for source in inventory.sources):
         raise PTV2StudyError("staged PTV2 SourceInventory revision does not match the study policy")
-    actual = set((inventory.staged_root / "sources").rglob("*.parquet"))
-    if actual != set(expected):
-        raise PTV2StudyError("staged PTV2 contains undeclared or missing Parquet shards")
     try:
-        import pyarrow.parquet as pq
+        initial_tree = _staged_tree_snapshot(sources_root)
+    except (OSError, ValueError) as error:
+        raise PTV2StudyError("staged PTV2 physical shard set is invalid") from error
+    if set(initial_tree) != _expected_staged_tree_entries(sources_root, tuple(expected)):
+        raise PTV2StudyError("staged PTV2 physical shard set does not match its receipt")
+    try:
+        import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
     except ImportError as error:
         raise PTV2StudyError("pyarrow is required to read staged PTV2 rows") from error
     for path in ordered_paths:
         source, source_file = expected[path]
-        _verify_file(path, source_file.bytes, source_file.sha256)
         cell, language = _normalize_source_cell(source.cell)
         identity = sha256(
             canonical_json(
@@ -717,52 +727,73 @@ def iter_ptv2_staged_source_rows(
                 ]
             )
         ).hexdigest()
-        parquet = pq.ParquetFile(path)
-        names = set(parquet.schema_arrow.names)
-        if "messages" not in names:
-            raise PTV2StudyError(f"PTV2 shard has no messages column: {path}")
-        source_row = 0
-        columns = ["messages"] + (["tools"] if "tools" in names else [])
-        for batch in parquet.iter_batches(columns=columns, batch_size=8192):
-            for offset, record in enumerate(batch.to_pylist()):
-                messages = record["messages"]
-                if isinstance(messages, str):
-                    messages = json.loads(messages)
-                if not isinstance(messages, list) or not all(
-                    isinstance(item, dict) for item in messages
-                ):
-                    raise PTV2StudyError("PTV2 messages must be a list of mappings")
-                if not messages or messages[-1].get("role") != "assistant":
-                    raise PTV2StudyError(
-                        "PTV2 row has no terminal source-native assistant response"
-                    )
-                response = canonical_json(messages[-1]).decode("utf-8")
-                tools = record.get("tools")
-                if isinstance(tools, str):
-                    tools = json.loads(tools)
-                if tools is not None and (
-                    not isinstance(tools, list) or not all(isinstance(item, dict) for item in tools)
-                ):
-                    raise PTV2StudyError("PTV2 tools must be a list of mappings")
-                conversation = canonical_json({"messages": messages, "tools": tools or []}).decode(
-                    "utf-8"
-                )
-                prompt_messages = messages[:-1]
-                if not any(
-                    item.get("role") in {"system", "developer", "user"}
-                    for item in prompt_messages
-                ):
-                    raise PTV2StudyError("PTV2 row has no prompt-bearing message")
-                yield PTV2StudySourceRow(
-                    prompt_uuid=prompt_uuid(prompt_messages, tools),
-                    source_identity_sha256=identity,
-                    source_row=source_row + offset,
-                    cell=cell,
-                    canonical_conversation=conversation,
-                    assistant_response=response,
-                    language=language,
-                )
-            source_row += batch.num_rows
+        try:
+            descriptor, initial_stat = _open_verified_source_fd(path, source_file)
+        except (OSError, ValueError) as error:
+            raise PTV2StudyError(f"staged PTV2 shard does not match inventory: {path}") from error
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(descriptor), "rb") as stream:
+                parquet = pq.ParquetFile(stream)
+                names = set(parquet.schema_arrow.names)
+                if "messages" not in names:
+                    raise PTV2StudyError(f"PTV2 shard has no messages column: {path}")
+                source_row = 0
+                columns = ["messages"] + (["tools"] if "tools" in names else [])
+                for batch in parquet.iter_batches(columns=columns, batch_size=8192):
+                    for offset, record in enumerate(batch.to_pylist()):
+                        messages = record["messages"]
+                        if isinstance(messages, str):
+                            messages = json.loads(messages)
+                        if not isinstance(messages, list) or not all(
+                            isinstance(item, dict) for item in messages
+                        ):
+                            raise PTV2StudyError("PTV2 messages must be a list of mappings")
+                        if not messages or messages[-1].get("role") != "assistant":
+                            raise PTV2StudyError(
+                                "PTV2 row has no terminal source-native assistant response"
+                            )
+                        response = canonical_json(messages[-1]).decode("utf-8")
+                        tools = record.get("tools")
+                        if isinstance(tools, str):
+                            tools = json.loads(tools)
+                        if tools is not None and (
+                            not isinstance(tools, list)
+                            or not all(isinstance(item, dict) for item in tools)
+                        ):
+                            raise PTV2StudyError("PTV2 tools must be a list of mappings")
+                        conversation = canonical_json(
+                            {"messages": messages, "tools": tools or []}
+                        ).decode("utf-8")
+                        prompt_messages = messages[:-1]
+                        if not any(
+                            item.get("role") in {"system", "developer", "user"}
+                            for item in prompt_messages
+                        ):
+                            raise PTV2StudyError("PTV2 row has no prompt-bearing message")
+                        yield PTV2StudySourceRow(
+                            prompt_uuid=prompt_uuid(prompt_messages, tools),
+                            source_identity_sha256=identity,
+                            source_row=source_row + offset,
+                            cell=cell,
+                            canonical_conversation=conversation,
+                            assistant_response=response,
+                            language=language,
+                        )
+                    source_row += batch.num_rows
+            try:
+                _verify_source_fd_stable(descriptor, initial_stat, path, source_file)
+            except ValueError as error:
+                raise PTV2StudyError(
+                    f"staged PTV2 shard changed during authentication: {path}"
+                ) from error
+        finally:
+            os.close(descriptor)
+    try:
+        if _staged_tree_snapshot(sources_root) != initial_tree:
+            raise PTV2StudyError("staged PTV2 source tree changed during authentication")
+    except (OSError, ValueError) as error:
+        raise PTV2StudyError("staged PTV2 source tree changed during authentication") from error
 
 
 def _iter_task5_selected_rows(
@@ -771,6 +802,8 @@ def _iter_task5_selected_rows(
     """Join Task 5 source references to the authenticated Task 3 physical rows."""
     if task5.arm != "B-prime":
         raise PTV2StudyError("A-repair complement must be the Task 5 B-prime arm")
+    _require_digest(task5.tokenizer_sha256, "Task 5 tokenizer digest")
+    _require_digest(task5.chat_template_sha256, "Task 5 chat-template digest")
     inventory = load_source_inventory(inventory_receipt)
     descriptor, temporary_name = tempfile.mkstemp(prefix="ptv2-task5-join-", suffix=".sqlite3")
     os.close(descriptor)
@@ -788,6 +821,8 @@ def _iter_task5_selected_rows(
             if (
                 selected.source_family != "ptv2"
                 or selected.source_manifest_sha256 != inventory.manifest_sha256
+                or selected.tokenizer_sha256 != task5.tokenizer_sha256
+                or selected.chat_template_sha256 != task5.chat_template_sha256
             ):
                 raise PTV2StudyError(
                     "Task 5 complement row is not bound to this PTV2 SourceInventory"
@@ -906,6 +941,8 @@ def _authenticate_task5_bprime(
             "ptv2_allowlist_sha256",
             "reserve_numerator",
             "reserve_denominator",
+            "tokenizer_sha256",
+            "chat_template_sha256",
         }
         or not isinstance(arm_record, dict)
         or not isinstance(arms, dict)
@@ -914,6 +951,13 @@ def _authenticate_task5_bprime(
         or manifest.get("paired_cd_sha256") != "0" * 64
     ):
         raise PTV2StudyError("Task 5 B-prime-only arm identity is missing")
+    _require_digest(identity.get("tokenizer_sha256"), "Task 5 tokenizer digest")
+    _require_digest(identity.get("chat_template_sha256"), "Task 5 chat-template digest")
+    if (
+        view.tokenizer_sha256 != identity["tokenizer_sha256"]
+        or view.chat_template_sha256 != identity["chat_template_sha256"]
+    ):
+        raise PTV2StudyError("Task 5 tokenizer/template identity does not reconcile")
     if not isinstance(index_record, dict) or not isinstance(index_record.get("path"), str):
         raise PTV2StudyError("Task 5 selection index identity is missing")
     expected_cells = {
@@ -953,6 +997,8 @@ def _authenticate_task5_bprime(
         "held_out_receipt_sha256": identity.get("held_out_receipt_sha256"),
         "ptv2_revision": identity.get("ptv2_revision"),
         "ptv2_allowlist_sha256": identity.get("ptv2_allowlist_sha256"),
+        "tokenizer_sha256": identity.get("tokenizer_sha256"),
+        "chat_template_sha256": identity.get("chat_template_sha256"),
         "paired_cd_sha256": manifest.get("paired_cd_sha256"),
         "arms": arms,
     }
