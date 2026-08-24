@@ -996,6 +996,8 @@ def _validate_task8_execution_receipt(
         "source_index_sha256",
         "source_stage_elapsed_seconds",
         "started_at_ns",
+        "parallel_phase_finished_at_ns",
+        "parallel_phase_elapsed_seconds",
         "finished_at_ns",
         "elapsed_seconds",
         "ranges",
@@ -1022,6 +1024,7 @@ def _validate_task8_execution_receipt(
         "tokenized_sha256": tokenized.get("database_sha256"),
     }
     started = execution.get("started_at_ns")
+    parallel_finished = execution.get("parallel_phase_finished_at_ns")
     finished = execution.get("finished_at_ns")
     if (
         set(execution) != expected_keys
@@ -1041,6 +1044,7 @@ def _validate_task8_execution_receipt(
         or not _is_nonnegative_int(execution.get("source_index_bytes"))
         or execution["source_index_bytes"] < 1
         or not _is_nonnegative_number(execution.get("source_stage_elapsed_seconds"))
+        or not _is_nonnegative_number(execution.get("parallel_phase_elapsed_seconds"))
         or not _is_nonnegative_number(execution.get("elapsed_seconds"))
         or not isinstance(started, int)
         or isinstance(started, bool)
@@ -1048,7 +1052,12 @@ def _validate_task8_execution_receipt(
         or not isinstance(finished, int)
         or isinstance(finished, bool)
         or finished < 0
+        or not isinstance(parallel_finished, int)
+        or isinstance(parallel_finished, bool)
+        or parallel_finished < started
+        or parallel_finished > finished
         or finished < started
+        or execution["parallel_phase_elapsed_seconds"] > execution["elapsed_seconds"]
         or not _is_nonnegative_int(tokenized.get("source_index_bytes"))
         or execution.get("source_index_bytes") != tokenized.get("source_index_bytes")
         or any(not _is_sha256(value) for value in lineage.values())
@@ -1173,6 +1182,11 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
         return [*shards, index, policy, *([execution] if execution is not None else [])]
     if role == "tokenized" and payload.get("schema_version") == 1:
         if payload.get("strategy") in {"A-repair", "B-balanced"}:
+            exact_two_million = payload.get("occurrence_count") == 2_000_000
+            if exact_two_million and "execution_receipt" not in payload:
+                raise PublicationError(
+                    "Task8 execution receipt is required for exact 2M publication"
+                )
             required = {
                 "strategy",
                 "occurrence_count",

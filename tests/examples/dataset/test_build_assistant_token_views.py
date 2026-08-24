@@ -335,8 +335,11 @@ def test_ptv2_derivation_publishes_an_authenticated_token_bundle_on_apfs(tmp_pat
     assert Path(corpus.receipt_path).is_file()
 
 
-def test_ptv2_task8_one_vs_96_is_byte_identical(tmp_path: Path) -> None:
+def test_ptv2_task8_one_vs_96_is_byte_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = _load_module()
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "96")
     index = tmp_path / "selection-201.sqlite3"
     connection = sqlite3.connect(index)
     connection.executescript(
@@ -385,6 +388,8 @@ def test_ptv2_task8_one_vs_96_is_byte_identical(tmp_path: Path) -> None:
         )
     connection.commit()
     connection.close()
+    original_index_bytes = index.stat().st_size
+    original_index_sha256 = hashlib.sha256(index.read_bytes()).hexdigest()
     view = SimpleNamespace(
         strategy="B-balanced",
         index_path=index,
@@ -409,6 +414,19 @@ def test_ptv2_task8_one_vs_96_is_byte_identical(tmp_path: Path) -> None:
     serial = module.derive_ptv2_one_pass_corpus(
         view, output_root=tmp_path / "serial", **common
     )
+    real_pretokenize = module._pretokenize_task8
+
+    def stage_then_mutate(**kwargs):
+        result = real_pretokenize(**kwargs)
+        with sqlite3.connect(index) as mutable:
+            mutable.execute(
+                "UPDATE source_rows SET canonical_conversation='mutated-after-stage' "
+                "WHERE source_row=0"
+            )
+            mutable.commit()
+        return result
+
+    monkeypatch.setattr(module, "_pretokenize_task8", stage_then_mutate)
     parallel = module.derive_ptv2_one_pass_corpus(
         view,
         output_root=tmp_path / "parallel",
@@ -432,8 +450,11 @@ def test_ptv2_task8_one_vs_96_is_byte_identical(tmp_path: Path) -> None:
     assert execution["selection_sha256"] == "c" * 64
     assert execution["declared_range_count"] == 201
     assert execution["effective_workers"] == 96
-    assert execution["source_index_bytes"] == index.stat().st_size
-    assert execution["source_index_sha256"] == hashlib.sha256(index.read_bytes()).hexdigest()
+    assert execution["source_index_bytes"] == original_index_bytes
+    assert execution["source_index_sha256"] == original_index_sha256
+    assert execution["finished_at_ns"] >= (bundle / "records.sqlite3").stat().st_mtime_ns
+    assert execution["elapsed_seconds"] >= execution["parallel_phase_elapsed_seconds"]
+    assert execution["finished_at_ns"] >= execution["parallel_phase_finished_at_ns"]
     assert set(execution["thread_environment"].values()) == {"1"}
     tokenized = json.loads((bundle / "TOKENIZED.json").read_bytes())
     assert tokenized["execution_receipt"] == {

@@ -106,6 +106,8 @@ def _task8_execution() -> dict[str, object]:
         "source_index_sha256": "b" * 64,
         "source_stage_elapsed_seconds": 0.2,
         "started_at_ns": 1,
+        "parallel_phase_finished_at_ns": 1,
+        "parallel_phase_elapsed_seconds": 0.5,
         "finished_at_ns": 2,
         "elapsed_seconds": 1.0,
         "ranges": ranges,
@@ -168,6 +170,30 @@ def test_task8_execution_receipt_is_declared_authenticated_and_semantically_boun
                 )
             ],
         )
+
+
+def test_exact_two_million_task8_requires_execution_receipt() -> None:
+    tokenized = {
+        "schema_version": 1,
+        "strategy": "B-balanced",
+        "occurrence_count": 2_000_000,
+        "assistant_tokens": 1,
+        "database_path": "records.sqlite3",
+        "database_bytes": 1,
+        "database_sha256": "3" * 64,
+        "selection_sha256": "c" * 64,
+        "ordered_occurrences_sha256": "d" * 64,
+        "source_response_root_sha256": "e" * 64,
+        "tokenizer_sha256": "f" * 64,
+        "chat_template_sha256": "1" * 64,
+        "assistant_loss_target_sha256": "2" * 64,
+    }
+
+    with pytest.raises(
+        publication.PublicationError,
+        match="Task8 execution receipt is required for exact 2M publication",
+    ):
+        publication._role_file_descriptors("tokenized", tokenized)
 
 
 def test_task5_execution_receipt_is_required_authenticated_and_reconciled(

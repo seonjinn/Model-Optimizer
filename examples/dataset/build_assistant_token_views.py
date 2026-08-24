@@ -205,6 +205,15 @@ class _Task8TokenResult:
     worker_pid: int
 
 
+@dataclass(frozen=True)
+class _Task8StagedView:
+    source: Any
+    index_path: Path
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.source, name)
+
+
 def resolve_task8_worker_count(
     requested_workers: int,
     *,
@@ -453,7 +462,13 @@ def _pretokenize_task8(
     work_root: Path,
     workers: int,
     source_commit: str,
-) -> tuple[tempfile.TemporaryDirectory[str], _Task8LookupTokenizer, Mapping[str, Any]]:
+) -> tuple[
+    tempfile.TemporaryDirectory[str],
+    Path,
+    _Task8LookupTokenizer,
+    Mapping[str, Any],
+    int,
+]:
     effective, allocated = resolve_task8_worker_count(
         workers, occurrence_count=occurrence_count
     )
@@ -558,6 +573,10 @@ def _pretokenize_task8(
                     )
             connection.commit()
         connection.close()
+        parallel_finished_wall_ns = time.time_ns()
+        parallel_elapsed_seconds = round(
+            (time.monotonic_ns() - started) / 1_000_000_000, 6
+        )
         execution: dict[str, Any] = {
             "schema_version": 1,
             "source_commit": source_commit,
@@ -572,14 +591,19 @@ def _pretokenize_task8(
             "source_index_sha256": source_index_sha256,
             "source_stage_elapsed_seconds": source_stage_elapsed_seconds,
             "started_at_ns": started_wall_ns,
-            "finished_at_ns": time.time_ns(),
-            "elapsed_seconds": round((time.monotonic_ns() - started) / 1_000_000_000, 6),
+            "parallel_phase_finished_at_ns": parallel_finished_wall_ns,
+            "parallel_phase_elapsed_seconds": parallel_elapsed_seconds,
             "ranges": [
                 {**asdict(result), "spool_path": result.spool_path.name} for result in ordered
             ],
         }
-        execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
-        return temporary, _Task8LookupTokenizer(tokenizer, database), MappingProxyType(execution)
+        return (
+            temporary,
+            staged_index,
+            _Task8LookupTokenizer(tokenizer, database),
+            MappingProxyType(execution),
+            started,
+        )
     except BaseException:
         temporary.cleanup()
         raise
@@ -601,6 +625,7 @@ def derive_ptv2_one_pass_corpus(
     workers: int = 1,
     source_commit: str | None = None,
     _parallel_execution: Mapping[str, Any] | None = None,
+    _parallel_started_monotonic_ns: int | None = None,
     milestone_occurrences: tuple[int, ...] = (500_224, 1_000_448, 1_300_000, 2_000_000),
     milestone_steps: tuple[int, ...] = (977, 1_954, 2_540, 3_908),
 ) -> PTV2OnePassCorpus:
@@ -654,7 +679,7 @@ def derive_ptv2_one_pass_corpus(
             raise ExposureViewError("parallel Task8 processing requires an exact source commit")
         if work_root is None:
             raise ExposureViewError("parallel Task8 processing requires a node-local work root")
-        temporary, lookup, execution = _pretokenize_task8(
+        temporary, staged_index, lookup, execution, started_monotonic_ns = _pretokenize_task8(
             index_path=index_path,
             strategy=strategy,
             occurrence_count=int(getattr(view, "occurrence_count", 0)),
@@ -666,7 +691,7 @@ def derive_ptv2_one_pass_corpus(
         )
         try:
             corpus = derive_ptv2_one_pass_corpus(
-                view,
+                _Task8StagedView(view, staged_index),
                 tokenizer_sha256=tokenizer_sha256,
                 chat_template_sha256=chat_template_sha256,
                 assistant_loss_target_sha256=assistant_loss_target_sha256,
@@ -676,6 +701,7 @@ def derive_ptv2_one_pass_corpus(
                 sequence_length=sequence_length,
                 workers=1,
                 _parallel_execution=execution,
+                _parallel_started_monotonic_ns=started_monotonic_ns,
                 milestone_occurrences=milestone_occurrences,
                 milestone_steps=milestone_steps,
             )
@@ -808,9 +834,16 @@ def derive_ptv2_one_pass_corpus(
     execution_descriptor: dict[str, Any] | None = None
     if _parallel_execution is not None:
         execution_payload = dict(_parallel_execution)
-        execution_payload.pop("receipt_sha256", None)
+        if _parallel_started_monotonic_ns is None:
+            raise ExposureViewError("Task8 total execution start is missing")
         execution_payload.update(
             {
+                "finished_at_ns": time.time_ns(),
+                "elapsed_seconds": round(
+                    (time.monotonic_ns() - _parallel_started_monotonic_ns)
+                    / 1_000_000_000,
+                    6,
+                ),
                 "selection_sha256": selection_sha256,
                 "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
                 "source_response_root_sha256": response_digest.hexdigest(),
