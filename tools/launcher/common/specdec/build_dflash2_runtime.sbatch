@@ -51,7 +51,7 @@ build_source="$4"
 build_directory="$5"
 configure_log="$prepared/dflash2-flashmla-cmake-configure.log"
 "$prepared/bin/python" -m pip install --disable-pip-version-check --no-cache-dir \
-    --only-binary=:all: --no-deps cmake==3.31.6 ninja==1.13.0
+    --only-binary=:all: --no-deps --ignore-installed cmake==3.31.6 ninja==1.13.0
 {
     "$prepared/bin/cmake" --version
     "$prepared/bin/ninja" --version

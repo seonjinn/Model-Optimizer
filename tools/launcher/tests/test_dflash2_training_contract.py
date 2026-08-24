@@ -805,6 +805,7 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "TORCH_CUDA_ARCH_LIST=10.0a",
         "cmake==3.31.6",
         "ninja==1.13.0",
+        "--ignore-installed",
         '"$prepared/bin/cmake" --version',
         '"$prepared/bin/ninja" --version',
         "CUDA target architectures",
