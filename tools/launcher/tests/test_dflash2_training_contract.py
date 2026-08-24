@@ -39,6 +39,7 @@ from common.specdec.drafter_job_manifest import (
     SlurmSettings,
     TargetTopology,
     load_manifest,
+    validate_source_path_for_cluster,
     write_manifest,
 )
 
@@ -130,6 +131,33 @@ def test_feature_base_rejects_a_dirty_launcher_checkout(tmp_path: Path) -> None:
     (repo / "untracked.py").write_text("DIRTY = True\n")
     with pytest.raises(ValueError, match="must be clean"):
         validate_dflash2_source_checkout(repo, launcher_head, feature_base)
+
+
+def test_lyris_project_source_prefix_is_exact_and_cluster_scoped() -> None:
+    """Only Lyris may consume the exact user-owned project source prefix."""
+    source = "/project/coreai_dlalgo_llm/users/sna/ModelOpt-dflash2"
+    validate_source_path_for_cluster(source, "lyris")
+    for cluster in ("oci-hsg", "ptyche"):
+        with pytest.raises(ValueError, match="Lyris project source"):
+            validate_source_path_for_cluster(source, cluster)
+    for unsafe in (
+        "/project/coreai_dlalgo_llm/users/other/ModelOpt",
+        "/project/other/users/sna/ModelOpt",
+        "/project/coreai_dlalgo_llm/users/sna/../other/ModelOpt",
+    ):
+        with pytest.raises(ValueError):
+            PinnedPaths(
+                **{**_template_experiment("q30-base").paths.__dict__, "source_path": unsafe}
+            )
+
+
+def test_lyris_project_source_is_a_valid_pinned_path() -> None:
+    """The quota-safe clean Lyris checkout remains a canonical pinned source path."""
+    source = "/project/coreai_dlalgo_llm/users/sna/ModelOpt-dflash2"
+    paths = PinnedPaths(
+        **{**_template_experiment("q30-base").paths.__dict__, "source_path": source}
+    )
+    assert paths.source_path == source
 
 
 def test_vllm_runtime_receipt_survives_archive_staging_without_git(tmp_path: Path) -> None:

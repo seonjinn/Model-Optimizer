@@ -22,8 +22,13 @@ while (( $# )); do
         *) usage ;;
     esac
 done
-[[ "$MANIFEST" == /home/* && -f "$MANIFEST" ]] || usage
-[[ "$RECEIPT" == /lustre/* && "$CLUSTER_PROFILE" == /home/* ]] || usage
+is_launcher_path() {
+    [[ "$1" == /home/* || "$1" == /project/coreai_dlalgo_llm/users/sna/* ]]
+}
+is_launcher_path "$MANIFEST" && [[ -f "$MANIFEST" ]] || usage
+if [[ "$RECEIPT" != /lustre/* ]] || ! is_launcher_path "$CLUSTER_PROFILE"; then
+    usage
+fi
 [[ -f "$CLUSTER_PROFILE" ]] || usage
 [[ -z "$TARGET" || "$TARGET" == "q30-base" || "$TARGET" == "q235-base" ]] || usage
 

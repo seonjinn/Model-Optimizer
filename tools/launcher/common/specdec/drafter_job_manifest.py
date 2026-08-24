@@ -37,6 +37,7 @@ __all__ = [
     "load_manifest",
     "speculative_tokens",
     "topology_v2_training_fingerprint",
+    "validate_source_path_for_cluster",
     "validate_topology",
     "write_manifest",
 ]
@@ -62,6 +63,7 @@ _TARGET_SLURM_DEFAULTS = {
 }
 
 _VLLM_DFLASH2_REQUIRED_ANCESTOR = "b389ac29465b33f9e9c534df221ea3c129e9793f"
+_LYRIS_PROJECT_SOURCE_ROOT = Path("/project/coreai_dlalgo_llm/users/sna")
 
 
 class _TargetDefaults(TypedDict):
@@ -102,6 +104,23 @@ def _normalized_path(name: str, value: str, root: str) -> str:
     return str(lexical)
 
 
+def _normalized_source_path(value: str) -> str:
+    if not value or not Path(value).is_absolute():
+        raise ValueError("source_path must be an absolute launcher path")
+    lexical = Path(os.path.abspath(value))
+    allowed = (Path("/home"), _LYRIS_PROJECT_SOURCE_ROOT)
+    if not any(lexical.is_relative_to(root) for root in allowed):
+        raise ValueError("source_path must be under /home or the exact Lyris project source root")
+    return str(lexical)
+
+
+def validate_source_path_for_cluster(source_path: str, cluster_name: str) -> None:
+    """Allow the quota-safe project checkout only for the Lyris profile."""
+    source = Path(_normalized_source_path(source_path))
+    if source.is_relative_to(_LYRIS_PROJECT_SOURCE_ROOT) and cluster_name != "lyris":
+        raise ValueError("Lyris project source cannot be used by another cluster profile")
+
+
 @dataclass(frozen=True)
 class PinnedPaths:
     """Immutable source and large-artifact locations recorded for a job."""
@@ -123,9 +142,7 @@ class PinnedPaths:
     dataset_receipt_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "source_path", _normalized_path("source_path", self.source_path, "/home")
-        )
+        object.__setattr__(self, "source_path", _normalized_source_path(self.source_path))
         if not _FULL_SHA.fullmatch(self.source_sha):
             raise ValueError("source_sha must be an exact 40-character lowercase commit SHA")
         if not _FULL_SHA256.fullmatch(self.runtime_archive_sha256):

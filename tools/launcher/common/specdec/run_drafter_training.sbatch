@@ -26,7 +26,7 @@ for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT CLUSTER_NAME 
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
 readonly LAUNCHER_ROOT
-[[ "$CLUSTER_PROFILE_PATH" == /home/* && -f "$CLUSTER_PROFILE_PATH" ]] || { echo "cluster profile is missing" >&2; exit 2; }
+[[ ( "$CLUSTER_PROFILE_PATH" == /home/* || "$CLUSTER_PROFILE_PATH" == /project/coreai_dlalgo_llm/users/sna/* ) && -f "$CLUSTER_PROFILE_PATH" ]] || { echo "cluster profile is missing" >&2; exit 2; }
 [[ "$(sha256sum "$CLUSTER_PROFILE_PATH" | cut -d' ' -f1)" == "$CLUSTER_PROFILE_SHA256" ]] || { echo "cluster profile SHA-256 mismatch" >&2; exit 2; }
 if [[ -n "${READINESS_RECEIPT:-}" ]]; then
     [[ "$READINESS_RECEIPT" == /lustre/* && -f "$READINESS_RECEIPT" && -n "${READINESS_RECEIPT_SHA256:-}" ]] || { echo "readiness receipt is missing" >&2; exit 2; }
@@ -72,6 +72,7 @@ from common.specdec.drafter_job_manifest import (
     legacy_training_fingerprint,
     load_manifest,
     topology_v2_training_fingerprint,
+    validate_source_path_for_cluster,
 )
 from common.specdec.dflash2_runtime_contract import (
     validate_artifact_receipt,
@@ -80,6 +81,7 @@ from common.specdec.dflash2_runtime_contract import (
 
 experiment = load_manifest(manifest)[int(sys.argv[2])]
 profile = load_cluster_profile(Path(sys.argv[3]))
+validate_source_path_for_cluster(experiment.paths.source_path, profile.name)
 receipt_path = Path(sys.argv[4]) if sys.argv[4] else None
 cluster_name = sys.argv[5]
 scratch_root = Path(sys.argv[6])
@@ -229,8 +231,8 @@ echo "training allocation: nodes=${ALLOCATED_NODES} segment=${ALLOCATION_SEGMENT
 for name in SOURCE_PATH SOURCE_SHA RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT METHOD BLOCK_SIZE RUN_NAME; do
     [[ -n "${!name:-}" ]] || { echo "missing manifest value: $name" >&2; exit 2; }
 done
-[[ "$SOURCE_PATH" == /home/* && "$IMAGE_PATH" == /lustre/* && "$RUNTIME_ARCHIVE" == /lustre/* && "$TARGET_PATH" == /lustre/* && "$DATASET_PATH" == /lustre/* && "$OUTPUT_ROOT" == /lustre/* ]] || {
-    echo "source must be /home and durable artifacts must be /lustre" >&2; exit 2;
+[[ ( "$SOURCE_PATH" == /home/* || "$SOURCE_PATH" == /project/coreai_dlalgo_llm/users/sna/* ) && "$IMAGE_PATH" == /lustre/* && "$RUNTIME_ARCHIVE" == /lustre/* && "$TARGET_PATH" == /lustre/* && "$DATASET_PATH" == /lustre/* && "$OUTPUT_ROOT" == /lustre/* ]] || {
+    echo "source must use an allowed launcher root and durable artifacts must be /lustre" >&2; exit 2;
 }
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "SOURCE_SHA must be a full commit SHA" >&2; exit 2; }
 [[ "$(git -C "$SOURCE_PATH" rev-parse HEAD)" == "$SOURCE_SHA" ]] || { echo "source SHA mismatch" >&2; exit 2; }

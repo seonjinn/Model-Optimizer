@@ -27,7 +27,7 @@ REQUEUE_SIGNAL_LEAD=300
 DRY_RUN=0
 
 usage() {
-    echo "usage: $0 --manifest /home/.../manifest.json --receipt /lustre/.../receipt.jsonl [--cluster-profile /home/.../profile.yaml] [--readiness-receipt /lustre/.../profile-probe.json] [--dependency JOBID] [--max-steps N] [--save-steps N] [--self-requeue] [--max-requeues N] [--requeue-signal-lead SECONDS] [--experiment-index N] [--job-name NAME] [--dry-run]" >&2
+    echo "usage: $0 --manifest LAUNCHER_PATH/manifest.json --receipt /lustre/.../receipt.jsonl [--cluster-profile LAUNCHER_PATH/profile.yaml] [--readiness-receipt /lustre/.../profile-probe.json] [--dependency JOBID] [--max-steps N] [--save-steps N] [--self-requeue] [--max-requeues N] [--requeue-signal-lead SECONDS] [--experiment-index N] [--job-name NAME] [--dry-run]" >&2
     exit 2
 }
 
@@ -52,9 +52,12 @@ while [[ $# -gt 0 ]]; do
         *) usage ;;
     esac
 done
-[[ "$MANIFEST" == /home/* && "$RECEIPT" == /lustre/* && -f "$MANIFEST" ]] || usage
-[[ "$RUNNER" == /home/* ]] || { echo "runner must be in /home source" >&2; exit 2; }
-[[ "$CLUSTER_PROFILE" == /home/* && -f "$CLUSTER_PROFILE" ]] || usage
+is_launcher_path() {
+    [[ "$1" == /home/* || "$1" == /project/coreai_dlalgo_llm/users/sna/* ]]
+}
+is_launcher_path "$MANIFEST" && [[ "$RECEIPT" == /lustre/* && -f "$MANIFEST" ]] || usage
+is_launcher_path "$RUNNER" || { echo "runner is outside an allowed launcher source root" >&2; exit 2; }
+is_launcher_path "$CLUSTER_PROFILE" && [[ -f "$CLUSTER_PROFILE" ]] || usage
 [[ -z "$ONLY_STEP" || "$ONLY_STEP" =~ ^[1-9][0-9]*$ ]] || usage
 [[ -z "$SAVE_STEPS" || "$SAVE_STEPS" =~ ^[1-9][0-9]*$ ]] || usage
 [[ "$MAX_REQUEUES" =~ ^[1-9][0-9]*$ ]] || usage
@@ -76,11 +79,14 @@ from common.specdec.cluster_profile import (
     validate_scratch_root,
 )
 from common.specdec.drafter_job_manifest import load_manifest
+from common.specdec.drafter_job_manifest import validate_source_path_for_cluster
 from common.specdec.dflash2_runtime_contract import validate_dflash2_source_checkout
 
 profile = load_cluster_profile(Path(sys.argv[1]))
 receipt_path = Path(sys.argv[2]) if sys.argv[2] else None
 experiments = load_manifest(Path(sys.argv[3]))
+for experiment in experiments:
+    validate_source_path_for_cluster(experiment.paths.source_path, profile.name)
 if profile.modelopt_feature_base is None:
     if any(experiment.paths.source_sha != profile.modelopt_commit for experiment in experiments):
         raise SystemExit("manifest source SHA does not match the cluster profile")
