@@ -239,6 +239,7 @@ class _AuthenticatedPTV2SourceRows:
         execution_receipt: Mapping[str, Any] | None = None,
         tasks: tuple[_PTV2ShardTask, ...] = (),
         policy: PTV2StudyPolicy | None = None,
+        started_monotonic_ns: int | None = None,
     ) -> None:
         self._temporary = temporary
         self.storage_path = storage_path
@@ -246,6 +247,7 @@ class _AuthenticatedPTV2SourceRows:
         self.execution_receipt = execution_receipt
         self._tasks = tasks
         self._policy = policy
+        self._started_monotonic_ns = started_monotonic_ns
         self._closed = False
 
     def __iter__(self) -> Iterator[PTV2StudySourceRow]:
@@ -354,6 +356,42 @@ class _AuthenticatedPTV2SourceRows:
         if self._policy is None:
             raise PTV2StudyError("authenticated PTV2 source policy is missing")
         return self._policy
+
+    def finalize_execution(self, index_path: Path) -> Mapping[str, Any]:
+        """Finalize total timing only after the selected index is durably published."""
+        if self.execution_receipt is None or self._started_monotonic_ns is None:
+            raise PTV2StudyError("parallel Task9 execution state is missing")
+        execution = dict(self.execution_receipt)
+        if {
+            "finished_at_ns",
+            "elapsed_seconds",
+            "selection_index_bytes",
+            "selection_index_sha256",
+            "receipt_sha256",
+        } & execution.keys():
+            raise PTV2StudyError("parallel Task9 execution was finalized before index publication")
+        _fsync_file(index_path)
+        initial = os.lstat(index_path)
+        if not stat.S_ISREG(initial.st_mode) or index_path.is_symlink():
+            raise PTV2StudyError("published Task9 selection index is unsafe")
+        index_sha256 = _sha256_file(index_path)
+        final = os.lstat(index_path)
+        if (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns) != (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+            final.st_mtime_ns,
+        ) or not stat.S_ISREG(final.st_mode):
+            raise PTV2StudyError("published Task9 selection index changed during finalization")
+        execution["selection_index_bytes"] = final.st_size
+        execution["selection_index_sha256"] = index_sha256
+        execution["finished_at_ns"] = max(time.time_ns(), final.st_mtime_ns)
+        total_elapsed = round((time.monotonic_ns() - self._started_monotonic_ns) / 1_000_000_000, 6)
+        execution["elapsed_seconds"] = max(
+            total_elapsed, float(execution["parallel_phase_elapsed_seconds"])
+        )
+        execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+        return MappingProxyType(execution)
 
     def close(self) -> None:
         if not self._closed:
@@ -729,7 +767,8 @@ def select_authenticated_b_balanced_view(
         )
         if workers > 1 and source.execution_receipt is None:
             raise PTV2StudyError("parallel Task9 execution receipt is missing")
-        return replace(view, execution_receipt=source.execution_receipt)
+        execution = source.finalize_execution(view.index_path) if workers > 1 else None
+        return replace(view, execution_receipt=execution)
 
 
 def select_authenticated_ptv2_study_views(
@@ -1370,8 +1409,8 @@ def _spool_authenticated_ptv2_source_rows_parallel(
                 "threads_per_worker": 1,
                 "thread_environment": thread_environment,
                 "started_at_ns": started_wall_ns,
-                "finished_at_ns": time.time_ns(),
-                "elapsed_seconds": round(
+                "parallel_phase_finished_at_ns": time.time_ns(),
+                "parallel_phase_elapsed_seconds": round(
                     (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000, 6
                 ),
                 "shards": [
@@ -1382,7 +1421,6 @@ def _spool_authenticated_ptv2_source_rows_parallel(
                     for result in ordered_results
                 ],
             }
-            execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
         return _AuthenticatedPTV2SourceRows(
             temporary,
             storage_path,
@@ -1390,6 +1428,7 @@ def _spool_authenticated_ptv2_source_rows_parallel(
             MappingProxyType(execution) if execution is not None else None,
             tasks,
             policy,
+            started_monotonic_ns if workers > 1 else None,
         )
     except BaseException:
         connection.close()
@@ -1900,6 +1939,8 @@ def write_ptv2_selection_receipt(
     selection_sha256 = sha256(canonical_json(identity)).hexdigest()
     if selection_sha256 != view.selection_sha256:
         raise PTV2StudyError("selection view identity cannot be recomputed")
+    if execution_receipt is not None:
+        _validate_finalized_task9_execution(execution_receipt, view.index_path)
     trust_roots = {
         "source_inventory_sha256": source_inventory_sha256,
         "held_out_receipt_sha256": held_out_receipt_sha256,
@@ -2044,7 +2085,6 @@ def write_ptv2_selection_receipt(
             raise PTV2StudyError("installed selection receipt inode does not match its partial")
         phase = PTV2SelectionPublicationPhase.PARENT_FSYNC
         _fsync_directory(output_root.parent)
-        return output_root / "SELECTION_RECEIPT.json"
     except BaseException as error:
         state = PTV2SelectionRecoveryState(
             phase=phase,
@@ -2059,6 +2099,60 @@ def write_ptv2_selection_receipt(
         raise PTV2StudyRecoveryError(
             "Task9 selection receipt publication requires typed recovery", state
         ) from error
+    return output_root / "SELECTION_RECEIPT.json"
+
+
+def _validate_finalized_task9_execution(
+    execution_receipt: Mapping[str, Any], index_path: Path
+) -> None:
+    execution = dict(execution_receipt)
+    claimed = execution.pop("receipt_sha256", None)
+    required = {
+        "schema_version",
+        "source_commit",
+        "source_inventory_sha256",
+        "declared_shard_count",
+        "allocated_cpus",
+        "requested_workers",
+        "effective_workers",
+        "threads_per_worker",
+        "thread_environment",
+        "started_at_ns",
+        "parallel_phase_finished_at_ns",
+        "parallel_phase_elapsed_seconds",
+        "finished_at_ns",
+        "elapsed_seconds",
+        "selection_index_bytes",
+        "selection_index_sha256",
+        "shards",
+    }
+    started = execution.get("started_at_ns")
+    parallel_finished = execution.get("parallel_phase_finished_at_ns")
+    finished = execution.get("finished_at_ns")
+    parallel_elapsed = execution.get("parallel_phase_elapsed_seconds")
+    elapsed = execution.get("elapsed_seconds")
+    index_stat = index_path.stat()
+    if (
+        set(execution) != required
+        or claimed != sha256(canonical_json(execution)).hexdigest()
+        or not isinstance(started, int)
+        or isinstance(started, bool)
+        or not isinstance(parallel_finished, int)
+        or isinstance(parallel_finished, bool)
+        or not isinstance(finished, int)
+        or isinstance(finished, bool)
+        or not started <= parallel_finished <= finished
+        or finished < index_stat.st_mtime_ns
+        or not isinstance(parallel_elapsed, (int, float))
+        or isinstance(parallel_elapsed, bool)
+        or parallel_elapsed < 0
+        or not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+        or elapsed < parallel_elapsed
+        or execution.get("selection_index_bytes") != index_stat.st_size
+        or execution.get("selection_index_sha256") != _sha256_file(index_path)
+    ):
+        raise PTV2StudyError("Task9 execution receipt is not finalized")
 
 
 def _require_approved_policy(

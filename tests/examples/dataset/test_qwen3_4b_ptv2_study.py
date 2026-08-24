@@ -87,6 +87,41 @@ def _parallel_shards() -> list[dict[str, object]]:
     ]
 
 
+def _finalized_task9_execution(
+    index_path: Path, *, source_inventory_sha256: str = "1" * 64
+) -> dict[str, Any]:
+    execution: dict[str, Any] = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "source_inventory_sha256": source_inventory_sha256,
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "parallel_phase_finished_at_ns": 2,
+        "parallel_phase_elapsed_seconds": 0.5,
+        "finished_at_ns": max(3, index_path.stat().st_mtime_ns),
+        "elapsed_seconds": 1.0,
+        "selection_index_bytes": index_path.stat().st_size,
+        "selection_index_sha256": sha256(index_path.read_bytes()).hexdigest(),
+        "shards": _parallel_shards(),
+    }
+    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+    return execution
+
+
 def test_task9_worker_count_is_bounded_by_allocation_and_exact_shards() -> None:
     assert study_module.resolve_ptv2_worker_count(
         96,
@@ -364,6 +399,31 @@ def test_task9_exact_201_shard_serial_and_p96_are_byte_and_semantically_identica
         }
     assert selected_sources == distinct_sources
     assert "candidate_rows" not in tables
+
+
+def test_task9_execution_timing_finishes_after_published_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Total execution timing includes the final index hash and durable publication."""
+    inventory_receipt, _ = _write_exact_ptv2_inventory(tmp_path)
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "96")
+
+    view = select_authenticated_b_balanced_view(
+        inventory_receipt,
+        policy=_scaled_policy(),
+        exclusions=ExclusionIndex(held_out=set()),
+        output_root=tmp_path / "timed-selection",
+        workers=96,
+        source_commit="1" * 40,
+    )
+
+    execution = view.execution_receipt
+    assert execution is not None
+    assert execution["finished_at_ns"] >= view.index_path.stat().st_mtime_ns
+    assert execution["elapsed_seconds"] >= execution["parallel_phase_elapsed_seconds"]
+    assert execution["parallel_phase_finished_at_ns"] <= execution["finished_at_ns"]
+    assert execution["selection_index_bytes"] == view.index_path.stat().st_size
+    assert execution["selection_index_sha256"] == sha256(view.index_path.read_bytes()).hexdigest()
 
 
 def test_task9_authenticated_spool_size_is_independent_of_source_payload(
@@ -787,31 +847,7 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
     )
     policy_path = tmp_path / "policy.yaml"
     policy_path.write_bytes(POLICY.read_bytes())
-    execution: dict[str, Any] = {
-        "schema_version": 1,
-        "source_commit": "a" * 40,
-        "source_inventory_sha256": "1" * 64,
-        "declared_shard_count": 201,
-        "allocated_cpus": 96,
-        "requested_workers": 96,
-        "effective_workers": 96,
-        "threads_per_worker": 1,
-        "thread_environment": dict.fromkeys(
-            (
-                "ARROW_NUM_THREADS",
-                "OMP_NUM_THREADS",
-                "MKL_NUM_THREADS",
-                "OPENBLAS_NUM_THREADS",
-                "NUMEXPR_NUM_THREADS",
-            ),
-            "1",
-        ),
-        "started_at_ns": 1,
-        "finished_at_ns": 2,
-        "elapsed_seconds": 1.0,
-        "shards": _parallel_shards(),
-    }
-    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+    execution = _finalized_task9_execution(view.index_path)
 
     with pytest.raises(PTV2StudyError, match="trust-root preimage"):
         write_ptv2_selection_receipt(
@@ -899,6 +935,49 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
         execution_path.write_bytes(canonical_json(forged_execution) + b"\n")
         with pytest.raises(publication.PublicationError, match="does not reconcile"):
             publication._validate_task9_execution_receipt(payload, files)
+
+
+def test_selection_writer_rejects_unfinalized_task9_execution(tmp_path: Path) -> None:
+    """A parallel-phase draft cannot be published as a complete Task9 execution receipt."""
+    rows = tuple(
+        _row(cell, index, cell)
+        for index, cell in enumerate(("math", "code", "stem", "chat", "multilingual"))
+    )
+    policy = _scaled_policy()
+    view = select_ptv2_b_balanced_view(
+        rows,
+        policy=policy,
+        output_root=tmp_path / "index",
+        trust_roots={
+            "source_inventory_sha256": "1" * 64,
+            "held_out_receipt_sha256": "3" * 64,
+        },
+    )
+    execution = _finalized_task9_execution(view.index_path)
+    for key in (
+        "finished_at_ns",
+        "elapsed_seconds",
+        "selection_index_bytes",
+        "selection_index_sha256",
+        "receipt_sha256",
+    ):
+        execution.pop(key)
+    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_bytes(POLICY.read_bytes())
+
+    with pytest.raises(PTV2StudyError, match="not finalized"):
+        write_ptv2_selection_receipt(
+            tmp_path / "receipt",
+            view,
+            policy=policy,
+            policy_path=policy_path,
+            source_inventory_sha256="1" * 64,
+            held_out_receipt_sha256="3" * 64,
+            execution_receipt=execution,
+        )
+
+    assert not (tmp_path / "receipt").exists()
 
 
 def test_a_repair_schema_v3_receipt_replays_strategy_specific_roots(
@@ -1027,8 +1106,7 @@ def test_selection_receipt_rename_and_parent_fsync_failures_carry_typed_recovery
     )
     policy_path = tmp_path / "policy.yaml"
     policy_path.write_bytes(POLICY.read_bytes())
-    execution: dict[str, Any] = {"schema_version": 1, "effective_workers": 96}
-    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+    execution = _finalized_task9_execution(view.index_path)
     rename = study_module._rename_no_replace
 
     def ambiguous_rename(source: Path, destination: Path) -> None:
