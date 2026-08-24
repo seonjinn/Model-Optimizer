@@ -1688,6 +1688,7 @@ def _validate_probe_against_identity(
             }:
                 raise ValueError("target replay schema mismatch")
             top = replay["top_logprobs"]
+            replay_token_id = replay["token_id"]
             replay_body = {
                 "model": target["path"],
                 "prompt": prompt_token_ids + token_ids[:position],
@@ -1705,7 +1706,9 @@ def _validate_probe_against_identity(
             if (
                 replay["position"] != position
                 or replay["expected_token_id"] != token_ids[position]
-                or replay["token_id"] != token_ids[position]
+                or not isinstance(replay_token_id, int)
+                or isinstance(replay_token_id, bool)
+                or replay_token_id < 0
                 or replay["request_sha256"] != _sha_json(replay_body)
                 or not isinstance(top, dict)
                 or not top
@@ -1717,7 +1720,8 @@ def _validate_probe_against_identity(
                     or not math.isfinite(value)
                     for key, value in top.items()
                 )
-                or f"token_id:{replay['token_id']}" not in top
+                or f"token_id:{replay_token_id}" not in top
+                or float(top[f"token_id:{replay_token_id}"]) != max(map(float, top.values()))
             ):
                 raise ValueError("target prefix replay evidence mismatch")
 
@@ -1765,20 +1769,28 @@ def analyze_divergence_probe(baseline_path: Path, dflash2_path: Path) -> dict[st
             not isinstance(replay, dict)
             or replay.get("position") != common
             or replay.get("expected_token_id", replay.get("token_id")) != target_token
-            or replay.get("token_id") != target_token
             or not isinstance(replay.get("top_logprobs"), dict)
         ):
-            raise ValueError("target replay does not reproduce the original argmax")
+            raise ValueError("target replay evidence does not match the common prefix")
         top_logprobs = replay["top_logprobs"]
         assert isinstance(top_logprobs, dict)
         draft_key = f"token_id:{draft_token}"
         target_key = f"token_id:{target_token}"
-        target_logprob = top_logprobs.get(target_key)
-        if not isinstance(target_logprob, (int, float)) or isinstance(target_logprob, bool):
-            raise ValueError("target argmax is absent from replay top logprobs")
         maximum_logprob = max(float(value) for value in top_logprobs.values())
-        if float(target_logprob) != maximum_logprob:
-            raise ValueError("target replay token is not an argmax at temperature zero")
+        replay_key = f"token_id:{replay['token_id']}"
+        replay_logprob = top_logprobs.get(replay_key)
+        if (
+            not isinstance(replay_logprob, (int, float))
+            or isinstance(replay_logprob, bool)
+            or float(replay_logprob) != maximum_logprob
+        ):
+            raise ValueError("target prefix replay did not emit an argmax at temperature zero")
+        target_logprob = top_logprobs.get(target_key)
+        target_is_argmax = (
+            isinstance(target_logprob, (int, float))
+            and not isinstance(target_logprob, bool)
+            and float(target_logprob) == maximum_logprob
+        )
         draft_logprob = top_logprobs.get(draft_key)
         draft_rank = None
         draft_is_argmax = False
@@ -1794,9 +1806,18 @@ def analyze_divergence_probe(baseline_path: Path, dflash2_path: Path) -> dict[st
                 "first_divergence_position": common,
                 "target_token_id": target_token,
                 "dflash2_token_id": draft_token,
+                "replay_token_id": replay["token_id"],
+                "target_token_is_replay_argmax": target_is_argmax,
                 "dflash2_token_is_target_argmax": draft_is_argmax,
                 "dflash2_token_target_rank": draft_rank,
                 "target_top_logprobs": top_logprobs,
+                "verdict": (
+                    "target-valid-argmax"
+                    if target_is_argmax and draft_is_argmax
+                    else "target-invalid"
+                    if target_is_argmax
+                    else "replay-inconclusive"
+                ),
             }
         )
     return {"schema_version": 1, "producer": "q30-dflash2-first-divergence-v1", "records": output}

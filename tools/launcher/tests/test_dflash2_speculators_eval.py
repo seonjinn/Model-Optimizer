@@ -142,8 +142,10 @@ def test_divergence_probe_identifies_first_invalid_dflash2_token(tmp_path: Path)
     assert row["dflash2_token_id"] == 99
     assert row["dflash2_token_is_target_argmax"] is False
     assert row["dflash2_token_target_rank"] == 2
+    assert row["verdict"] == "target-invalid"
 
     tied = json.loads(baseline.read_text())
+    tied["records"][0]["replays"][2]["token_id"] = 99
     tied["records"][0]["replays"][2]["top_logprobs"] = {
         "token_id:99": -0.1,
         "token_id:12": -0.1,
@@ -156,6 +158,32 @@ def test_divergence_probe_identifies_first_invalid_dflash2_token(tmp_path: Path)
     tied_row = analyze_divergence_probe(baseline, draft)["records"][0]
     assert tied_row["dflash2_token_is_target_argmax"] is True
     assert tied_row["dflash2_token_target_rank"] == 1
+    assert tied_row["replay_token_id"] == 99
+    assert tied_row["verdict"] == "target-valid-argmax"
+
+    tied["records"][1]["replays"][2]["token_id"] = 77
+    tied["records"][1]["replays"][2]["top_logprobs"] = {
+        "token_id:77": -0.1,
+        "token_id:12": -1.0,
+        "token_id:99": -1.0,
+    }
+    unsigned = {key: value for key, value in tied.items() if key != "receipt_sha256"}
+    tied["receipt_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    baseline.write_text(json.dumps(tied) + "\n")
+    changed_draft = json.loads(draft.read_text())
+    changed_draft["records"][1]["token_ids"] = [10, 11, 99]
+    unsigned = {
+        key: value for key, value in changed_draft.items() if key != "receipt_sha256"
+    }
+    changed_draft["receipt_sha256"] = hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    draft.write_text(json.dumps(changed_draft) + "\n")
+    inconclusive = analyze_divergence_probe(baseline, draft)["records"][1]
+    assert inconclusive["target_token_is_replay_argmax"] is False
+    assert inconclusive["verdict"] == "replay-inconclusive"
 
 
 def test_capture_divergence_probe_uses_pinned_vllm_token_schema(
