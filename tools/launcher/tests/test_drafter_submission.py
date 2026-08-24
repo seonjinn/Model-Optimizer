@@ -277,6 +277,26 @@ def test_model_staging_fails_closed_and_bounds_shared_filesystem_operations() ->
     assert 'rm -rf "$ARTIFACT_DIR"' not in script
 
 
+def test_local_model_staging_can_materialize_template_on_cpu_datamover() -> None:
+    """Exact local snapshots need no GPU merely to externalize an embedded template."""
+    script = (_LAUNCHER_DIR / "common/specdec/stage_hf_model.sh").read_text()
+
+    for required in (
+        "--materialize-chat-template",
+        "--cpu-datamover",
+        '[[ "$SOURCE_KIND" == "local" ]] || usage',
+        'PARTITION="cpu_datamover"',
+        "--cpus-per-task=96",
+        'root / "chat_template.jinja"',
+        'config.get("chat_template")',
+        "os.O_EXCL",
+        'getattr(os, "O_NOFOLLOW", 0)',
+        "os.fsync",
+    ):
+        assert required in script
+    assert "args+=(--gpus-per-node=4)" not in script
+
+
 def test_model_staging_rejects_broken_destinations_and_cleans_failed_publishes() -> None:
     """Failure cleanup covers errexit, and lexical symlinks cannot evade conflict checks."""
     script = (_LAUNCHER_DIR / "common/specdec/stage_hf_model.sh").read_text()

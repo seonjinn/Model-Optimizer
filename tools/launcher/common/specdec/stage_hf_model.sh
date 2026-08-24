@@ -24,9 +24,11 @@ RUNTIME_ARCHIVE=""
 ACCOUNT="nemotron_n3_post"
 PARTITION="batch"
 LOG_DIR="/raid/scratch"
+MATERIALIZE_CHAT_TEMPLATE=0
+CPU_DATAMOVER=0
 
 usage() {
-    echo "usage: $0 (--repo ID --revision SHA --image /lustre/... --runtime-archive /lustre/... | --source-dir /lustre/... --source-id SHA) --artifact-dir /lustre/... [--cluster-profile PATH --readiness-receipt PATH] [--scratch-root PATH] [--log-dir PATH]" >&2
+    echo "usage: $0 (--repo ID --revision SHA --image /lustre/... --runtime-archive /lustre/... | --source-dir /lustre/... --source-id SHA [--materialize-chat-template] [--cpu-datamover]) --artifact-dir /lustre/... [--cluster-profile PATH --readiness-receipt PATH] [--scratch-root PATH] [--log-dir PATH]" >&2
     exit 2
 }
 
@@ -45,6 +47,8 @@ while [[ $# -gt 0 ]]; do
         --log-dir) LOG_DIR="$2"; shift 2 ;;
         --cluster-profile) CLUSTER_PROFILE="$2"; shift 2 ;;
         --readiness-receipt) READINESS_RECEIPT="$2"; shift 2 ;;
+        --materialize-chat-template) MATERIALIZE_CHAT_TEMPLATE=1; shift ;;
+        --cpu-datamover) CPU_DATAMOVER=1; shift ;;
         --run-stage) MODE="run"; shift ;;
         *) usage ;;
     esac
@@ -158,6 +162,13 @@ else
     SOURCE_IDENTITY="$REVISION"
     SOURCE_LABEL="${REPOSITORY//\//-}"
 fi
+if (( MATERIALIZE_CHAT_TEMPLATE || CPU_DATAMOVER )); then
+    [[ "$SOURCE_KIND" == "local" ]] || usage
+fi
+if (( CPU_DATAMOVER )); then
+    [[ -z "$CLUSTER_PROFILE" ]] || usage
+    PARTITION="cpu_datamover"
+fi
 
 job_name() {
     printf 'stage-hf-%s-%s' "$(printf '%s' "$SOURCE_LABEL" | tr -c '[:alnum:].-' '-')" "${SOURCE_IDENTITY:0:12}"
@@ -181,6 +192,20 @@ completed_artifact_matches() {
 
 run_stage() (
     require_inputs
+    if (( CPU_DATAMOVER )); then
+        [[ "${SLURM_JOB_PARTITION:-}" == "cpu_datamover" ]] || {
+            echo "local model staging requires cpu_datamover" >&2
+            return 2
+        }
+        [[ "${SLURM_CPUS_PER_TASK:-}" == "96" ]] || {
+            echo "local model staging requires exactly 96 CPUs" >&2
+            return 2
+        }
+        [[ -z "${SLURM_JOB_GPUS:-}" && -z "${SLURM_GPUS_ON_NODE:-}" ]] || {
+            echo "local model staging must not allocate GPUs" >&2
+            return 2
+        }
+    fi
     local work_dir="${SCRATCH_ROOT}/${SLURM_JOB_ID:?SLURM_JOB_ID is required}/hf-stage"
     local local_snapshot="${work_dir}/snapshot"
     local partial="${ARTIFACT_DIR}.partial-${SLURM_JOB_ID}"
@@ -217,6 +242,47 @@ run_stage() (
         srun --nodes=1 --ntasks=1 --container-image="$IMAGE" --container-mounts="${work_dir}:/stage" \
             python3 -c 'from huggingface_hub import snapshot_download; import os; snapshot_download(repo_id=os.environ["STAGE_REPOSITORY"], revision=os.environ["STAGE_REVISION"], local_dir="/stage/snapshot", local_dir_use_symlinks=False)'
     fi
+    if (( MATERIALIZE_CHAT_TEMPLATE )); then
+        python3 - "$local_snapshot" <<'PY'
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+config_path = root / "tokenizer_config.json"
+template_path = root / "chat_template.jinja"
+config_metadata = os.lstat(config_path)
+if stat.S_ISLNK(config_metadata.st_mode) or not stat.S_ISREG(config_metadata.st_mode):
+    raise ValueError("tokenizer configuration is not a no-follow regular file")
+config = json.loads(config_path.read_bytes())
+template = config.get("chat_template") if isinstance(config, dict) else None
+if not isinstance(template, str) or not template or "\0" in template:
+    raise ValueError("tokenizer configuration has no materializable chat template")
+payload = template.encode("utf-8")
+if os.path.lexists(template_path):
+    metadata = os.lstat(template_path)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or template_path.read_bytes() != payload
+    ):
+        raise ValueError("existing chat template differs from tokenizer configuration")
+else:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(template_path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+    fi
 
     # shellcheck disable=SC2016 # The child shell expands these file-specific variables.
     find "$local_snapshot" -type f -print0 | xargs -0 -r -P 4 -n 1 sh -c '
@@ -246,7 +312,10 @@ submit() {
     fi
 
     local args
-    if [[ -n "$CLUSTER_PROFILE" ]]; then
+    if (( CPU_DATAMOVER )); then
+        args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes=1
+            --ntasks=1 --cpus-per-task=96)
+    elif [[ -n "$CLUSTER_PROFILE" ]]; then
         args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes="$PROFILE_EVAL_NODES"
             --ntasks-per-node=1 "${PROFILE_GPU_ARGS[@]}" --segment="$PROFILE_EVAL_SEGMENT")
     else
@@ -263,6 +332,8 @@ submit() {
     else
         command+=(--repo "$REPOSITORY" --revision "$REVISION" --image "$IMAGE" --runtime-archive "$RUNTIME_ARCHIVE")
     fi
+    (( MATERIALIZE_CHAT_TEMPLATE )) && command+=(--materialize-chat-template)
+    (( CPU_DATAMOVER )) && command+=(--cpu-datamover)
     if [[ -n "$CLUSTER_PROFILE" ]]; then
         args+=("--export=ALL,DRAFTER_LAUNCHER_ROOT=$LAUNCHER_ROOT")
         command+=(--cluster-profile "$CLUSTER_PROFILE" --readiness-receipt "$READINESS_RECEIPT")
