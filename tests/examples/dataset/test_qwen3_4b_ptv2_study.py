@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from dataclasses import replace
 from hashlib import sha256
@@ -33,6 +34,7 @@ try:
         select_authenticated_b_balanced_view,
         select_ptv2_b_balanced_view,
         select_ptv2_study_views,
+        write_ptv2_selection_receipt,
         write_task9_balanced_view_json,
     )
     from specdec_corpus_contracts import canonical_json
@@ -388,6 +390,61 @@ def test_task10_balanced_projection_is_a_stable_b_only_json_contract(tmp_path: P
     assert "a_repair" not in payload
 
 
+def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
+    tmp_path: Path,
+) -> None:
+    """The production Task9 receipt is a self-contained, semantically replayable input."""
+    rows = (
+        _row("math", 0, "math"),
+        _row("code", 1, "code-a"),
+        _row("code", 2, "code-b"),
+        _row("stem", 3, "stem"),
+        _row("chat", 4, "chat"),
+        _row("multilingual", 5, "multi"),
+    )
+    policy = _scaled_policy()
+    view = select_ptv2_b_balanced_view(rows, policy=policy, output_root=tmp_path / "index")
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_bytes(POLICY.read_bytes())
+
+    receipt = write_ptv2_selection_receipt(
+        tmp_path / "receipt",
+        view,
+        policy=policy,
+        policy_path=policy_path,
+        source_inventory_sha256="1" * 64,
+        baseline_receipt_sha256="2" * 64,
+        held_out_receipt_sha256="3" * 64,
+    )
+
+    payload = json.loads(receipt.read_bytes())
+    assert payload["schema_version"] == 3
+    assert (
+        payload["selection_sha256"]
+        == sha256(canonical_json(payload["selection_identity"])).hexdigest()
+    )
+    assert payload["occurrence_count"] == view.occurrence_count
+    assert (receipt.parent / payload["index"]["path"]).is_file()
+    shard = receipt.parent / payload["shards"][0]["path"]
+    assert len(shard.read_text(encoding="utf-8").splitlines()) == view.occurrence_count
+    sys.path.insert(0, str(MODULE_DIR))
+    try:
+        import specdec_publication as publication
+    finally:
+        sys.path.pop(0)
+    descriptors = publication._role_file_descriptors("selection", payload)
+    files = [
+        (
+            item["path"],
+            receipt.parent / item["path"],
+            item["bytes"],
+            item["sha256"],
+        )
+        for item in descriptors
+    ]
+    publication._validate_ptv2_selection_policy(payload, files)
+
+
 def test_b_index_publication_is_no_replace_and_preserves_prior_receipt(tmp_path: Path) -> None:
     """A retry must not overwrite an immutable B index with a fresh SQLite file."""
     rows = (
@@ -558,6 +615,111 @@ def test_staged_inventory_requires_a_published_task3_receipt(
 
     with pytest.raises(PTV2StudyError, match="authenticated staged SourceInventory"):
         tuple(iter_ptv2_staged_source_rows(tmp_path / "SOURCE_PLAN.json", policy=_fixture_policy()))
+
+
+def test_task5_published_complement_joins_the_task3_physical_row_stream(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C2 accepts the real Task5 schema-v2 artifact only when its row joins Task3."""
+    inventory_receipt, _ = _write_authenticated_staged_parquet(tmp_path)
+    monkeypatch.setattr(study_module, "_DECLARED_PTV2_PARQUET_SHARDS", 1)
+    policy = _fixture_policy()
+    physical = next(iter_ptv2_staged_source_rows(inventory_receipt, policy=policy))
+    inventory = load_source_inventory(inventory_receipt)
+    source = inventory.sources[0]
+    selected = {
+        "prompt_uuid": physical.prompt_uuid,
+        "arm": "C",
+        "domain": "math",
+        "lane": "target-synth",
+        "language": "",
+        "context_bucket": "le4k",
+        "source_id": "fixture",
+        "source_family": "ptv2",
+        "source_repository_id": source.repository_id,
+        "source_configuration": source.configuration,
+        "source_split": source.split,
+        "source_revision": source.revision,
+        "source_file_sha256": source.files[0].sha256,
+        "source_manifest_sha256": inventory.manifest_sha256,
+        "source_file_path": source.files[0].path,
+        "source_row_index": physical.source_row,
+        "candidate_rank": 0,
+        "candidate_rank_sha256": "a" * 64,
+        "selection_index": 0,
+        "status": "primary",
+        "canonical_prompt": {"messages": [{"role": "user", "content": "first"}]},
+    }
+    root = tmp_path / "task5"
+    shards = root / "shards"
+    shards.mkdir(parents=True)
+    line = canonical_json(selected) + b"\n"
+    shard = shards / "rows-000001.jsonl"
+    shard.write_bytes(line)
+    index = root / "selection-index.sqlite3"
+    connection = sqlite3.connect(index)
+    connection.execute(
+        "CREATE TABLE rows(arm,status,selection_index,lane,prompt_uuid,shard_path,"
+        "byte_offset,byte_length,row_sha256,domain,language,candidate_rank)"
+    )
+    connection.execute(
+        "INSERT INTO rows VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "C",
+            "primary",
+            0,
+            "target-synth",
+            physical.prompt_uuid,
+            shard.relative_to(root).as_posix(),
+            0,
+            len(line),
+            sha256(line).hexdigest(),
+            "math",
+            "",
+            0,
+        ),
+    )
+    connection.commit()
+    connection.close()
+    manifest = {
+        "schema_version": 2,
+        "selection_sha256": "b" * 64,
+        "paired_cd_sha256": "c" * 64,
+        "row_count": 1,
+        "shards": [
+            {
+                "path": shard.relative_to(root).as_posix(),
+                "row_count": 1,
+                "byte_count": len(line),
+                "sha256": sha256(line).hexdigest(),
+            }
+        ],
+        "index": {"path": index.name, "sha256": sha256(index.read_bytes()).hexdigest()},
+        "arms": {
+            "C": {
+                "primary_count": 1,
+                "reserve_count": 0,
+                "cell_counts": {"math": 1},
+                "lane_counts": {"target-synth": 1},
+                "bucket_floors": {},
+                "non_agentic_bucket_floors": {},
+                "lane_bucket_floors": {},
+                "count_proof_sha256": "d" * 64,
+            }
+        },
+    }
+    manifest["root_sha256"] = sha256(canonical_json(manifest)).hexdigest()
+    manifest_path = root / "SELECTION_MANIFEST.json"
+    manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+    view = study_module.load_prompt_view(
+        manifest_path,
+        expected_manifest_sha256=sha256(manifest_path.read_bytes()).hexdigest(),
+        arm="C",
+    )
+
+    assert tuple(study_module._iter_task5_selected_rows(view, inventory_receipt, policy)) == (
+        physical,
+    )
 
 
 def test_b_cli_uses_the_immutable_declared_shard_contract(

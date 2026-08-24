@@ -297,3 +297,34 @@ reaches the expected Task 3 receipt error; `git diff --check` PASS.
   one-pass schedule, source-native flag, and publication/tokenizer/template/
   loss-mask identities. The direct regression verifies Task10's exact field
   names and that no A-repair field is emitted.
+
+## Final schema-v3 writer and direct-success evidence
+
+- RED: the direct schema-v3 writer test initially failed during collection
+  because `write_ptv2_selection_receipt()` did not exist.
+- GREEN: `write_ptv2_selection_receipt()` now installs a sibling, fsynced,
+  no-replace receipt directory holding immutable copies of the semantic policy
+  and selection SQLite plus a streamed occurrence JSONL shard. Its
+  `selection_identity` is recomputed from the view's semantic roots and is
+  required to hash exactly to `selection_sha256`; publication independently
+  replays the index, source-row conversation/response hashes, and JSONL shard
+  root before accepting schema v3. Mutated/rehash-only synthetic metadata is
+  therefore insufficient.
+- C2 GREEN: a genuine Task5 schema-v2 `SELECTION_MANIFEST.json`, selection
+  SQLite, and shard fixture joined a real staged Task3 Parquet physical row by
+  repository/configuration/split/revision/file/row/UUID. This tests the actual
+  `load_prompt_view()` adapter rather than a Task9-invented complement format.
+- C5/APFS GREEN: an authenticated final-assistant conversation was tokenized
+  through the Task7 PTV2 path and published as a durable SQLite/receipt bundle;
+  the existing Darwin/APFS no-link-count no-replace and typed-poisoned-partial
+  probes remain green.
+- Task10 compatibility remains a separate B-only JSON projection with the
+  exact documented `Task9BalancedView` fields; the selection writer does not
+  introduce launch-code glue or A-repair coupling.
+
+### Final verification
+
+- Focused Task9 suite: PASS, `72 passed` (336 pre-existing macOS pytest
+  temporary-directory cleanup warnings).
+- Changed-file Ruff: PASS. `git diff --check`: PASS.
+- Local `pre-commit` and Pyright remain unavailable; they were not bootstrapped.

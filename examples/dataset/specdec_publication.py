@@ -462,6 +462,14 @@ def _validate_ptv2_selection_policy(
         raise PublicationError("PTV2 semantic policy must be a mapping")
     if _sha256_bytes(_identity_json(decoded_policy)) != payload["policy_sha256"]:
         raise PublicationError("PTV2 semantic policy does not match policy_sha256")
+    identity = payload["selection_identity"]
+    if not isinstance(identity, Mapping) or _sha256_bytes(_identity_json(identity)) != payload[
+        "selection_sha256"
+    ]:
+        raise PublicationError("PTV2 selection identity does not match selection_sha256")
+    for key in ("strategy", "occurrence_count", "ordered_occurrences_sha256"):
+        if identity.get(key) != payload[key]:
+            raise PublicationError(f"PTV2 selection identity does not reconcile {key}")
     index_file = next((item for item in files if item[0] == payload["index"]["path"]), None)
     if index_file is None:
         raise PublicationError("PTV2 selection index was not authenticated")
@@ -500,6 +508,28 @@ def _validate_ptv2_selection_policy(
         or semantic.hexdigest() != payload["ordered_occurrences_sha256"]
     ):
         raise PublicationError("PTV2 selection index semantics do not match its receipt")
+    shard_semantic = hashlib.sha256()
+    shard_count = 0
+    for _, path, _, _ in files:
+        if path.name == index_file[1].name or path.name == policy_file[1].name:
+            continue
+        with path.open("rb") as stream:
+            for raw in stream:
+                try:
+                    occurrence = json.loads(raw)
+                except json.JSONDecodeError as error:
+                    raise PublicationError("PTV2 occurrence shard is not JSONL") from error
+                if not isinstance(occurrence, list) or len(occurrence) != 8:
+                    raise PublicationError("PTV2 occurrence shard has invalid row shape")
+                shard_semantic.update(_identity_json(occurrence))
+                shard_semantic.update(b"\n")
+                shard_count += 1
+    if (
+        shard_count != count
+        or shard_semantic.hexdigest() != payload["shard_semantic_sha256"]
+        or payload["shard_semantic_sha256"] != payload["ordered_occurrences_sha256"]
+    ):
+        raise PublicationError("PTV2 occurrence shards do not match selection index semantics")
 
 
 def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -520,6 +550,7 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             raise PublicationError("PTV2 selection receipt root SHA-256 mismatch")
         required = {
             "selection_sha256",
+            "selection_identity",
             "policy_sha256",
             "policy_file_sha256",
             "source_inventory_sha256",
@@ -528,6 +559,7 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             "strategy",
             "occurrence_count",
             "ordered_occurrences_sha256",
+            "shard_semantic_sha256",
             "policy",
             "index",
             "shards",

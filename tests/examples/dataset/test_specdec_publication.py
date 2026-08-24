@@ -184,9 +184,15 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
 
+    selection_identity = {
+        "strategy": "B-balanced",
+        "occurrence_count": 1,
+        "ordered_occurrences_sha256": ordered,
+    }
     payload = {
         "schema_version": 3,
-        "selection_sha256": "1" * 64,
+        "selection_sha256": hashlib.sha256(publication._identity_json(selection_identity)).hexdigest(),
+        "selection_identity": selection_identity,
         "policy_sha256": hashlib.sha256(
             publication._identity_json({"seed": 20260822, "strategy": "B-balanced"})
         ).hexdigest(),
@@ -197,6 +203,7 @@ def test_ptv2_selection_receipt_authenticates_policy_index_and_occurrence_shards
         "strategy": "B-balanced",
         "occurrence_count": 1,
         "ordered_occurrences_sha256": ordered,
+        "shard_semantic_sha256": ordered,
         "policy": descriptor(policy),
         "index": descriptor(index),
         "shards": [descriptor(shard)],
@@ -356,9 +363,15 @@ def test_ptv2_schema_v3_receipts_publish_as_a_complete_bundle(tmp_path: Path) ->
     ordered = digest(
         json.dumps(list(occurrence), sort_keys=True, separators=(",", ":")).encode() + b"\n"
     )
+    selection_identity = {
+        "strategy": "B-balanced",
+        "occurrence_count": 1,
+        "ordered_occurrences_sha256": ordered,
+    }
     selection_body = {
         "schema_version": 3,
-        "selection_sha256": "2" * 64,
+        "selection_sha256": digest(publication._identity_json(selection_identity)),
+        "selection_identity": selection_identity,
         "policy_sha256": digest(publication._identity_json({"seed": 1, "strategy": "B-balanced"})),
         "policy_file_sha256": digest(policy.read_bytes()),
         "source_inventory_sha256": source_root_sha,
@@ -367,6 +380,7 @@ def test_ptv2_schema_v3_receipts_publish_as_a_complete_bundle(tmp_path: Path) ->
         "strategy": "B-balanced",
         "occurrence_count": 1,
         "ordered_occurrences_sha256": ordered,
+        "shard_semantic_sha256": ordered,
         "policy": descriptor(policy),
         "index": descriptor(index),
         "shards": [descriptor(shard)],

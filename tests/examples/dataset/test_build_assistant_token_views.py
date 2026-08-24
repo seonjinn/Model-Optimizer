@@ -269,6 +269,66 @@ def test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation(
         )
 
 
+def test_ptv2_derivation_publishes_an_authenticated_token_bundle_on_apfs(tmp_path: Path) -> None:
+    """A real tokenizer invocation writes durable Task7 token evidence without link-count assumptions."""
+    module = _load_module()
+    index = tmp_path / "selection.sqlite3"
+    assistant = {"role": "assistant", "content": json.dumps({"ids": [1, 2, 3], "mask": [0, 1, 1]})}
+    conversation = _canonical(
+        {"messages": [{"role": "user", "content": "prompt"}, assistant]}
+    ).decode()
+    response = _canonical(assistant).decode()
+    conversation_sha256 = hashlib.sha256(conversation.encode()).hexdigest()
+    response_sha256 = hashlib.sha256(response.encode()).hexdigest()
+    occurrence = (0, "a" * 64, "b" * 64, 0, "math", 0, conversation_sha256, response_sha256)
+    connection = sqlite3.connect(index)
+    connection.executescript(
+        "CREATE TABLE source_rows("
+        "source_identity_sha256 TEXT,source_row INTEGER,canonical_conversation TEXT,"
+        "assistant_response TEXT);"
+        "CREATE TABLE occurrences("
+        "strategy TEXT,ordinal INTEGER,prompt_uuid TEXT,source_identity_sha256 TEXT,"
+        "source_row INTEGER,cell TEXT,reuse_index INTEGER,conversation_sha256 TEXT,"
+        "assistant_response_sha256 TEXT);"
+    )
+    connection.execute(
+        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 0, conversation, response)
+    )
+    connection.execute(
+        "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", ("B-balanced", *occurrence)
+    )
+    connection.commit()
+    connection.close()
+    view = SimpleNamespace(
+        strategy="B-balanced",
+        index_path=index,
+        occurrence_count=1,
+        ordered_occurrences_sha256=hashlib.sha256(_canonical(list(occurrence)) + b"\n").hexdigest(),
+        selection_sha256="c" * 64,
+        source_response_root_sha256=hashlib.sha256(
+            _canonical(["b" * 64, 0, conversation_sha256, response_sha256]) + b"\n"
+        ).hexdigest(),
+        unique_prompt_count=1,
+        natural_duplicate_count=0,
+        constructed_repeat_count=0,
+        trainer_epochs=1,
+    )
+
+    corpus = module.derive_ptv2_one_pass_corpus(
+        view,
+        tokenizer_sha256=TOKENIZER_SHA256,
+        chat_template_sha256=CHAT_TEMPLATE_SHA256,
+        assistant_loss_target_sha256="2" * 64,
+        training_config_sha256="3" * 64,
+        tokenizer=_Tokenizer(),
+        output_root=tmp_path / "tokenized",
+    )
+
+    assert corpus.assistant_tokens == 2
+    assert Path(corpus.tokenized_path).is_file()
+    assert Path(corpus.receipt_path).is_file()
+
+
 def test_ptv2_token_bundle_publish_is_atomic_no_replace_and_apfs_safe(tmp_path: Path) -> None:
     """The Task 7 bundle path must not rely on POSIX directory link counts."""
     module = _load_module()

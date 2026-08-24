@@ -10,9 +10,10 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import tempfile
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from itertools import islice
 from pathlib import Path
@@ -25,7 +26,12 @@ from build_specdec_inventory import ExclusionReceipt, make_exclusion_receipt
 from promote_synthesis_reserve import ResponsePromotionError, load_prompt_view
 from specdec_corpus_contracts import canonical_json
 from specdec_identity import ExclusionIndex, prompt_uuid
-from stage_ptv23_sources import SourceInventory, load_source_inventory, stage_source_inventory
+from stage_ptv23_sources import (
+    SourceInventory,
+    _rename_no_replace,
+    load_source_inventory,
+    stage_source_inventory,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
@@ -46,6 +52,7 @@ __all__ = [
     "select_authenticated_ptv2_study_views",
     "select_ptv2_b_balanced_view",
     "select_ptv2_study_views",
+    "write_ptv2_selection_receipt",
     "write_task9_balanced_view_json",
 ]
 
@@ -930,6 +937,114 @@ def write_task9_balanced_view_json(
         _fsync_directory(path.parent)
 
 
+def write_ptv2_selection_receipt(
+    output_root: Path,
+    view: PTV2StudyView,
+    *,
+    policy: PTV2StudyPolicy,
+    policy_path: Path,
+    source_inventory_sha256: str,
+    baseline_receipt_sha256: str,
+    held_out_receipt_sha256: str,
+) -> Path:
+    """Publish Task9's schema-v3 selection evidence with no synthetic row metadata.
+
+    The receipt owns durable copies of its semantic policy and selection index.  The
+    occurrence shard is streamed from that index's actual selected rows, so a
+    consumer can independently recompute both the ordered root and the Task9
+    selection identity without trusting a caller-built dictionary.
+    """
+    for label, digest in (
+        ("source inventory", source_inventory_sha256),
+        ("baseline receipt", baseline_receipt_sha256),
+        ("held-out receipt", held_out_receipt_sha256),
+    ):
+        _require_digest(digest, label)
+        if digest == "0" * 64:
+            raise PTV2StudyError(f"{label} digest must be nonzero")
+    if policy_path.is_symlink() or not policy_path.is_file():
+        raise PTV2StudyError("policy path must be a regular file")
+    if view.index_path.is_symlink() or not view.index_path.is_file():
+        raise PTV2StudyError("selection index must be a regular file")
+    identity = _selection_identity(view, policy)
+    selection_sha256 = sha256(canonical_json(identity)).hexdigest()
+    if selection_sha256 != view.selection_sha256:
+        raise PTV2StudyError("selection view identity cannot be recomputed")
+    output_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if output_root.is_symlink() or output_root.exists():
+        raise FileExistsError(f"immutable Task9 selection receipt already exists: {output_root}")
+    partial = output_root.parent / f".{output_root.name}.partial-{uuid.uuid4().hex}"
+    if partial.exists() or partial.is_symlink():
+        raise PTV2StudyRecoveryError("Task9 selection receipt partial requires recovery")
+    partial.mkdir(mode=0o700)
+    try:
+        policy_copy = partial / "policy.yaml"
+        index_copy = partial / "selection.sqlite3"
+        _copy_regular_file_nofollow(policy_path, policy_copy)
+        _copy_regular_file_nofollow(view.index_path, index_copy)
+        shard = partial / "occurrences-000000.jsonl"
+        shard_digest = sha256()
+        rows = 0
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(shard, flags, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                for occurrence in iter_ptv2_study_occurrences(view):
+                    encoded = canonical_json(
+                        [
+                            occurrence.ordinal,
+                            occurrence.prompt_uuid,
+                            occurrence.source_identity_sha256,
+                            occurrence.source_row,
+                            occurrence.cell,
+                            occurrence.reuse_index,
+                            occurrence.conversation_sha256,
+                            occurrence.assistant_response_sha256,
+                        ]
+                    ) + b"\n"
+                    stream.write(encoded)
+                    shard_digest.update(encoded)
+                    rows += 1
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            _fsync_directory(partial)
+        if rows != view.occurrence_count:
+            raise PTV2StudyError("selection index row count changed during receipt publication")
+        payload: dict[str, Any] = {
+            "schema_version": 3,
+            "selection_sha256": selection_sha256,
+            "selection_identity": identity,
+            "policy_sha256": policy.policy_sha256,
+            "policy_file_sha256": _sha256_file(policy_copy),
+            "source_inventory_sha256": source_inventory_sha256,
+            "baseline_receipt_sha256": baseline_receipt_sha256,
+            "held_out_receipt_sha256": held_out_receipt_sha256,
+            "strategy": view.strategy,
+            "occurrence_count": view.occurrence_count,
+            "ordered_occurrences_sha256": view.ordered_occurrences_sha256,
+            "shard_semantic_sha256": shard_digest.hexdigest(),
+            "policy": _file_descriptor(policy_copy),
+            "index": _file_descriptor(index_copy),
+            "shards": [_file_descriptor(shard)],
+        }
+        payload["root_sha256"] = sha256(canonical_json(payload)).hexdigest()
+        receipt = partial / "SELECTION_RECEIPT.json"
+        _write_bytes_nofollow(receipt, canonical_json(payload) + b"\n")
+        _fsync_directory(partial)
+        _rename_no_replace(partial, output_root)
+        _fsync_directory(output_root.parent)
+        return output_root / "SELECTION_RECEIPT.json"
+    except BaseException:
+        if partial.exists() and not output_root.exists():
+            raise PTV2StudyRecoveryError(
+                f"Task9 selection receipt failed; recover preserved partial {partial}"
+            ) from None
+        raise
+
+
 def _require_approved_policy(
     root: Mapping[str, Any],
     historical: Mapping[str, Any],
@@ -1457,22 +1572,7 @@ def _build_view(
     maximum_multiplicity = max(uuid_histogram, default=0)
     trusted = dict(trust_roots or {})
     trust_root_sha256 = sha256(canonical_json(trusted)).hexdigest()
-    selection = {
-        "strategy": strategy,
-        "policy_sha256": policy.policy_sha256,
-        "occurrence_count": count,
-        "unique_prompt_count": unique,
-        "cell_occurrence_counts": dict(complete_cells),
-        "multilingual_occurrence_counts": dict(complete_languages),
-        "repair_complement_counts": repair_counts if strategy == "A-repair" else {},
-        "uuid_multiplicity_histogram": uuid_histogram,
-        "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
-        "ordered_prompt_uuids_sha256": prompt_digest.hexdigest(),
-        "source_response_root_sha256": response_digest.hexdigest(),
-        "occurrence_multiplicity_sha256": multiplicity_digest.hexdigest(),
-        "trust_roots": trusted,
-    }
-    return PTV2StudyView(
+    provisional = PTV2StudyView(
         strategy,
         count,
         policy.trainer_epochs,
@@ -1498,11 +1598,33 @@ def _build_view(
         occurrence_digest.hexdigest(),
         prompt_digest.hexdigest(),
         response_digest.hexdigest(),
-        sha256(canonical_json(selection)).hexdigest(),
+        "0" * 64,
         trust_root_sha256,
         overlap,
         capacities,
     )
+    selection_sha256 = sha256(canonical_json(_selection_identity(provisional, policy))).hexdigest()
+    return replace(provisional, selection_sha256=selection_sha256)
+
+
+def _selection_identity(view: PTV2StudyView, policy: PTV2StudyPolicy) -> dict[str, Any]:
+    """Return the exact schema-v3 selection preimage, excluding mutable file paths."""
+    return {
+        "strategy": view.strategy,
+        "policy_sha256": policy.policy_sha256,
+        "occurrence_count": view.occurrence_count,
+        "unique_prompt_count": view.unique_prompt_count,
+        "cell_occurrence_counts": dict(view.cell_occurrence_counts),
+        "multilingual_occurrence_counts": dict(view.multilingual_occurrence_counts),
+        "repair_complement_counts": dict(view.repair_complement_counts),
+        "uuid_multiplicity_histogram": dict(view.uuid_multiplicity_histogram),
+        "source_occurrence_multiplicity_histogram": dict(view.source_occurrence_multiplicity_histogram),
+        "ordered_occurrences_sha256": view.ordered_occurrences_sha256,
+        "ordered_prompt_uuids_sha256": view.ordered_prompt_uuids_sha256,
+        "source_response_root_sha256": view.source_response_root_sha256,
+        "occurrence_multiplicity_sha256": view.occurrence_multiplicity_sha256,
+        "trust_root_sha256": view.trust_root_sha256,
+    }
 
 
 def _trusted_roots(
@@ -1627,6 +1749,54 @@ def _ceil_div(value: int, divisor: int) -> int:
 def _require_digest(value: object, name: str) -> None:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise PTV2StudyError(f"{name} must be an exact lowercase SHA-256")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _file_descriptor(path: Path) -> dict[str, Any]:
+    return {"path": path.name, "bytes": path.stat().st_size, "sha256": _sha256_file(path)}
+
+
+def _copy_regular_file_nofollow(source: Path, destination: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    source_descriptor = os.open(source, flags)
+    destination_descriptor: int | None = None
+    try:
+        metadata = os.fstat(source_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PTV2StudyError(f"source is not a regular file: {source}")
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            create_flags |= os.O_NOFOLLOW
+        destination_descriptor = os.open(destination, create_flags, 0o600)
+        while chunk := os.read(source_descriptor, 1024 * 1024):
+            os.write(destination_descriptor, chunk)
+        os.fsync(destination_descriptor)
+        if metadata.st_size != destination.stat().st_size:
+            raise PTV2StudyError("selection receipt copy size mismatch")
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        os.close(source_descriptor)
+
+
+def _write_bytes_nofollow(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _fsync_file(path: Path) -> None:
