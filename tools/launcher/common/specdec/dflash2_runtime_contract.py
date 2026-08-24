@@ -27,6 +27,7 @@ _FLASHMLA_VLLM_RECIPE = "cmake/external_projects/flashmla.cmake"
 _FLASHMLA_BUILD_MANIFEST = "dflash2-flashmla-build-manifest.json"
 _FLASHMLA_CONFIGURE_LOG = "dflash2-flashmla-cmake-configure.log"
 _FLASHMLA_EXTENSION_STEMS = ("_flashmla_C", "_flashmla_extension_C")
+_VLLM_CUTLASS_REVISION = "v4.4.2"
 _DFLASH2_FEATURE_PATHS = (
     "modelopt/torch/export/plugins/hf_spec_export.py",
     "modelopt/torch/speculative/config.py",
@@ -471,6 +472,60 @@ def _verified_commit_file(
     return artifact
 
 
+def _verified_source_archive(
+    repository_path: Path,
+    archive_path: Path,
+    expected_commit: str,
+    label: str,
+) -> dict[str, Any]:
+    """Authenticate a clean exact Git checkout and the archive consumed by CMake."""
+    if not _FULL_SHA.fullmatch(expected_commit):
+        raise ValueError(f"{label} commit must be an exact lowercase SHA")
+    repository = repository_path.resolve(strict=True)
+    top_level = _git(repository, "rev-parse", "--show-toplevel")
+    head = _git(repository, "rev-parse", "HEAD")
+    status = _git(repository, "status", "--porcelain", "--untracked-files=all")
+    tree = _git(repository, "rev-parse", f"{expected_commit}^{{tree}}")
+    if (
+        top_level.returncode
+        or Path(top_level.stdout.strip()).resolve() != repository
+        or head.returncode
+        or head.stdout.strip() != expected_commit
+        or status.returncode
+        or status.stdout
+        or tree.returncode
+        or not _FULL_SHA.fullmatch(tree.stdout.strip())
+    ):
+        raise ValueError(f"{label} checkout must be clean at exact commit {expected_commit}")
+
+    archive = archive_path.resolve(strict=True)
+    expected_digest = hashlib.sha256()
+    expected_bytes = 0
+    process = subprocess.Popen(  # nosec B603 - fixed Git executable and argv.
+        [_GIT, "-C", str(repository), "archive", expected_commit],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    while chunk := process.stdout.read(16 * 1024 * 1024):
+        expected_digest.update(chunk)
+        expected_bytes += len(chunk)
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    if process.wait(timeout=120) != 0:
+        raise ValueError(f"{label} git archive failed: {stderr.decode(errors='replace')}")
+    descriptor = _file_descriptor(archive, archive.name)
+    if (
+        descriptor["bytes"] != expected_bytes
+        or descriptor["sha256"] != expected_digest.hexdigest()
+    ):
+        raise ValueError(f"{label} archive does not match exact checkout bytes")
+    return {
+        "commit": expected_commit,
+        "tree_sha1": tree.stdout.strip(),
+        "archive": descriptor,
+    }
+
+
 def _runtime_files(package: Path) -> list[dict[str, Any]]:
     files = sorted(
         item
@@ -508,6 +563,9 @@ def _flashmla_configure_evidence(configure_log: Path) -> dict[str, str]:
         "ninja_version": r"(?m)^(1\.13\.0)$",
         "cuda_architectures": r"CUDA target architectures:.*(10\.0[af])",
         "flashmla_architectures": r"FlashMLA CUDA architectures:.*(10\.0[af])",
+        "vllm_cutlass_source": (
+            r"The VLLM_CUTLASS_SRC_DIR is set, using (\S*/vllm-cutlass-source)"
+        ),
     }
     evidence: dict[str, str] = {}
     for name, pattern in patterns.items():
@@ -529,6 +587,10 @@ def write_flashmla_configure_preflight(
     vllm_commit: str,
     flashmla_commit: str,
     slurm_job_id: str,
+    *,
+    vllm_cutlass_path: Path,
+    vllm_cutlass_archive_path: Path,
+    vllm_cutlass_commit: str,
 ) -> str:
     """Publish configure-only evidence before attempting a source build."""
     if not slurm_job_id.isdigit():
@@ -550,6 +612,13 @@ def write_flashmla_configure_preflight(
     if submodules.returncode or any(line[0] != " " for line in submodule_lines):
         raise ValueError("FlashMLA configure requires initialized exact submodules")
     configure_log = configure_log_path.resolve(strict=True)
+    vllm_cutlass = _verified_source_archive(
+        vllm_cutlass_path,
+        vllm_cutlass_archive_path,
+        vllm_cutlass_commit,
+        "vLLM CUTLASS",
+    )
+    vllm_cutlass["revision"] = _VLLM_CUTLASS_REVISION
     body: dict[str, Any] = {
         "schema_version": 1,
         "producer": "dflash2-flashmla-configure-preflight-v1",
@@ -562,6 +631,7 @@ def write_flashmla_configure_preflight(
             _FLASHMLA_SOURCE_INTERFACE,
         ),
         "flashmla_submodules": submodule_lines,
+        "vllm_cutlass": vllm_cutlass,
         "base_runtime": _file_descriptor(
             base_runtime_path.resolve(strict=True), str(base_runtime_path.resolve(strict=True))
         ),
@@ -590,6 +660,10 @@ def write_flashmla_build_manifest(
     configure_log_path: Path,
     vllm_commit: str,
     flashmla_commit: str,
+    *,
+    vllm_cutlass_path: Path,
+    vllm_cutlass_archive_path: Path,
+    vllm_cutlass_commit: str,
 ) -> str:
     """Bind exact source-build inputs to both installed FlashMLA extensions."""
     vllm_package = _verified_checkout(vllm_package_path, vllm_commit, vllm_commit)
@@ -605,6 +679,13 @@ def write_flashmla_build_manifest(
         "vLLM FlashMLA build recipe",
     )
     flashmla_repository = flashmla_package.parent
+    vllm_cutlass = _verified_source_archive(
+        vllm_cutlass_path,
+        vllm_cutlass_archive_path,
+        vllm_cutlass_commit,
+        "vLLM CUTLASS",
+    )
+    vllm_cutlass["revision"] = _VLLM_CUTLASS_REVISION
     submodules = _git(flashmla_repository, "submodule", "status", "--recursive")
     submodule_lines = [line for line in submodules.stdout.splitlines() if line]
     if submodules.returncode or any(line[0] != " " for line in submodule_lines):
@@ -623,6 +704,7 @@ def write_flashmla_build_manifest(
             _FLASHMLA_SOURCE_INTERFACE,
         ),
         "flashmla_submodules": submodule_lines,
+        "vllm_cutlass": vllm_cutlass,
         "base_runtime": _file_descriptor(
             base_runtime_path.resolve(strict=True), str(base_runtime_path.resolve(strict=True))
         ),
@@ -923,6 +1005,9 @@ def main() -> None:
     flashmla_build.add_argument("--configure-log", type=Path, required=True)
     flashmla_build.add_argument("--vllm-commit", required=True)
     flashmla_build.add_argument("--flashmla-commit", required=True)
+    flashmla_build.add_argument("--vllm-cutlass", type=Path, required=True)
+    flashmla_build.add_argument("--vllm-cutlass-archive", type=Path, required=True)
+    flashmla_build.add_argument("--vllm-cutlass-commit", required=True)
     configure = subparsers.add_parser("flashmla-configure-preflight")
     configure.add_argument("--output", type=Path, required=True)
     configure.add_argument("--vllm-package", type=Path, required=True)
@@ -933,6 +1018,9 @@ def main() -> None:
     configure.add_argument("--configure-log", type=Path, required=True)
     configure.add_argument("--vllm-commit", required=True)
     configure.add_argument("--flashmla-commit", required=True)
+    configure.add_argument("--vllm-cutlass", type=Path, required=True)
+    configure.add_argument("--vllm-cutlass-archive", type=Path, required=True)
+    configure.add_argument("--vllm-cutlass-commit", required=True)
     configure.add_argument("--slurm-job-id", required=True)
     artifact = subparsers.add_parser("artifact-receipt")
     artifact.add_argument("--artifact", type=Path, required=True)
@@ -967,6 +1055,9 @@ def main() -> None:
             args.configure_log,
             args.vllm_commit,
             args.flashmla_commit,
+            vllm_cutlass_path=args.vllm_cutlass,
+            vllm_cutlass_archive_path=args.vllm_cutlass_archive,
+            vllm_cutlass_commit=args.vllm_cutlass_commit,
         )
     elif args.command == "flashmla-configure-preflight":
         receipt_sha256 = write_flashmla_configure_preflight(
@@ -980,6 +1071,9 @@ def main() -> None:
             args.vllm_commit,
             args.flashmla_commit,
             args.slurm_job_id,
+            vllm_cutlass_path=args.vllm_cutlass,
+            vllm_cutlass_archive_path=args.vllm_cutlass_archive,
+            vllm_cutlass_commit=args.vllm_cutlass_commit,
         )
     elif args.command == "artifact-receipt":
         receipt_sha256 = write_artifact_receipt(

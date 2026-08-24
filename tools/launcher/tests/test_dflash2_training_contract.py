@@ -107,6 +107,28 @@ def _flashmla_checkout(tmp_path: Path) -> tuple[Path, str]:
     return package, _git(repo, "rev-parse", "HEAD")
 
 
+def _cutlass_checkout(tmp_path: Path) -> tuple[Path, str, Path]:
+    repo = tmp_path / "cutlass"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Test User")
+    _git(repo, "config", "user.email", "test@example.com")
+    header = repo / "include/cutlass/cutlass.h"
+    header.parent.mkdir(parents=True)
+    header.write_text("#pragma once\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "pinned vLLM CUTLASS source")
+    commit = _git(repo, "rev-parse", "HEAD")
+    archive = tmp_path / "vllm-cutlass-source.tar"
+    with archive.open("wb") as stream:
+        subprocess.run(
+            ["git", "-C", str(repo), "archive", "HEAD"],
+            check=True,
+            stdout=stream,
+        )
+    return repo, commit, archive
+
+
 def _dflash2_source_checkout(tmp_path: Path) -> tuple[Path, str, str]:
     repo = tmp_path / "modelopt"
     repo.mkdir()
@@ -200,6 +222,7 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
     """A wheel may add ARM64 extensions, but every tracked PR source byte must remain exact."""
     package, required, expected = _vllm_checkout(tmp_path)
     flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
+    cutlass, cutlass_commit, cutlass_archive = _cutlass_checkout(tmp_path)
     runtime = tmp_path / "runtime/vllm"
     runtime.parent.mkdir()
     __import__("shutil").copytree(package, runtime)
@@ -227,6 +250,7 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
         "1.13.0\n"
         "-- CUDA target architectures: 10.0a\n"
         "-- FlashMLA CUDA architectures: 10.0f\n"
+        "-- The VLLM_CUTLASS_SRC_DIR is set, using /scratch/vllm-cutlass-source\n"
     )
     build_manifest = tmp_path / "dflash2-flashmla-build-manifest.json"
     runtime_contract.write_flashmla_build_manifest(
@@ -240,6 +264,9 @@ def test_vllm_receipt_binds_tracked_source_and_compiled_runtime_extras(tmp_path:
         configure_log,
         expected,
         flashmla_commit,
+        vllm_cutlass_path=cutlass,
+        vllm_cutlass_archive_path=cutlass_archive,
+        vllm_cutlass_commit=cutlass_commit,
     )
     receipt = tmp_path / "vllm-runtime-v4.json"
     receipt_sha = write_vllm_runtime_receipt(
@@ -319,6 +346,7 @@ def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) 
     """A source-build receipt requires both exact vLLM FlashMLA extension outputs."""
     package, _, expected = _vllm_checkout(tmp_path)
     flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
+    cutlass, cutlass_commit, cutlass_archive = _cutlass_checkout(tmp_path)
     runtime = tmp_path / "runtime/vllm"
     runtime.mkdir(parents=True)
     (runtime / "_flashmla_C.abi3.so").write_bytes(b"only-one-extension")
@@ -338,6 +366,7 @@ def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) 
                 "1.13.0\n"
                 "-- CUDA target architectures: 10.0a\n"
                 "-- FlashMLA CUDA architectures: 10.0f\n"
+                "-- The VLLM_CUTLASS_SRC_DIR is set, using /scratch/vllm-cutlass-source\n"
             )
             if name.endswith(".log")
             else name
@@ -353,6 +382,9 @@ def test_flashmla_build_manifest_rejects_missing_extension_pair(tmp_path: Path) 
             *inputs,
             expected,
             flashmla_commit,
+            vllm_cutlass_path=cutlass,
+            vllm_cutlass_archive_path=cutlass_archive,
+            vllm_cutlass_commit=cutlass_commit,
         )
 
 
@@ -360,6 +392,7 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
     """Configure-only evidence proves exact job-local tools and Blackwell architecture gates."""
     package, _, expected = _vllm_checkout(tmp_path)
     flashmla, flashmla_commit = _flashmla_checkout(tmp_path)
+    cutlass, cutlass_commit, cutlass_archive = _cutlass_checkout(tmp_path)
     inputs = []
     for name in ("base-runtime.tar.zst", "vllm.sqsh", "builder.sbatch"):
         item = tmp_path / name
@@ -373,6 +406,7 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
         "1.13.0\n"
         "-- CUDA target architectures: 10.0a\n"
         "-- FlashMLA CUDA architectures: 10.0f\n"
+        "-- The VLLM_CUTLASS_SRC_DIR is set, using /scratch/vllm-cutlass-source\n"
     )
     receipt = tmp_path / "configure-preflight.json"
 
@@ -385,12 +419,19 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
         expected,
         flashmla_commit,
         "12345",
+        vllm_cutlass_path=cutlass,
+        vllm_cutlass_archive_path=cutlass_archive,
+        vllm_cutlass_commit=cutlass_commit,
     )
 
     body = json.loads(receipt.read_text())
     assert hashlib.sha256(receipt.read_bytes()).hexdigest() == receipt_sha
     assert body["producer"] == "dflash2-flashmla-configure-preflight-v1"
     assert body["slurm_job_id"] == "12345"
+    assert body["vllm_cutlass"]["commit"] == cutlass_commit
+    assert body["vllm_cutlass"]["archive"]["sha256"] == hashlib.sha256(
+        cutlass_archive.read_bytes()
+    ).hexdigest()
     with pytest.raises(FileExistsError):
         runtime_contract.write_flashmla_configure_preflight(
             receipt,
@@ -401,6 +442,25 @@ def test_flashmla_configure_preflight_binds_isolated_toolchain(tmp_path: Path) -
             expected,
             flashmla_commit,
             "12345",
+            vllm_cutlass_path=cutlass,
+            vllm_cutlass_archive_path=cutlass_archive,
+            vllm_cutlass_commit=cutlass_commit,
+        )
+
+    (cutlass / "include/cutlass/cutlass.h").write_text("mutated\n")
+    with pytest.raises(ValueError, match="CUTLASS checkout must be clean"):
+        runtime_contract.write_flashmla_configure_preflight(
+            tmp_path / "forged-preflight.json",
+            package,
+            flashmla,
+            *inputs,
+            configure_log,
+            expected,
+            flashmla_commit,
+            "12345",
+            vllm_cutlass_path=cutlass,
+            vllm_cutlass_archive_path=cutlass_archive,
+            vllm_cutlass_commit=cutlass_commit,
         )
 
 
@@ -860,6 +920,9 @@ def test_dflash2_runtime_builder_smokes_exact_installed_selector() -> None:
         "import vllm._flashmla_extension_C",
         "_is_flashmla_available() == (True, None)",
         "FLASH_MLA_SRC_DIR",
+        "VLLM_CUTLASS_SRC_DIR",
+        "da5e086dab31d63815acafdac9a9c5893b1c69e2",
+        "vllm-cutlass-source.tar",
         "TORCH_CUDA_ARCH_LIST=10.0a",
         "cmake==3.31.6",
         "ninja==1.13.0",

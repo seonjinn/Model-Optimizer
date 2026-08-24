@@ -10,22 +10,24 @@ if [[ "${1:-}" == --configure-only ]]; then
     MODE=configure-only
     shift
 fi
-[[ $# == 7 ]] || {
-    echo "usage: $0 [--configure-only] BASE_RUNTIME OUTPUT VLLM_CHECKOUT FLASHMLA_CHECKOUT IMAGE LAUNCHER_ROOT SCRATCH_ROOT" >&2
+[[ $# == 8 ]] || {
+    echo "usage: $0 [--configure-only] BASE_RUNTIME OUTPUT VLLM_CHECKOUT FLASHMLA_CHECKOUT VLLM_CUTLASS_CHECKOUT IMAGE LAUNCHER_ROOT SCRATCH_ROOT" >&2
     exit 2
 }
 BASE_RUNTIME="$(realpath "$1")"
 OUTPUT_ARCHIVE="$(realpath -m "$2")"
 VLLM_CHECKOUT="$(realpath "$3")"
 FLASHMLA_CHECKOUT="$(realpath "$4")"
-IMAGE="$(realpath "$5")"
-LAUNCHER_ROOT="$(realpath "$6")"
-SCRATCH_ROOT="$(realpath -m "$7")"
+VLLM_CUTLASS_CHECKOUT="$(realpath "$5")"
+IMAGE="$(realpath "$6")"
+LAUNCHER_ROOT="$(realpath "$7")"
+SCRATCH_ROOT="$(realpath -m "$8")"
 EXPECTED_COMMIT=b389ac29465b33f9e9c534df221ea3c129e9793f
 REQUIRED_COMMIT=b389ac29465b33f9e9c534df221ea3c129e9793f
 FLASHMLA_COMMIT=a8f794d1251cbfd88a5011445dd5582289c727e4
+VLLM_CUTLASS_COMMIT=da5e086dab31d63815acafdac9a9c5893b1c69e2
 
-[[ -f "$BASE_RUNTIME" && -f "$IMAGE" && -d "$VLLM_CHECKOUT/vllm" && -d "$FLASHMLA_CHECKOUT/flash_mla" ]] || exit 2
+[[ -f "$BASE_RUNTIME" && -f "$IMAGE" && -d "$VLLM_CHECKOUT/vllm" && -d "$FLASHMLA_CHECKOUT/flash_mla" && -d "$VLLM_CUTLASS_CHECKOUT/include/cutlass" ]] || exit 2
 [[ ! -e "$OUTPUT_ARCHIVE" && ! -e "${OUTPUT_ARCHIVE}.sha256" ]] || {
     echo "refusing to replace existing runtime output" >&2
     exit 2
@@ -34,27 +36,35 @@ FLASHMLA_COMMIT=a8f794d1251cbfd88a5011445dd5582289c727e4
 [[ -z "$(git -C "$VLLM_CHECKOUT" status --porcelain --untracked-files=all)" ]]
 [[ "$(git -C "$FLASHMLA_CHECKOUT" rev-parse HEAD)" == "$FLASHMLA_COMMIT" ]]
 [[ -z "$(git -C "$FLASHMLA_CHECKOUT" status --porcelain --untracked-files=all)" ]]
+[[ "$(git -C "$VLLM_CUTLASS_CHECKOUT" rev-parse HEAD)" == "$VLLM_CUTLASS_COMMIT" ]]
+[[ -z "$(git -C "$VLLM_CUTLASS_CHECKOUT" status --porcelain --untracked-files=all)" ]]
 
 work_root="${SCRATCH_ROOT%/}/${SLURM_JOB_ID:?SLURM_JOB_ID is required}/dflash2-runtime"
 prepared="$work_root/runtime"
 build_source="$work_root/vllm-source"
 build_directory="$work_root/vllm-build"
+vllm_cutlass_source="$work_root/vllm-cutlass-source"
+vllm_cutlass_archive="$work_root/vllm-cutlass-source.tar"
 mkdir -p "$prepared" "$build_source" "$build_directory" "$(dirname "$OUTPUT_ARCHIVE")"
 tar --extract --file="$BASE_RUNTIME" --directory="$prepared"
 git -C "$VLLM_CHECKOUT" archive HEAD | tar -x -C "$build_source"
+git -C "$VLLM_CUTLASS_CHECKOUT" archive HEAD >"$vllm_cutlass_archive"
+mkdir -p "$vllm_cutlass_source"
+tar -xf "$vllm_cutlass_archive" -C "$vllm_cutlass_source"
 
 mounts="${work_root}:${work_root},${VLLM_CHECKOUT}:${VLLM_CHECKOUT}:ro,${FLASHMLA_CHECKOUT}:${FLASHMLA_CHECKOUT}:ro,${LAUNCHER_ROOT}:${LAUNCHER_ROOT}:ro"
 srun --nodes=1 --ntasks=1 --ntasks-per-node=1 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE" --container-mounts="$mounts" \
     bash -s -- "$prepared" "$VLLM_CHECKOUT" "$FLASHMLA_CHECKOUT" "$build_source" \
-    "$build_directory" "$MODE" <<'INNER'
+    "$build_directory" "$vllm_cutlass_source" "$MODE" <<'INNER'
 set -euo pipefail
 prepared="$1"
 checkout="$2"
 flashmla_checkout="$3"
 build_source="$4"
 build_directory="$5"
-mode="$6"
+vllm_cutlass_source="$6"
+mode="$7"
 configure_log="$prepared/dflash2-flashmla-cmake-configure.log"
 "$prepared/bin/python" -m pip install --disable-pip-version-check --no-cache-dir \
     --only-binary=:all: --no-deps --ignore-installed cmake==3.31.6 ninja==1.13.0
@@ -93,6 +103,7 @@ while IFS= read -r -d '' extension; do
     cp -a "$extension" "$runtime_package/$relative"
 done < <(find "$system_package" -type f \( -name '*.so' -o -name '_version.py' \) -print0)
 TORCH_CUDA_ARCH_LIST=10.0a FLASH_MLA_SRC_DIR="$flashmla_checkout" \
+    VLLM_CUTLASS_SRC_DIR="$vllm_cutlass_source" \
     "$prepared/bin/cmake" -S "$build_source" -B "$build_directory" \
     -G Ninja -DVLLM_TARGET_DEVICE=cuda -DVLLM_PYTHON_EXECUTABLE="$prepared/bin/python" \
     -DCMAKE_INSTALL_PREFIX="$site_package" -DCMAKE_BUILD_TYPE=Release \
@@ -100,7 +111,8 @@ TORCH_CUDA_ARCH_LIST=10.0a FLASH_MLA_SRC_DIR="$flashmla_checkout" \
 grep -Eq 'CUDA target architectures:.*10\.0[af]' "$configure_log"
 grep -Eq 'FlashMLA CUDA architectures:.*10\.0[af]' "$configure_log"
 [[ "$mode" != configure-only ]] || exit 0
-FLASH_MLA_SRC_DIR="$flashmla_checkout" "$prepared/bin/cmake" --build "$build_directory" \
+FLASH_MLA_SRC_DIR="$flashmla_checkout" VLLM_CUTLASS_SRC_DIR="$vllm_cutlass_source" \
+    "$prepared/bin/cmake" --build "$build_directory" \
     --target _flashmla_C _flashmla_extension_C --parallel 16
 "$prepared/bin/cmake" --install "$build_directory" --component _flashmla_C
 "$prepared/bin/cmake" --install "$build_directory" --component _flashmla_extension_C
@@ -114,6 +126,9 @@ if [[ "$MODE" == configure-only ]]; then
         --base-runtime "$BASE_RUNTIME" --image "$IMAGE" --builder "${BASH_SOURCE[0]}" \
         --configure-log "$prepared/dflash2-flashmla-cmake-configure.log" \
         --vllm-commit "$EXPECTED_COMMIT" --flashmla-commit "$FLASHMLA_COMMIT" \
+        --vllm-cutlass "$VLLM_CUTLASS_CHECKOUT" \
+        --vllm-cutlass-archive "$vllm_cutlass_archive" \
+        --vllm-cutlass-commit "$VLLM_CUTLASS_COMMIT" \
         --slurm-job-id "$SLURM_JOB_ID" >"${OUTPUT_ARCHIVE}.sha256"
     exit 0
 fi
@@ -127,6 +142,9 @@ PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
     --base-runtime "$BASE_RUNTIME" --image "$IMAGE" --builder "${BASH_SOURCE[0]}" \
     --configure-log "$prepared/dflash2-flashmla-cmake-configure.log" \
     --vllm-commit "$EXPECTED_COMMIT" --flashmla-commit "$FLASHMLA_COMMIT" \
+    --vllm-cutlass "$VLLM_CUTLASS_CHECKOUT" \
+    --vllm-cutlass-archive "$vllm_cutlass_archive" \
+    --vllm-cutlass-commit "$VLLM_CUTLASS_COMMIT" \
     >"$prepared/dflash2-flashmla-build-manifest.sha256"
 receipt="$prepared/dflash2-vllm-runtime-receipt.json"
 PYTHONPATH="$LAUNCHER_ROOT/tools/launcher" python3 \
