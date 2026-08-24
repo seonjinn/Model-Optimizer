@@ -15,11 +15,10 @@ from pathlib import Path
 import build_specdec_inventory as inventory_module
 from build_qwen4b_bprime import baseline_exclusion_from_audit, held_out_exclusion_from_json
 from build_specdec_inventory import (
-    _CandidateShardTask,
     _authenticated_snapshot_tokenizer,
+    _CandidateShardTask,
     _process_candidate_shard,
     build_candidate_inventory,
-    sha256_file,
 )
 from specdec_corpus_contracts import canonical_json, sha256_bytes
 from stage_ptv23_sources import SourceInventory, load_source_inventory
@@ -85,6 +84,7 @@ def main() -> int:
                 source,
                 descriptor,
                 path,
+                args.scratch_root / f"staged{path.suffix}",
                 spool,
                 mini.manifest_sha256,
                 snapshot.tokenizer_sha256,

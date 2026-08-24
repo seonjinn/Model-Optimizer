@@ -85,17 +85,31 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         files=(),
     )
     files = []
+    excluded = {
+        "messages": json.dumps(
+            [
+                {"role": "user", "content": "explode-before-tokenization"},
+                {"role": "assistant", "content": "answer"},
+            ]
+        ),
+        "tools": "[]",
+    }
     for index in range(201):
         path = tmp_path / f"shard-{index}.jsonl"
         rows = [
             {
-                "messages": [
-                    {"role": "user", "content": f"question-{index}-{row}"},
-                    {"role": "assistant", "content": "answer"},
-                ]
+                "messages": json.dumps(
+                    [
+                        {"role": "user", "content": f"question-{index}-{row}"},
+                        {"role": "assistant", "content": "answer"},
+                    ]
+                ),
+                "tools": "[]",
             }
             for row in range(3)
         ]
+        if index == 0:
+            rows.insert(0, excluded)
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         descriptor = module.SourceFile(path.name, path.stat().st_size, module.sha256_file(path))
         files.append((source, descriptor, path))
@@ -103,11 +117,22 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
     monkeypatch.setattr(module, "_verified_candidate_files", lambda _inventory: files)
     monkeypatch.setattr(module, "_declared_candidate_files", lambda _inventory: (files, {}))
     monkeypatch.setattr(module, "_staged_tree_snapshot", lambda _root: {})
-    baseline = module.make_exclusion_receipt("baseline", ())
+    excluded_messages, excluded_tools, *_ = module._ptv2_target_prompt_identity(excluded)
+    excluded_uuid = module.sha256_bytes(
+        module.canonicalize_prompt(excluded_messages, excluded_tools)
+    )
+    baseline = module.make_exclusion_receipt("baseline", (excluded_uuid,))
     held_out = module.make_exclusion_receipt("held-out", ())
+
+    class ExplodingTokenizer(CandidateTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            if any(message.get("content") == "explode-before-tokenization" for message in messages):
+                raise RuntimeError("excluded rows must not be tokenized")
+            return super().apply_chat_template(messages, **kwargs)
+
     serial = module.build_candidate_inventory(
         inventory,
-        tokenizer=CandidateTokenizer(),
+        tokenizer=ExplodingTokenizer(),
         tokenizer_sha256="f" * 64,
         baseline_exclusion=baseline,
         held_out_exclusion=held_out,
@@ -115,7 +140,7 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
     )
     parallel = module.build_candidate_inventory(
         inventory,
-        tokenizer=CandidateTokenizer(),
+        tokenizer=ExplodingTokenizer(),
         tokenizer_sha256="f" * 64,
         baseline_exclusion=baseline,
         held_out_exclusion=held_out,
@@ -129,6 +154,7 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         assert parallel.execution_receipt is not None
         assert parallel.execution_receipt["effective_workers"] == 96
         assert parallel.execution_receipt["declared_shard_count"] == 201
+        assert parallel.quarantine_counts["historical_exclusion"] == 1
     finally:
         serial.close()
         parallel.close()

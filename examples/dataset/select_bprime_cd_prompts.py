@@ -1319,7 +1319,12 @@ def publish_prompt_view_bundle(
 
 
 def publish_bprime_prompt_view_bundle(
-    bundle: BPrimePromptViewBundle, output_dir: Path, *, rows_per_shard: int = 10_000
+    bundle: BPrimePromptViewBundle,
+    output_dir: Path,
+    *,
+    rows_per_shard: int = 10_000,
+    execution_receipt: Mapping[str, Any] | None = None,
+    candidate_inventory_sha256: str | None = None,
 ) -> PublishedPromptViews:
     """Publish an authenticated PTV2-only B-prime complement."""
     return _publish_prompt_view_bundle(
@@ -1328,6 +1333,8 @@ def publish_bprime_prompt_view_bundle(
         rows_per_shard=rows_per_shard,
         views=(bundle.B_prime,),
         selection_mode="B-prime-only",
+        execution_receipt=execution_receipt,
+        candidate_inventory_sha256=candidate_inventory_sha256,
     )
 
 
@@ -1338,6 +1345,8 @@ def _publish_prompt_view_bundle(
     rows_per_shard: int,
     views: tuple[PromptView, ...],
     selection_mode: str | None,
+    execution_receipt: Mapping[str, Any] | None = None,
+    candidate_inventory_sha256: str | None = None,
 ) -> PublishedPromptViews:
     """Stream canonical rows to hashed JSONL shards plus a compact indexed root manifest."""
     if (
@@ -1501,6 +1510,31 @@ def _publish_prompt_view_bundle(
             manifest["identity"]["chat_template_sha256"] = bundle.chat_template_sha256
         if selection_mode is not None:
             manifest["selection_mode"] = selection_mode
+        if execution_receipt is not None:
+            execution_payload = dict(execution_receipt)
+            declared_execution_sha256 = execution_payload.pop("receipt_sha256", None)
+            if not isinstance(
+                declared_execution_sha256, str
+            ) or declared_execution_sha256 != sha256_bytes(canonical_json(execution_payload)):
+                raise ValueError("Task5 execution receipt identity is invalid")
+            if (
+                not isinstance(candidate_inventory_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", candidate_inventory_sha256) is None
+            ):
+                raise ValueError("Task5 execution receipt requires candidate inventory identity")
+            execution_payload["candidate_inventory_sha256"] = candidate_inventory_sha256
+            execution_payload["selection_sha256"] = bundle.selection_sha256
+            execution_payload["receipt_sha256"] = sha256_bytes(canonical_json(execution_payload))
+            execution_path = partial / "EXECUTION_RECEIPT.json"
+            execution_bytes = canonical_json(execution_payload) + b"\n"
+            _write_bytes_durable(execution_path, execution_bytes)
+            manifest["execution_receipt"] = {
+                "path": execution_path.name,
+                "byte_count": len(execution_bytes),
+                "sha256": sha256_bytes(execution_bytes),
+            }
+        elif candidate_inventory_sha256 is not None:
+            raise ValueError("candidate inventory identity requires an execution receipt")
         root_sha256 = sha256_bytes(canonical_json(manifest))
         manifest["root_sha256"] = root_sha256
         expected_artifact_identity = PromptPublicationArtifactIdentity(

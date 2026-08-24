@@ -797,6 +797,20 @@ def load_prompt_view(
             "sha256"
         ) or shard.stat().st_size != descriptor.get("byte_count"):
             raise ResponsePromotionError(f"selection shard identity mismatch: {shard.name}")
+    execution_descriptor = manifest.get("execution_receipt")
+    if execution_descriptor is not None:
+        if not isinstance(execution_descriptor, dict) or not isinstance(
+            execution_descriptor.get("path"), str
+        ):
+            raise ResponsePromotionError("invalid execution receipt descriptor")
+        execution_path = (manifest_path.parent / execution_descriptor["path"]).resolve(strict=True)
+        if (
+            not execution_path.is_relative_to(manifest_root)
+            or not execution_path.is_file()
+            or _sha256_file(execution_path) != execution_descriptor.get("sha256")
+            or execution_path.stat().st_size != execution_descriptor.get("byte_count")
+        ):
+            raise ResponsePromotionError("execution receipt identity mismatch")
     index_descriptor = manifest.get("index")
     if not isinstance(index_descriptor, dict) or not isinstance(index_descriptor.get("path"), str):
         raise ResponsePromotionError("selection index descriptor is missing")

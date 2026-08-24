@@ -1091,6 +1091,11 @@ def _candidate_domain(source: SourceIdentity) -> str:
 
 def _row_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
     messages = row.get("messages") or row.get("conversations")
+    if isinstance(messages, str):
+        try:
+            messages = json.loads(messages)
+        except json.JSONDecodeError as error:
+            raise ValueError("missing_messages") from error
     if (
         not isinstance(messages, list)
         or not messages
@@ -1100,11 +1105,21 @@ def _row_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
     return deepcopy(messages)
 
 
+def _row_tools(row: dict[str, Any]) -> list[dict[str, Any]]:
+    tools = row.get("tools") or []
+    if isinstance(tools, str):
+        try:
+            tools = json.loads(tools)
+        except json.JSONDecodeError as error:
+            raise ValueError("invalid_tools") from error
+    if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
+        raise ValueError("invalid_tools")
+    return deepcopy(tools)
+
+
 def _target_prompt(row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     messages = _row_messages(row)
-    tools = deepcopy(row.get("tools") or [])
-    if not isinstance(tools, list):
-        raise ValueError("invalid_tools")
+    tools = _row_tools(row)
     if messages[-1].get("role") == "assistant":
         messages.pop()
     if not messages:
@@ -1122,9 +1137,7 @@ def _ptv2_target_prompt_identity(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str, str]:
     """Extract a PTV2 prompt and bind its source-native terminal response."""
     messages = _row_messages(row)
-    tools = deepcopy(row.get("tools") or [])
-    if not isinstance(tools, list):
-        raise ValueError("invalid_tools")
+    tools = _row_tools(row)
     if messages[-1].get("role") != "assistant":
         raise ValueError("PTV2 source-native assistant response is missing")
     source_conversation = canonical_json({"messages": messages, "tools": tools})
@@ -1331,6 +1344,7 @@ class _CandidateShardTask:
     source: SourceIdentity
     descriptor: SourceFile
     path: Path
+    staged_path: Path
     spool_path: Path
     source_manifest_sha256: str
     tokenizer_sha256: str
@@ -1458,14 +1472,6 @@ def _spool_candidate_payload(
         messages = canonical_prompt["messages"]
         tools = canonical_prompt["tools"]
         prompt_uuid = sha256_bytes(canonical_bytes)
-        language = _normalize_language(row.get("language"), source)
-        input_ids = _candidate_tokenize(
-            _PROCESS_TOKENIZER,
-            messages,
-            tools,
-            add_generation_prompt=not replay_valid,
-        )
-        context_bucket = _context_bucket(len(input_ids))
     except TrajectoryValidationError as error:
         return {
             "prompt_uuid": prompt_uuid,
@@ -1482,6 +1488,33 @@ def _spool_candidate_payload(
             "prompt_uuid": prompt_uuid,
             "canonical_prompt": json.loads(canonical_bytes) if canonical_bytes is not None else None,
             "reason": reason,
+        }
+    try:
+        language = _normalize_language(row.get("language"), source)
+        input_ids = _candidate_tokenize(
+            _PROCESS_TOKENIZER,
+            messages,
+            tools,
+            add_generation_prompt=not replay_valid,
+        )
+        context_bucket = _context_bucket(len(input_ids))
+    except ValueError as error:
+        reason = str(error)
+        if reason.startswith("conversation exceeds the 32K inventory limit"):
+            reason = "context_too_long"
+        payload = {
+            "prompt_uuid": prompt_uuid,
+            "canonical_prompt": json.loads(canonical_bytes),
+        }
+        if reason in _CANDIDATE_QUARANTINE_CODES:
+            return payload | {"reason": reason}
+        return payload | {"deferred_error_type": type(error).__name__, "deferred_error": reason}
+    except Exception as error:
+        return {
+            "prompt_uuid": prompt_uuid,
+            "canonical_prompt": json.loads(canonical_bytes),
+            "deferred_error_type": type(error).__name__,
+            "deferred_error": str(error),
         }
     candidate = CandidatePrompt(
         prompt_uuid=prompt_uuid,
@@ -1511,9 +1544,48 @@ def _spool_candidate_payload(
     return {"prompt_uuid": prompt_uuid, "candidate": _candidate_record(candidate)}
 
 
+def _stage_authenticated_source_once(
+    source_path: Path, staged_path: Path, source_file: SourceFile
+) -> None:
+    """Authenticate one shared-storage stream while copying it to node-local storage."""
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source_path, source_flags)
+    initial = os.fstat(descriptor)
+    if not stat.S_ISREG(initial.st_mode) or initial.st_size != source_file.bytes:
+        os.close(descriptor)
+        raise ValueError(f"source file stable identity mismatch: {source_file.path}")
+    stage_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    staged_descriptor = os.open(staged_path, stage_flags, 0o600)
+    digest = hashlib.sha256()
+    try:
+        with os.fdopen(os.dup(descriptor), "rb") as source_stream, os.fdopen(
+            staged_descriptor, "wb"
+        ) as staged_stream:
+            for chunk in iter(lambda: source_stream.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+                staged_stream.write(chunk)
+            staged_stream.flush()
+            os.fsync(staged_stream.fileno())
+        final = os.fstat(descriptor)
+        pathname = os.lstat(source_path)
+        if (
+            digest.hexdigest() != source_file.sha256
+            or _stable_stat_identity(final) != _stable_stat_identity(initial)
+            or stat.S_ISLNK(pathname.st_mode)
+            or (pathname.st_dev, pathname.st_ino) != (final.st_dev, final.st_ino)
+        ):
+            raise ValueError(f"source file changed during authentication: {source_file.path}")
+    except BaseException:
+        os.close(descriptor)
+        staged_path.unlink(missing_ok=True)
+        raise
+    os.close(descriptor)
+
+
 def _process_candidate_shard(task: _CandidateShardTask) -> _CandidateShardResult:
     started = time.monotonic_ns()
-    descriptor, initial = _open_verified_source_fd(task.path, task.descriptor)
+    _stage_authenticated_source_once(task.path, task.staged_path, task.descriptor)
+    staged_initial = os.lstat(task.staged_path)
     connection = sqlite3.connect(task.spool_path)
     connection.execute("PRAGMA journal_mode=DELETE")
     connection.execute("PRAGMA synchronous=NORMAL")
@@ -1522,7 +1594,7 @@ def _process_candidate_shard(task: _CandidateShardTask) -> _CandidateShardResult
     )
     row_count = 0
     try:
-        for row_index, raw_row in _iter_candidate_rows_fd(descriptor, task.path.suffix):
+        for row_index, raw_row in _iter_candidate_rows(task.staged_path):
             payload = _spool_candidate_payload(task, row_index, raw_row)
             connection.execute(
                 "INSERT INTO records VALUES (?, ?)", (row_index, canonical_json(payload))
@@ -1531,14 +1603,17 @@ def _process_candidate_shard(task: _CandidateShardTask) -> _CandidateShardResult
             if row_count % 10_000 == 0:
                 connection.commit()
         connection.commit()
-        _verify_source_fd_stable(descriptor, initial, task.path, task.descriptor)
+        staged_final = os.lstat(task.staged_path)
+        if (
+            _stable_stat_identity(staged_final) != _stable_stat_identity(staged_initial)
+            or sha256_file(task.staged_path) != task.descriptor.sha256
+        ):
+            raise ValueError("node-local staged source changed during candidate processing")
     except BaseException:
         connection.close()
-        os.close(descriptor)
         task.spool_path.unlink(missing_ok=True)
         raise
     connection.close()
-    os.close(descriptor)
     return _CandidateShardResult(
         task.index,
         task.spool_path,
@@ -1695,6 +1770,8 @@ def _build_candidate_inventory_parallel(
     storage_root = Path(tempfile.mkdtemp(prefix="specdec-candidates-", dir=storage_parent))
     spool_root = storage_root / "shards"
     spool_root.mkdir(mode=0o700)
+    stage_root = storage_root / "staged"
+    stage_root.mkdir(mode=0o700)
     database_path = storage_root / "candidates.sqlite3"
     connection = _create_candidate_database(database_path)
     started_wall_ns = time.time_ns()
@@ -1707,6 +1784,7 @@ def _build_candidate_inventory_parallel(
             source,
             descriptor,
             path,
+            stage_root / f"shard-{index:03d}{path.suffix}",
             spool_root / f"shard-{index:03d}.sqlite3",
             source_inventory.manifest_sha256,
             tokenizer_sha256,
@@ -1744,20 +1822,35 @@ def _build_candidate_inventory_parallel(
                     if prompt_uuid in held_out_prompt_ids:
                         _quarantine(quarantine_counts, "heldout_exclusion")
                         continue
+                    canonical_prompt = payload.get("canonical_prompt")
+                    candidate_record = payload.get("candidate")
+                    canonical_bytes = (
+                        canonical_json(canonical_prompt)
+                        if canonical_prompt is not None
+                        else canonical_json(candidate_record["canonical_prompt"])
+                        if isinstance(candidate_record, dict)
+                        else None
+                    )
+                    if prompt_uuid is not None and canonical_bytes is not None:
+                        previous = connection.execute(
+                            "SELECT canonical_bytes FROM candidates WHERE prompt_uuid = ?",
+                            (prompt_uuid,),
+                        ).fetchone()
+                        if previous is not None:
+                            if previous[0] != canonical_bytes:
+                                raise UUIDCollisionError(f"UUID collision: {prompt_uuid}")
+                            _quarantine(quarantine_counts, "duplicate_prompt_uuid")
+                            continue
                     reason = payload.get("reason")
                     if reason is not None:
                         _quarantine(quarantine_counts, reason)
                         continue
+                    if payload.get("deferred_error") is not None:
+                        raise ValueError(
+                            f"deferred {payload.get('deferred_error_type')}: "
+                            f"{payload['deferred_error']}"
+                        )
                     candidate = _candidate_from_record(payload["candidate"])
-                    previous = connection.execute(
-                        "SELECT canonical_bytes FROM candidates WHERE prompt_uuid = ?",
-                        (candidate.prompt_uuid,),
-                    ).fetchone()
-                    if previous is not None:
-                        if previous[0] != candidate.canonical_bytes:
-                            raise UUIDCollisionError(f"UUID collision: {candidate.prompt_uuid}")
-                        _quarantine(quarantine_counts, "duplicate_prompt_uuid")
-                        continue
                     _insert_candidate(connection, candidate)
                     accepted_count += 1
                     cell = CandidateCell(

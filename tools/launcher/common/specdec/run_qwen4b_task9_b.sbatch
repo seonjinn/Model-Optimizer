@@ -102,6 +102,6 @@ python3 "$REPO_ROOT/examples/dataset/qwen3_4b_ptv2_study.py" \
     echo "Task9 B selection did not publish its immutable receipt" >&2
     exit 1
 }
-[[ -f "$RECEIPT_ROOT.EXECUTION_RECEIPT.json" \
-    && ! -L "$RECEIPT_ROOT.EXECUTION_RECEIPT.json" ]] || exit 1
+[[ -f "$RECEIPT_ROOT/EXECUTION_RECEIPT.json" \
+    && ! -L "$RECEIPT_ROOT/EXECUTION_RECEIPT.json" ]] || exit 1
 sha256sum "$RECEIPT_ROOT/SELECTION_RECEIPT.json"

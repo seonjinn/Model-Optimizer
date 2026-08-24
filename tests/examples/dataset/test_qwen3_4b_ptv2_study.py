@@ -11,6 +11,7 @@ from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -83,6 +84,15 @@ def test_task9_worker_count_is_bounded_by_allocation_and_exact_shards() -> None:
             declared_shards=200,
             environ={"SLURM_CPUS_PER_TASK": "96"},
         )
+
+
+def test_task9_runner_requires_the_atomically_published_execution_receipt() -> None:
+    runner = (
+        ROOT / "tools/launcher/common/specdec/run_qwen4b_task9_b.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert '"$RECEIPT_ROOT/EXECUTION_RECEIPT.json"' in runner
+    assert '"$RECEIPT_ROOT.EXECUTION_RECEIPT.json"' not in runner
 
 
 def _row(cell: str, source_row: int, prompt: str, *, language: str = "") -> PTV2StudySourceRow:
@@ -285,6 +295,46 @@ def _write_exact_ptv2_inventory(
         / first_source.files[0].path
     )
     return staged.staged_root / "SOURCE_INVENTORY.json", first_staged
+
+
+def test_task9_exact_201_shard_serial_and_p96_are_byte_and_semantically_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production 201-shard process path preserves the serial source-order contract."""
+    inventory_receipt, _ = _write_exact_ptv2_inventory(tmp_path)
+    policy = _scaled_policy()
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "96")
+    with (
+        study_module._spool_authenticated_ptv2_source_rows(
+            inventory_receipt,
+            policy=policy,
+            storage_dir=tmp_path / "serial-spool",
+        ) as serial,
+        study_module._spool_authenticated_ptv2_source_rows(
+            inventory_receipt,
+            policy=policy,
+            storage_dir=tmp_path / "p96-spool",
+            workers=96,
+            source_commit="1" * 40,
+        ) as parallel,
+    ):
+        serial_rows = tuple(serial)
+        parallel_rows = tuple(parallel)
+        assert parallel.execution_receipt is not None
+        assert parallel.execution_receipt["effective_workers"] == 96
+        assert parallel.execution_receipt["allocated_cpus"] == 96
+        assert canonical_json([row.__dict__ for row in parallel_rows]) == canonical_json(
+            [row.__dict__ for row in serial_rows]
+        )
+
+        serial_view = select_ptv2_b_balanced_view(
+            serial_rows, policy=policy, output_root=tmp_path / "serial-selection"
+        )
+        parallel_view = select_ptv2_b_balanced_view(
+            parallel_rows, policy=policy, output_root=tmp_path / "p96-selection"
+        )
+        assert parallel_view.selection_sha256 == serial_view.selection_sha256
+        assert parallel_view.index_path.read_bytes() == serial_view.index_path.read_bytes()
 
 
 def _genuine_scaled_task5_bundle(
@@ -674,6 +724,12 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
     )
     policy_path = tmp_path / "policy.yaml"
     policy_path.write_bytes(POLICY.read_bytes())
+    execution: dict[str, Any] = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "effective_workers": 96,
+    }
+    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
 
     with pytest.raises(PTV2StudyError, match="trust-root preimage"):
         write_ptv2_selection_receipt(
@@ -703,6 +759,7 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
         policy_path=policy_path,
         source_inventory_sha256="1" * 64,
         held_out_receipt_sha256="3" * 64,
+        execution_receipt=execution,
     )
 
     payload = json.loads(receipt.read_bytes())
@@ -716,6 +773,10 @@ def test_schema_v3_selection_writer_recomputes_identity_and_streams_source_rows(
     )
     assert payload["occurrence_count"] == view.occurrence_count
     assert (receipt.parent / payload["index"]["path"]).is_file()
+    execution_path = receipt.parent / payload["execution_receipt"]["path"]
+    assert execution_path.is_file()
+    execution_payload = json.loads(execution_path.read_bytes())
+    assert execution_payload["selection_sha256"] == view.selection_sha256
     shard = receipt.parent / payload["shards"][0]["path"]
     assert len(shard.read_text(encoding="utf-8").splitlines()) == view.occurrence_count
     sys.path.insert(0, str(MODULE_DIR))
@@ -862,6 +923,8 @@ def test_selection_receipt_rename_and_parent_fsync_failures_carry_typed_recovery
     )
     policy_path = tmp_path / "policy.yaml"
     policy_path.write_bytes(POLICY.read_bytes())
+    execution: dict[str, Any] = {"schema_version": 1, "effective_workers": 96}
+    execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
     rename = study_module._rename_no_replace
 
     def ambiguous_rename(source: Path, destination: Path) -> None:
@@ -878,11 +941,14 @@ def test_selection_receipt_rename_and_parent_fsync_failures_carry_typed_recovery
             policy_path=policy_path,
             source_inventory_sha256="1" * 64,
             held_out_receipt_sha256="3" * 64,
+            execution_receipt=execution,
         )
     state = study_module.ptv2_selection_recovery_state(caught.value)
     assert state.phase is study_module.PTV2SelectionPublicationPhase.RENAME
     assert state.destination_observation.identity == state.expected_partial_identity
     assert state.partial_observation.status == "absent"
+    assert (installed / "SELECTION_RECEIPT.json").is_file()
+    assert (installed / "EXECUTION_RECEIPT.json").is_file()
 
     monkeypatch.setattr(study_module, "_rename_no_replace", rename)
     fsync_directory = study_module._fsync_directory
@@ -902,6 +968,7 @@ def test_selection_receipt_rename_and_parent_fsync_failures_carry_typed_recovery
             policy_path=policy_path,
             source_inventory_sha256="1" * 64,
             held_out_receipt_sha256="3" * 64,
+            execution_receipt=execution,
         )
     state = study_module.ptv2_selection_recovery_state(caught.value)
     assert state.phase is study_module.PTV2SelectionPublicationPhase.PARENT_FSYNC
@@ -1449,8 +1516,10 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
         seen["policy"] = policy
         seen["held_out"] = exclusions.held_out
         seen["workers"] = kwargs["workers"]
-        seen["execution_receipt_path"] = kwargs["execution_receipt_path"]
-        return select_ptv2_b_balanced_view(rows, policy=policy, output_root=output_root)
+        view = select_ptv2_b_balanced_view(rows, policy=policy, output_root=output_root)
+        execution: dict[str, Any] = {"schema_version": 1, "effective_workers": 96}
+        execution["receipt_sha256"] = sha256(canonical_json(execution)).hexdigest()
+        return replace(view, execution_receipt=execution)
 
     monkeypatch.setattr(study_module, "load_ptv2_study_policy", lambda _: _scaled_policy())
     monkeypatch.setattr(study_module, "select_authenticated_b_balanced_view", _authenticated)
@@ -1469,6 +1538,7 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
                     "receipt_view": view.strategy,
                     "source_inventory_sha256": kwargs["source_inventory_sha256"],
                     "held_out_receipt_sha256": kwargs["held_out_receipt_sha256"],
+                    "execution_receipt": kwargs["execution_receipt"],
                 }
             )
             or root / "SELECTION_RECEIPT.json"
@@ -1501,5 +1571,5 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
     assert seen["receipt_view"] == "B-balanced"
     assert seen["source_inventory_sha256"] == "a" * 64
     assert seen["workers"] == 96
-    assert seen["execution_receipt_path"] == tmp_path / "receipt.EXECUTION_RECEIPT.json"
+    assert cast("dict[str, Any]", seen["execution_receipt"])["effective_workers"] == 96
     assert seen["held_out_receipt_sha256"] == make_exclusion_receipt("held-out", ()).receipt_sha256

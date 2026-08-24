@@ -23,7 +23,7 @@ from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -57,6 +57,7 @@ try:
         select_bprime_prompt_view,
         select_prompt_views,
     )
+    from specdec_corpus_contracts import canonical_json
     from stage_ptv23_sources import (
         SourceFile,
         SourceIdentity,
@@ -449,10 +450,26 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
         held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
     )
+    execution: dict[str, Any] = {"schema_version": 1, "effective_workers": 96}
+    execution["receipt_sha256"] = hashlib.sha256(canonical_json(execution)).hexdigest()
+    destination = tmp_path / "bprime-only"
     try:
         published = publish_bprime_prompt_view_bundle(
-            bundle, tmp_path / "bprime-only", rows_per_shard=37
+            bundle,
+            destination,
+            rows_per_shard=37,
+            execution_receipt=execution,
+            candidate_inventory_sha256=candidates.inventory_sha256,
         )
+        before = published.manifest_path.read_bytes()
+        with pytest.raises(FileExistsError) as caught:
+            publish_bprime_prompt_view_bundle(
+                bundle,
+                destination,
+                rows_per_shard=37,
+                execution_receipt=execution,
+                candidate_inventory_sha256=candidates.inventory_sha256,
+            )
     finally:
         bundle.close()
         candidates.rows.close()
@@ -460,6 +477,9 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
 
     assert manifest["selection_mode"] == "B-prime-only"
     assert set(manifest["arms"]) == {"B-prime"}
+    assert published.manifest_path.read_bytes() == before
+    assert (destination / "EXECUTION_RECEIPT.json").is_file()
+    assert getattr(caught.value, "recovery_state").destination_path == destination
     with sqlite3.connect(published.index_path) as connection:
         assert {row[0] for row in connection.execute("SELECT DISTINCT arm FROM rows")} == {
             "B-prime"

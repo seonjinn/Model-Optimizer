@@ -622,8 +622,9 @@ def _validate_ptv2_selection_policy(
         raise PublicationError("PTV2 selection identity does not match index semantics")
     shard_semantic = hashlib.sha256()
     shard_count = 0
+    occurrence_paths = {descriptor["path"] for descriptor in payload["shards"]}
     for _, path, _, _ in files:
-        if path.name == index_file[1].name or path.name == policy_file[1].name:
+        if path.name not in occurrence_paths:
             continue
         with path.open("rb") as stream:
             for raw in stream:
@@ -682,9 +683,10 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             if strategy == "A-repair"
             else set()
         )
+        execution_fields = {"execution_receipt"} if "execution_receipt" in payload else set()
         if strategy not in {"A-repair", "B-balanced"} or set(
             payload
-        ) != required | strategy_fields | {
+        ) != required | strategy_fields | execution_fields | {
             "schema_version",
             "root_sha256",
         }:
@@ -713,7 +715,10 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
             value = payload[key]
             if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
                 raise PublicationError(f"PTV2 selection receipt {key} is not a SHA-256")
-        return [*shards, index, policy]
+        execution = payload.get("execution_receipt")
+        if execution is not None and not isinstance(execution, dict):
+            raise PublicationError("PTV2 execution receipt descriptor is malformed")
+        return [*shards, index, policy, *([execution] if execution is not None else [])]
     if role == "tokenized" and payload.get("schema_version") == 1:
         if payload.get("strategy") in {"A-repair", "B-balanced"}:
             required = {

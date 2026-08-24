@@ -162,26 +162,6 @@ def held_out_exclusion_from_json(path: Path) -> ExclusionReceipt:
     return make_exclusion_receipt("held-out", tuple(payload))
 
 
-def _write_durable_receipt(path: Path, payload: dict[str, Any]) -> None:
-    payload.pop("receipt_sha256", None)
-    payload["receipt_sha256"] = sha256_bytes(canonical_json(payload))
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o444)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(canonical_json(payload) + b"\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-    parent_descriptor = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(parent_descriptor)
-    finally:
-        os.close(parent_descriptor)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-inventory", type=Path, required=True)
@@ -212,12 +192,6 @@ def main() -> int:
     )
     if candidates.execution_receipt is None:
         raise RuntimeError("parallel Task5 candidate execution receipt is missing")
-    candidate_execution_path = args.output_dir.with_name(
-        f"{args.output_dir.name}.CANDIDATE_EXECUTION_RECEIPT.json"
-    )
-    candidate_execution = dict(candidates.execution_receipt)
-    candidate_execution["candidate_inventory_sha256"] = candidates.inventory_sha256
-    _write_durable_receipt(candidate_execution_path, candidate_execution)
     bundle = None
     try:
         bundle = select_bprime_prompt_view(
@@ -229,19 +203,18 @@ def main() -> int:
             baseline_receipt_sha256=baseline.receipt_sha256,
             held_out_receipt_sha256=held_out.receipt_sha256,
         )
-        published = publish_bprime_prompt_view_bundle(bundle, args.output_dir)
+        published = publish_bprime_prompt_view_bundle(
+            bundle,
+            args.output_dir,
+            execution_receipt=candidates.execution_receipt,
+            candidate_inventory_sha256=candidates.inventory_sha256,
+        )
     finally:
         if bundle is not None:
             bundle.close()
         candidates.close()
     manifest_sha256 = sha256_file(published.manifest_path)
-    execution_receipt_path = args.output_dir.with_name(
-        f"{args.output_dir.name}.EXECUTION_RECEIPT.json"
-    )
-    execution_payload = dict(candidates.execution_receipt)
-    execution_payload["selection_manifest_sha256"] = manifest_sha256
-    execution_payload["selection_root_sha256"] = published.root_sha256
-    _write_durable_receipt(execution_receipt_path, execution_payload)
+    execution_receipt_path = args.output_dir / "EXECUTION_RECEIPT.json"
     print(
         json.dumps(
             {

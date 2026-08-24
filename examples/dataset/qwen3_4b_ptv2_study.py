@@ -31,6 +31,7 @@ from build_specdec_inventory import (
     ExclusionReceipt,
     _expected_staged_tree_entries,
     _open_verified_source_fd,
+    _stage_authenticated_source_once,
     _staged_tree_snapshot,
     _verify_source_fd_stable,
     make_exclusion_receipt,
@@ -310,6 +311,7 @@ class PTV2StudyView:
     trust_root_sha256: str
     held_out_overlap_count: int
     source_capacity_counts: Mapping[str, int]
+    execution_receipt: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -578,7 +580,6 @@ def select_authenticated_b_balanced_view(
     output_root: Path | None = None,
     workers: int = 1,
     source_commit: str | None = None,
-    execution_receipt_path: Path | None = None,
 ) -> PTV2StudyView:
     """Production B entrypoint: derive rows and overlap state from authenticated roots only."""
     if not isinstance(exclusions, ExclusionIndex):
@@ -614,26 +615,9 @@ def select_authenticated_b_balanced_view(
                 }
             ),
         )
-        if execution_receipt_path is not None:
-            if source.execution_receipt is None:
-                raise PTV2StudyError("parallel Task9 execution receipt is missing")
-            payload = dict(source.execution_receipt)
-            payload["selection_sha256"] = view.selection_sha256
-            payload.pop("receipt_sha256", None)
-            payload["receipt_sha256"] = sha256(canonical_json(payload)).hexdigest()
-            execution_receipt_path.parent.mkdir(parents=True, exist_ok=True)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(execution_receipt_path, flags, 0o444)
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(canonical_json(payload) + b"\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            directory = os.open(execution_receipt_path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        return view
+        if workers > 1 and source.execution_receipt is None:
+            raise PTV2StudyError("parallel Task9 execution receipt is missing")
+        return replace(view, execution_receipt=source.execution_receipt)
 
 
 def select_authenticated_ptv2_study_views(
@@ -911,6 +895,7 @@ class _PTV2ShardTask:
     source: SourceIdentity
     source_file: SourceFile
     path: Path
+    staged_path: Path
     spool_path: Path
 
 
@@ -963,7 +948,8 @@ def _process_ptv2_shard(task: _PTV2ShardTask) -> _PTV2ShardResult:
         import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
     except ImportError as error:
         raise PTV2StudyError("pyarrow is required to read staged PTV2 rows") from error
-    descriptor, initial_stat = _open_verified_source_fd(task.path, task.source_file)
+    _stage_authenticated_source_once(task.path, task.staged_path, task.source_file)
+    initial_stat = os.lstat(task.staged_path)
     connection = sqlite3.connect(task.spool_path)
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute(
@@ -985,8 +971,7 @@ def _process_ptv2_shard(task: _PTV2ShardTask) -> _PTV2ShardResult:
     cell, language = _normalize_source_cell(task.source.cell)
     row_count = 0
     try:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        with os.fdopen(os.dup(descriptor), "rb") as stream:
+        with task.staged_path.open("rb") as stream:
             parquet = pq.ParquetFile(stream)
             names = set(parquet.schema_arrow.names)
             if "messages" not in names:
@@ -1037,14 +1022,18 @@ def _process_ptv2_shard(task: _PTV2ShardTask) -> _PTV2ShardResult:
                     if row_count % 10_000 == 0:
                         connection.commit()
         connection.commit()
-        _verify_source_fd_stable(descriptor, initial_stat, task.path, task.source_file)
+        final_stat = os.lstat(task.staged_path)
+        if (
+            (final_stat.st_dev, final_stat.st_ino, final_stat.st_size, final_stat.st_mtime_ns)
+            != (initial_stat.st_dev, initial_stat.st_ino, initial_stat.st_size, initial_stat.st_mtime_ns)
+            or _sha256_file(task.staged_path) != task.source_file.sha256
+        ):
+            raise PTV2StudyError("node-local staged PTV2 shard changed during processing")
     except BaseException:
         connection.close()
-        os.close(descriptor)
         task.spool_path.unlink(missing_ok=True)
         raise
     connection.close()
-    os.close(descriptor)
     return _PTV2ShardResult(
         task.index,
         task.spool_path,
@@ -1159,9 +1148,18 @@ def _spool_authenticated_ptv2_source_rows_parallel(
     temporary_root = Path(temporary.name)
     spool_root = temporary_root / "shards"
     spool_root.mkdir(mode=0o700)
+    stage_root = temporary_root / "staged"
+    stage_root.mkdir(mode=0o700)
     storage_path = temporary_root / "source-rows.sqlite3"
     tasks = tuple(
-        _PTV2ShardTask(index, source, descriptor, path, spool_root / f"shard-{index:03d}.sqlite3")
+        _PTV2ShardTask(
+            index,
+            source,
+            descriptor,
+            path,
+            stage_root / f"shard-{index:03d}{path.suffix}",
+            spool_root / f"shard-{index:03d}.sqlite3",
+        )
         for index, (source, descriptor, path) in enumerate(declared)
     )
     started_wall_ns = time.time_ns()
@@ -1588,9 +1586,6 @@ def main() -> int:
         exclusions=ExclusionIndex(held_out=set(held_out)),
         workers=args.workers,
         source_commit=os.environ.get("SOURCE_COMMIT"),
-        execution_receipt_path=args.selection_receipt_root.with_name(
-            f"{args.selection_receipt_root.name}.EXECUTION_RECEIPT.json"
-        ),
     )
     inventory = load_source_inventory(inventory_path)
     held_out_receipt = make_exclusion_receipt("held-out", tuple(held_out))
@@ -1601,6 +1596,7 @@ def main() -> int:
         policy_path=args.policy,
         source_inventory_sha256=inventory.manifest_sha256,
         held_out_receipt_sha256=held_out_receipt.receipt_sha256,
+        execution_receipt=view.execution_receipt,
     )
     print(
         json.dumps(
@@ -1713,6 +1709,7 @@ def write_ptv2_selection_receipt(
     held_out_receipt_sha256: str,
     baseline_receipt_sha256: str | None = None,
     complement_selection_sha256: str | None = None,
+    execution_receipt: Mapping[str, Any] | None = None,
 ) -> Path:
     """Publish Task9's schema-v3 selection evidence with no synthetic row metadata.
 
@@ -1824,6 +1821,23 @@ def write_ptv2_selection_receipt(
             _fsync_directory(partial)
         if rows != view.occurrence_count:
             raise PTV2StudyError("selection index row count changed during receipt publication")
+        execution_descriptor: dict[str, Any] | None = None
+        if execution_receipt is not None:
+            execution_payload = dict(execution_receipt)
+            declared_execution_sha256 = execution_payload.pop("receipt_sha256", None)
+            if (
+                not isinstance(declared_execution_sha256, str)
+                or declared_execution_sha256
+                != sha256(canonical_json(execution_payload)).hexdigest()
+            ):
+                raise PTV2StudyError("Task9 execution receipt identity is invalid")
+            execution_payload["selection_sha256"] = selection_sha256
+            execution_payload["receipt_sha256"] = sha256(
+                canonical_json(execution_payload)
+            ).hexdigest()
+            execution_path = partial / "EXECUTION_RECEIPT.json"
+            _write_bytes_nofollow(execution_path, canonical_json(execution_payload) + b"\n")
+            execution_descriptor = _file_descriptor(execution_path)
         payload: dict[str, Any] = {
             "schema_version": 3,
             "selection_sha256": selection_sha256,
@@ -1841,6 +1855,8 @@ def write_ptv2_selection_receipt(
             "index": _file_descriptor(index_copy),
             "shards": [_file_descriptor(shard)],
         }
+        if execution_descriptor is not None:
+            payload["execution_receipt"] = execution_descriptor
         if view.strategy == "A-repair":
             payload |= {
                 "baseline_receipt_sha256": baseline_receipt_sha256,

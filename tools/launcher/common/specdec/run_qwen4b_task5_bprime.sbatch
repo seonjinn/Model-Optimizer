@@ -63,5 +63,5 @@ srun --nodes=1 --ntasks=1 --cpus-per-task=96 --kill-on-bad-exit=1 \
         --output-dir "$OUTPUT_DIR" \
         --workers "$SLURM_CPUS_PER_TASK"
 [[ -f "$OUTPUT_DIR/SELECTION_MANIFEST.json" && ! -L "$OUTPUT_DIR/SELECTION_MANIFEST.json" ]] || exit 1
-[[ -f "$OUTPUT_DIR.EXECUTION_RECEIPT.json" && ! -L "$OUTPUT_DIR.EXECUTION_RECEIPT.json" ]] || exit 1
+[[ -f "$OUTPUT_DIR/EXECUTION_RECEIPT.json" && ! -L "$OUTPUT_DIR/EXECUTION_RECEIPT.json" ]] || exit 1
 sha256sum "$OUTPUT_DIR/SELECTION_MANIFEST.json"
