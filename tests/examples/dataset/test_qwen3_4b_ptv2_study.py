@@ -1445,9 +1445,11 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
     )
     seen: dict[str, object] = {}
 
-    def _authenticated(_: Path, *, policy, exclusions, output_root):
+    def _authenticated(_: Path, *, policy, exclusions, output_root, **kwargs):
         seen["policy"] = policy
         seen["held_out"] = exclusions.held_out
+        seen["workers"] = kwargs["workers"]
+        seen["execution_receipt_path"] = kwargs["execution_receipt_path"]
         return select_ptv2_b_balanced_view(rows, policy=policy, output_root=output_root)
 
     monkeypatch.setattr(study_module, "load_ptv2_study_policy", lambda _: _scaled_policy())
@@ -1498,4 +1500,6 @@ def test_b_cli_uses_the_immutable_declared_shard_contract(
     assert seen["receipt_root"] == tmp_path / "receipt"
     assert seen["receipt_view"] == "B-balanced"
     assert seen["source_inventory_sha256"] == "a" * 64
+    assert seen["workers"] == 96
+    assert seen["execution_receipt_path"] == tmp_path / "receipt.EXECUTION_RECEIPT.json"
     assert seen["held_out_receipt_sha256"] == make_exclusion_receipt("held-out", ()).receipt_sha256
