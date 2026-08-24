@@ -387,7 +387,64 @@ def test_oci_transfer_submitter_uses_cpu_partition_and_test_only(
         assert str(context.durable / "transfers/logs") in command
 
 
-@pytest.mark.parametrize("cluster", ["lyris", "ptyche"])
+def test_lyris_transfer_submitter_uses_one_partition_managed_node(
+    tmp_path: Path,
+) -> None:
+    """Lyris transfers use one GB200 node without requesting explicit GPUs."""
+    context = _transfer_context(tmp_path)
+    _write_profile(context, _HEAD, name="lyris")
+    command_dir = tmp_path / "bin"
+    command_dir.mkdir()
+    calls = tmp_path / "sbatch.calls"
+    sbatch = command_dir / "sbatch"
+    sbatch.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$*" >> "$SBATCH_CALLS"\n'
+        '[[ "$1" == "--test-only" ]] && exit 0\n'
+        'printf "8124\\n"\n'
+    )
+    sbatch.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{command_dir}{os.pathsep}{os.environ['PATH']}",
+        "SBATCH_CALLS": str(calls),
+    }
+
+    result = subprocess.run(
+        [
+            _BASH,
+            str(_TRANSFERS / "submit_transfer.sh"),
+            "--cluster-profile",
+            str(context.profile),
+            "upload",
+            "--artifact-id",
+            context.artifact_id,
+            "--artifact-source-commit",
+            _ARTIFACT_SOURCE_COMMIT,
+            "--source",
+            str(context.source),
+            "--remote-root",
+            "fake:project/specdec",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "8124"
+    submitted = calls.read_text().splitlines()
+    assert len(submitted) == 2
+    for command in submitted:
+        assert "--account=account" in command
+        assert "--partition=gb200" in command
+        assert "--nodes=1" in command
+        assert "--cpus-per-task=16" in command
+        assert "--gpus" not in command
+
+
+@pytest.mark.parametrize("cluster", ["ptyche"])
 def test_transfer_submitter_fails_closed_without_approved_partition(
     tmp_path: Path, cluster: str
 ) -> None:

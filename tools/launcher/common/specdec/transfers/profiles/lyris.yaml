@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: lyris
-partition:
-cpus_per_task:
+partition: gb200
+cpus_per_task: 16
 gpus_per_node:
-walltime:
+walltime: "01:00:00"
