@@ -20,6 +20,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -57,6 +58,12 @@ class FakeTokenizer:
             input_ids.insert(0, 77)
             mask.insert(0, 0)
         return {"input_ids": input_ids, "assistant_masks": mask}
+
+
+class CandidateTokenizer:
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs["add_generation_prompt"] is True
+        return {"input_ids": [index + 1 for index, _ in enumerate(messages)]}
 
 
 def _write_bound_source(tmp_path: Path, rows: list[dict]) -> Path:
@@ -288,6 +295,176 @@ def test_candidate_inventory_verifies_every_source_before_parsing_rows(tmp_path:
             baseline_exclusion=module.make_exclusion_receipt("baseline", set()),
             held_out_exclusion=module.make_exclusion_receipt("held-out", set()),
         )
+
+
+def test_candidate_inventory_normalizes_raw_ptv2_cells_for_bprime_selection(
+    tmp_path: Path,
+) -> None:
+    """A full Task3 PTV2 inventory reaches the genuine B-prime publisher."""
+    module = _load_module()
+    revision = module.APPROVED_PTV2_REVISION
+    repository = "nvidia/Nemotron-Post-Training-Dataset-v2"
+    sources = []
+    splits = (
+        "chat",
+        "code",
+        "math",
+        "stem",
+        "multilingual_ja",
+        "multilingual_it",
+        "multilingual_de",
+        "multilingual_es",
+        "multilingual_fr",
+    )
+    remaining = 201
+    for split_index, split in enumerate(splits):
+        count = remaining // (len(splits) - split_index)
+        remaining -= count
+        files = []
+        for file_index in range(count):
+            relative = f"data/{split}/{file_index:03d}.jsonl"
+            staged = tmp_path / "sources" / repository / revision / relative
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_text(
+                json.dumps(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": f"question-{split}-{file_index}",
+                            },
+                            {
+                                "role": "assistant",
+                                "content": f"answer-{split}-{file_index}",
+                            },
+                        ]
+                    }
+                )
+                + "\n"
+            )
+            files.append(
+                module.SourceFile(
+                    relative,
+                    staged.stat().st_size,
+                    module.sha256_file(staged),
+                )
+            )
+        sources.append(
+            module.SourceIdentity(
+                repository,
+                "default",
+                split,
+                revision,
+                "CC-BY-4.0",
+                True,
+                split,
+                "target-synth",
+                tuple(files),
+            )
+        )
+    canonical_manifest = module.canonical_json(
+        {
+            "schema_version": 1,
+            "name": "ptv2-normalization",
+            "sources": [
+                {
+                    "repository_id": source.repository_id,
+                    "configuration": source.configuration,
+                    "split": source.split,
+                    "revision": source.revision,
+                    "license_expression": source.license_expression,
+                    "approved_use": source.approved_use,
+                    "cell": source.cell,
+                    "lane": source.lane,
+                    "files": [
+                        {
+                            "path": file.path,
+                            "bytes": file.bytes,
+                            "sha256": file.sha256,
+                        }
+                        for file in source.files
+                    ],
+                }
+                for source in sources
+            ],
+        }
+    )
+    inventory = module.SourceInventory(
+        1,
+        "ptv2-normalization",
+        tuple(sources),
+        hashlib.sha256(canonical_manifest).hexdigest(),
+        canonical_manifest,
+        {},
+        tmp_path,
+    )
+
+    candidates = module.build_candidate_inventory(
+        inventory,
+        tokenizer=CandidateTokenizer(),
+        tokenizer_sha256="f" * 64,
+        baseline_exclusion=module.make_exclusion_receipt("baseline", ()),
+        held_out_exclusion=module.make_exclusion_receipt("held-out", ()),
+    )
+    try:
+        observed = {(row.domain, row.language) for row in candidates.rows}
+        sys.path.insert(0, str(MODULE_PATH.parent))
+        try:
+            sys.modules.pop("bprime_cd_policy", None)
+            sys.modules.pop("select_bprime_cd_prompts", None)
+            import bprime_cd_policy as policy_module
+            import select_bprime_cd_prompts as selection_module
+        finally:
+            sys.path.pop(0)
+        cells = MappingProxyType(
+            {
+                name: policy_module.PromptCell(1)
+                for name in ("stem", "japanese", "spanish", "french", "italian")
+            }
+        )
+        policy = policy_module.PromptPolicy(
+            1,
+            20260822,
+            1,
+            1,
+            MappingProxyType({"B-prime": policy_module.ArmPolicy(5, cells, MappingProxyType({}))}),
+            (256_000_000, 1_000_000_000),
+            4096,
+            32768,
+            frozenset({"en", "ja", "es", "fr", "it"}),
+            frozenset({"de"}),
+            "a" * 64,
+        )
+        bundle = selection_module.select_bprime_prompt_view(
+            candidates,
+            policy,
+            source_inventory=inventory,
+            baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
+            held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
+        )
+        try:
+            published = selection_module.publish_bprime_prompt_view_bundle(
+                bundle, tmp_path / "published-bprime", rows_per_shard=2
+            )
+        finally:
+            bundle.close()
+    finally:
+        candidates.rows.close()
+
+    assert observed == {
+        ("instruction-chat", "en"),
+        ("code", "en"),
+        ("math", "en"),
+        ("stem-science", "en"),
+        ("multilingual", "ja"),
+        ("multilingual", "it"),
+        ("multilingual", "de"),
+        ("multilingual", "es"),
+        ("multilingual", "fr"),
+    }
+    selection_manifest = json.loads(published.manifest_path.read_bytes())
+    assert selection_manifest["selection_mode"] == "B-prime-only"
+    assert set(selection_manifest["arms"]) == {"B-prime"}
 
 
 @pytest.mark.parametrize(

@@ -41,12 +41,18 @@ from build_specdec_inventory import (
     is_approved_ptv2_source,
 )
 from specdec_corpus_contracts import canonical_json, sha256_bytes
-from stage_ptv23_sources import _fsync_directory, _rename_no_replace, _write_bytes_durable
+from stage_ptv23_sources import (
+    SourceInventory,
+    _fsync_directory,
+    _rename_no_replace,
+    _write_bytes_durable,
+)
 
 if TYPE_CHECKING:
     from bprime_cd_policy import PromptPolicy
 
 __all__ = [
+    "BPrimePromptViewBundle",
     "DiskBackedSelectedRows",
     "PromptPublicationArtifactIdentity",
     "PromptPublicationDurabilityError",
@@ -62,7 +68,9 @@ __all__ = [
     "SelectionBlockedError",
     "build_policy_count_proofs",
     "prompt_publication_recovery_state",
+    "publish_bprime_prompt_view_bundle",
     "publish_prompt_view_bundle",
+    "select_bprime_prompt_view",
     "select_prompt_views",
 ]
 
@@ -200,6 +208,38 @@ class PromptViewBundle:
         self._storage.close()
 
     def __enter__(self) -> PromptViewBundle:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+@dataclass(frozen=True)
+class BPrimePromptViewBundle:
+    """A PTV2-only B-prime selection with no C/D publication surface."""
+
+    B_prime: PromptView
+    policy_sha256: str
+    seed: int
+    source_inventory_sha256: str
+    baseline_receipt_sha256: str
+    held_out_receipt_sha256: str
+    ptv2_revision: str
+    ptv2_allowlist_sha256: str
+    reserve_numerator: int
+    reserve_denominator: int
+    paired_cd_sha256: str
+    selection_sha256: str
+    _storage: _SelectionStorage
+
+    @property
+    def selection_digest(self) -> str:
+        return self.selection_sha256
+
+    def close(self) -> None:
+        self._storage.close()
+
+    def __enter__(self) -> BPrimePromptViewBundle:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -545,6 +585,162 @@ def select_prompt_views(
     except BaseException:
         storage.close()
         raise
+
+
+def select_bprime_prompt_view(
+    inventory: CandidateInventory,
+    policy: PromptPolicy,
+    *,
+    source_inventory: SourceInventory,
+    baseline_receipt_sha256: str,
+    held_out_receipt_sha256: str,
+) -> BPrimePromptViewBundle:
+    """Select the authenticated PTV2-only B-prime complement without C/D."""
+    storage = _SelectionStorage()
+    try:
+        _validate_digest(inventory.inventory_sha256, "source inventory")
+        if candidate_inventory_sha256(inventory) != inventory.inventory_sha256:
+            raise ValueError("source inventory streamed identity mismatch")
+        if (
+            inventory.ptv2_revision != APPROVED_PTV2_REVISION
+            or inventory.ptv2_allowlist_sha256 != APPROVED_PTV2_ALLOWLIST_SHA256
+        ):
+            raise ValueError("source inventory PTV2 allowlist identity mismatch")
+        _validate_digest(policy.policy_sha256, "policy")
+        _validate_exclusion_receipts(inventory, baseline_receipt_sha256, held_out_receipt_sha256)
+        _validate_bprime_source_inventory(source_inventory)
+        _validate_bprime_only_rows(inventory.rows, source_inventory)
+        connection = storage.open_working_connection()
+        _create_selection_schema(connection)
+        _spool_candidates(connection, inventory.rows, policy)
+        floors_by_cell: dict[str, dict[str, int]] = {}
+        for cell, (domain, lane, language) in _BPRIME_CELLS.items():
+            floors_by_cell[cell] = _select_sql_cell(
+                connection,
+                quota=policy.count_for("B-prime", cell),
+                arm="B-prime",
+                cell=cell,
+                domain=domain,
+                lane=lane,
+                language=language,
+                source_family="ptv2",
+                source_revision=inventory.ptv2_revision,
+                approved_ptv2=True,
+                policy=policy,
+                inventory_sha256=inventory.inventory_sha256,
+                baseline_receipt_sha256=baseline_receipt_sha256,
+                held_out_receipt_sha256=held_out_receipt_sha256,
+            )
+        _assign_selection_indexes(connection)
+        connection.commit()
+        view = _build_disk_view(storage, "B-prime", floors_by_cell, policy, (), {})
+        paired_cd_sha256 = "0" * 64
+        metadata = {
+            "schema_version": 2,
+            "selection_mode": "B-prime-only",
+            "policy_sha256": policy.policy_sha256,
+            "seed": policy.seed,
+            "source_inventory_sha256": inventory.inventory_sha256,
+            "baseline_receipt_sha256": baseline_receipt_sha256,
+            "held_out_receipt_sha256": held_out_receipt_sha256,
+            "ptv2_revision": inventory.ptv2_revision,
+            "ptv2_allowlist_sha256": inventory.ptv2_allowlist_sha256,
+            "paired_cd_sha256": paired_cd_sha256,
+            "arms": {view.arm: _compact_view_record(view)},
+        }
+        selection_sha256 = _stream_selection_digest(connection, metadata)
+        storage.release_working_connection()
+        return BPrimePromptViewBundle(
+            B_prime=view,
+            policy_sha256=policy.policy_sha256,
+            seed=policy.seed,
+            source_inventory_sha256=inventory.inventory_sha256,
+            baseline_receipt_sha256=baseline_receipt_sha256,
+            held_out_receipt_sha256=held_out_receipt_sha256,
+            ptv2_revision=inventory.ptv2_revision,
+            ptv2_allowlist_sha256=inventory.ptv2_allowlist_sha256,
+            reserve_numerator=policy.reserve_numerator,
+            reserve_denominator=policy.reserve_denominator,
+            paired_cd_sha256=paired_cd_sha256,
+            selection_sha256=selection_sha256,
+            _storage=storage,
+        )
+    except BaseException:
+        storage.close()
+        raise
+
+
+def _validate_bprime_source_inventory(source_inventory: SourceInventory) -> None:
+    if (
+        not isinstance(source_inventory, SourceInventory)
+        or sha256(source_inventory.canonical_manifest).hexdigest()
+        != source_inventory.manifest_sha256
+    ):
+        raise ValueError("B-prime-only Task 3 source inventory identity mismatch")
+    if sum(len(source.files) for source in source_inventory.sources) != 201:
+        raise ValueError("B-prime-only selection requires exactly 201 PTV2 source shards")
+    if any(
+        source.lane != "target-synth"
+        or not is_approved_ptv2_source(
+            source.repository_id, source.configuration, source.split, source.revision
+        )
+        for source in source_inventory.sources
+    ):
+        raise ValueError("B-prime-only selection requires a PTV2-only approved inventory")
+
+
+def _validate_bprime_only_rows(rows: Iterable[Any], source_inventory: SourceInventory) -> None:
+    canonical = {
+        "chat": ("instruction-chat", "en"),
+        "code": ("code", "en"),
+        "math": ("math", "en"),
+        "stem": ("stem-science", "en"),
+        "multilingual_ja": ("multilingual", "ja"),
+        "multilingual_it": ("multilingual", "it"),
+        "multilingual_de": ("multilingual", "de"),
+        "multilingual_es": ("multilingual", "es"),
+        "multilingual_fr": ("multilingual", "fr"),
+    }
+    source_files = {
+        (
+            source.repository_id,
+            source.configuration,
+            source.split,
+            source.revision,
+            file.path,
+            file.sha256,
+        )
+        for source in source_inventory.sources
+        for file in source.files
+    }
+    for row in rows:
+        if not isinstance(row, CandidatePrompt):
+            raise TypeError("candidate inventory rows must be CandidatePrompt values")
+        if row.source_family != "ptv2" or not is_approved_ptv2_source(
+            row.source_repository_id,
+            row.source_configuration,
+            row.source_split,
+            row.source_revision,
+        ):
+            raise ValueError("B-prime-only selection requires a PTV2-only approved inventory")
+        expected = canonical.get(row.source_split)
+        if expected is None or row.domain != expected[0] or row.lane != "target-synth":
+            raise ValueError("PTV2 candidate does not use the canonical cell and lane")
+        if row.language != expected[1]:
+            raise ValueError("PTV2 candidate language does not match its source split")
+        if (
+            row.source_manifest_sha256 != source_inventory.manifest_sha256
+            or (
+                row.source_repository_id,
+                row.source_configuration,
+                row.source_split,
+                row.source_revision,
+                row.source_file_path,
+                row.source_file_sha256,
+            )
+            not in source_files
+        ):
+            raise ValueError("PTV2 candidate source digest does not match Task 3 inventory")
 
 
 def _select_prompt_views_impl(
@@ -1069,6 +1265,37 @@ def _observe_publication_inode(path: Path) -> PromptPublicationInodeSnapshot:
 def publish_prompt_view_bundle(
     bundle: PromptViewBundle, output_dir: Path, *, rows_per_shard: int = 10_000
 ) -> PublishedPromptViews:
+    """Publish the full B-prime/C/D selection bundle."""
+    return _publish_prompt_view_bundle(
+        bundle,
+        output_dir,
+        rows_per_shard=rows_per_shard,
+        views=(bundle.B_prime, bundle.C, bundle.D),
+        selection_mode=None,
+    )
+
+
+def publish_bprime_prompt_view_bundle(
+    bundle: BPrimePromptViewBundle, output_dir: Path, *, rows_per_shard: int = 10_000
+) -> PublishedPromptViews:
+    """Publish an authenticated PTV2-only B-prime complement."""
+    return _publish_prompt_view_bundle(
+        bundle,
+        output_dir,
+        rows_per_shard=rows_per_shard,
+        views=(bundle.B_prime,),
+        selection_mode="B-prime-only",
+    )
+
+
+def _publish_prompt_view_bundle(
+    bundle: PromptViewBundle | BPrimePromptViewBundle,
+    output_dir: Path,
+    *,
+    rows_per_shard: int,
+    views: tuple[PromptView, ...],
+    selection_mode: str | None,
+) -> PublishedPromptViews:
     """Stream canonical rows to hashed JSONL shards plus a compact indexed root manifest."""
     if (
         isinstance(rows_per_shard, bool)
@@ -1146,7 +1373,7 @@ def publish_prompt_view_bundle(
             """
         )
         phase = PromptPublicationPhase.SHARD_WRITE
-        for view in (bundle.B_prime, bundle.C, bundle.D):
+        for view in views:
             for rows in (view.primary_rows, view.reserve_rows):
                 for selected in rows:
                     if shard_file is None or shard_count == rows_per_shard:
@@ -1220,15 +1447,14 @@ def publish_prompt_view_bundle(
                 "reserve_numerator": bundle.reserve_numerator,
                 "reserve_denominator": bundle.reserve_denominator,
             },
-            "arms": {
-                view.arm: _compact_view_record(view)
-                for view in (bundle.B_prime, bundle.C, bundle.D)
-            },
+            "arms": {view.arm: _compact_view_record(view) for view in views},
             "row_count": row_count,
             "rows_per_shard": rows_per_shard,
             "shards": shards,
             "index": {"path": "selection-index.sqlite3", "sha256": index_sha256},
         }
+        if selection_mode is not None:
+            manifest["selection_mode"] = selection_mode
         root_sha256 = sha256_bytes(canonical_json(manifest))
         manifest["root_sha256"] = root_sha256
         expected_artifact_identity = PromptPublicationArtifactIdentity(
@@ -1288,7 +1514,9 @@ def publish_prompt_view_bundle(
     )
 
 
-def _validate_selected_rank(row: SelectedPrompt, bundle: PromptViewBundle) -> None:
+def _validate_selected_rank(
+    row: SelectedPrompt, bundle: PromptViewBundle | BPrimePromptViewBundle
+) -> None:
     fields = (
         bundle.policy_sha256,
         str(bundle.seed),

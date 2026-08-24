@@ -886,9 +886,11 @@ def _authenticate_task5_bprime(
         }
         or not isinstance(arm_record, dict)
         or not isinstance(arms, dict)
-        or set(arms) != {"B-prime", "C", "D"}
+        or set(arms) != {"B-prime"}
+        or manifest.get("selection_mode") != "B-prime-only"
+        or manifest.get("paired_cd_sha256") != "0" * 64
     ):
-        raise PTV2StudyError("Task 5 B-prime arm identity is missing")
+        raise PTV2StudyError("Task 5 B-prime-only arm identity is missing")
     if not isinstance(index_record, dict) or not isinstance(index_record.get("path"), str):
         raise PTV2StudyError("Task 5 selection index identity is missing")
     expected_cells = {
@@ -920,6 +922,7 @@ def _authenticate_task5_bprime(
         raise PTV2StudyError("Task 5 B-prime arm count proof does not reconcile")
     selection_metadata = {
         "schema_version": manifest.get("schema_version"),
+        "selection_mode": manifest.get("selection_mode"),
         "policy_sha256": identity.get("policy_sha256"),
         "seed": identity.get("seed"),
         "source_inventory_sha256": identity.get("source_inventory_sha256"),

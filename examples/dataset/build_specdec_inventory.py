@@ -602,7 +602,14 @@ def _verified_candidate_files(
 
 def _normalize_language(value: Any, source: SourceIdentity) -> str:
     if value is None:
-        value = _APPROVED_SOURCE_LANGUAGES.get((source.repository_id, source.split))
+        if _approved_ptv2_source(source):
+            value = (
+                source.split.removeprefix("multilingual_")
+                if source.split.startswith("multilingual_")
+                else "en"
+            )
+        else:
+            value = _APPROVED_SOURCE_LANGUAGES.get((source.repository_id, source.split))
     if not isinstance(value, str) or not value.strip():
         raise ValueError("invalid_language")
     normalized = value.strip().lower().replace("_", "-")
@@ -610,6 +617,20 @@ def _normalize_language(value: Any, source: SourceIdentity) -> str:
     if normalized not in _LANGUAGE_CODES:
         raise ValueError("invalid_language")
     return normalized
+
+
+def _candidate_domain(source: SourceIdentity) -> str:
+    if not _approved_ptv2_source(source):
+        return source.cell
+    expected_cell = source.split
+    if source.cell != expected_cell:
+        raise ValueError(
+            f"approved PTV2 source cell does not match split: {source.cell!r} != {expected_cell!r}"
+        )
+    return {
+        "chat": "instruction-chat",
+        "stem": "stem-science",
+    }.get(source.cell, "multilingual" if source.cell.startswith("multilingual_") else source.cell)
 
 
 def _row_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -892,7 +913,7 @@ def build_candidate_inventory(
                     source_revision=source.revision,
                     source_file_sha256=descriptor.sha256,
                     source_row_index=row_index,
-                    domain=source.cell,
+                    domain=_candidate_domain(source),
                     language=language,
                     lane=source.lane,
                     context_bucket=context_bucket,

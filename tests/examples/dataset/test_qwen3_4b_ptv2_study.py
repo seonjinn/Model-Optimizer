@@ -49,11 +49,12 @@ try:
         write_task9_balanced_view_json,
     )
     from select_bprime_cd_prompts import (
+        BPrimePromptViewBundle,
         PromptView,
-        PromptViewBundle,
         SelectedPrompt,
+        publish_bprime_prompt_view_bundle,
         publish_prompt_view_bundle,
-        select_prompt_views,
+        select_bprime_prompt_view,
     )
     from specdec_corpus_contracts import canonical_json
     from specdec_identity import prompt_uuid
@@ -178,7 +179,7 @@ def _write_authenticated_staged_parquet(tmp_path: Path) -> tuple[Path, Path]:
     return receipt, staged_file
 
 
-def _genuine_scaled_task5_bundle() -> PromptViewBundle:
+def _genuine_scaled_task5_bundle() -> BPrimePromptViewBundle:
     approved_ptv2_revision = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
     b_cells = {name: PromptCell(1) for name in ("stem", "japanese", "spanish", "french", "italian")}
     non_agentic = {
@@ -266,6 +267,10 @@ def _genuine_scaled_task5_bundle() -> PromptViewBundle:
                 split,
             )
         )
+    candidates = [row for row in candidates if row.source_family == "ptv2"]
+    task3_manifest = b"authenticated-task3-ptv2-fixture"
+    task3_sha256 = sha256(task3_manifest).hexdigest()
+    candidates = [replace(row, source_manifest_sha256=task3_sha256) for row in candidates]
     capacity = Counter(
         CandidateCell(row.domain, row.lane, row.language, row.context_bucket) for row in candidates
     )
@@ -282,9 +287,61 @@ def _genuine_scaled_task5_bundle() -> PromptViewBundle:
         APPROVED_PTV2_ALLOWLIST_SHA256,
     )
     inventory = replace(inventory, inventory_sha256=candidate_inventory_sha256(inventory))
-    return select_prompt_views(
+    matching = {row.source_split: row for row in candidates}
+    source_splits = (
+        "chat",
+        "code",
+        "math",
+        "stem",
+        "multilingual_ja",
+        "multilingual_it",
+        "multilingual_de",
+        "multilingual_es",
+        "multilingual_fr",
+    )
+    remaining = 201
+    sources = []
+    for index, split in enumerate(source_splits):
+        count = remaining // (len(source_splits) - index)
+        remaining -= count
+        selected = matching.get(split)
+        files = tuple(
+            SourceFile(
+                selected.source_file_path
+                if file_index == 0 and selected
+                else f"{split}/{file_index}.parquet",
+                1,
+                selected.source_file_sha256
+                if file_index == 0 and selected
+                else sha256(f"{split}/{file_index}".encode()).hexdigest(),
+            )
+            for file_index in range(count)
+        )
+        sources.append(
+            SourceIdentity(
+                "nvidia/Nemotron-Post-Training-Dataset-v2",
+                "default",
+                split,
+                approved_ptv2_revision,
+                "NVIDIA Open Model License",
+                True,
+                split,
+                "target-synth",
+                files,
+            )
+        )
+    source_inventory = SourceInventory(
+        1,
+        "ptv2-fixture",
+        tuple(sources),
+        task3_sha256,
+        task3_manifest,
+        MappingProxyType({}),
+    )
+    return select_bprime_prompt_view(
         inventory,
         task5_policy,
+        source_inventory=source_inventory,
         baseline_receipt_sha256=baseline_sha256,
         held_out_receipt_sha256=held_out_sha256,
     )
@@ -1018,7 +1075,9 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
     """A genuine Task5 selector/publication is replayed; a forged selection root is rejected."""
     task5_bundle = _genuine_scaled_task5_bundle()
     try:
-        published = publish_prompt_view_bundle(task5_bundle, tmp_path / "task5", rows_per_shard=4)
+        published = publish_bprime_prompt_view_bundle(
+            task5_bundle, tmp_path / "task5", rows_per_shard=4
+        )
     finally:
         task5_bundle.close()
     manifest_path = published.manifest_path
@@ -1049,6 +1108,47 @@ def test_a_repair_authenticates_genuine_task5_bprime_selection_and_arm_proof(
 
     assert len(arm_identity) == 64
     manifest = json.loads(manifest_path.read_bytes())
+
+    contaminated = json.loads(manifest_path.read_bytes())
+    contaminated["arms"]["C"] = contaminated["arms"]["B-prime"]
+    root_record = {key: value for key, value in contaminated.items() if key != "root_sha256"}
+    contaminated["root_sha256"] = sha256(canonical_json(root_record)).hexdigest()
+    manifest_path.write_bytes(canonical_json(contaminated) + b"\n")
+    contaminated_sha256 = sha256(manifest_path.read_bytes()).hexdigest()
+    contaminated_view = study_module.load_prompt_view(
+        manifest_path,
+        expected_manifest_sha256=contaminated_sha256,
+        arm="B-prime",
+    )
+    with pytest.raises(PTV2StudyError, match="B-prime-only"):
+        study_module._authenticate_task5_bprime(
+            manifest_path,
+            expected_manifest_sha256=contaminated_sha256,
+            view=contaminated_view,
+            policy=study_policy,
+        )
+
+    manifest_path.write_bytes(canonical_json(manifest) + b"\n")
+    forged_source = json.loads(manifest_path.read_bytes())
+    forged_source["identity"]["source_inventory_sha256"] = "e" * 64
+    root_record = {key: value for key, value in forged_source.items() if key != "root_sha256"}
+    forged_source["root_sha256"] = sha256(canonical_json(root_record)).hexdigest()
+    manifest_path.write_bytes(canonical_json(forged_source) + b"\n")
+    forged_source_sha256 = sha256(manifest_path.read_bytes()).hexdigest()
+    forged_source_view = study_module.load_prompt_view(
+        manifest_path,
+        expected_manifest_sha256=forged_source_sha256,
+        arm="B-prime",
+    )
+    with pytest.raises(PTV2StudyError, match="selection digest"):
+        study_module._authenticate_task5_bprime(
+            manifest_path,
+            expected_manifest_sha256=forged_source_sha256,
+            view=forged_source_view,
+            policy=study_policy,
+        )
+
+    manifest_path.write_bytes(canonical_json(manifest) + b"\n")
     manifest["selection_sha256"] = "f" * 64
     root_record = {key: value for key, value in manifest.items() if key != "root_sha256"}
     manifest["root_sha256"] = sha256(canonical_json(root_record)).hexdigest()
