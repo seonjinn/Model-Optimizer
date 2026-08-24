@@ -709,15 +709,15 @@ def _prepare_candidate(
         or not messages
         or any(
             not isinstance(message, dict)
-            or message.get("role") not in {"system", "user", "assistant", "tool"}
+            or message.get("role") not in {"system", "developer", "user", "assistant", "tool"}
             or not isinstance(message.get("content"), str)
             for message in messages
         )
     ):
         raise ValueError("Task8 record_json lacks canonical messages")
     tools = producer_row.get("tools", [])
-    if not isinstance(tools, list):
-        raise ValueError("Task8 record_json tools must be a list")
+    if not isinstance(tools, list) or any(not _valid_hf_tool(tool) for tool in tools):
+        raise ValueError("Task8 record_json tool schema is invalid")
     identifier = _required_task8_string(row, "prompt_uuid")
     streaming_row: dict[str, object] = {
         "conversation_id": identifier,
@@ -728,6 +728,25 @@ def _prepare_candidate(
         "_rank": _rank(seed, ordinal, identifier),
     }
     return streaming_row, category
+
+
+def _valid_hf_tool(value: object) -> bool:
+    if not isinstance(value, dict) or value.get("type") != "function":
+        return False
+    function = value.get("function")
+    if not isinstance(function, dict):
+        return False
+    name = function.get("name")
+    description = function.get("description")
+    parameters = function.get("parameters")
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and (description is None or isinstance(description, str))
+        and isinstance(parameters, dict)
+        and parameters.get("type") == "object"
+        and isinstance(parameters.get("properties", {}), dict)
+    )
 
 
 def _category_quotas() -> dict[str, int]:

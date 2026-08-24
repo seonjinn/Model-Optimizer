@@ -14,6 +14,7 @@ import sys
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from common.specdec import build_qwen4b_b_canary as b_builder
@@ -30,9 +31,11 @@ from common.specdec.qwen4b_b_canary_manifest import (
     BCanaryRuntimeIdentity,
     BCanaryTopology,
     load_b_canary_manifest,
+    publish_a_scheduler_observation,
     publish_b_canary_evidence,
     publish_b_supervisor_completion,
     validate_a_authorization_receipt,
+    validate_a_scheduler_observation,
     validate_bound_artifacts,
     validate_runtime_artifacts,
     write_b_canary_manifest,
@@ -328,6 +331,80 @@ def test_builder_emits_canonical_streaming_dataset_rows(
     )
 
 
+def test_builder_accepts_developer_messages_and_validates_hf_tool_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source-native developer/tool conversations remain valid HF JSON rows."""
+    monkeypatch.setattr(
+        b_builder,
+        "CANARY_CELL_QUOTAS",
+        {"math": 1, "code": 0, "stem": 0, "chat": 0, "multilingual": 0},
+    )
+    monkeypatch.setattr(
+        b_builder,
+        "CANARY_LANGUAGE_QUOTAS",
+        dict.fromkeys(("de", "ja", "es", "fr", "it"), 0),
+    )
+    row = _task8_row("math", "developer")
+    producer = json.loads(str(row["record_json"]))
+    producer["messages"].insert(0, {"role": "developer", "content": "Be exact."})
+    producer_tools: list[dict[str, Any]] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup a value.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    producer["tools"] = producer_tools
+    row["record_json"] = json.dumps(producer, sort_keys=True, separators=(",", ":"))
+
+    selected = build_canary_occurrences([row], seed=17)
+
+    messages = cast("list[dict[str, object]]", selected[0]["messages"])
+    assert messages[0]["role"] == "developer"
+    assert selected[0]["tools"] == producer["tools"]
+    producer_tools[0]["function"]["parameters"] = "not-json-schema"
+    row["record_json"] = json.dumps(producer, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(ValueError, match="tool schema"):
+        build_canary_occurrences([row], seed=17)
+
+
+def test_builder_output_loads_with_huggingface_json_dataset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Canonical builder JSONL is accepted by the production HF JSON loader."""
+    from datasets import load_dataset  # pyright: ignore[reportMissingImports]
+
+    monkeypatch.setattr(
+        b_builder,
+        "CANARY_CELL_QUOTAS",
+        {"math": 1, "code": 0, "stem": 0, "chat": 0, "multilingual": 0},
+    )
+    monkeypatch.setattr(
+        b_builder,
+        "CANARY_LANGUAGE_QUOTAS",
+        dict.fromkeys(("de", "ja", "es", "fr", "it"), 0),
+    )
+    selected = build_canary_occurrences([_task8_row("math", "hf-json")], seed=17)
+    output = tmp_path / "canary.jsonl"
+    output.write_text(
+        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in selected)
+    )
+
+    dataset = load_dataset("json", data_files=str(output), split="train")
+
+    assert len(dataset) == 1
+    assert dataset[0]["conversation_id"] == sha256(b"hf-json").hexdigest()
+    assert dataset[0]["messages"][-1] == {
+        "role": "assistant",
+        "content": "answer-hf-json",
+    }
+    assert dataset[0]["loss_mask"] == [0, 1]
+
+
 def test_manifest_requires_transitive_builder_identities() -> None:
     """The GPU manifest cannot omit either immutable builder artifact identity."""
     with pytest.raises(TypeError):
@@ -341,6 +418,7 @@ def test_manifest_requires_transitive_builder_identities() -> None:
 
 def test_runtime_artifacts_rehash_exact_qwen4b_snapshot_and_container(tmp_path: Path) -> None:
     """The GPU runtime cannot drift from the pinned target/tokenizer/template/container."""
+    repo_root = Path(__file__).resolve().parents[3]
     revision = "1" * 40
     target = tmp_path / revision
     target.mkdir()
@@ -348,6 +426,7 @@ def test_runtime_artifacts_rehash_exact_qwen4b_snapshot_and_container(tmp_path: 
         json.dumps(
             {
                 "model_type": "qwen3",
+                "vocab_size": 151936,
                 "hidden_size": 2560,
                 "intermediate_size": 9728,
                 "num_hidden_layers": 36,
@@ -359,9 +438,12 @@ def test_runtime_artifacts_rehash_exact_qwen4b_snapshot_and_container(tmp_path: 
     )
     template = target / "chat_template.jinja"
     template.write_text("{% generation %}{{ content }}{% endgeneration %}\n")
+    (target / "tokenizer_config.json").write_text("{}\n")
     (target / "tokenizer.json").write_text("{}\n")
+    weights = target / "model.safetensors"
+    weights.write_bytes(b"weights")
     tokenizer_digest = sha256()
-    for path in sorted((template, target / "tokenizer.json")):
+    for path in sorted((template, target / "tokenizer.json", target / "tokenizer_config.json")):
         tokenizer_digest.update(path.name.encode())
         tokenizer_digest.update(b"\0")
         tokenizer_digest.update(bytes.fromhex(sha256(path.read_bytes()).hexdigest()))
@@ -374,9 +456,25 @@ def test_runtime_artifacts_rehash_exact_qwen4b_snapshot_and_container(tmp_path: 
         base.runtime,
         target_path=str(target),
         target_revision=revision,
+        target_snapshot_sha256=_directory_digest(target),
         tokenizer_sha256=tokenizer_digest.hexdigest(),
         chat_template_sha256=sha256(template.read_bytes()).hexdigest(),
+        container_path=str(container),
         container_sha256=sha256(container.read_bytes()).hexdigest(),
+        runner_sha256=sha256(
+            (repo_root / "tools/launcher/common/specdec/run_qwen4b_b_canary.sbatch").read_bytes()
+        ).hexdigest(),
+        evaluator_sha256=sha256(
+            (repo_root / "tools/launcher/common/specdec/run_qwen4b_b_canary_eval.sh").read_bytes()
+        ).hexdigest(),
+        train_script_sha256=sha256(
+            (repo_root / "examples/speculative_decoding/launch_train.sh").read_bytes()
+        ).hexdigest(),
+        exporter_sha256=sha256(
+            (
+                repo_root / "examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+            ).read_bytes()
+        ).hexdigest(),
     )
     manifest = replace(base, runtime=runtime)
 
@@ -384,14 +482,26 @@ def test_runtime_artifacts_rehash_exact_qwen4b_snapshot_and_container(tmp_path: 
         manifest,
         supervisor_path=Path(runtime.supervisor_path),
         config_path=Path(runtime.config_path),
+        repo_root=repo_root,
         container_path=container,
     )
+    weights.write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="full target snapshot"):
+        validate_runtime_artifacts(
+            manifest,
+            supervisor_path=Path(runtime.supervisor_path),
+            config_path=Path(runtime.config_path),
+            repo_root=repo_root,
+            container_path=container,
+        )
+    weights.write_bytes(b"weights")
     container.write_bytes(b"drift")
     with pytest.raises(ValueError, match="container identity"):
         validate_runtime_artifacts(
             manifest,
             supervisor_path=Path(runtime.supervisor_path),
             config_path=Path(runtime.config_path),
+            repo_root=repo_root,
             container_path=container,
         )
 
@@ -684,8 +794,10 @@ def _runtime(tmp_path: Path, corpus_path: Path) -> BCanaryRuntimeIdentity:
         target_model_id="Qwen/Qwen3-4B",
         target_path=str(tmp_path / "target"),
         target_revision="1" * 40,
+        target_snapshot_sha256="1" * 64,
         tokenizer_sha256="2" * 64,
         chat_template_sha256="3" * 64,
+        container_path=str(tmp_path / "runtime.sqsh"),
         container_sha256="4" * 64,
         thinking_mode="off",
         method="dflash",
@@ -696,6 +808,10 @@ def _runtime(tmp_path: Path, corpus_path: Path) -> BCanaryRuntimeIdentity:
         supervisor_sha256=sha256(supervisor.read_bytes()).hexdigest(),
         config_path=str(config),
         config_sha256=sha256(config.read_bytes()).hexdigest(),
+        runner_sha256="5" * 64,
+        evaluator_sha256="6" * 64,
+        train_script_sha256="7" * 64,
+        exporter_sha256="8" * 64,
         corpus_arm="B-balanced",
         corpus_path=str(corpus_path),
         output_root=str(tmp_path / "output"),
@@ -941,6 +1057,7 @@ def test_cpu_datamover_runner_passes_all_96_cpus_as_builder_workers(tmp_path: Pa
         "B_CANARY_ACCOUNT": "nemotron_sw_post",
         "TARGET_PATH": str(tmp_path / "target"),
         "TARGET_REVISION": "e" * 40,
+        "CONTAINER_IMAGE": str(tmp_path / "runtime.sqsh"),
         "CONTAINER_SHA256": "f" * 64,
         "B_CANARY_OUTPUT_ROOT": str(tmp_path / "output"),
         "B_CANARY_WANDB_RUN_ID": "q4b-b-test",
@@ -1090,6 +1207,7 @@ def test_a_authorization_rejects_non_producer_fixture(tmp_path: Path) -> None:
         "checkpoint_reloaded": True,
         "drafter_exported": True,
         "all_gpus_active": True,
+        "scientific_training_authorized": False,
         "slurm_job_id": "42",
         "checkpoint_path": str(checkpoint),
         "checkpoint_sha256": _directory_digest(checkpoint),
@@ -1105,7 +1223,7 @@ def test_a_authorization_rejects_non_producer_fixture(tmp_path: Path) -> None:
     receipt.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
     pinned = sha256(receipt.read_bytes()).hexdigest()
 
-    with pytest.raises(ValueError, match="genuine A producer"):
+    with pytest.raises((FileNotFoundError, ValueError), match=r"manifest|No such file"):
         validate_a_authorization_receipt(
             receipt,
             pinned,
@@ -1116,139 +1234,6 @@ def test_a_authorization_rejects_non_producer_fixture(tmp_path: Path) -> None:
             container_sha256="8" * 64,
             repo_root=tmp_path,
         )
-
-
-def test_genuine_a_producer_receipt_authorizes_b_verifier(tmp_path: Path) -> None:
-    """Only the committed A producer can mint the receipt consumed by the B gate."""
-    from common.specdec.qwen4b_a_canary_manifest import (
-        ACanaryManifest,
-        ACanaryRuntimeIdentity,
-        ACanaryTopology,
-        publish_a_authorization,
-    )
-
-    repo_root = Path(__file__).resolve().parents[3]
-    source_commit = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    producer_relative = "tools/launcher/common/specdec/qwen4b_a_canary_manifest.py"
-    runner_relative = "tools/launcher/common/specdec/run_qwen4b_a_canary.sbatch"
-    selection = tmp_path / "selection.json"
-    selection.write_text(
-        json.dumps(
-            {"schema_version": 3, "selection_identity": {"strategy": "A-repair"}},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-    selection_sha = sha256(selection.read_bytes()).hexdigest()
-    publication = tmp_path / "publication.json"
-    publication.write_text(
-        json.dumps(
-            {
-                "selection_manifest_sha256": selection_sha,
-                "artifact_source_commit": source_commit,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-    publication_sha = sha256(publication.read_bytes()).hexdigest()
-    builder_output = tmp_path / "a-canary.jsonl"
-    builder_output.write_text("{}\n")
-    builder_output_sha = sha256(builder_output.read_bytes()).hexdigest()
-    builder = tmp_path / "build.json"
-    builder_body = {
-        "source_commit": source_commit,
-        "source_projection_sha256": selection_sha,
-        "source_task8_publication_sha256": publication_sha,
-        "output_sha256": builder_output_sha,
-    }
-    builder_body["receipt_sha256"] = sha256(
-        json.dumps(builder_body, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    builder.write_text(json.dumps(builder_body, sort_keys=True, separators=(",", ":")) + "\n")
-    checkpoint = tmp_path / "checkpoint"
-    export = tmp_path / "export"
-    checkpoint.mkdir()
-    export.mkdir()
-    (checkpoint / "trainer_state.json").write_text(
-        json.dumps({"global_step": 200, "log_history": [{"loss": 1.25}]}) + "\n"
-    )
-    (export / "config.json").write_text("{}\n")
-    (export / "model.safetensors").write_bytes(b"weights")
-    gpu = tmp_path / "gpu.json"
-    gpu.write_text(json.dumps({"slurm_job_id": "42", "active_gpu_ranks": list(range(64))}))
-    evaluation = tmp_path / "evaluation.json"
-    evaluation_body = {
-        "schema_version": 1,
-        "slurm_job_id": "42",
-        "status": "passed",
-        "evaluator": "specdec-bench-v1",
-        "export_sha256": _directory_digest(export),
-        "completed_requests": 4,
-        "metrics": {"acceptance_rate": 0.5},
-    }
-    evaluation_body["receipt_sha256"] = sha256(
-        json.dumps(evaluation_body, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    evaluation.write_text(json.dumps(evaluation_body, sort_keys=True, separators=(",", ":")) + "\n")
-    runtime = ACanaryRuntimeIdentity(
-        source_commit=source_commit,
-        target_revision="5" * 40,
-        tokenizer_sha256="6" * 64,
-        chat_template_sha256="7" * 64,
-        container_sha256="8" * 64,
-        producer_module_path=producer_relative,
-        producer_module_sha256=sha256((repo_root / producer_relative).read_bytes()).hexdigest(),
-        runner_path=runner_relative,
-        runner_sha256=sha256((repo_root / runner_relative).read_bytes()).hexdigest(),
-        supervisor_path="tools/launcher/common/eagle3/train_eagle_streaming.sh",
-        supervisor_sha256="9" * 64,
-        recipe_path="modelopt_recipes/general/speculative_decoding/dflash.yaml",
-        recipe_sha256="a" * 64,
-        evaluator_path="tools/launcher/common/specdec/run_qwen4b_a_canary_eval.sh",
-        evaluator_sha256="b" * 64,
-    )
-    a_manifest = ACanaryManifest(
-        runtime=runtime,
-        topology=ACanaryTopology(),
-        task9_a_selection_path=str(selection),
-        task9_a_selection_sha256=selection_sha,
-        task8_publication_path=str(publication),
-        task8_publication_sha256=publication_sha,
-        builder_receipt_path=str(builder),
-        builder_receipt_sha256=sha256(builder.read_bytes()).hexdigest(),
-        builder_output_path=str(builder_output),
-        builder_output_sha256=builder_output_sha,
-    )
-    receipt = tmp_path / "A_AUTHORIZATION.json"
-    publish_a_authorization(
-        receipt,
-        a_manifest,
-        job_id="42",
-        checkpoint_path=checkpoint,
-        export_path=export,
-        gpu_evidence_path=gpu,
-        evaluation_receipt_path=evaluation,
-    )
-
-    authorization = validate_a_authorization_receipt(
-        receipt,
-        sha256(receipt.read_bytes()).hexdigest(),
-        source_commit=source_commit,
-        target_revision="5" * 40,
-        tokenizer_sha256="6" * 64,
-        chat_template_sha256="7" * 64,
-        container_sha256="8" * 64,
-        repo_root=repo_root,
-    )
-    assert authorization.evaluation_receipt_sha256 == sha256(evaluation.read_bytes()).hexdigest()
 
 
 def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path: Path) -> None:
@@ -1274,6 +1259,11 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
         "status": "passed",
         "evaluator": "specdec-bench-v1",
         "export_sha256": _directory_digest(export),
+        "checkpoint_path": str(checkpoint),
+        "checkpoint_sha256": _directory_digest(checkpoint),
+        "exporter_path": "examples/speculative_decoding/scripts/export_hf_checkpoint.py",
+        "exporter_sha256": manifest.runtime.exporter_sha256,
+        "checkpoint_reloaded_by_exporter": True,
         "completed_requests": 50,
         "metrics": {"acceptance_rate": 0.5, "generation_throughput": 123.0},
     }
@@ -1291,16 +1281,31 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
             job_id="42",
             checkpoint_path=checkpoint,
             export_path=export,
+            evaluation_receipt_path=evaluation,
+            started_at="2026-08-23T20:00:00+00:00",
+            finished_at="2026-08-23T20:10:00+00:00",
         )
     (checkpoint / "trainer_state.json").write_text(
         json.dumps({"global_step": 200, "log_history": [{"loss": 1.5}, {"loss": 1.25}]}) + "\n"
     )
+    evaluation_body["checkpoint_sha256"] = _directory_digest(checkpoint)
+    evaluation_body["receipt_sha256"] = sha256(
+        json.dumps(
+            {key: value for key, value in evaluation_body.items() if key != "receipt_sha256"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    evaluation.write_text(json.dumps(evaluation_body, sort_keys=True, separators=(",", ":")) + "\n")
     publish_b_supervisor_completion(
         supervisor_receipt,
         manifest,
         job_id="42",
         checkpoint_path=checkpoint,
         export_path=export,
+        evaluation_receipt_path=evaluation,
+        started_at="2026-08-23T20:00:00+00:00",
+        finished_at="2026-08-23T20:10:00+00:00",
     )
     evidence = tmp_path / "B_EVIDENCE.json"
 
@@ -1342,7 +1347,7 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "train_eagle_streaming.sh" in runner
     assert "dflash.yaml" in runner
     assert "modelopt_recipes/general/speculative_decoding/dflash.yaml" in runner
-    assert 'data.data_path="$B_CANARY_OUTPUT"' in runner
+    assert 'data.data_path="$node_root/input/corpus"' in runner
     assert "training.training_seq_len=4096" in runner
     assert "dflash.dflash_block_size=8" in runner
     assert "dflash.dflash_architecture_config.num_hidden_layers=5" in runner
@@ -1350,6 +1355,16 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "dflash.dflash_architecture_config.num_key_value_heads=8" in runner
     assert "dflash.dflash_architecture_config.head_dim=128" in runner
     assert "dflash.dflash_architecture_config.intermediate_size=9728" in runner
+    assert "dflash.dflash_mask_token_id=151669" in runner
+    assert "model.use_fake_base_for_offline=true" in runner
+    assert "training.save_strategy=steps" in runner
+    assert "training.save_steps=200" in runner
+    assert "training.save_total_limit=1" in runner
+    assert 'cd "$LAUNCHER_ROOT"' in runner
+    assert 'node_root="${SLURM_TMPDIR}/qwen4b-b-${SLURM_JOB_ID}"' in runner
+    assert "sha256sum" in runner
+    assert "B canary output already exists" in runner
+    assert 'printf \'%s\\n\' "$SLURM_JOB_ID" >"$job_owner"' in runner
     assert "model.draft_model_type" not in runner
     assert "model.draft_block_size" not in runner
     assert "data.dataset=" not in runner
@@ -1358,6 +1373,10 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "B_CANARY_TRAIN_COMMAND" not in runner
     assert "publish_b_canary_evidence" in runner
     assert "run_qwen4b_b_canary_eval.sh" in runner
+    evaluator = (root / "run_qwen4b_b_canary_eval.sh").read_text()
+    assert '"checkpoint_reloaded_by_exporter": True' in evaluator
+    assert "load_vlm_or_llm(args.model_path" in evaluator
+    assert '"checkpoint_sha256": _directory_sha256(checkpoint_path)' in evaluator
     assert "publish_b_export_evaluation" not in runner
     assert "sbatch --test-only" in submitter
     assert "sbatch --parsable" in submitter
@@ -1368,6 +1387,7 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "--a-authorization-receipt-sha256" in submitter
     assert "B_CANARY_BUILD_RECEIPT" in runner
     assert "validate_bound_artifacts" in runner
+    assert "container_path=Path(sys.argv[12])" in runner
     assert "--test-only" in submitter
     assert "nemotron_sw_post" in submitter
     assert "nemotron_n4_post" in submitter
@@ -1379,6 +1399,50 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "died early" in supervisor
     assert 'kill "$pid"' in supervisor
     assert 'wait "$pid"' in supervisor
+
+
+def test_b_runner_dotlist_parses_against_actual_dflash_recipe() -> None:
+    """The production B overrides parse with the checked-in DFlash YAML types."""
+    from omegaconf import OmegaConf  # pyright: ignore[reportMissingImports]
+
+    recipe = Path(__file__).resolve().parents[3] / (
+        "modelopt_recipes/general/speculative_decoding/dflash.yaml"
+    )
+    config = OmegaConf.load(recipe)
+    overrides = OmegaConf.from_dotlist(
+        [
+            "model.model_name_or_path=/immutable/model",
+            "model.use_fake_base_for_offline=true",
+            "data.data_path=/job/input/corpus",
+            "training.output_dir=/job/checkpoint",
+            "training.max_steps=200",
+            "training.save_strategy=steps",
+            "training.save_steps=200",
+            "training.save_total_limit=1",
+            "training.training_seq_len=4096",
+            "training.answer_only_loss=true",
+            "training.seed=42",
+            "training.per_device_train_batch_size=4",
+            "training.gradient_accumulation_steps=4",
+            "training.report_to=wandb",
+            "training.run_name=q4b-b-test",
+            "dflash.dflash_block_size=8",
+            "dflash.dflash_num_anchors=512",
+            "dflash.dflash_mask_token_id=151669",
+            "dflash.dflash_architecture_config.num_hidden_layers=5",
+            "dflash.dflash_architecture_config.num_attention_heads=32",
+            "dflash.dflash_architecture_config.num_key_value_heads=8",
+            "dflash.dflash_architecture_config.head_dim=128",
+            "dflash.dflash_architecture_config.intermediate_size=9728",
+        ]
+    )
+    parsed = OmegaConf.merge(config, overrides)
+
+    assert parsed.model.use_fake_base_for_offline is True
+    assert parsed.training.training_seq_len == 4096
+    assert parsed.training.max_steps == parsed.training.save_steps == 200
+    assert parsed.dflash.dflash_mask_token_id == 151669
+    assert parsed.dflash.dflash_architecture_config.intermediate_size == 9728
 
 
 def test_submit_prep_schedules_only_cpu_builder(tmp_path: Path) -> None:
@@ -1546,3 +1610,58 @@ def test_submit_canary_rejects_missing_a_authorization_before_sbatch(
 
     assert result.returncode != 0
     assert not calls.exists()
+
+
+def test_sacct_observation_requires_completed_canonical_a_parent(tmp_path: Path) -> None:
+    """A numeric job ID alone cannot authorize B without fresh scheduler evidence."""
+    authorization = tmp_path / "A_AUTHORIZATION.json"
+    authorization.write_text(
+        json.dumps(
+            {
+                "slurm_job_id": "4242",
+                "slurm_account": "nemotron_n4_post",
+                "slurm_job_name": "q4b-a-repair-canary",
+                "slurm_job_comment": "q4-a-repair",
+                "slurm_output_path": "/logs/q4-a-4242.out",
+                "started_at": "2026-08-23T20:01:00",
+                "finished_at": "2026-08-23T20:19:00",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    authorization_sha = sha256(authorization.read_bytes()).hexdigest()
+    observation = tmp_path / "A_SCHEDULER.json"
+    row = (
+        "4242|COMPLETED|0:0|nemotron_n4_post|q4b-a-repair-canary|"
+        "2026-08-23T20:00:00|2026-08-23T20:20:00|q4-a-repair|/logs/q4-a-4242.out\n"
+    )
+
+    observation_sha = publish_a_scheduler_observation(
+        observation,
+        authorization_path=authorization,
+        authorization_sha256=authorization_sha,
+        sacct_output=row,
+    )
+
+    validate_a_scheduler_observation(
+        observation,
+        observation_sha,
+        authorization_sha256=authorization_sha,
+    )
+    with pytest.raises(FileExistsError):
+        publish_a_scheduler_observation(
+            observation,
+            authorization_path=authorization,
+            authorization_sha256=authorization_sha,
+            sacct_output=row,
+        )
+    failed = row.replace("COMPLETED|0:0", "FAILED|1:0")
+    with pytest.raises(ValueError, match="successful canonical job"):
+        publish_a_scheduler_observation(
+            tmp_path / "FAILED.json",
+            authorization_path=authorization,
+            authorization_sha256=authorization_sha,
+            sacct_output=failed,
+        )

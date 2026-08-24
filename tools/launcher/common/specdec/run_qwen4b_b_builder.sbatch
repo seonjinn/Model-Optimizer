@@ -15,7 +15,7 @@ required=(
     TASK8_PUBLICATION_SHA256 TASK9_SELECTION_RECEIPT_SHA256
     B_CANARY_BUILD_ROOT B_CANARY_READINESS B_CANARY_MANIFEST
     B_CANARY_SEED B_CANARY_ACCOUNT TARGET_PATH TARGET_REVISION CONTAINER_SHA256
-    B_CANARY_OUTPUT_ROOT B_CANARY_WANDB_RUN_ID
+    CONTAINER_IMAGE B_CANARY_OUTPUT_ROOT B_CANARY_WANDB_RUN_ID
 )
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
@@ -113,6 +113,7 @@ from common.specdec.qwen4b_b_canary_manifest import (
     BCanaryManifest,
     BCanaryRuntimeIdentity,
     BCanaryTopology,
+    _directory_sha256,
     write_b_canary_manifest,
 )
 
@@ -146,12 +147,20 @@ readiness_payload = json.loads(readiness_path.read_bytes())
 repo_root = Path(__import__("os").environ["REPO_ROOT"])
 supervisor = repo_root / "tools/launcher/common/eagle3/train_eagle_streaming.sh"
 config = repo_root / "modelopt_recipes/general/speculative_decoding/dflash.yaml"
+runner = repo_root / "tools/launcher/common/specdec/run_qwen4b_b_canary.sbatch"
+evaluator = repo_root / "tools/launcher/common/specdec/run_qwen4b_b_canary_eval.sh"
+train_script = repo_root / "examples/speculative_decoding/launch_train.sh"
+exporter = repo_root / "examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+target = Path(__import__("os").environ["TARGET_PATH"])
+container = Path(__import__("os").environ["CONTAINER_IMAGE"])
 runtime = BCanaryRuntimeIdentity(
     target_model_id="Qwen/Qwen3-4B",
-    target_path=__import__("os").environ["TARGET_PATH"],
+    target_path=str(target),
     target_revision=__import__("os").environ["TARGET_REVISION"],
+    target_snapshot_sha256=_directory_sha256(target),
     tokenizer_sha256=view.tokenizer_sha256,
     chat_template_sha256=view.chat_template_sha256,
+    container_path=str(container),
     container_sha256=__import__("os").environ["CONTAINER_SHA256"],
     thinking_mode="off",
     method="dflash",
@@ -162,6 +171,10 @@ runtime = BCanaryRuntimeIdentity(
     supervisor_sha256=hashlib.sha256(supervisor.read_bytes()).hexdigest(),
     config_path=str(config),
     config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+    runner_sha256=hashlib.sha256(runner.read_bytes()).hexdigest(),
+    evaluator_sha256=hashlib.sha256(evaluator.read_bytes()).hexdigest(),
+    train_script_sha256=hashlib.sha256(train_script.read_bytes()).hexdigest(),
+    exporter_sha256=hashlib.sha256(exporter.read_bytes()).hexdigest(),
     corpus_arm="B-balanced",
     corpus_path=str(output_path),
     output_root=__import__("os").environ["B_CANARY_OUTPUT_ROOT"],

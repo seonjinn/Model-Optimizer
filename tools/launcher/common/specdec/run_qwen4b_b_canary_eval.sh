@@ -5,7 +5,7 @@
 set -euo pipefail
 
 for name in B_CANARY_EXPORT B_CANARY_EVALUATION_RECEIPT B_CANARY_EVAL_OUTPUT \
-    LAUNCHER_ROOT SLURM_JOB_ID; do
+    B_CANARY_CHECKPOINT B_CANARY_MANIFEST REPO_ROOT LAUNCHER_ROOT SLURM_JOB_ID; do
     [[ -n "${!name:-}" ]] || { echo "missing evaluator environment: $name" >&2; exit 2; }
 done
 [[ "$SLURM_JOB_ID" =~ ^[0-9]+$ ]] || exit 2
@@ -20,7 +20,8 @@ bash "$WRAPPER"
 
 PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$B_CANARY_EVAL_OUTPUT/$RUN_ID" "$B_CANARY_EVALUATION_RECEIPT" \
-    "$SLURM_JOB_ID" "$B_CANARY_EXPORT" <<'PY'
+    "$SLURM_JOB_ID" "$B_CANARY_EXPORT" "$B_CANARY_CHECKPOINT/checkpoint-200" \
+    "$B_CANARY_MANIFEST" "$REPO_ROOT" <<'PY'
 import csv
 import hashlib
 import json
@@ -29,7 +30,7 @@ import sys
 from pathlib import Path
 
 from common.specdec.qwen4b_b_atomic import atomic_publish_bytes
-from common.specdec.qwen4b_b_canary_manifest import _directory_sha256
+from common.specdec.qwen4b_b_canary_manifest import _directory_sha256, load_b_canary_manifest
 
 run_root, receipt_path, job_id, export_path = (
     Path(sys.argv[1]),
@@ -37,6 +38,15 @@ run_root, receipt_path, job_id, export_path = (
     sys.argv[3],
     Path(sys.argv[4]),
 )
+checkpoint_path, manifest_path, repo_root = Path(sys.argv[5]), Path(sys.argv[6]), Path(sys.argv[7])
+runtime = load_b_canary_manifest(manifest_path).runtime
+exporter = repo_root / "examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+exporter_raw = exporter.read_bytes()
+if (
+    hashlib.sha256(exporter_raw).hexdigest() != runtime.exporter_sha256
+    or b"load_vlm_or_llm(args.model_path" not in exporter_raw
+):
+    raise ValueError("bound B exporter does not prove checkpoint reload")
 manifest = json.loads((run_root / "manifest.json").read_bytes())
 if manifest.get("status") != "success" or str(manifest.get("slurm_job_id")) != job_id:
     raise ValueError("Speculators evaluator did not complete in the current B job")
@@ -64,6 +74,11 @@ body = {
     "status": "passed",
     "evaluator": "specdec-bench-v1",
     "export_sha256": _directory_sha256(export_path),
+    "checkpoint_path": str(checkpoint_path),
+    "checkpoint_sha256": _directory_sha256(checkpoint_path),
+    "exporter_path": "examples/speculative_decoding/scripts/export_hf_checkpoint.py",
+    "exporter_sha256": runtime.exporter_sha256,
+    "checkpoint_reloaded_by_exporter": True,
     "completed_requests": completed,
     "metrics": {
         "mean_output_tps": sum(throughput) / len(throughput),

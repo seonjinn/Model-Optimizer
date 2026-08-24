@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,10 +26,12 @@ __all__ = [
     "BCanaryRuntimeIdentity",
     "BCanaryTopology",
     "load_b_canary_manifest",
+    "publish_a_scheduler_observation",
     "publish_b_canary_evidence",
     "publish_b_gpu_activity",
     "publish_b_supervisor_completion",
     "validate_a_authorization_receipt",
+    "validate_a_scheduler_observation",
     "validate_bound_artifacts",
     "validate_canary_evidence",
     "validate_runtime_artifacts",
@@ -89,8 +92,10 @@ class BCanaryRuntimeIdentity:
     target_model_id: str
     target_path: str
     target_revision: str
+    target_snapshot_sha256: str
     tokenizer_sha256: str
     chat_template_sha256: str
+    container_path: str
     container_sha256: str
     thinking_mode: str
     method: str
@@ -101,6 +106,10 @@ class BCanaryRuntimeIdentity:
     supervisor_sha256: str
     config_path: str
     config_sha256: str
+    runner_sha256: str
+    evaluator_sha256: str
+    train_script_sha256: str
+    exporter_sha256: str
     corpus_arm: str
     corpus_path: str
     output_root: str
@@ -120,15 +129,27 @@ class BCanaryRuntimeIdentity:
         }
         if any(getattr(self, key) != value for key, value in expected.items()):
             raise ValueError("B canary runtime identity diverges from the canonical study")
-        for name in ("target_path", "supervisor_path", "config_path", "corpus_path", "output_root"):
+        for name in (
+            "target_path",
+            "container_path",
+            "supervisor_path",
+            "config_path",
+            "corpus_path",
+            "output_root",
+        ):
             if not Path(getattr(self, name)).is_absolute():
                 raise ValueError(f"B canary {name} must be absolute")
         for name in (
             "tokenizer_sha256",
             "chat_template_sha256",
+            "target_snapshot_sha256",
             "container_sha256",
             "supervisor_sha256",
             "config_sha256",
+            "runner_sha256",
+            "evaluator_sha256",
+            "train_script_sha256",
+            "exporter_sha256",
         ):
             if _SHA256.fullmatch(getattr(self, name)) is None:
                 raise ValueError(f"B canary {name} must be exact")
@@ -228,6 +249,7 @@ class ACanaryAuthorization:
     export_sha256: str
     gpu_evidence_sha256: str
     evaluation_receipt_sha256: str
+    slurm_job_id: str
 
 
 def write_b_canary_manifest(path: Path, manifest: BCanaryManifest) -> None:
@@ -326,7 +348,9 @@ def validate_runtime_artifacts(
     *,
     supervisor_path: Path,
     config_path: Path,
+    repo_root: Path,
     container_path: Path | None = None,
+    require_clean_checkout: bool = False,
 ) -> None:
     """Rehash the exact launcher, target snapshot, tokenizer, template, and container."""
     runtime = manifest.runtime
@@ -342,9 +366,12 @@ def validate_runtime_artifacts(
     target = Path(runtime.target_path)
     if target.resolve().name != runtime.target_revision:
         raise ValueError("B target snapshot path does not bind the exact revision")
+    if _directory_sha256(target) != runtime.target_snapshot_sha256:
+        raise ValueError("B full target snapshot identity changed")
     config = json.loads(_stable_file_bytes(target / "config.json"))
     expected_target = {
         "model_type": "qwen3",
+        "vocab_size": 151936,
         "hidden_size": 2560,
         "intermediate_size": 9728,
         "num_hidden_layers": 36,
@@ -384,12 +411,38 @@ def validate_runtime_artifacts(
         != runtime.chat_template_sha256
     ):
         raise ValueError("B chat-template identity changed")
+    if container_path is not None and str(container_path) != runtime.container_path:
+        raise ValueError("B container path identity changed")
     if (
         container_path is not None
         and hashlib.sha256(_stable_file_bytes(container_path)).hexdigest()
         != runtime.container_sha256
     ):
         raise ValueError("B container identity changed")
+    closure = {
+        "tools/launcher/common/specdec/run_qwen4b_b_canary.sbatch": runtime.runner_sha256,
+        "tools/launcher/common/specdec/run_qwen4b_b_canary_eval.sh": runtime.evaluator_sha256,
+        "examples/speculative_decoding/launch_train.sh": runtime.train_script_sha256,
+        "examples/speculative_decoding/scripts/export_hf_checkpoint.py": runtime.exporter_sha256,
+    }
+    for relative, expected in closure.items():
+        if hashlib.sha256(_stable_file_bytes(repo_root / relative)).hexdigest() != expected:
+            raise ValueError("B launcher/train/export closure identity changed")
+    if require_clean_checkout:
+        head = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if head != manifest.source_commit or dirty:
+            raise ValueError("B runtime requires the exact clean source commit")
 
 
 def validate_a_authorization_receipt(
@@ -402,6 +455,7 @@ def validate_a_authorization_receipt(
     chat_template_sha256: str,
     container_sha256: str,
     repo_root: Path,
+    b_runtime: BCanaryRuntimeIdentity | None = None,
 ) -> ACanaryAuthorization:
     """Verify a caller-pinned, job-issued A-repair authorization trust root."""
     raw = _stable_file_bytes(path)
@@ -431,9 +485,116 @@ def validate_a_authorization_receipt(
         "checkpoint_reloaded": True,
         "drafter_exported": True,
         "all_gpus_active": True,
+        "scientific_training_authorized": False,
     }
     if any(payload.get(key) != value for key, value in required.items()):
         raise ValueError("A authorization receipt semantics mismatch")
+    from common.specdec.qwen4b_a_canary_manifest import load_a_canary_manifest
+    from common.specdec.qwen4b_a_canary_manifest import (
+        validate_bound_artifacts as validate_a_bound_artifacts,
+    )
+    from common.specdec.qwen4b_a_canary_manifest import (
+        validate_supervisor_completion as validate_a_supervisor_completion,
+    )
+
+    a_manifest_path = Path(str(payload.get("a_manifest_path", "")))
+    if not a_manifest_path.is_absolute():
+        raise ValueError("A authorization manifest path must be absolute")
+    try:
+        a_manifest_raw = _stable_file_bytes(a_manifest_path)
+    except OSError as error:
+        raise ValueError("A authorization manifest is unavailable") from error
+    if hashlib.sha256(a_manifest_raw).hexdigest() != payload.get("a_manifest_sha256"):
+        raise ValueError("A authorization manifest identity mismatch")
+    a_manifest = load_a_canary_manifest(a_manifest_path)
+    validate_a_bound_artifacts(a_manifest, repository_root=repo_root)
+    runtime = a_manifest.runtime
+    manifest_identity = {
+        "source_commit": runtime.source_commit,
+        "target_revision": runtime.target_revision,
+        "target_path": runtime.target_path,
+        "target_snapshot_sha256": runtime.target_snapshot_sha256,
+        "target_config_sha256": runtime.target_config_sha256,
+        "tokenizer_sha256": runtime.tokenizer_sha256,
+        "chat_template_sha256": runtime.chat_template_sha256,
+        "container_path": runtime.container_path,
+        "container_sha256": runtime.container_sha256,
+        "producer_module_path": runtime.producer_module_path,
+        "producer_module_sha256": runtime.producer_module_sha256,
+        "runner_path": runtime.runner_path,
+        "runner_sha256": runtime.runner_sha256,
+        "supervisor_path": runtime.supervisor_path,
+        "supervisor_sha256": runtime.supervisor_sha256,
+        "recipe_path": runtime.recipe_path,
+        "recipe_sha256": runtime.recipe_sha256,
+        "evaluator_path": runtime.evaluator_path,
+        "evaluator_sha256": runtime.evaluator_sha256,
+        "exporter_path": runtime.exporter_path,
+        "exporter_sha256": runtime.exporter_sha256,
+        "train_script_path": runtime.train_script_path,
+        "train_script_sha256": runtime.train_script_sha256,
+        "task9_a_selection_path": a_manifest.task9_a_selection_path,
+        "task9_a_selection_sha256": a_manifest.task9_a_selection_sha256,
+        "task8_publication_path": a_manifest.task8_publication_path,
+        "task8_publication_sha256": a_manifest.task8_publication_sha256,
+        "builder_receipt_path": a_manifest.builder_receipt_path,
+        "builder_receipt_sha256": a_manifest.builder_receipt_sha256,
+        "builder_output_path": a_manifest.builder_output_path,
+        "builder_output_sha256": a_manifest.builder_output_sha256,
+    }
+    if any(payload.get(key) != value for key, value in manifest_identity.items()):
+        raise ValueError("A authorization does not transitively bind its manifest")
+    completion_path = Path(str(payload.get("supervisor_completion_path", "")))
+    completion_raw = _stable_file_bytes(completion_path)
+    if hashlib.sha256(completion_raw).hexdigest() != payload.get("supervisor_completion_sha256"):
+        raise ValueError("A authorization supervisor completion identity mismatch")
+    completion = validate_a_supervisor_completion(
+        completion_path,
+        manifest=a_manifest,
+        job_id=str(payload.get("slurm_job_id", "")),
+        checkpoint_path=Path(str(payload.get("checkpoint_path", ""))),
+        export_path=Path(str(payload.get("export_path", ""))),
+        evaluation_receipt_path=Path(str(payload.get("evaluation_receipt_path", ""))),
+    )
+    if payload.get("started_at") != completion.get("started_at") or payload.get(
+        "finished_at"
+    ) != completion.get("finished_at"):
+        raise ValueError("A authorization timing is not supervisor-issued")
+    if b_runtime is not None:
+        shared_parent = {
+            "target_revision": b_runtime.target_revision,
+            "target_path": b_runtime.target_path,
+            "target_snapshot_sha256": b_runtime.target_snapshot_sha256,
+            "tokenizer_sha256": b_runtime.tokenizer_sha256,
+            "chat_template_sha256": b_runtime.chat_template_sha256,
+            "container_path": b_runtime.container_path,
+            "container_sha256": b_runtime.container_sha256,
+            "supervisor_sha256": b_runtime.supervisor_sha256,
+            "recipe_sha256": b_runtime.config_sha256,
+            "train_script_sha256": b_runtime.train_script_sha256,
+            "exporter_sha256": b_runtime.exporter_sha256,
+        }
+        if any(payload.get(key) != value for key, value in shared_parent.items()):
+            raise ValueError("A/B canonical parent or launcher identity mismatch")
+    checkout_head = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    checkout_dirty = subprocess.run(
+        ["git", "-C", str(repo_root), "status", "--porcelain"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if (
+        checkout_head.returncode != 0
+        or checkout_dirty.returncode != 0
+        or checkout_head.stdout.strip() != source_commit
+        or checkout_dirty.stdout
+    ):
+        raise ValueError("A authorization requires the exact clean source checkout")
     genuine_sources = {
         "producer_module_path": "tools/launcher/common/specdec/qwen4b_a_canary_manifest.py",
         "runner_path": "tools/launcher/common/specdec/run_qwen4b_a_canary.sbatch",
@@ -487,6 +648,15 @@ def validate_a_authorization_receipt(
         "evaluation_receipt_sha256",
         "producer_module_sha256",
         "runner_sha256",
+        "a_manifest_sha256",
+        "supervisor_completion_sha256",
+        "target_snapshot_sha256",
+        "target_config_sha256",
+        "supervisor_sha256",
+        "recipe_sha256",
+        "evaluator_sha256",
+        "exporter_sha256",
+        "train_script_sha256",
     )
     if any(_SHA256.fullmatch(str(payload.get(name, ""))) is None for name in digest_fields):
         raise ValueError("A authorization digest lineage is incomplete")
@@ -494,6 +664,14 @@ def validate_a_authorization_receipt(
         raise ValueError("A authorization target revision is invalid")
     if not str(payload.get("slurm_job_id", "")).isdigit():
         raise ValueError("A authorization is not job-generated")
+    if (
+        payload.get("slurm_account") not in {"nemotron_sw_post", "nemotron_n4_post"}
+        or payload.get("slurm_job_name") != "q4b-a-repair-canary"
+        or not isinstance(payload.get("slurm_job_comment"), str)
+        or not payload["slurm_job_comment"]
+        or not Path(str(payload.get("slurm_output_path", ""))).is_absolute()
+    ):
+        raise ValueError("A authorization Slurm identity is incomplete")
     for path_field, digest_field in (
         ("task9_a_selection_path", "task9_a_selection_sha256"),
         ("task8_publication_path", "task8_publication_sha256"),
@@ -576,6 +754,100 @@ def validate_a_authorization_receipt(
     )
 
 
+def publish_a_scheduler_observation(
+    path: Path,
+    *,
+    authorization_path: Path,
+    authorization_sha256: str,
+    sacct_output: str,
+) -> str:
+    """Publish a fresh no-replace scheduler observation for a completed A job."""
+    authorization_raw = _stable_file_bytes(authorization_path)
+    if hashlib.sha256(authorization_raw).hexdigest() != authorization_sha256:
+        raise ValueError("A scheduler observation authorization identity mismatch")
+    authorization = json.loads(authorization_raw)
+    if not isinstance(authorization, dict):
+        raise ValueError("A scheduler observation authorization must be an object")
+    rows = [line.split("|") for line in sacct_output.splitlines() if line.strip()]
+    parent_rows = [row for row in rows if row and row[0] == str(authorization.get("slurm_job_id"))]
+    if len(parent_rows) != 1 or len(parent_rows[0]) != 9:
+        raise ValueError("sacct must return exactly one A parent job row")
+    job_id, state, exit_code, account, job_name, start, end, comment, stdout = parent_rows[0]
+    expected = {
+        "account": authorization.get("slurm_account"),
+        "job_name": authorization.get("slurm_job_name"),
+        "comment": authorization.get("slurm_job_comment"),
+        "stdout": authorization.get("slurm_output_path"),
+    }
+    observed = {"account": account, "job_name": job_name, "comment": comment, "stdout": stdout}
+
+    def timestamp(value: str) -> datetime:
+        parsed = datetime.fromisoformat(value)
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+    try:
+        scheduler_start = timestamp(start)
+        scheduler_end = timestamp(end)
+        supervisor_start = timestamp(str(authorization["started_at"]))
+        supervisor_end = timestamp(str(authorization["finished_at"]))
+    except (KeyError, ValueError) as error:
+        raise ValueError("A scheduler observation timestamps are invalid") from error
+    if (
+        state != "COMPLETED"
+        or exit_code != "0:0"
+        or account not in {"nemotron_sw_post", "nemotron_n4_post"}
+        or observed != expected
+        or not start
+        or not end
+        or not scheduler_start <= supervisor_start <= supervisor_end <= scheduler_end
+    ):
+        raise ValueError("A scheduler observation does not prove a successful canonical job")
+    payload = {
+        "schema_version": 1,
+        "producer": "sacct-a-repair-observation-v1",
+        "observed_at": datetime.now(UTC).isoformat(),
+        "a_authorization_receipt_sha256": authorization_sha256,
+        "slurm_job_id": job_id,
+        "state": state,
+        "exit_code": exit_code,
+        **observed,
+        "start": start,
+        "end": end,
+    }
+    payload["receipt_sha256"] = _sha256_json(payload)
+    atomic_publish_bytes(
+        path,
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+        job_id="sacct",
+    )
+    return hashlib.sha256(_stable_file_bytes(path)).hexdigest()
+
+
+def validate_a_scheduler_observation(
+    path: Path,
+    expected_sha256: str,
+    *,
+    authorization_sha256: str,
+) -> None:
+    """Verify a caller-pinned fresh scheduler observation of the A parent job."""
+    raw = _stable_file_bytes(path)
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("A scheduler observation file identity mismatch")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("A scheduler observation must be an object")
+    claim = payload.pop("receipt_sha256", None)
+    if (
+        claim != _sha256_json(payload)
+        or payload.get("producer") != "sacct-a-repair-observation-v1"
+        or payload.get("a_authorization_receipt_sha256") != authorization_sha256
+        or payload.get("state") != "COMPLETED"
+        or payload.get("exit_code") != "0:0"
+        or payload.get("account") not in {"nemotron_sw_post", "nemotron_n4_post"}
+    ):
+        raise ValueError("A scheduler observation semantics mismatch")
+
+
 def publish_b_canary_evidence(
     path: Path,
     manifest: BCanaryManifest,
@@ -601,22 +873,30 @@ def publish_b_canary_evidence(
     supervisor_claim = (
         supervisor.pop("receipt_sha256", None) if isinstance(supervisor, dict) else None
     )
+    evaluation_raw = _stable_file_bytes(evaluation_receipt_path)
     if (
         not isinstance(supervisor, dict)
         or supervisor_claim != _sha256_json(supervisor)
-        or supervisor.get("producer") != "canonical-dflash-supervisor-v1"
+        or supervisor.get("producer") != "canonical-dflash-exporter-reload-v1"
         or str(supervisor.get("slurm_job_id")) != job_id
         or supervisor.get("status") != "completed"
         or supervisor.get("supervisor_sha256") != manifest.runtime.supervisor_sha256
         or supervisor.get("config_sha256") != manifest.runtime.config_sha256
+        or supervisor.get("exporter_sha256") != manifest.runtime.exporter_sha256
+        or supervisor.get("evaluation_receipt_sha256") != hashlib.sha256(evaluation_raw).hexdigest()
         or supervisor.get("checkpoint_sha256") != checkpoint_sha
         or supervisor.get("export_sha256") != export_sha
         or supervisor.get("checkpoint_reloaded_by_exporter") is not True
         or supervisor.get("final_training_loss") != finite_loss
     ):
         raise ValueError("B canonical supervisor completion identity mismatch")
-    evaluation_raw = _stable_file_bytes(evaluation_receipt_path)
-    _validate_evaluator_receipt(evaluation_raw, job_id=job_id, export_sha256=export_sha)
+    _validate_evaluator_receipt(
+        evaluation_raw,
+        job_id=job_id,
+        export_sha256=export_sha,
+        manifest=manifest,
+        checkpoint_path=checkpoint_path,
+    )
     gpu_raw = _stable_file_bytes(gpu_evidence_path)
     gpu = json.loads(gpu_raw)
     if (
@@ -659,22 +939,45 @@ def publish_b_supervisor_completion(
     job_id: str,
     checkpoint_path: Path,
     export_path: Path,
+    evaluation_receipt_path: Path,
+    started_at: str,
+    finished_at: str,
 ) -> None:
     """Record successful canonical trainer/exporter completion in the current job."""
     if not job_id.isdigit():
         raise ValueError("B supervisor completion requires a numeric Slurm job ID")
+    try:
+        started = datetime.fromisoformat(started_at)
+        finished = datetime.fromisoformat(finished_at)
+    except ValueError as error:
+        raise ValueError("B supervisor completion timestamps are invalid") from error
+    if started.tzinfo is None or finished.tzinfo is None or started >= finished:
+        raise ValueError("B supervisor completion timestamps are not ordered")
     state = json.loads(_stable_file_bytes(checkpoint_path / "trainer_state.json"))
     final_loss = _last_finite_training_loss(state, expected_step=manifest.topology.max_steps)
     export_config = json.loads(_stable_file_bytes(export_path / "config.json"))
     if not isinstance(export_config, dict) or not tuple(export_path.glob("*.safetensors")):
         raise ValueError("B canonical exporter did not produce a loadable HF artifact")
+    evaluation_raw = _stable_file_bytes(evaluation_receipt_path)
+    _validate_evaluator_receipt(
+        evaluation_raw,
+        job_id=job_id,
+        export_sha256=_directory_sha256(export_path),
+        manifest=manifest,
+        checkpoint_path=checkpoint_path,
+    )
     payload = {
         "schema_version": 1,
-        "producer": "canonical-dflash-supervisor-v1",
+        "producer": "canonical-dflash-exporter-reload-v1",
         "slurm_job_id": job_id,
         "status": "completed",
         "supervisor_sha256": manifest.runtime.supervisor_sha256,
         "config_sha256": manifest.runtime.config_sha256,
+        "exporter_sha256": manifest.runtime.exporter_sha256,
+        "evaluation_receipt_path": str(evaluation_receipt_path),
+        "evaluation_receipt_sha256": hashlib.sha256(evaluation_raw).hexdigest(),
+        "started_at": started_at,
+        "finished_at": finished_at,
         "checkpoint_sha256": _directory_sha256(checkpoint_path),
         "export_sha256": _directory_sha256(export_path),
         "checkpoint_reloaded_by_exporter": True,
@@ -707,7 +1010,14 @@ def _last_finite_training_loss(state: object, *, expected_step: int) -> float:
     return losses[-1]
 
 
-def _validate_evaluator_receipt(raw: bytes, *, job_id: str, export_sha256: str) -> None:
+def _validate_evaluator_receipt(
+    raw: bytes,
+    *,
+    job_id: str,
+    export_sha256: str,
+    manifest: BCanaryManifest | None = None,
+    checkpoint_path: Path | None = None,
+) -> None:
     evaluation = json.loads(raw)
     if not isinstance(evaluation, dict):
         raise ValueError("evaluator receipt must be an object")
@@ -731,6 +1041,20 @@ def _validate_evaluator_receipt(raw: bytes, *, job_id: str, export_sha256: str) 
         )
     ):
         raise ValueError("evaluator output lacks genuine completed metrics")
+    if manifest is not None:
+        expected_reload = {
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": (
+                None if checkpoint_path is None else _directory_sha256(checkpoint_path)
+            ),
+            "exporter_path": "examples/speculative_decoding/scripts/export_hf_checkpoint.py",
+            "exporter_sha256": manifest.runtime.exporter_sha256,
+            "checkpoint_reloaded_by_exporter": True,
+        }
+        if checkpoint_path is None or any(
+            evaluation.get(key) != value for key, value in expected_reload.items()
+        ):
+            raise ValueError("B evaluator exporter/reload evidence mismatch")
 
 
 def publish_b_gpu_activity(log_root: Path, path: Path, *, job_id: str) -> None:
