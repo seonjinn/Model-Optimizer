@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import subprocess
@@ -548,10 +549,37 @@ def test_materialize_dataset_view_replaces_absolute_links_with_authenticated_har
         json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     assert claim == expected_claim
+    assert body["storage"] == "hardlink"
     assert body["source_tree_sha256"] == body["output_tree_sha256"]
     assert receipt_sha256 == hashlib.sha256(receipt.read_bytes()).hexdigest()
     with pytest.raises(FileExistsError):
         runtime_contract.materialize_dataset_view(source, output, receipt)
+
+
+def test_materialize_dataset_view_authenticates_cross_filesystem_copies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EXDEV falls back to a rehashed byte copy and records that storage identity."""
+    target = tmp_path / "target.jsonl"
+    target.write_text('{"messages": ["cross-device"]}\n')
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / target.name).symlink_to(target.resolve())
+    output = tmp_path / "physical"
+    receipt = tmp_path / "materialization.json"
+
+    def cross_device(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "cross-device test")
+
+    monkeypatch.setattr(runtime_contract.os, "link", cross_device)
+    runtime_contract.materialize_dataset_view(source, output, receipt)
+
+    copied = output / target.name
+    assert copied.read_bytes() == target.read_bytes()
+    assert copied.stat().st_ino != target.stat().st_ino
+    body = json.loads(receipt.read_text())
+    assert body["storage"] == "copy"
+    assert body["ordered_files"][0]["storage"] == "copy"
 
 
 def test_dflash2_submitter_serializes_canary_and_cumulative_writers() -> None:

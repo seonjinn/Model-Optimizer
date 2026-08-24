@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -88,6 +89,7 @@ def materialize_dataset_view(source_path: Path, output_path: Path, receipt_path:
         raise ValueError("dataset source view must contain only JSONL or Parquet symlinks")
 
     descriptors: list[dict[str, Any]] = []
+    storage_modes: set[str] = set()
     temporary = output_path.with_name(f".{output_path.name}.partial-{os.getpid()}")
     temporary.parent.mkdir(parents=True, exist_ok=True)
     temporary.mkdir()
@@ -97,13 +99,26 @@ def materialize_dataset_view(source_path: Path, output_path: Path, receipt_path:
             if not target.is_file() or target.is_symlink():
                 raise ValueError(f"dataset source target is not a regular file: {entry.name}")
             raw = _stable_bytes(target)
-            os.link(target, temporary / entry.name, follow_symlinks=False)
+            materialized = temporary / entry.name
+            try:
+                os.link(target, materialized, follow_symlinks=False)
+                storage = "hardlink"
+            except OSError as error:
+                if error.errno != errno.EXDEV:
+                    raise
+                shutil.copyfile(target, materialized, follow_symlinks=False)
+                storage = "copy"
+            materialized_raw = _stable_bytes(materialized)
+            if materialized_raw != raw:
+                raise ValueError(f"materialized dataset bytes mismatch: {entry.name}")
+            storage_modes.add(storage)
             descriptors.append(
                 {
                     "path": entry.name,
                     "source_target": str(target),
                     "bytes": len(raw),
                     "sha256": hashlib.sha256(raw).hexdigest(),
+                    "storage": storage,
                 }
             )
         logical_sha256 = artifact_tree_sha256(temporary)
@@ -118,7 +133,7 @@ def materialize_dataset_view(source_path: Path, output_path: Path, receipt_path:
         "producer": "dflash2-dataset-hardlink-materialization-v1",
         "source_path": str(source),
         "output_path": str(output_path.resolve(strict=True)),
-        "storage": "hardlink",
+        "storage": next(iter(storage_modes)) if len(storage_modes) == 1 else "mixed",
         "ordered_files": descriptors,
         "source_tree_sha256": logical_sha256,
         "output_tree_sha256": artifact_tree_sha256(output_path),
