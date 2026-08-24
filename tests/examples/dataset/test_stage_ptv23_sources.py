@@ -496,6 +496,6 @@ def test_submitter_pulls_then_test_only_before_real_submission(tmp_path: Path) -
     )
     assert pull_index < test_index < real_index
     submitted = lines[real_index]
-    assert "--cpus-per-task=144" in submitted
+    assert "--cpus-per-task=96" in submitted
     assert "--gpus" not in submitted and "--gres" not in submitted
     assert _canonical_manifest_sha256(manifest) in submitted

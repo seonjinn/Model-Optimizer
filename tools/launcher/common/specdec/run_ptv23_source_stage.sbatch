@@ -4,7 +4,7 @@
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=144
+#SBATCH --cpus-per-task=96
 #SBATCH --mem=0
 
 set -euo pipefail
@@ -17,8 +17,8 @@ for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || { echo "invalid Slurm job identity" >&2; exit 2; }
-[[ "${SLURM_CPUS_PER_TASK:-}" == 144 ]] || {
-    echo "PTV23 source staging requires 144 CPUs on a GB200 data-mover node" >&2
+[[ "${SLURM_CPUS_PER_TASK:-}" == 96 ]] || {
+    echo "PTV23 source staging requires 96 CPUs on the OCI data-mover node" >&2
     exit 2
 }
 [[ -z "${SLURM_JOB_GPUS:-}" && -z "${SLURM_GPUS_ON_NODE:-}" ]] || {
