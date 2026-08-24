@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -516,6 +517,41 @@ def test_dataset_receipt_rejects_a_claimed_1_3m_count_for_other_bytes(tmp_path: 
             kind="dataset",
             occurrence_count=1_300_000,
         )
+
+
+def test_materialize_dataset_view_replaces_absolute_links_with_authenticated_hardlinks(
+    tmp_path: Path,
+) -> None:
+    """A container-visible dataset view preserves exact ordered bytes without dangling links."""
+    targets = tmp_path / "targets"
+    targets.mkdir()
+    first = targets / "chat-00000.jsonl"
+    second = targets / "code-00000.jsonl"
+    first.write_text('{"messages": ["first"]}\n')
+    second.write_text('{"messages": ["second"]}\n')
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / first.name).symlink_to(first.resolve())
+    (source / second.name).symlink_to(second.resolve())
+    output = tmp_path / "physical"
+    receipt = tmp_path / "materialization.json"
+
+    receipt_sha256 = runtime_contract.materialize_dataset_view(source, output, receipt)
+
+    assert sorted(item.name for item in output.iterdir()) == [first.name, second.name]
+    assert all(item.is_file() and not item.is_symlink() for item in output.iterdir())
+    assert (output / first.name).stat().st_ino == first.stat().st_ino
+    assert (output / second.name).stat().st_ino == second.stat().st_ino
+    body = json.loads(receipt.read_text())
+    claim = body.pop("receipt_sha256")
+    expected_claim = hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert claim == expected_claim
+    assert body["source_tree_sha256"] == body["output_tree_sha256"]
+    assert receipt_sha256 == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    with pytest.raises(FileExistsError):
+        runtime_contract.materialize_dataset_view(source, output, receipt)
 
 
 def test_dflash2_submitter_serializes_canary_and_cumulative_writers() -> None:

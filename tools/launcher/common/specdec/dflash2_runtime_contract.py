@@ -74,6 +74,66 @@ def artifact_tree_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def materialize_dataset_view(source_path: Path, output_path: Path, receipt_path: Path) -> str:
+    """Replace an ordered symlink dataset view with exact same-filesystem hardlinks."""
+    source = source_path.resolve(strict=True)
+    if not source.is_dir() or source.is_symlink():
+        raise ValueError("dataset source view must be a directory")
+    if output_path.exists() or receipt_path.exists():
+        raise FileExistsError("dataset materialization outputs already exist")
+    entries = sorted(source_path.iterdir())
+    if not entries or any(
+        not entry.is_symlink() or entry.suffix not in {".jsonl", ".parquet"} for entry in entries
+    ):
+        raise ValueError("dataset source view must contain only JSONL or Parquet symlinks")
+
+    descriptors: list[dict[str, Any]] = []
+    temporary = output_path.with_name(f".{output_path.name}.partial-{os.getpid()}")
+    temporary.parent.mkdir(parents=True, exist_ok=True)
+    temporary.mkdir()
+    try:
+        for entry in entries:
+            target = entry.resolve(strict=True)
+            if not target.is_file() or target.is_symlink():
+                raise ValueError(f"dataset source target is not a regular file: {entry.name}")
+            raw = _stable_bytes(target)
+            os.link(target, temporary / entry.name, follow_symlinks=False)
+            descriptors.append(
+                {
+                    "path": entry.name,
+                    "source_target": str(target),
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            )
+        logical_sha256 = artifact_tree_sha256(temporary)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.rename(output_path)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+    body: dict[str, Any] = {
+        "schema_version": 1,
+        "producer": "dflash2-dataset-hardlink-materialization-v1",
+        "source_path": str(source),
+        "output_path": str(output_path.resolve(strict=True)),
+        "storage": "hardlink",
+        "ordered_files": descriptors,
+        "source_tree_sha256": logical_sha256,
+        "output_tree_sha256": artifact_tree_sha256(output_path),
+    }
+    body["receipt_sha256"] = _sha_json(body)
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with receipt_path.open("x", encoding="utf-8") as stream:
+            stream.write(_canonical(body) + "\n")
+    except BaseException:
+        shutil.rmtree(output_path, ignore_errors=True)
+        raise
+    return hashlib.sha256(_stable_bytes(receipt_path)).hexdigest()
+
+
 def _dataset_layout(
     path: Path, admitted_prefix_count: int
 ) -> tuple[int, str, list[dict[str, Any]]]:
@@ -455,6 +515,10 @@ def main() -> None:
     artifact.add_argument("--output", type=Path, required=True)
     artifact.add_argument("--kind", choices=("target", "dataset"), required=True)
     artifact.add_argument("--occurrence-count", type=int)
+    materialize = subparsers.add_parser("materialize-dataset")
+    materialize.add_argument("--source", type=Path, required=True)
+    materialize.add_argument("--output", type=Path, required=True)
+    materialize.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "vllm-receipt":
         receipt_sha256 = write_vllm_runtime_receipt(
@@ -464,13 +528,15 @@ def main() -> None:
             args.required_ancestor,
             runtime_package_path=args.runtime_package,
         )
-    else:
+    elif args.command == "artifact-receipt":
         receipt_sha256 = write_artifact_receipt(
             args.output,
             args.artifact,
             kind=args.kind,
             occurrence_count=args.occurrence_count,
         )
+    else:
+        receipt_sha256 = materialize_dataset_view(args.source, args.output, args.receipt)
     print(receipt_sha256)
 
 
