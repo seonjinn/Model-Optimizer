@@ -274,6 +274,19 @@ def test_candidate_diagnostic_compares_post_tokenization_accepted_rows() -> None
     assert "SELECT payload FROM tokenized ORDER BY source_row_index" in diagnostic
     assert '"phase2_row_count": tokenization_result.row_count' in diagnostic
     assert 'first_payload = payload["candidate"]' not in diagnostic
+    assert '"encoded_is_dict": isinstance(encoded, dict)' in diagnostic
+    assert '"encoded_is_mapping": isinstance(encoded, Mapping)' in diagnostic
+    assert '"exception_message": str(error)' in diagnostic
+
+
+def test_candidate_diagnostic_launcher_requires_explicit_shard() -> None:
+    launcher = (
+        MODULE_PATH.parents[2]
+        / "tools/launcher/common/specdec/run_qwen4b_candidate_diagnostic.sbatch"
+    ).read_text(encoding="utf-8")
+
+    assert "DIAGNOSTIC_RECEIPT SHARD_INDEX" in launcher
+    assert '--shard-index "$SHARD_INDEX"' in launcher
 
 
 def _write_bound_source(tmp_path: Path, rows: list[dict]) -> Path:

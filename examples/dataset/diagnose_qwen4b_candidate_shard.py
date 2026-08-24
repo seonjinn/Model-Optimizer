@@ -9,12 +9,15 @@ import argparse
 import json
 import os
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import build_specdec_inventory as inventory_module
 from build_qwen4b_bprime import baseline_exclusion_from_audit, held_out_exclusion_from_json
 from build_specdec_inventory import (
     _authenticated_snapshot_tokenizer,
+    _candidate_tokenize,
     _CandidateShardTask,
     _CandidateTokenizeTask,
     _create_candidate_database,
@@ -26,6 +29,58 @@ from build_specdec_inventory import (
 )
 from specdec_corpus_contracts import canonical_json, sha256_bytes
 from stage_ptv23_sources import SourceInventory, load_source_inventory
+
+
+def tokenizer_contract_probe(payload: Mapping[str, object], tokenizer: Any) -> dict[str, object]:
+    """Describe tokenizer return types without persisting source conversation content."""
+    record = payload.get("pretoken_candidate")
+    if not isinstance(record, Mapping):
+        raise ValueError("diagnostic pretoken candidate is missing")
+    canonical_prompt = record.get("canonical_prompt")
+    if not isinstance(canonical_prompt, Mapping):
+        raise ValueError("diagnostic canonical prompt is missing")
+    messages = canonical_prompt.get("messages")
+    tools = canonical_prompt.get("tools")
+    if not isinstance(messages, list) or not isinstance(tools, list):
+        raise ValueError("diagnostic canonical prompt schema is invalid")
+    add_generation_prompt = not bool(record.get("replay_valid"))
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tools=tools or None,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
+        return_dict=True,
+    )
+    input_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
+    probe: dict[str, object] = {
+        "encoded_type": f"{type(encoded).__module__}.{type(encoded).__qualname__}",
+        "encoded_is_dict": isinstance(encoded, dict),
+        "encoded_is_mapping": isinstance(encoded, Mapping),
+        "encoded_keys": sorted(str(key) for key in encoded) if isinstance(encoded, Mapping) else [],
+        "input_ids_type": f"{type(input_ids).__module__}.{type(input_ids).__qualname__}",
+        "input_ids_length": len(input_ids) if isinstance(input_ids, list) else None,
+        "input_ids_first_type": (
+            f"{type(input_ids[0]).__module__}.{type(input_ids[0]).__qualname__}"
+            if isinstance(input_ids, list) and input_ids
+            else None
+        ),
+    }
+    try:
+        token_ids = _candidate_tokenize(
+            tokenizer,
+            messages,
+            tools,
+            add_generation_prompt=add_generation_prompt,
+        )
+    except Exception as error:
+        probe["candidate_tokenize"] = {
+            "status": "rejected",
+            "exception_type": f"{type(error).__module__}.{type(error).__qualname__}",
+            "exception_message": str(error),
+        }
+    else:
+        probe["candidate_tokenize"] = {"status": "accepted", "token_count": len(token_ids)}
+    return probe
 
 
 def main() -> int:
@@ -100,6 +155,7 @@ def main() -> int:
         historical = set(baseline.prompt_ids)
         heldout = set(held_out.prompt_ids)
         reasons: dict[str, int] = {}
+        first_selected_payload: dict[str, object] | None = None
         with sqlite3.connect(spool) as connection:
             connection.execute(
                 "CREATE TABLE selected(source_row_index INTEGER PRIMARY KEY,payload BLOB NOT NULL) "
@@ -116,6 +172,8 @@ def main() -> int:
                     quarantine_counts=reasons,
                 ):
                     continue
+                if first_selected_payload is None:
+                    first_selected_payload = payload
                 connection.execute("INSERT INTO selected VALUES(?,?)", (source_row_index, raw))
             connection.commit()
         tokenization_result = _tokenize_candidate_shard(
@@ -163,6 +221,11 @@ def main() -> int:
         "source_file_sha256": descriptor.sha256,
         "serial": serial_summary,
         "process": process_summary,
+        "tokenizer_probe": (
+            tokenizer_contract_probe(first_selected_payload, tokenizer)
+            if first_selected_payload is not None
+            else None
+        ),
         "counts_match": serial_summary["accepted_count"] == process_summary["accepted_count"]
         and serial_summary["quarantine_counts"] == process_summary["quarantine_counts"],
     }

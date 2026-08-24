@@ -9,7 +9,7 @@
 
 set -euo pipefail
 required=(REPO_ROOT SOURCE_COMMIT SOURCE_INVENTORY TOKENIZER_RECEIPT TOKENIZER_RECEIPT_SHA256
-    BASELINE_AUDIT HELD_OUT_UUIDS IMAGE_PATH DIAGNOSTIC_RECEIPT)
+    BASELINE_AUDIT HELD_OUT_UUIDS IMAGE_PATH DIAGNOSTIC_RECEIPT SHARD_INDEX)
 for name in "${required[@]}"; do [[ -n "${!name:-}" ]] || exit 2; done
 [[ "$(git -C "$REPO_ROOT" rev-parse HEAD)" == "$SOURCE_COMMIT" \
     && -z "$(git -C "$REPO_ROOT" status --porcelain)" ]] || exit 2
@@ -24,4 +24,4 @@ srun --nodes=1 --ntasks=1 --cpus-per-task=2 --kill-on-bad-exit=1 \
         --source-inventory "$SOURCE_INVENTORY" --tokenizer-receipt "$TOKENIZER_RECEIPT" \
         --tokenizer-receipt-sha256 "$TOKENIZER_RECEIPT_SHA256" \
         --baseline-audit "$BASELINE_AUDIT" --held-out-uuids "$HELD_OUT_UUIDS" \
-        --shard-index 0 --scratch-root "$scratch" --receipt "$DIAGNOSTIC_RECEIPT"
+        --shard-index "$SHARD_INDEX" --scratch-root "$scratch" --receipt "$DIAGNOSTIC_RECEIPT"
