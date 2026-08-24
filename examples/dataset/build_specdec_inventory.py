@@ -1781,6 +1781,8 @@ def _build_candidate_inventory_parallel(
             "requested_workers": workers,
             "effective_workers": effective_workers,
             "threads_per_worker": 1,
+            "accepted_count": accepted_count,
+            "quarantine_counts": dict(sorted(quarantine_counts.items())),
             "started_at_ns": started_wall_ns,
             "finished_at_ns": finished_wall_ns,
             "elapsed_seconds": round(
