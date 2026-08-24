@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -25,11 +26,12 @@ __all__ = [
     "BCanaryTopology",
     "load_b_canary_manifest",
     "publish_b_canary_evidence",
-    "publish_b_export_evaluation",
     "publish_b_gpu_activity",
+    "publish_b_supervisor_completion",
     "validate_a_authorization_receipt",
     "validate_bound_artifacts",
     "validate_canary_evidence",
+    "validate_runtime_artifacts",
     "write_b_canary_manifest",
 ]
 
@@ -225,6 +227,7 @@ class ACanaryAuthorization:
     checkpoint_sha256: str
     export_sha256: str
     gpu_evidence_sha256: str
+    evaluation_receipt_sha256: str
 
 
 def write_b_canary_manifest(path: Path, manifest: BCanaryManifest) -> None:
@@ -318,6 +321,77 @@ def validate_bound_artifacts(
     )
 
 
+def validate_runtime_artifacts(
+    manifest: BCanaryManifest,
+    *,
+    supervisor_path: Path,
+    config_path: Path,
+    container_path: Path | None = None,
+) -> None:
+    """Rehash the exact launcher, target snapshot, tokenizer, template, and container."""
+    runtime = manifest.runtime
+    for actual, declared_path, declared_sha256 in (
+        (supervisor_path, runtime.supervisor_path, runtime.supervisor_sha256),
+        (config_path, runtime.config_path, runtime.config_sha256),
+    ):
+        if (
+            str(actual) != declared_path
+            or hashlib.sha256(_stable_file_bytes(actual)).hexdigest() != declared_sha256
+        ):
+            raise ValueError("B runtime launcher identity changed")
+    target = Path(runtime.target_path)
+    if target.resolve().name != runtime.target_revision:
+        raise ValueError("B target snapshot path does not bind the exact revision")
+    config = json.loads(_stable_file_bytes(target / "config.json"))
+    expected_target = {
+        "model_type": "qwen3",
+        "hidden_size": 2560,
+        "intermediate_size": 9728,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+    }
+    if not isinstance(config, dict) or any(
+        config.get(key) != value for key, value in expected_target.items()
+    ):
+        raise ValueError("B target snapshot is not the exact Qwen3-4B architecture")
+    tokenizer_names = {
+        "added_tokens.json",
+        "chat_template.jinja",
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "vocab.json",
+        "vocab.txt",
+    }
+    tokenizer_files = sorted(
+        path for path in target.iterdir() if path.name in tokenizer_names and path.is_file()
+    )
+    if not tokenizer_files or any(path.is_symlink() for path in tokenizer_files):
+        raise ValueError("B tokenizer snapshot is missing or contains symlinks")
+    tokenizer_digest = hashlib.sha256()
+    for path in tokenizer_files:
+        tokenizer_digest.update(path.name.encode())
+        tokenizer_digest.update(b"\0")
+        tokenizer_digest.update(bytes.fromhex(hashlib.sha256(_stable_file_bytes(path)).hexdigest()))
+    if tokenizer_digest.hexdigest() != runtime.tokenizer_sha256:
+        raise ValueError("B tokenizer snapshot identity changed")
+    if (
+        hashlib.sha256(_stable_file_bytes(target / "chat_template.jinja")).hexdigest()
+        != runtime.chat_template_sha256
+    ):
+        raise ValueError("B chat-template identity changed")
+    if (
+        container_path is not None
+        and hashlib.sha256(_stable_file_bytes(container_path)).hexdigest()
+        != runtime.container_sha256
+    ):
+        raise ValueError("B container identity changed")
+
+
 def validate_a_authorization_receipt(
     path: Path,
     expected_sha256: str,
@@ -327,6 +401,7 @@ def validate_a_authorization_receipt(
     tokenizer_sha256: str,
     chat_template_sha256: str,
     container_sha256: str,
+    repo_root: Path,
 ) -> ACanaryAuthorization:
     """Verify a caller-pinned, job-issued A-repair authorization trust root."""
     raw = _stable_file_bytes(path)
@@ -359,6 +434,33 @@ def validate_a_authorization_receipt(
     }
     if any(payload.get(key) != value for key, value in required.items()):
         raise ValueError("A authorization receipt semantics mismatch")
+    genuine_sources = {
+        "producer_module_path": "tools/launcher/common/specdec/qwen4b_a_canary_manifest.py",
+        "runner_path": "tools/launcher/common/specdec/run_qwen4b_a_canary.sbatch",
+    }
+    if any(payload.get(key) != value for key, value in genuine_sources.items()):
+        raise ValueError("A authorization lacks genuine A producer identity")
+    for path_field, digest_field in (
+        ("producer_module_path", "producer_module_sha256"),
+        ("runner_path", "runner_sha256"),
+    ):
+        relative = Path(str(payload[path_field]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("A authorization genuine producer path is invalid")
+        source_path = repo_root / relative
+        try:
+            source_raw = _stable_file_bytes(source_path)
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("A authorization genuine A producer is unavailable") from error
+        if hashlib.sha256(source_raw).hexdigest() != payload.get(digest_field):
+            raise ValueError("A authorization genuine A producer identity mismatch")
+        committed = subprocess.run(
+            ["git", "-C", str(repo_root), "show", f"{source_commit}:{relative.as_posix()}"],
+            check=False,
+            capture_output=True,
+        )
+        if committed.returncode != 0 or committed.stdout != source_raw:
+            raise ValueError("A authorization genuine producer is not source-commit exact")
     identical_parent = {
         "target_revision": target_revision,
         "tokenizer_sha256": tokenizer_sha256,
@@ -382,6 +484,9 @@ def validate_a_authorization_receipt(
         "checkpoint_sha256",
         "export_sha256",
         "gpu_evidence_sha256",
+        "evaluation_receipt_sha256",
+        "producer_module_sha256",
+        "runner_sha256",
     )
     if any(_SHA256.fullmatch(str(payload.get(name, ""))) is None for name in digest_fields):
         raise ValueError("A authorization digest lineage is incomplete")
@@ -448,18 +553,19 @@ def validate_a_authorization_receipt(
     trainer_state = json.loads(
         _stable_file_bytes(Path(str(payload["checkpoint_path"])) / "trainer_state.json")
     )
-    losses = trainer_state.get("loss_history") if isinstance(trainer_state, dict) else None
-    if (
-        not isinstance(trainer_state, dict)
-        or trainer_state.get("global_step") != 200
-        or not isinstance(losses, list)
-        or not losses
-        or any(
-            not isinstance(loss, (int, float)) or not math.isfinite(float(loss)) for loss in losses
-        )
-        or float(payload["finite_loss"]) != float(losses[-1])
+    if float(payload["finite_loss"]) != _last_finite_training_loss(
+        trainer_state, expected_step=200
     ):
         raise ValueError("A authorization finite-loss evidence mismatch")
+    evaluation_path = Path(str(payload.get("evaluation_receipt_path", "")))
+    evaluation_raw = _stable_file_bytes(evaluation_path)
+    if hashlib.sha256(evaluation_raw).hexdigest() != payload["evaluation_receipt_sha256"]:
+        raise ValueError("A authorization evaluator identity mismatch")
+    _validate_evaluator_receipt(
+        evaluation_raw,
+        job_id=str(payload["slurm_job_id"]),
+        export_sha256=str(payload["export_sha256"]),
+    )
     return ACanaryAuthorization(
         receipt_sha256=expected_sha256,
         **{
@@ -479,33 +585,38 @@ def publish_b_canary_evidence(
     export_path: Path,
     evaluation_receipt_path: Path,
     gpu_evidence_path: Path,
+    supervisor_receipt_path: Path,
 ) -> None:
     """Derive immutable B evidence from artifacts produced by the current job."""
     if not job_id.isdigit():
         raise ValueError("B evidence requires the current Slurm job ID")
     trainer_state = json.loads(_stable_file_bytes(checkpoint_path / "trainer_state.json"))
-    losses = trainer_state.get("loss_history") if isinstance(trainer_state, dict) else None
-    if (
-        not isinstance(trainer_state, dict)
-        or trainer_state.get("global_step") != manifest.topology.max_steps
-        or not isinstance(losses, list)
-        or not losses
-        or any(
-            not isinstance(loss, (int, float)) or not math.isfinite(float(loss)) for loss in losses
-        )
-    ):
-        raise ValueError("B training output lacks finite 200-step loss evidence")
+    finite_loss = _last_finite_training_loss(
+        trainer_state, expected_step=manifest.topology.max_steps
+    )
     checkpoint_sha = _directory_sha256(checkpoint_path)
     export_sha = _directory_sha256(export_path)
-    evaluation_raw = _stable_file_bytes(evaluation_receipt_path)
-    evaluation = json.loads(evaluation_raw)
+    supervisor_raw = _stable_file_bytes(supervisor_receipt_path)
+    supervisor = json.loads(supervisor_raw)
+    supervisor_claim = (
+        supervisor.pop("receipt_sha256", None) if isinstance(supervisor, dict) else None
+    )
     if (
-        not isinstance(evaluation, dict)
-        or str(evaluation.get("slurm_job_id")) != job_id
-        or evaluation.get("status") != "passed"
-        or evaluation.get("export_sha256") != export_sha
+        not isinstance(supervisor, dict)
+        or supervisor_claim != _sha256_json(supervisor)
+        or supervisor.get("producer") != "canonical-dflash-supervisor-v1"
+        or str(supervisor.get("slurm_job_id")) != job_id
+        or supervisor.get("status") != "completed"
+        or supervisor.get("supervisor_sha256") != manifest.runtime.supervisor_sha256
+        or supervisor.get("config_sha256") != manifest.runtime.config_sha256
+        or supervisor.get("checkpoint_sha256") != checkpoint_sha
+        or supervisor.get("export_sha256") != export_sha
+        or supervisor.get("checkpoint_reloaded_by_exporter") is not True
+        or supervisor.get("final_training_loss") != finite_loss
     ):
-        raise ValueError("B evaluator output identity mismatch")
+        raise ValueError("B canonical supervisor completion identity mismatch")
+    evaluation_raw = _stable_file_bytes(evaluation_receipt_path)
+    _validate_evaluator_receipt(evaluation_raw, job_id=job_id, export_sha256=export_sha)
     gpu_raw = _stable_file_bytes(gpu_evidence_path)
     gpu = json.loads(gpu_raw)
     if (
@@ -523,8 +634,10 @@ def publish_b_canary_evidence(
         "export_path": str(export_path),
         "export_sha256": export_sha,
         "evaluation_receipt_sha256": hashlib.sha256(evaluation_raw).hexdigest(),
+        "supervisor_receipt_sha256": hashlib.sha256(supervisor_raw).hexdigest(),
         "gpu_evidence_sha256": hashlib.sha256(gpu_raw).hexdigest(),
         "finite_loss": True,
+        "final_training_loss": finite_loss,
         "checkpoint_reloaded": True,
         "drafter_exported": True,
         "evaluator_completed": True,
@@ -539,30 +652,33 @@ def publish_b_canary_evidence(
     )
 
 
-def publish_b_export_evaluation(
-    path: Path, manifest: BCanaryManifest, *, job_id: str, export_path: Path
+def publish_b_supervisor_completion(
+    path: Path,
+    manifest: BCanaryManifest,
+    *,
+    job_id: str,
+    checkpoint_path: Path,
+    export_path: Path,
 ) -> None:
-    """Publish the canonical current-job export reload/evaluation result."""
+    """Record successful canonical trainer/exporter completion in the current job."""
     if not job_id.isdigit():
-        raise ValueError("B export evaluation requires a numeric Slurm job ID")
-    config_path = export_path / "config.json"
-    config = json.loads(_stable_file_bytes(config_path))
-    weights = sorted(export_path.glob("*.safetensors"))
-    if not isinstance(config, dict) or not weights:
-        raise ValueError("B export evaluation requires reloadable config and safetensors")
-    if config.get("draft_model_type") not in {None, "dflash"}:
-        raise ValueError("B export method identity mismatch")
-    if config.get("draft_block_size") not in {None, 8}:
-        raise ValueError("B export block-size identity mismatch")
+        raise ValueError("B supervisor completion requires a numeric Slurm job ID")
+    state = json.loads(_stable_file_bytes(checkpoint_path / "trainer_state.json"))
+    final_loss = _last_finite_training_loss(state, expected_step=manifest.topology.max_steps)
+    export_config = json.loads(_stable_file_bytes(export_path / "config.json"))
+    if not isinstance(export_config, dict) or not tuple(export_path.glob("*.safetensors")):
+        raise ValueError("B canonical exporter did not produce a loadable HF artifact")
     payload = {
         "schema_version": 1,
+        "producer": "canonical-dflash-supervisor-v1",
         "slurm_job_id": job_id,
-        "status": "passed",
-        "evaluator": "artifact-reload-v1",
-        "target_model_id": manifest.runtime.target_model_id,
-        "method": manifest.runtime.method,
-        "block_size": manifest.runtime.block_size,
+        "status": "completed",
+        "supervisor_sha256": manifest.runtime.supervisor_sha256,
+        "config_sha256": manifest.runtime.config_sha256,
+        "checkpoint_sha256": _directory_sha256(checkpoint_path),
         "export_sha256": _directory_sha256(export_path),
+        "checkpoint_reloaded_by_exporter": True,
+        "final_training_loss": final_loss,
     }
     payload["receipt_sha256"] = _sha256_json(payload)
     atomic_publish_bytes(
@@ -570,6 +686,51 @@ def publish_b_export_evaluation(
         (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(),
         job_id=job_id,
     )
+
+
+def _last_finite_training_loss(state: object, *, expected_step: int) -> float:
+    if not isinstance(state, dict) or state.get("global_step") != expected_step:
+        raise ValueError("training output global step mismatch")
+    history = state.get("log_history")
+    if not isinstance(history, list):
+        raise ValueError("training output lacks trainer_state.log_history")
+    losses = [
+        float(entry["loss"])
+        for entry in history
+        if isinstance(entry, dict)
+        and isinstance(entry.get("loss"), (int, float))
+        and not isinstance(entry.get("loss"), bool)
+        and math.isfinite(float(entry["loss"]))
+    ]
+    if not losses:
+        raise ValueError("training output lacks finite loss")
+    return losses[-1]
+
+
+def _validate_evaluator_receipt(raw: bytes, *, job_id: str, export_sha256: str) -> None:
+    evaluation = json.loads(raw)
+    if not isinstance(evaluation, dict):
+        raise ValueError("evaluator receipt must be an object")
+    claim = evaluation.pop("receipt_sha256", None)
+    metrics = evaluation.get("metrics")
+    if (
+        claim != _sha256_json(evaluation)
+        or str(evaluation.get("slurm_job_id")) != job_id
+        or evaluation.get("status") != "passed"
+        or evaluation.get("evaluator") != "specdec-bench-v1"
+        or evaluation.get("export_sha256") != export_sha256
+        or not isinstance(evaluation.get("completed_requests"), int)
+        or evaluation["completed_requests"] <= 0
+        or not isinstance(metrics, dict)
+        or not metrics
+        or any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            for value in metrics.values()
+        )
+    ):
+        raise ValueError("evaluator output lacks genuine completed metrics")
 
 
 def publish_b_gpu_activity(log_root: Path, path: Path, *, job_id: str) -> None:

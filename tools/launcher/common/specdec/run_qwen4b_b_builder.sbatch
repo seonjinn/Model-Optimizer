@@ -145,7 +145,7 @@ write_b_readiness_receipt(readiness_path, readiness)
 readiness_payload = json.loads(readiness_path.read_bytes())
 repo_root = Path(__import__("os").environ["REPO_ROOT"])
 supervisor = repo_root / "tools/launcher/common/eagle3/train_eagle_streaming.sh"
-config = repo_root / "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/dflash.yaml"
+config = repo_root / "modelopt_recipes/general/speculative_decoding/dflash.yaml"
 runtime = BCanaryRuntimeIdentity(
     target_model_id="Qwen/Qwen3-4B",
     target_path=__import__("os").environ["TARGET_PATH"],

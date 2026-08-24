@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import os
 import subprocess
@@ -29,9 +31,10 @@ from common.specdec.qwen4b_b_canary_manifest import (
     BCanaryTopology,
     load_b_canary_manifest,
     publish_b_canary_evidence,
-    publish_b_export_evaluation,
+    publish_b_supervisor_completion,
     validate_a_authorization_receipt,
     validate_bound_artifacts,
+    validate_runtime_artifacts,
     write_b_canary_manifest,
 )
 from common.specdec.qwen4b_b_readiness import (
@@ -238,18 +241,18 @@ def test_b_canary_builder_preserves_exact_scaled_cell_and_language_quotas() -> N
     selected = build_canary_occurrences(rows, seed=17)
 
     assert len(selected) == 102_400
-    assert {
-        cell: sum(row["domain"] == cell for row in selected) for cell in CANARY_CELL_QUOTAS
-    } == CANARY_CELL_QUOTAS
-    assert {
-        language: sum(
-            json.loads(str(row["record_json"]))["language"] == language for row in selected
-        )
-        for language in CANARY_LANGUAGE_QUOTAS
-    } == CANARY_LANGUAGE_QUOTAS
+    assert all(
+        set(row) == {"conversation_id", "messages", "tools", "input_ids", "loss_mask"}
+        for row in selected
+    )
+    assert len({str(row["conversation_id"]) for row in selected}) == len(selected)
 
 
 def _task8_row(cell: str, identifier: str, *, language: str = "") -> dict[str, object]:
+    messages = [
+        {"role": "user", "content": f"question-{identifier}"},
+        {"role": "assistant", "content": f"answer-{identifier}"},
+    ]
     raw: dict[str, object] = {
         "prompt_uuid": sha256(identifier.encode()).hexdigest(),
         "domain": cell,
@@ -260,6 +263,8 @@ def _task8_row(cell: str, identifier: str, *, language: str = "") -> dict[str, o
         "assistant_tokens": 1,
         "rejection_reason": None,
         "language": language,
+        "messages": messages,
+        "tools": [],
     }
     return {key: value for key, value in raw.items() if key != "language"} | {
         "record_json": json.dumps(raw, sort_keys=True, separators=(",", ":"))
@@ -275,6 +280,54 @@ def test_builder_rejects_invented_pre_task8_row_schema() -> None:
         )
 
 
+def test_builder_emits_canonical_streaming_dataset_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task8 wrappers become directly loadable StreamingDataset JSONL rows."""
+    monkeypatch.setattr(
+        b_builder,
+        "CANARY_CELL_QUOTAS",
+        {"math": 1, "code": 0, "stem": 0, "chat": 0, "multilingual": 0},
+    )
+    monkeypatch.setattr(
+        b_builder,
+        "CANARY_LANGUAGE_QUOTAS",
+        dict.fromkeys(("de", "ja", "es", "fr", "it"), 0),
+    )
+    selected = build_canary_occurrences([_task8_row("math", "streaming")], seed=17)
+
+    assert selected == [
+        {
+            "conversation_id": sha256(b"streaming").hexdigest(),
+            "messages": [
+                {"role": "user", "content": "question-streaming"},
+                {"role": "assistant", "content": "answer-streaming"},
+            ],
+            "tools": [],
+            "input_ids": [1, 2],
+            "loss_mask": [0, 1],
+        }
+    ]
+    loader_path = (
+        Path(__file__).resolve().parents[3]
+        / "modelopt/torch/speculative/plugins/hf_streaming_dataset.py"
+    )
+    module = ast.parse(loader_path.read_text())
+    function = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "normalize_streaming_entry"
+    )
+    namespace: dict[str, object] = {"json": json, "hashlib": hashlib}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(loader_path), "exec"), namespace)
+    normalize = namespace["normalize_streaming_entry"]
+    assert callable(normalize)
+    assert normalize(selected[0]) == (
+        sha256(b"streaming").hexdigest(),
+        selected[0]["messages"],
+    )
+
+
 def test_manifest_requires_transitive_builder_identities() -> None:
     """The GPU manifest cannot omit either immutable builder artifact identity."""
     with pytest.raises(TypeError):
@@ -283,6 +336,63 @@ def test_manifest_requires_transitive_builder_identities() -> None:
             canary_occurrence_count=102_400,
             topology=_topology(),
             source_commit="f" * 40,
+        )
+
+
+def test_runtime_artifacts_rehash_exact_qwen4b_snapshot_and_container(tmp_path: Path) -> None:
+    """The GPU runtime cannot drift from the pinned target/tokenizer/template/container."""
+    revision = "1" * 40
+    target = tmp_path / revision
+    target.mkdir()
+    (target / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "hidden_size": 2560,
+                "intermediate_size": 9728,
+                "num_hidden_layers": 36,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+            }
+        )
+    )
+    template = target / "chat_template.jinja"
+    template.write_text("{% generation %}{{ content }}{% endgeneration %}\n")
+    (target / "tokenizer.json").write_text("{}\n")
+    tokenizer_digest = sha256()
+    for path in sorted((template, target / "tokenizer.json")):
+        tokenizer_digest.update(path.name.encode())
+        tokenizer_digest.update(b"\0")
+        tokenizer_digest.update(bytes.fromhex(sha256(path.read_bytes()).hexdigest()))
+    container = tmp_path / "runtime.sqsh"
+    container.write_bytes(b"runtime")
+    corpus = tmp_path / "canary.jsonl"
+    corpus.write_text("{}\n")
+    base = _manifest(tmp_path, corpus)
+    runtime = replace(
+        base.runtime,
+        target_path=str(target),
+        target_revision=revision,
+        tokenizer_sha256=tokenizer_digest.hexdigest(),
+        chat_template_sha256=sha256(template.read_bytes()).hexdigest(),
+        container_sha256=sha256(container.read_bytes()).hexdigest(),
+    )
+    manifest = replace(base, runtime=runtime)
+
+    validate_runtime_artifacts(
+        manifest,
+        supervisor_path=Path(runtime.supervisor_path),
+        config_path=Path(runtime.config_path),
+        container_path=container,
+    )
+    container.write_bytes(b"drift")
+    with pytest.raises(ValueError, match="container identity"):
+        validate_runtime_artifacts(
+            manifest,
+            supervisor_path=Path(runtime.supervisor_path),
+            config_path=Path(runtime.config_path),
+            container_path=container,
         )
 
 
@@ -900,8 +1010,8 @@ def test_manifest_binds_oci_16_node_200_step_runtime_contract(tmp_path: Path) ->
     assert json.loads(path.read_text())["topology"]["cpu_datamover"] == 96
 
 
-def test_a_authorization_is_caller_pinned_job_evidence(tmp_path: Path) -> None:
-    """A authorization recomputes self, file, checkpoint, export, and GPU identities."""
+def test_a_authorization_rejects_non_producer_fixture(tmp_path: Path) -> None:
+    """Handwritten JSON cannot impersonate the genuine repository-owned A producer."""
     checkpoint = tmp_path / "a-checkpoint"
     export = tmp_path / "a-export"
     checkpoint.mkdir()
@@ -995,18 +1105,7 @@ def test_a_authorization_is_caller_pinned_job_evidence(tmp_path: Path) -> None:
     receipt.write_text(json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n")
     pinned = sha256(receipt.read_bytes()).hexdigest()
 
-    authorization = validate_a_authorization_receipt(
-        receipt,
-        pinned,
-        source_commit="f" * 40,
-        target_revision="5" * 40,
-        tokenizer_sha256="6" * 64,
-        chat_template_sha256="7" * 64,
-        container_sha256="8" * 64,
-    )
-    assert authorization.receipt_sha256 == pinned
-    (checkpoint / "trainer_state.json").write_text('{"tampered":true}\n')
-    with pytest.raises(ValueError, match="artifact identity"):
+    with pytest.raises(ValueError, match="genuine A producer"):
         validate_a_authorization_receipt(
             receipt,
             pinned,
@@ -1015,7 +1114,141 @@ def test_a_authorization_is_caller_pinned_job_evidence(tmp_path: Path) -> None:
             tokenizer_sha256="6" * 64,
             chat_template_sha256="7" * 64,
             container_sha256="8" * 64,
+            repo_root=tmp_path,
         )
+
+
+def test_genuine_a_producer_receipt_authorizes_b_verifier(tmp_path: Path) -> None:
+    """Only the committed A producer can mint the receipt consumed by the B gate."""
+    from common.specdec.qwen4b_a_canary_manifest import (
+        ACanaryManifest,
+        ACanaryRuntimeIdentity,
+        ACanaryTopology,
+        publish_a_authorization,
+    )
+
+    repo_root = Path(__file__).resolve().parents[3]
+    source_commit = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    producer_relative = "tools/launcher/common/specdec/qwen4b_a_canary_manifest.py"
+    runner_relative = "tools/launcher/common/specdec/run_qwen4b_a_canary.sbatch"
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps(
+            {"schema_version": 3, "selection_identity": {"strategy": "A-repair"}},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    selection_sha = sha256(selection.read_bytes()).hexdigest()
+    publication = tmp_path / "publication.json"
+    publication.write_text(
+        json.dumps(
+            {
+                "selection_manifest_sha256": selection_sha,
+                "artifact_source_commit": source_commit,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    publication_sha = sha256(publication.read_bytes()).hexdigest()
+    builder_output = tmp_path / "a-canary.jsonl"
+    builder_output.write_text("{}\n")
+    builder_output_sha = sha256(builder_output.read_bytes()).hexdigest()
+    builder = tmp_path / "build.json"
+    builder_body = {
+        "source_commit": source_commit,
+        "source_projection_sha256": selection_sha,
+        "source_task8_publication_sha256": publication_sha,
+        "output_sha256": builder_output_sha,
+    }
+    builder_body["receipt_sha256"] = sha256(
+        json.dumps(builder_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    builder.write_text(json.dumps(builder_body, sort_keys=True, separators=(",", ":")) + "\n")
+    checkpoint = tmp_path / "checkpoint"
+    export = tmp_path / "export"
+    checkpoint.mkdir()
+    export.mkdir()
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 200, "log_history": [{"loss": 1.25}]}) + "\n"
+    )
+    (export / "config.json").write_text("{}\n")
+    (export / "model.safetensors").write_bytes(b"weights")
+    gpu = tmp_path / "gpu.json"
+    gpu.write_text(json.dumps({"slurm_job_id": "42", "active_gpu_ranks": list(range(64))}))
+    evaluation = tmp_path / "evaluation.json"
+    evaluation_body = {
+        "schema_version": 1,
+        "slurm_job_id": "42",
+        "status": "passed",
+        "evaluator": "specdec-bench-v1",
+        "export_sha256": _directory_digest(export),
+        "completed_requests": 4,
+        "metrics": {"acceptance_rate": 0.5},
+    }
+    evaluation_body["receipt_sha256"] = sha256(
+        json.dumps(evaluation_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    evaluation.write_text(json.dumps(evaluation_body, sort_keys=True, separators=(",", ":")) + "\n")
+    runtime = ACanaryRuntimeIdentity(
+        source_commit=source_commit,
+        target_revision="5" * 40,
+        tokenizer_sha256="6" * 64,
+        chat_template_sha256="7" * 64,
+        container_sha256="8" * 64,
+        producer_module_path=producer_relative,
+        producer_module_sha256=sha256((repo_root / producer_relative).read_bytes()).hexdigest(),
+        runner_path=runner_relative,
+        runner_sha256=sha256((repo_root / runner_relative).read_bytes()).hexdigest(),
+        supervisor_path="tools/launcher/common/eagle3/train_eagle_streaming.sh",
+        supervisor_sha256="9" * 64,
+        recipe_path="modelopt_recipes/general/speculative_decoding/dflash.yaml",
+        recipe_sha256="a" * 64,
+        evaluator_path="tools/launcher/common/specdec/run_qwen4b_a_canary_eval.sh",
+        evaluator_sha256="b" * 64,
+    )
+    a_manifest = ACanaryManifest(
+        runtime=runtime,
+        topology=ACanaryTopology(),
+        task9_a_selection_path=str(selection),
+        task9_a_selection_sha256=selection_sha,
+        task8_publication_path=str(publication),
+        task8_publication_sha256=publication_sha,
+        builder_receipt_path=str(builder),
+        builder_receipt_sha256=sha256(builder.read_bytes()).hexdigest(),
+        builder_output_path=str(builder_output),
+        builder_output_sha256=builder_output_sha,
+    )
+    receipt = tmp_path / "A_AUTHORIZATION.json"
+    publish_a_authorization(
+        receipt,
+        a_manifest,
+        job_id="42",
+        checkpoint_path=checkpoint,
+        export_path=export,
+        gpu_evidence_path=gpu,
+        evaluation_receipt_path=evaluation,
+    )
+
+    authorization = validate_a_authorization_receipt(
+        receipt,
+        sha256(receipt.read_bytes()).hexdigest(),
+        source_commit=source_commit,
+        target_revision="5" * 40,
+        tokenizer_sha256="6" * 64,
+        chat_template_sha256="7" * 64,
+        container_sha256="8" * 64,
+        repo_root=repo_root,
+    )
+    assert authorization.evaluation_receipt_sha256 == sha256(evaluation.read_bytes()).hexdigest()
 
 
 def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path: Path) -> None:
@@ -1035,9 +1268,40 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
     )
     (export / "model.safetensors").write_bytes(b"weights")
     evaluation = tmp_path / "evaluation.json"
-    publish_b_export_evaluation(evaluation, manifest, job_id="42", export_path=export)
+    evaluation_body = {
+        "schema_version": 1,
+        "slurm_job_id": "42",
+        "status": "passed",
+        "evaluator": "specdec-bench-v1",
+        "export_sha256": _directory_digest(export),
+        "completed_requests": 50,
+        "metrics": {"acceptance_rate": 0.5, "generation_throughput": 123.0},
+    }
+    evaluation_body["receipt_sha256"] = sha256(
+        json.dumps(evaluation_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    evaluation.write_text(json.dumps(evaluation_body, sort_keys=True, separators=(",", ":")) + "\n")
     gpu = tmp_path / "gpu.json"
     gpu.write_text(json.dumps({"slurm_job_id": "42", "active_gpu_ranks": list(range(64))}) + "\n")
+    supervisor_receipt = tmp_path / "supervisor.json"
+    with pytest.raises(ValueError, match="log_history"):
+        publish_b_supervisor_completion(
+            supervisor_receipt,
+            manifest,
+            job_id="42",
+            checkpoint_path=checkpoint,
+            export_path=export,
+        )
+    (checkpoint / "trainer_state.json").write_text(
+        json.dumps({"global_step": 200, "log_history": [{"loss": 1.5}, {"loss": 1.25}]}) + "\n"
+    )
+    publish_b_supervisor_completion(
+        supervisor_receipt,
+        manifest,
+        job_id="42",
+        checkpoint_path=checkpoint,
+        export_path=export,
+    )
     evidence = tmp_path / "B_EVIDENCE.json"
 
     publish_b_canary_evidence(
@@ -1048,6 +1312,7 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
         export_path=export,
         evaluation_receipt_path=evaluation,
         gpu_evidence_path=gpu,
+        supervisor_receipt_path=supervisor_receipt,
     )
     payload = json.loads(evidence.read_bytes())
     assert payload["finite_loss"] is True
@@ -1061,6 +1326,7 @@ def test_b_evidence_is_derived_from_current_job_outputs_and_no_replace(tmp_path:
             export_path=export,
             evaluation_receipt_path=evaluation,
             gpu_evidence_path=gpu,
+            supervisor_receipt_path=supervisor_receipt,
         )
 
 
@@ -1075,13 +1341,29 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "--cpus-per-task=96" in runner
     assert "train_eagle_streaming.sh" in runner
     assert "dflash.yaml" in runner
+    assert "modelopt_recipes/general/speculative_decoding/dflash.yaml" in runner
+    assert 'data.data_path="$B_CANARY_OUTPUT"' in runner
+    assert "training.training_seq_len=4096" in runner
+    assert "dflash.dflash_block_size=8" in runner
+    assert "dflash.dflash_architecture_config.num_hidden_layers=5" in runner
+    assert "dflash.dflash_architecture_config.num_attention_heads=32" in runner
+    assert "dflash.dflash_architecture_config.num_key_value_heads=8" in runner
+    assert "dflash.dflash_architecture_config.head_dim=128" in runner
+    assert "dflash.dflash_architecture_config.intermediate_size=9728" in runner
+    assert "model.draft_model_type" not in runner
+    assert "model.draft_block_size" not in runner
+    assert "data.dataset=" not in runner
+    assert "data.max_length=" not in runner
     assert "B_CANARY_SERVE_COMMAND" not in runner
     assert "B_CANARY_TRAIN_COMMAND" not in runner
     assert "publish_b_canary_evidence" in runner
+    assert "run_qwen4b_b_canary_eval.sh" in runner
+    assert "publish_b_export_evaluation" not in runner
     assert "sbatch --test-only" in submitter
     assert "sbatch --parsable" in submitter
     assert "run_qwen4b_b_builder.sbatch" in submitter
     assert "--submit-prep" in submitter
+    assert "--submit-canary-only" in submitter
     assert "--a-authorization-receipt" in submitter
     assert "--a-authorization-receipt-sha256" in submitter
     assert "B_CANARY_BUILD_RECEIPT" in runner
@@ -1090,7 +1372,13 @@ def test_canary_runner_and_submitter_enforce_bounded_evidence_contract() -> None
     assert "nemotron_sw_post" in submitter
     assert "nemotron_n4_post" in submitter
     assert '"required_training_order": "A-repair-first"' in submitter
-    assert '"b_preparation_only": sys.argv[3] != "--submit-canary"' in submitter
+    assert '"b_preparation_only": sys.argv[3] not in {' in submitter
+    supervisor = (
+        Path(__file__).resolve().parents[1] / "common/eagle3/train_eagle_streaming.sh"
+    ).read_text()
+    assert "died early" in supervisor
+    assert 'kill "$pid"' in supervisor
+    assert 'wait "$pid"' in supervisor
 
 
 def test_submit_prep_schedules_only_cpu_builder(tmp_path: Path) -> None:
@@ -1188,7 +1476,10 @@ def test_submit_prep_schedules_only_cpu_builder(tmp_path: Path) -> None:
     assert payload["b_preparation_only"] is True
 
 
-def test_submit_canary_rejects_missing_a_authorization_before_sbatch(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["--submit-canary", "--submit-canary-only"])
+def test_submit_canary_rejects_missing_a_authorization_before_sbatch(
+    tmp_path: Path, mode: str
+) -> None:
     """The A-repair trust root must be authenticated before any scheduler call."""
     repo_root = Path(__file__).resolve().parents[3]
     submitter = repo_root / "tools/launcher/common/specdec/submit_qwen4b_b_canary.sh"
@@ -1207,7 +1498,7 @@ def test_submit_canary_rejects_missing_a_authorization_before_sbatch(tmp_path: P
         [
             "bash",
             str(submitter),
-            "--submit-canary",
+            mode,
             "--account",
             "nemotron_sw_post",
             "--repo-root",

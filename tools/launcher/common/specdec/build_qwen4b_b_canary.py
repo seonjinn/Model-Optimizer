@@ -291,8 +291,9 @@ def build_canary_occurrences(
     selected.sort(key=lambda row: str(row["_rank"]))
     for row in selected:
         row.pop("_rank")
-    if len(selected) != 102_400:
-        raise AssertionError("B canary selection must contain 102400 occurrences")
+    expected_occurrences = sum(_category_quotas().values())
+    if len(selected) != expected_occurrences:
+        raise AssertionError(f"B canary selection must contain {expected_occurrences} occurrences")
     return selected
 
 
@@ -682,9 +683,51 @@ def _prepare_candidate(
         if language:
             raise ValueError("non-multilingual B canary rows must have an empty language")
         category = cell
+    input_ids = row.get("input_ids")
+    producer_input_ids = producer_row.get("input_ids")
+    loss_mask = row.get("loss_mask")
+    producer_loss_mask = producer_row.get("loss_mask")
+    if (
+        not isinstance(input_ids, list)
+        or not input_ids
+        or any(isinstance(token, bool) or not isinstance(token, int) for token in input_ids)
+        or input_ids != producer_input_ids
+    ):
+        raise ValueError("Task8 token IDs do not match record_json")
+    if (
+        not isinstance(loss_mask, list)
+        or len(loss_mask) != len(input_ids)
+        or any(not isinstance(masked, bool) for masked in loss_mask)
+        or loss_mask != producer_loss_mask
+        or row.get("assistant_tokens") != sum(loss_mask)
+        or producer_row.get("assistant_tokens") != sum(loss_mask)
+    ):
+        raise ValueError("Task8 loss mask does not match record_json")
+    messages = producer_row.get("messages")
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or any(
+            not isinstance(message, dict)
+            or message.get("role") not in {"system", "user", "assistant", "tool"}
+            or not isinstance(message.get("content"), str)
+            for message in messages
+        )
+    ):
+        raise ValueError("Task8 record_json lacks canonical messages")
+    tools = producer_row.get("tools", [])
+    if not isinstance(tools, list):
+        raise ValueError("Task8 record_json tools must be a list")
     identifier = _required_task8_string(row, "prompt_uuid")
-    row["_rank"] = _rank(seed, ordinal, identifier)
-    return row, category
+    streaming_row: dict[str, object] = {
+        "conversation_id": identifier,
+        "messages": messages,
+        "tools": tools,
+        "input_ids": input_ids,
+        "loss_mask": [int(masked) for masked in loss_mask],
+        "_rank": _rank(seed, ordinal, identifier),
+    }
+    return streaming_row, category
 
 
 def _category_quotas() -> dict[str, int]:
