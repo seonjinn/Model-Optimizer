@@ -89,6 +89,8 @@ scratch_root="$job_local_parent/qwen4b-task9-b-${SLURM_JOB_ID}"
 }
 mkdir -p "$scratch_root"
 trap 'find "$scratch_root" -depth -delete 2>/dev/null || true' EXIT
+export ARROW_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
 
 python3 "$REPO_ROOT/examples/dataset/qwen3_4b_ptv2_study.py" \
     --policy "$POLICY" \

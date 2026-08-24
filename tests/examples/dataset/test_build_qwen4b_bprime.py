@@ -124,3 +124,11 @@ def test_task5_runner_uses_an_authenticated_container_runtime() -> None:
     assert "IMAGE_PATH=$IMAGE_PATH,IMAGE_SHA256=$IMAGE_SHA256" in submitter
     assert '"$OUTPUT_DIR/EXECUTION_RECEIPT.json"' in runner
     assert '"$OUTPUT_DIR.EXECUTION_RECEIPT.json"' not in runner
+    for name in (
+        "ARROW_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        assert f"{name}=1" in runner

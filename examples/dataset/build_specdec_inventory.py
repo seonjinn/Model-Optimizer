@@ -1363,6 +1363,20 @@ class _CandidateShardResult:
     worker_pid: int
 
 
+@dataclass(frozen=True)
+class _CandidateTokenizeTask:
+    index: int
+    spool_path: Path
+
+
+@dataclass(frozen=True)
+class _CandidateTokenizeResult:
+    index: int
+    row_count: int
+    elapsed_seconds: float
+    worker_pid: int
+
+
 def resolve_candidate_worker_count(
     *, requested_workers: int, declared_shard_count: int, environ: Mapping[str, str] | None = None
 ) -> tuple[int, int]:
@@ -1441,33 +1455,22 @@ def _spool_candidate_payload(
     assert _PROCESS_TOKENIZER is not None
     row = dict(raw_row)
     source = task.source
+    if source.lane != "target-synth":
+        raise ValueError("parallel candidate processing only supports target-synth sources")
     source_id = f"{source.repository_id}:{source.configuration}:{source.split}"
     prompt_uuid: str | None = None
     canonical_bytes: bytes | None = None
     try:
         source_conversation_sha256: str | None = None
         source_response_sha256: str | None = None
-        if source.lane in {"interactive-swe-replay", "generic-tool-replay"}:
-            validation = validate_trajectory(
-                row,
-                source_id=f"{source_id}:{row_index}",
-                lane=source.lane,
-                tokenizer=_PROCESS_TOKENIZER,
-                training_seq_len=task.training_seq_len,
+        if _approved_ptv2_source(source):
+            messages, tools, source_conversation_sha256, source_response_sha256 = (
+                _ptv2_target_prompt_identity(row)
             )
-            messages = validation.canonical["messages"]
-            tools = validation.canonical["tools"]
-            canonical_bytes = validation.canonical_bytes
-            replay_valid = True
         else:
-            if _approved_ptv2_source(source):
-                messages, tools, source_conversation_sha256, source_response_sha256 = (
-                    _ptv2_target_prompt_identity(row)
-                )
-            else:
-                messages, tools = _target_prompt(row)
-            canonical_bytes = canonicalize_prompt(messages, tools)
-            replay_valid = False
+            messages, tools = _target_prompt(row)
+        canonical_bytes = canonicalize_prompt(messages, tools)
+        replay_valid = False
         canonical_prompt = json.loads(canonical_bytes)
         messages = canonical_prompt["messages"]
         tools = canonical_prompt["tools"]
@@ -1489,33 +1492,7 @@ def _spool_candidate_payload(
             "canonical_prompt": json.loads(canonical_bytes) if canonical_bytes is not None else None,
             "reason": reason,
         }
-    try:
-        language = _normalize_language(row.get("language"), source)
-        input_ids = _candidate_tokenize(
-            _PROCESS_TOKENIZER,
-            messages,
-            tools,
-            add_generation_prompt=not replay_valid,
-        )
-        context_bucket = _context_bucket(len(input_ids))
-    except ValueError as error:
-        reason = str(error)
-        if reason.startswith("conversation exceeds the 32K inventory limit"):
-            reason = "context_too_long"
-        payload = {
-            "prompt_uuid": prompt_uuid,
-            "canonical_prompt": json.loads(canonical_bytes),
-        }
-        if reason in _CANDIDATE_QUARANTINE_CODES:
-            return payload | {"reason": reason}
-        return payload | {"deferred_error_type": type(error).__name__, "deferred_error": reason}
-    except Exception as error:
-        return {
-            "prompt_uuid": prompt_uuid,
-            "canonical_prompt": json.loads(canonical_bytes),
-            "deferred_error_type": type(error).__name__,
-            "deferred_error": str(error),
-        }
+    language = _normalize_language(row.get("language"), source)
     candidate = CandidatePrompt(
         prompt_uuid=prompt_uuid,
         canonical_bytes=canonical_bytes,
@@ -1526,11 +1503,11 @@ def _spool_candidate_payload(
         domain=_candidate_domain(source),
         language=language,
         lane=source.lane,
-        context_bucket=context_bucket,
-        full_token_count=len(input_ids),
+        context_bucket="",
+        full_token_count=0,
         source_manifest_sha256=task.source_manifest_sha256,
         source_file_path=task.descriptor.path,
-        input_ids=input_ids,
+        input_ids=(),
         tokenizer_sha256=task.tokenizer_sha256,
         replay_valid=replay_valid,
         source_family="ptv2" if _approved_ptv2_source(source) else "ptv3",
@@ -1541,7 +1518,7 @@ def _spool_candidate_payload(
         source_response_sha256=source_response_sha256,
         chat_template_sha256=task.chat_template_sha256,
     )
-    return {"prompt_uuid": prompt_uuid, "candidate": _candidate_record(candidate)}
+    return {"prompt_uuid": prompt_uuid, "pretoken_candidate": _candidate_record(candidate)}
 
 
 def _stage_authenticated_source_once(
@@ -1645,6 +1622,83 @@ def _run_candidate_shard_workers(
             raise
     if len(results) != len(tasks):
         raise RuntimeError("candidate processing did not return every declared shard")
+    return tuple(results[index] for index in range(len(tasks)))
+
+
+def _tokenize_candidate_shard(task: _CandidateTokenizeTask) -> _CandidateTokenizeResult:
+    started = time.monotonic_ns()
+    assert _PROCESS_TOKENIZER is not None
+    connection = sqlite3.connect(task.spool_path)
+    connection.execute(
+        "CREATE TABLE tokenized(source_row_index INTEGER PRIMARY KEY,payload BLOB NOT NULL) "
+        "WITHOUT ROWID"
+    )
+    row_count = 0
+    try:
+        for source_row_index, encoded in connection.execute(
+            "SELECT source_row_index,payload FROM selected ORDER BY source_row_index"
+        ):
+            payload = json.loads(encoded)
+            record = payload["pretoken_candidate"]
+            canonical_prompt = record["canonical_prompt"]
+            try:
+                input_ids = _candidate_tokenize(
+                    _PROCESS_TOKENIZER,
+                    canonical_prompt["messages"],
+                    canonical_prompt["tools"],
+                    add_generation_prompt=not record["replay_valid"],
+                )
+                record["input_ids"] = input_ids
+                record["full_token_count"] = len(input_ids)
+                record["context_bucket"] = _context_bucket(len(input_ids))
+                output = {"candidate": record}
+            except ValueError as error:
+                reason = str(error)
+                if reason.startswith("conversation exceeds the 32K inventory limit"):
+                    reason = "context_too_long"
+                if reason not in _CANDIDATE_QUARANTINE_CODES:
+                    raise
+                output = {"reason": reason}
+            connection.execute(
+                "INSERT INTO tokenized VALUES(?,?)",
+                (source_row_index, canonical_json(output)),
+            )
+            row_count += 1
+            if row_count % 10_000 == 0:
+                connection.commit()
+        connection.commit()
+    except BaseException:
+        connection.close()
+        raise
+    connection.close()
+    return _CandidateTokenizeResult(
+        task.index,
+        row_count,
+        round((time.monotonic_ns() - started) / 1_000_000_000, 6),
+        os.getpid(),
+    )
+
+
+def _run_candidate_tokenizers(
+    tasks: tuple[_CandidateTokenizeTask, ...], workers: int
+) -> tuple[_CandidateTokenizeResult, ...]:
+    results: dict[int, _CandidateTokenizeResult] = {}
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=get_context("fork"),
+        initializer=_initialize_candidate_worker,
+    ) as executor:
+        futures = {executor.submit(_tokenize_candidate_shard, task): task.index for task in tasks}
+        try:
+            for future in as_completed(futures):
+                result = future.result()
+                results[result.index] = result
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    if len(results) != len(tasks):
+        raise RuntimeError("candidate tokenization did not return every declared shard")
     return tuple(results[index] for index in range(len(tasks)))
 
 
@@ -1778,6 +1832,10 @@ def _build_candidate_inventory_parallel(
     started_monotonic_ns = time.monotonic_ns()
     global _PROCESS_TOKENIZER
     _PROCESS_TOKENIZER = tokenizer
+    _initialize_candidate_worker()
+    thread_environment = {name: os.environ.get(name) for name in _THREAD_ENVIRONMENT}
+    if set(thread_environment.values()) != {"1"}:
+        raise ValueError("parallel candidate thread caps did not reconcile")
     tasks = tuple(
         _CandidateShardTask(
             index,
@@ -1802,6 +1860,9 @@ def _build_candidate_inventory_parallel(
         sources_root = source_inventory.staged_root.resolve(strict=True) / "sources"
         if _staged_tree_snapshot(sources_root) != initial_tree:
             raise ValueError("authenticated physical shard set changed during processing")
+        connection.execute(
+            "CREATE TABLE candidate_seen(prompt_uuid TEXT PRIMARY KEY,canonical_bytes BLOB NOT NULL)"
+        )
         for result in results:
             observed = os.lstat(result.spool_path)
             if (
@@ -1811,8 +1872,12 @@ def _build_candidate_inventory_parallel(
             ):
                 raise ValueError("candidate worker spool changed before deterministic merge")
             with sqlite3.connect(result.spool_path) as shard:
-                for (raw_payload,) in shard.execute(
-                    "SELECT payload FROM records ORDER BY source_row_index"
+                shard.execute(
+                    "CREATE TABLE selected(source_row_index INTEGER PRIMARY KEY,payload BLOB NOT NULL) "
+                    "WITHOUT ROWID"
+                )
+                for source_row_index, raw_payload in shard.execute(
+                    "SELECT source_row_index,payload FROM records ORDER BY source_row_index"
                 ):
                     payload = json.loads(raw_payload)
                     prompt_uuid = payload.get("prompt_uuid")
@@ -1823,7 +1888,7 @@ def _build_candidate_inventory_parallel(
                         _quarantine(quarantine_counts, "heldout_exclusion")
                         continue
                     canonical_prompt = payload.get("canonical_prompt")
-                    candidate_record = payload.get("candidate")
+                    candidate_record = payload.get("pretoken_candidate")
                     canonical_bytes = (
                         canonical_json(canonical_prompt)
                         if canonical_prompt is not None
@@ -1833,7 +1898,7 @@ def _build_candidate_inventory_parallel(
                     )
                     if prompt_uuid is not None and canonical_bytes is not None:
                         previous = connection.execute(
-                            "SELECT canonical_bytes FROM candidates WHERE prompt_uuid = ?",
+                            "SELECT canonical_bytes FROM candidate_seen WHERE prompt_uuid = ?",
                             (prompt_uuid,),
                         ).fetchone()
                         if previous is not None:
@@ -1845,11 +1910,30 @@ def _build_candidate_inventory_parallel(
                     if reason is not None:
                         _quarantine(quarantine_counts, reason)
                         continue
-                    if payload.get("deferred_error") is not None:
-                        raise ValueError(
-                            f"deferred {payload.get('deferred_error_type')}: "
-                            f"{payload['deferred_error']}"
-                        )
+                    if prompt_uuid is None or canonical_bytes is None:
+                        raise ValueError("candidate identity is missing before tokenization")
+                    connection.execute(
+                        "INSERT INTO candidate_seen VALUES(?,?)", (prompt_uuid, canonical_bytes)
+                    )
+                    shard.execute(
+                        "INSERT INTO selected VALUES(?,?)", (source_row_index, raw_payload)
+                    )
+                shard.commit()
+        connection.commit()
+        tokenization_results = _run_candidate_tokenizers(
+            tuple(_CandidateTokenizeTask(task.index, task.spool_path) for task in tasks),
+            effective_workers,
+        )
+        for task in tasks:
+            with sqlite3.connect(task.spool_path) as shard:
+                for (raw_payload,) in shard.execute(
+                    "SELECT payload FROM tokenized ORDER BY source_row_index"
+                ):
+                    payload = json.loads(raw_payload)
+                    reason = payload.get("reason")
+                    if reason is not None:
+                        _quarantine(quarantine_counts, reason)
+                        continue
                     candidate = _candidate_from_record(payload["candidate"])
                     _insert_candidate(connection, candidate)
                     accepted_count += 1
@@ -1862,6 +1946,7 @@ def _build_candidate_inventory_parallel(
                     capacity[cell] = capacity.get(cell, 0) + 1
                     if accepted_count % 10_000 == 0:
                         connection.commit()
+        connection.execute("DROP TABLE candidate_seen")
         connection.commit()
         connection.close()
         finished_wall_ns = time.time_ns()
@@ -1874,6 +1959,7 @@ def _build_candidate_inventory_parallel(
             "requested_workers": workers,
             "effective_workers": effective_workers,
             "threads_per_worker": 1,
+            "thread_environment": thread_environment,
             "accepted_count": accepted_count,
             "quarantine_counts": dict(sorted(quarantine_counts.items())),
             "started_at_ns": started_wall_ns,
@@ -1882,6 +1968,7 @@ def _build_candidate_inventory_parallel(
                 (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000, 6
             ),
             "shards": [asdict(result) | {"spool_path": result.spool_path.name} for result in results],
+            "tokenization_shards": [asdict(result) for result in tokenization_results],
         }
         execution["receipt_sha256"] = sha256_bytes(canonical_json(execution))
         return _finalize_candidate_inventory(

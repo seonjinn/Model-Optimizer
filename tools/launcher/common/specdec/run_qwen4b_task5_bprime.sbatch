@@ -48,6 +48,8 @@ scratch="$job_local_parent/qwen4b-task5-bprime-${SLURM_JOB_ID}"
 [[ ! -e "$scratch" && ! -L "$scratch" ]] || exit 2
 mkdir -p "$scratch"
 trap 'find "$scratch" -depth -delete 2>/dev/null || true' EXIT
+export ARROW_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
 
 srun --nodes=1 --ntasks=1 --cpus-per-task=96 --kill-on-bad-exit=1 \
     --no-container-mount-home --container-image="$IMAGE_PATH" \

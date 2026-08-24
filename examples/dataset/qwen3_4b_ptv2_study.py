@@ -1125,16 +1125,15 @@ def _spool_authenticated_ptv2_source_rows_parallel(
         raise PTV2StudyError("SourceInventory revision does not match the study policy")
     sources_root = inventory.staged_root / "sources"
     initial_tree = _staged_tree_snapshot(sources_root)
-    declared: list[tuple[SourceIdentity, SourceFile, Path]] = []
-    for source in inventory.sources:
-        for source_file in source.files:
-            declared.append(
-                (
-                    source,
-                    source_file,
-                    sources_root / source.repository_id / source.revision / source_file.path,
-                )
-            )
+    declared = [
+        (
+            source,
+            source_file,
+            sources_root / source.repository_id / source.revision / source_file.path,
+        )
+        for source in inventory.sources
+        for source_file in source.files
+    ]
     if set(initial_tree) != _expected_staged_tree_entries(
         sources_root, tuple(path for _source, _descriptor, path in declared)
     ):
@@ -1142,6 +1141,19 @@ def _spool_authenticated_ptv2_source_rows_parallel(
     effective_workers, allocated_cpus = resolve_ptv2_worker_count(
         workers, declared_shards=len(declared)
     )
+    _initialize_ptv2_worker()
+    thread_environment = {
+        name: os.environ.get(name)
+        for name in (
+            "ARROW_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        )
+    }
+    if set(thread_environment.values()) != {"1"}:
+        raise PTV2StudyError("parallel Task9 thread caps did not reconcile")
     if storage_dir is not None:
         storage_dir.mkdir(parents=True, exist_ok=True)
     temporary = tempfile.TemporaryDirectory(prefix="ptv2-authenticated-", dir=storage_dir)
@@ -1223,6 +1235,7 @@ def _spool_authenticated_ptv2_source_rows_parallel(
             "requested_workers": workers,
             "effective_workers": effective_workers,
             "threads_per_worker": 1,
+            "thread_environment": thread_environment,
             "started_at_ns": started_wall_ns,
             "finished_at_ns": time.time_ns(),
             "elapsed_seconds": round(

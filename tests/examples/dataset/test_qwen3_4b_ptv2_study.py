@@ -93,6 +93,14 @@ def test_task9_runner_requires_the_atomically_published_execution_receipt() -> N
 
     assert '"$RECEIPT_ROOT/EXECUTION_RECEIPT.json"' in runner
     assert '"$RECEIPT_ROOT.EXECUTION_RECEIPT.json"' not in runner
+    for name in (
+        "ARROW_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        assert f"{name}=1" in runner
 
 
 def _row(cell: str, source_row: int, prompt: str, *, language: str = "") -> PTV2StudySourceRow:
@@ -323,6 +331,7 @@ def test_task9_exact_201_shard_serial_and_p96_are_byte_and_semantically_identica
         assert parallel.execution_receipt is not None
         assert parallel.execution_receipt["effective_workers"] == 96
         assert parallel.execution_receipt["allocated_cpus"] == 96
+        assert set(parallel.execution_receipt["thread_environment"].values()) == {"1"}
         assert canonical_json([row.__dict__ for row in parallel_rows]) == canonical_json(
             [row.__dict__ for row in serial_rows]
         )

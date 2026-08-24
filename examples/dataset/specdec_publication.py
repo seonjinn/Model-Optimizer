@@ -409,6 +409,12 @@ def _authenticate_artifacts(bundle: CorpusBundle) -> tuple[_AuthenticatedArtifac
             files.append((relative, path, size, digest))
         if artifact.role == "selection" and payload.get("schema_version") == 3:
             _validate_ptv2_selection_policy(payload, files)
+        if (
+            artifact.role == "selection"
+            and payload.get("schema_version") == 2
+            and payload.get("selection_mode") == "B-prime-only"
+        ):
+            _validate_task5_execution_receipt(payload, files)
         authenticated.append(
             _AuthenticatedArtifact(artifact.role, receipt, artifact.receipt_sha256, tuple(files))
         )
@@ -645,6 +651,59 @@ def _validate_ptv2_selection_policy(
         raise PublicationError("PTV2 occurrence shards do not match selection index semantics")
 
 
+def _validate_task5_execution_receipt(
+    selection: Mapping[str, Any], files: list[tuple[str, Path, int, str]]
+) -> None:
+    descriptor = selection.get("execution_receipt")
+    if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("path"), str):
+        raise PublicationError("Task5 selection execution receipt is missing")
+    execution_file = next((item for item in files if item[0] == descriptor["path"]), None)
+    if execution_file is None:
+        raise PublicationError("Task5 execution receipt was not authenticated")
+    try:
+        raw = execution_file[1].read_bytes()
+        execution = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise PublicationError("Task5 execution receipt is invalid") from error
+    if not isinstance(execution, dict) or raw != _identity_json(execution) + b"\n":
+        raise PublicationError("Task5 execution receipt is not canonical")
+    claimed = execution.pop("receipt_sha256", None)
+    required = {
+        "schema_version",
+        "source_commit",
+        "source_manifest_sha256",
+        "declared_shard_count",
+        "allocated_cpus",
+        "requested_workers",
+        "effective_workers",
+        "threads_per_worker",
+        "thread_environment",
+        "started_at_ns",
+        "finished_at_ns",
+        "elapsed_seconds",
+        "accepted_count",
+        "quarantine_counts",
+        "shards",
+        "tokenization_shards",
+        "candidate_inventory_sha256",
+        "selection_sha256",
+    }
+    thread_environment = execution.get("thread_environment")
+    if (
+        not required.issubset(execution)
+        or claimed != _sha256_bytes(_identity_json(execution))
+        or execution.get("selection_sha256") != selection.get("selection_sha256")
+        or not isinstance(execution.get("candidate_inventory_sha256"), str)
+        or _SHA256.fullmatch(execution["candidate_inventory_sha256"]) is None
+        or execution.get("effective_workers") != 96
+        or execution.get("allocated_cpus") != 96
+        or execution.get("threads_per_worker") != 1
+        or not isinstance(thread_environment, dict)
+        or set(thread_environment.values()) != {"1"}
+    ):
+        raise PublicationError("Task5 execution receipt does not reconcile")
+
+
 def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
     if role == "selection" and payload.get("schema_version") == 2:
         root_sha256 = payload.get("root_sha256")
@@ -655,7 +714,10 @@ def _role_file_descriptors(role: str, payload: dict[str, Any]) -> list[dict[str,
         index = payload.get("index")
         if not isinstance(shards, list) or not shards or not isinstance(index, dict):
             raise PublicationError("selection manifest declared files are malformed")
-        return [*shards, index]
+        execution = payload.get("execution_receipt")
+        if payload.get("selection_mode") == "B-prime-only" and not isinstance(execution, dict):
+            raise PublicationError("Task5 selection execution receipt is missing")
+        return [*shards, index, *([execution] if isinstance(execution, dict) else [])]
     if role == "selection" and payload.get("schema_version") == 3:
         root_sha256 = payload.get("root_sha256")
         root_record = {key: value for key, value in payload.items() if key != "root_sha256"}

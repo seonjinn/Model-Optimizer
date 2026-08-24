@@ -94,6 +94,15 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         ),
         "tools": "[]",
     }
+    duplicate = {
+        "messages": json.dumps(
+            [
+                {"role": "user", "content": "deduplicate-before-tokenization"},
+                {"role": "assistant", "content": "answer"},
+            ]
+        ),
+        "tools": "[]",
+    }
     for index in range(201):
         path = tmp_path / f"shard-{index}.jsonl"
         rows = [
@@ -109,7 +118,7 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
             for row in range(3)
         ]
         if index == 0:
-            rows.insert(0, excluded)
+            rows[:0] = [excluded, duplicate, duplicate]
         path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         descriptor = module.SourceFile(path.name, path.stat().st_size, module.sha256_file(path))
         files.append((source, descriptor, path))
@@ -124,15 +133,26 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
     baseline = module.make_exclusion_receipt("baseline", (excluded_uuid,))
     held_out = module.make_exclusion_receipt("held-out", ())
 
-    class ExplodingTokenizer(CandidateTokenizer):
+    class ObservedTokenizer(CandidateTokenizer):
+        def __init__(self, marker: Path) -> None:
+            self.marker = marker
+
         def apply_chat_template(self, messages, **kwargs):
             if any(message.get("content") == "explode-before-tokenization" for message in messages):
+                self.marker.with_suffix(".excluded").write_bytes(b"called")
                 raise RuntimeError("excluded rows must not be tokenized")
+            if any(
+                message.get("content") == "deduplicate-before-tokenization"
+                for message in messages
+            ):
+                with self.marker.open("ab") as stream:
+                    stream.write(b"1")
             return super().apply_chat_template(messages, **kwargs)
 
+    serial_marker = tmp_path / "serial-tokenizer-calls"
     serial = module.build_candidate_inventory(
         inventory,
-        tokenizer=ExplodingTokenizer(),
+        tokenizer=ObservedTokenizer(serial_marker),
         tokenizer_sha256="f" * 64,
         baseline_exclusion=baseline,
         held_out_exclusion=held_out,
@@ -140,7 +160,7 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
     )
     parallel = module.build_candidate_inventory(
         inventory,
-        tokenizer=ExplodingTokenizer(),
+        tokenizer=ObservedTokenizer(tmp_path / "parallel-tokenizer-calls"),
         tokenizer_sha256="f" * 64,
         baseline_exclusion=baseline,
         held_out_exclusion=held_out,
@@ -154,7 +174,10 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         assert parallel.execution_receipt is not None
         assert parallel.execution_receipt["effective_workers"] == 96
         assert parallel.execution_receipt["declared_shard_count"] == 201
+        assert set(parallel.execution_receipt["thread_environment"].values()) == {"1"}
         assert parallel.quarantine_counts["historical_exclusion"] == 1
+        assert not (tmp_path / "parallel-tokenizer-calls.excluded").exists()
+        assert (tmp_path / "parallel-tokenizer-calls").read_bytes() == b"1"
     finally:
         serial.close()
         parallel.close()

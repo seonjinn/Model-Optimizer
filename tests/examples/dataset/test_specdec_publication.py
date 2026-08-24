@@ -39,6 +39,83 @@ def _canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
+def test_task5_execution_receipt_is_required_authenticated_and_reconciled(
+    tmp_path: Path,
+) -> None:
+    execution = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "source_manifest_sha256": "b" * 64,
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "finished_at_ns": 2,
+        "elapsed_seconds": 1.0,
+        "accepted_count": 1,
+        "quarantine_counts": {},
+        "shards": [],
+        "tokenization_shards": [],
+        "candidate_inventory_sha256": "c" * 64,
+        "selection_sha256": "d" * 64,
+    }
+    execution["receipt_sha256"] = hashlib.sha256(
+        json.dumps(execution, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    path = tmp_path / "EXECUTION_RECEIPT.json"
+    path.write_bytes(_canonical(execution))
+    descriptor = {
+        "path": path.name,
+        "bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    selection = {
+        "schema_version": 2,
+        "selection_mode": "B-prime-only",
+        "selection_sha256": "d" * 64,
+        "execution_receipt": descriptor,
+    }
+    files = [(path.name, path, path.stat().st_size, descriptor["sha256"])]
+
+    manifest = {
+        **selection,
+        "shards": [descriptor],
+        "index": descriptor,
+    }
+    manifest["root_sha256"] = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert descriptor in publication._role_file_descriptors("selection", manifest)
+    missing = {key: value for key, value in manifest.items() if key != "execution_receipt"}
+    missing.pop("root_sha256")
+    missing["root_sha256"] = hashlib.sha256(
+        json.dumps(missing, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    with pytest.raises(publication.PublicationError, match="execution receipt is missing"):
+        publication._role_file_descriptors("selection", missing)
+
+    publication._validate_task5_execution_receipt(selection, files)
+    with pytest.raises(publication.PublicationError, match="not authenticated"):
+        publication._validate_task5_execution_receipt(selection, [])
+    tampered = dict(execution)
+    tampered["effective_workers"] = 1
+    path.write_bytes(_canonical(tampered))
+    with pytest.raises(publication.PublicationError, match="does not reconcile"):
+        publication._validate_task5_execution_receipt(selection, files)
+
+
 def test_ptv2_lineage_flows_from_source_to_selection_then_tokenization() -> None:
     """A genuine upstream source receipt need not contain downstream selection state."""
 

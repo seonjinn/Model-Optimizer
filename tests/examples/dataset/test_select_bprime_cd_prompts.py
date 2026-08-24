@@ -450,7 +450,33 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
         baseline_receipt_sha256=candidates.baseline_exclusion.receipt_sha256,
         held_out_receipt_sha256=candidates.held_out_exclusion.receipt_sha256,
     )
-    execution: dict[str, Any] = {"schema_version": 1, "effective_workers": 96}
+    execution: dict[str, Any] = {
+        "schema_version": 1,
+        "source_commit": "a" * 40,
+        "source_manifest_sha256": source_inventory.manifest_sha256,
+        "declared_shard_count": 201,
+        "allocated_cpus": 96,
+        "requested_workers": 96,
+        "effective_workers": 96,
+        "threads_per_worker": 1,
+        "thread_environment": dict.fromkeys(
+            (
+                "ARROW_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "OPENBLAS_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ),
+            "1",
+        ),
+        "started_at_ns": 1,
+        "finished_at_ns": 2,
+        "elapsed_seconds": 1.0,
+        "accepted_count": len(candidates.rows),
+        "quarantine_counts": {},
+        "shards": [],
+        "tokenization_shards": [],
+    }
     execution["receipt_sha256"] = hashlib.sha256(canonical_json(execution)).hexdigest()
     destination = tmp_path / "bprime-only"
     try:
@@ -480,6 +506,38 @@ def test_bprime_only_producer_authenticates_physical_task3_and_publishes_only_bp
     assert published.manifest_path.read_bytes() == before
     assert (destination / "EXECUTION_RECEIPT.json").is_file()
     assert getattr(caught.value, "recovery_state").destination_path == destination
+    pytest.importorskip("pyarrow")
+    sys.path.insert(0, str(MODULE_DIR))
+    try:
+        import specdec_publication as publication
+    finally:
+        sys.path.pop(0)
+    descriptors = publication._role_file_descriptors("selection", manifest)
+    assert manifest["execution_receipt"] in descriptors
+    authenticated_files = tuple(
+        (
+            descriptor["path"],
+            destination / descriptor["path"],
+            descriptor.get("bytes", descriptor.get("byte_count", (destination / descriptor["path"]).stat().st_size)),
+            descriptor["sha256"],
+        )
+        for descriptor in descriptors
+    )
+    publication._validate_task5_execution_receipt(manifest, list(authenticated_files))
+    copied = tmp_path / "copied-publication"
+    copied.mkdir()
+    publication._copy_authenticated_inputs(
+        copied,
+        (
+            publication._AuthenticatedArtifact(
+                "selection",
+                published.manifest_path,
+                hashlib.sha256(published.manifest_path.read_bytes()).hexdigest(),
+                authenticated_files,
+            ),
+        ),
+    )
+    assert (copied / "inputs/selection/files/EXECUTION_RECEIPT.json").is_file()
     with sqlite3.connect(published.index_path) as connection:
         assert {row[0] for row in connection.execute("SELECT DISTINCT arm FROM rows")} == {
             "B-prime"
