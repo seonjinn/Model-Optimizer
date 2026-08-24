@@ -93,6 +93,93 @@ def _atomic_json(path: Path, payload: dict[str, Any], *, no_replace: bool = Fals
             os.unlink(temporary)
 
 
+def _read_prompt_prefix(path: Path, limit: int) -> list[tuple[int, str]]:
+    prompts: list[tuple[int, str]] = []
+    with path.open() as stream:
+        for source_row, line in enumerate(stream):
+            if source_row >= limit:
+                break
+            row = json.loads(line)
+            prompt = row.get("prompt") if isinstance(row, dict) else None
+            if not isinstance(prompt, str) or not prompt:
+                raise ValueError(f"prompt {source_row} is not a non-empty string: {path}")
+            recorded_source_row = row.get("_specdec_source_row", source_row)
+            if (
+                isinstance(recorded_source_row, bool)
+                or not isinstance(recorded_source_row, int)
+                or recorded_source_row < 0
+            ):
+                raise ValueError(f"invalid source row {source_row}: {path}")
+            prompts.append((recorded_source_row, prompt))
+    if not prompts:
+        raise ValueError(f"no prompts: {path}")
+    return prompts
+
+
+def materialize_prompt_set(
+    source_manifest_path: Path,
+    source_hf_home: Path,
+    output_hf_home: Path,
+    output_manifest_path: Path,
+) -> dict[str, Any]:
+    """Materialize an authenticated source-order cycle of exactly 200 rows/subset."""
+    source = compute_prompt_set(source_manifest_path, source_hf_home)
+    if output_manifest_path.exists() or output_hf_home.exists():
+        raise FileExistsError("matched prompt output already exists")
+    snapshot = (
+        output_hf_home
+        / "hub/datasets--RedHatAI--speculator_benchmarks/snapshots"
+        / DATASET_REVISION
+    )
+    snapshot.mkdir(parents=True)
+    source_manifest = _load_json(source_manifest_path)
+    source_files = source_manifest["files"]
+    files: dict[str, dict[str, object]] = {}
+    for subset in STANDARD_SUBSETS:
+        source_path = Path(str(source_files[subset]["path"]))
+        rows: list[dict[str, Any]] = []
+        with source_path.open() as stream:
+            for index, line in enumerate(stream):
+                if index >= EVALUATION_REQUESTS_PER_SUBSET:
+                    break
+                row = json.loads(line)
+                if not isinstance(row, dict) or not isinstance(row.get("prompt"), str):
+                    raise ValueError(f"invalid source prompt row: {subset}[{index}]")
+                rows.append(row)
+        if not rows:
+            raise ValueError(f"empty source subset: {subset}")
+        output_path = snapshot / f"{subset}.jsonl"
+        with output_path.open("x") as stream:
+            for ordinal in range(EVALUATION_REQUESTS_PER_SUBSET):
+                source_row = ordinal % len(rows)
+                derived = {**rows[source_row], "_specdec_source_row": source_row}
+                stream.write(_canonical(derived) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        files[subset] = {
+            "path": str(output_path.resolve(strict=True)),
+            "sha256": _sha256(output_path),
+        }
+    payload: dict[str, Any] = {
+        "dataset_id": DATASET_ID,
+        "revision": DATASET_REVISION,
+        "hf_home": str(output_hf_home.resolve(strict=True)),
+        "files": files,
+        "derivation": {
+            "producer": "speculator-benchmarks-source-order-cycle-v1",
+            "requests_per_subset": EVALUATION_REQUESTS_PER_SUBSET,
+            "source_manifest_path": str(source_manifest_path.resolve(strict=True)),
+            "source_manifest_sha256": _sha256(source_manifest_path),
+            "source_hf_home": str(source_hf_home.resolve(strict=True)),
+            "source_prompt_sha256": source["prompt_sha256"],
+            "source_files": source["files"],
+        },
+    }
+    _atomic_json(output_manifest_path, payload, no_replace=True)
+    compute_prompt_set(output_manifest_path, output_hf_home)
+    return payload
+
+
 def compute_prompt_set(
     dataset_manifest_path: Path,
     hf_home: Path,
@@ -114,10 +201,31 @@ def compute_prompt_set(
     files = manifest.get("files")
     if not isinstance(files, dict) or set(files) != set(STANDARD_SUBSETS):
         raise ValueError("dataset manifest must contain exactly the nine subsets")
+    source_prompt_set: dict[str, Any] | None = None
+    derivation = manifest.get("derivation")
+    if derivation is not None:
+        if (
+            not isinstance(derivation, dict)
+            or derivation.get("producer") != "speculator-benchmarks-source-order-cycle-v1"
+            or derivation.get("requests_per_subset") != requests_per_subset
+        ):
+            raise ValueError("invalid matched-prompt derivation")
+        source_manifest = Path(str(derivation.get("source_manifest_path", "")))
+        source_home = Path(str(derivation.get("source_hf_home", "")))
+        if (
+            not source_manifest.is_file()
+            or _sha256(source_manifest) != derivation.get("source_manifest_sha256")
+            or source_manifest.resolve(strict=True) == dataset_manifest_path.resolve(strict=True)
+        ):
+            raise ValueError("matched-prompt source manifest mismatch")
+        source_prompt_set = compute_prompt_set(source_manifest, source_home)
+        if (
+            derivation.get("source_prompt_sha256") != source_prompt_set["prompt_sha256"]
+            or derivation.get("source_files") != source_prompt_set["files"]
+        ):
+            raise ValueError("matched-prompt source provenance mismatch")
     snapshot = (
-        active_home
-        / "hub/datasets--RedHatAI--speculator_benchmarks/snapshots"
-        / DATASET_REVISION
+        active_home / "hub/datasets--RedHatAI--speculator_benchmarks/snapshots" / DATASET_REVISION
     ).resolve(strict=False)
     prompts: list[dict[str, object]] = []
     file_descriptors: dict[str, dict[str, object]] = {}
@@ -131,23 +239,24 @@ def compute_prompt_set(
         expected_sha = entry.get("sha256")
         if not path.is_file() or not isinstance(expected_sha, str) or _sha256(path) != expected_sha:
             raise ValueError(f"dataset file hash mismatch: {subset}")
-        count = 0
-        with path.open() as stream:
-            for index, line in enumerate(stream):
-                if index >= requests_per_subset:
-                    break
-                row = json.loads(line)
-                prompt = row.get("prompt") if isinstance(row, dict) else None
-                if not isinstance(prompt, str) or not prompt:
-                    raise ValueError(f"{subset}: prompt {index} is not a non-empty string")
-                prompts.append({"subset": subset, "index": index, "prompt": prompt})
-                count += 1
-        if count != requests_per_subset:
-            raise ValueError(f"{subset}: fewer than {requests_per_subset} prompts")
+        available_prompts = _read_prompt_prefix(path, requests_per_subset)
+        for ordinal in range(requests_per_subset):
+            selected_row, prompt = available_prompts[ordinal % len(available_prompts)]
+            prompts.append(
+                {
+                    "subset": subset,
+                    "index": ordinal,
+                    "source_row": selected_row,
+                    "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                }
+            )
         file_descriptors[subset] = {
             "path": str(path.resolve(strict=True)),
             "sha256": expected_sha,
+            "available_rows": len(available_prompts),
         }
+    if source_prompt_set is not None and prompts != source_prompt_set["ordered_prompts"]:
+        raise ValueError("materialized prompt schedule does not match its source")
     return {
         "dataset_id": DATASET_ID,
         "revision": DATASET_REVISION,
@@ -157,6 +266,7 @@ def compute_prompt_set(
         "requests_per_subset": requests_per_subset,
         "total_requests": len(prompts),
         "prompt_sha256": _sha_json(prompts),
+        "ordered_prompts": prompts,
         "files": file_descriptors,
     }
 
@@ -305,26 +415,26 @@ def _load_ledger(path: Path, requests_per_subset: int) -> list[dict[str, Any]]:
                 raise ValueError("output ledger row must be an object")
             records.append(value)
     expected = [
-        (subset, index)
-        for subset in STANDARD_SUBSETS
-        for index in range(requests_per_subset)
+        (subset, index) for subset in STANDARD_SUBSETS for index in range(requests_per_subset)
     ]
     actual = [(row.get("subset"), row.get("index")) for row in records]
     if actual != expected:
         raise ValueError("output ledger request order/count mismatch")
     for row in records:
         if (
-            set(row) != {
+            set(row)
+            != {
                 "subset",
                 "index",
+                "source_row",
                 "prompt_sha256",
                 "output_sha256",
                 "finish_reason",
             }
-            or not all(
-                _is_sha256(row.get(name))
-                for name in ("prompt_sha256", "output_sha256")
-            )
+            or not all(_is_sha256(row.get(name)) for name in ("prompt_sha256", "output_sha256"))
+            or isinstance(row.get("source_row"), bool)
+            or not isinstance(row.get("source_row"), int)
+            or row["source_row"] < 0
             or row.get("finish_reason") not in {"stop", "length"}
         ):
             raise ValueError("output ledger row schema mismatch")
@@ -337,17 +447,28 @@ def validate_output_equivalence(
     *,
     requests_per_subset: int = CORRECTNESS_REQUESTS_PER_SUBSET,
     artifact_identity_sha256: str | None = None,
+    expected_prompt_schedule: list[dict[str, object]] | None = None,
 ) -> dict[str, Any]:
     """Require deterministic target output identity before speed metrics are publishable."""
     if requests_per_subset != CORRECTNESS_REQUESTS_PER_SUBSET:
         raise ValueError("correctness gate requires all 200 prompts per subset")
     baseline = _load_ledger(baseline_path, requests_per_subset)
     dflash2 = _load_ledger(dflash2_path, requests_per_subset)
+    if expected_prompt_schedule is not None:
+        actual_schedule = [
+            {
+                "subset": row["subset"],
+                "index": row["index"],
+                "source_row": row["source_row"],
+                "prompt_sha256": row["prompt_sha256"],
+            }
+            for row in baseline
+        ]
+        if actual_schedule != expected_prompt_schedule:
+            raise ValueError("captured prompt ledger does not match artifact identity")
     for expected, actual in zip(baseline, dflash2, strict=True):
         if expected != actual:
-            raise ValueError(
-                f"target output mismatch: {expected['subset']}[{expected['index']}]"
-            )
+            raise ValueError(f"target output mismatch: {expected['subset']}[{expected['index']}]")
     if artifact_identity_sha256 is not None and not _is_sha256(artifact_identity_sha256):
         raise ValueError("artifact identity SHA-256 must be exact")
     return {
@@ -557,9 +678,7 @@ def validate_report_receipt(path: Path) -> dict[str, Any]:
         concurrency=concurrency,
         artifact_identity_sha256=artifact_sha,
     )
-    replayed_metrics = summarize_pair(
-        runs["baseline"], runs["dflash2"], tensor_parallel_size=2
-    )
+    replayed_metrics = summarize_pair(runs["baseline"], runs["dflash2"], tensor_parallel_size=2)
     for key, value in replayed_metrics.items():
         if payload.get(key) != value:
             raise ValueError(f"metric report replay mismatch: {key}")
@@ -598,40 +717,40 @@ def capture_outputs(
             for subset in STANDARD_SUBSETS:
                 entry = files[subset]
                 assert isinstance(entry, dict)
-                with Path(str(entry["path"])).open() as prompts:
-                    for index in range(requests_per_subset):
-                        row = json.loads(next(prompts))
-                        prompt = row["prompt"]
-                        body = json.dumps(
-                            {
-                                "model": model,
-                                "prompt": prompt,
-                                "max_tokens": max_tokens,
-                                "temperature": 0,
-                                "top_p": 1,
-                            }
-                        ).encode()
-                        request = urllib.request.Request(
-                            endpoint.rstrip("/") + "/completions",
-                            data=body,
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        )
-                        with urllib.request.urlopen(request, timeout=600) as response:
-                            result = json.loads(response.read())
-                        choice = result["choices"][0]
-                        text = choice["text"]
-                        finish = choice["finish_reason"]
-                        if not isinstance(text, str) or finish not in {"stop", "length"}:
-                            raise ValueError("invalid completion response")
-                        record = {
-                            "subset": subset,
-                            "index": index,
-                            "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-                            "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
-                            "finish_reason": finish,
+                prompts = _read_prompt_prefix(Path(str(entry["path"])), requests_per_subset)
+                for index in range(requests_per_subset):
+                    source_row, prompt = prompts[index % len(prompts)]
+                    body = json.dumps(
+                        {
+                            "model": model,
+                            "prompt": prompt,
+                            "max_tokens": max_tokens,
+                            "temperature": 0,
+                            "top_p": 1,
                         }
-                        stream.write(_canonical(record) + "\n")
+                    ).encode()
+                    request = urllib.request.Request(
+                        endpoint.rstrip("/") + "/completions",
+                        data=body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=600) as response:
+                        result = json.loads(response.read())
+                    choice = result["choices"][0]
+                    text = choice["text"]
+                    finish = choice["finish_reason"]
+                    if not isinstance(text, str) or finish not in {"stop", "length"}:
+                        raise ValueError("invalid completion response")
+                    record = {
+                        "subset": subset,
+                        "index": index,
+                        "source_row": source_row,
+                        "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                        "output_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                        "finish_reason": finish,
+                    }
+                    stream.write(_canonical(record) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, output_path)
@@ -649,6 +768,12 @@ def main() -> None:
     prompts.add_argument("--dataset-manifest", required=True)
     prompts.add_argument("--hf-home", required=True)
     prompts.add_argument("--output", required=True)
+
+    materialize = commands.add_parser("materialize-prompts")
+    materialize.add_argument("--source-manifest", required=True)
+    materialize.add_argument("--source-hf-home", required=True)
+    materialize.add_argument("--output-hf-home", required=True)
+    materialize.add_argument("--output-manifest", required=True)
 
     capture = commands.add_parser("capture-outputs")
     capture.add_argument("--dataset-manifest", required=True)
@@ -699,6 +824,13 @@ def main() -> None:
         payload = compute_prompt_set(Path(args.dataset_manifest), Path(args.hf_home))
         payload["receipt_sha256"] = _sha_json(payload)
         _atomic_json(Path(args.output), payload, no_replace=True)
+    elif args.command == "materialize-prompts":
+        materialize_prompt_set(
+            Path(args.source_manifest),
+            Path(args.source_hf_home),
+            Path(args.output_hf_home),
+            Path(args.output_manifest),
+        )
     elif args.command == "capture-outputs":
         capture_outputs(
             Path(args.dataset_manifest),
@@ -709,10 +841,15 @@ def main() -> None:
         )
     elif args.command == "compare-outputs":
         artifact_identity_sha256 = _sha256(Path(args.artifact_identity))
+        identity = _load_json(Path(args.artifact_identity))
+        dataset = identity.get("dataset")
+        if not isinstance(dataset, dict) or not isinstance(dataset.get("ordered_prompts"), list):
+            raise ValueError("artifact identity has no ordered prompt schedule")
         payload = validate_output_equivalence(
             Path(args.baseline),
             Path(args.dflash2),
             artifact_identity_sha256=artifact_identity_sha256,
+            expected_prompt_schedule=dataset["ordered_prompts"],
         )
         payload["receipt_sha256"] = _sha_json(payload)
         _atomic_json(Path(args.output), payload, no_replace=True)
@@ -757,11 +894,7 @@ def main() -> None:
         )
         _atomic_json(Path(args.output), payload, no_replace=True)
     elif args.command == "verify-milestone":
-        print(
-            _canonical(
-                validate_milestone_export(Path(args.manifest), Path(args.export))
-            )
-        )
+        print(_canonical(validate_milestone_export(Path(args.manifest), Path(args.export))))
     else:
         print(_canonical(validate_report_receipt(Path(args.report))))
 

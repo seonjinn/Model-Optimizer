@@ -18,6 +18,7 @@ from common.specdec.dflash2_speculators_eval import (
     DATASET_REVISION,
     STANDARD_SUBSETS,
     compute_prompt_set,
+    materialize_prompt_set,
     summarize_pair,
     validate_milestone_export,
     validate_output_equivalence,
@@ -36,9 +37,7 @@ def _sha256(path: Path) -> str:
 def _write_prompt_snapshot(tmp_path: Path, *, rows: int = 200) -> tuple[Path, Path]:
     hf_home = tmp_path / "hf"
     snapshot = (
-        hf_home
-        / "hub/datasets--RedHatAI--speculator_benchmarks/snapshots"
-        / DATASET_REVISION
+        hf_home / "hub/datasets--RedHatAI--speculator_benchmarks/snapshots" / DATASET_REVISION
     )
     snapshot.mkdir(parents=True)
     files: dict[str, dict[str, str]] = {}
@@ -77,6 +76,7 @@ def _write_ledger(path: Path, *, mutate: tuple[str, int] | None = None) -> None:
                 record = {
                     "subset": subset,
                     "index": index,
+                    "source_row": index,
                     "prompt_sha256": hashlib.sha256(
                         f"{subset} prompt {index}".encode()
                     ).hexdigest(),
@@ -160,10 +160,43 @@ def test_prompt_digest_binds_exact_revision_nine_subsets_and_200_rows(tmp_path: 
     assert len(str(provenance["prompt_sha256"])) == 64
 
 
-@pytest.mark.parametrize("mutation", ["revision", "short-subset", "prompt"])
+def test_prompt_digest_cycles_short_subsets_to_exact_request_budget(tmp_path: Path) -> None:
+    """A finite benchmark subset is replayed deterministically to the 200-request budget."""
+    manifest, hf_home = _write_prompt_snapshot(tmp_path, rows=3)
+
+    provenance = compute_prompt_set(manifest, hf_home, requests_per_subset=200)
+
+    assert provenance["total_requests"] == 1800
+    assert all(entry["available_rows"] == 3 for entry in provenance["files"].values())
+
+
+def test_materialized_prompt_set_is_exact_200_row_authenticated_cycle(tmp_path: Path) -> None:
+    """GuideLLM and correctness consume the same source-bound 200-row files."""
+    manifest, hf_home = _write_prompt_snapshot(tmp_path, rows=3)
+    output_home = tmp_path / "matched-hf"
+    output_manifest = tmp_path / "matched-manifest.json"
+
+    materialize_prompt_set(manifest, hf_home, output_home, output_manifest)
+    provenance = compute_prompt_set(output_manifest, output_home)
+
+    assert provenance["total_requests"] == 1800
+    assert provenance["ordered_prompts"][3]["source_row"] == 0
+    for entry in provenance["files"].values():
+        assert sum(1 for _ in Path(entry["path"]).open()) == 200
+
+    payload = json.loads(output_manifest.read_text())
+    source = Path(payload["derivation"]["source_files"][STANDARD_SUBSETS[0]]["path"])
+    source.write_text(source.read_text().replace("prompt 0", "tampered", 1))
+    with pytest.raises(ValueError):
+        compute_prompt_set(output_manifest, output_home)
+
+
+@pytest.mark.parametrize("mutation", ["revision", "empty-subset", "prompt"])
 def test_prompt_digest_rejects_unmatched_inputs(tmp_path: Path, mutation: str) -> None:
-    """Wrong revisions, short subsets, and mutated bytes fail closed."""
-    manifest, hf_home = _write_prompt_snapshot(tmp_path, rows=199 if mutation == "short-subset" else 200)
+    """Wrong revisions, empty subsets, and mutated bytes fail closed."""
+    manifest, hf_home = _write_prompt_snapshot(
+        tmp_path, rows=0 if mutation == "empty-subset" else 200
+    )
     if mutation == "revision":
         payload = json.loads(manifest.read_text())
         payload["revision"] = "0" * 40
@@ -240,8 +273,39 @@ def test_output_equivalence_is_a_fail_closed_gate(tmp_path: Path) -> None:
 
     assert receipt["status"] == "passed"
     assert receipt["matched_requests"] == 1800
+    expected_schedule = [
+        {
+            "subset": subset,
+            "index": index,
+            "source_row": index,
+            "prompt_sha256": hashlib.sha256(f"{subset} prompt {index}".encode()).hexdigest(),
+        }
+        for subset in STANDARD_SUBSETS
+        for index in range(200)
+    ]
+    validate_output_equivalence(
+        baseline,
+        draft,
+        requests_per_subset=200,
+        expected_prompt_schedule=expected_schedule,
+    )
+    expected_schedule[0]["source_row"] = 1
+    with pytest.raises(ValueError, match="does not match artifact identity"):
+        validate_output_equivalence(
+            baseline,
+            draft,
+            requests_per_subset=200,
+            expected_prompt_schedule=expected_schedule,
+        )
     _write_ledger(draft, mutate=(STANDARD_SUBSETS[-1], 199))
     with pytest.raises(ValueError, match="target output mismatch"):
+        validate_output_equivalence(baseline, draft, requests_per_subset=200)
+    rows = baseline.read_text().splitlines()
+    first = json.loads(rows[0])
+    first["source_row"] = True
+    rows[0] = json.dumps(first, sort_keys=True)
+    baseline.write_text("\n".join(rows) + "\n")
+    with pytest.raises(ValueError, match="ledger row schema"):
         validate_output_equivalence(baseline, draft, requests_per_subset=200)
 
 
@@ -266,9 +330,7 @@ def test_pair_summary_reports_per_gpu_speed_latency_and_acceptance(tmp_path: Pat
     assert len(report["subsets"]) == 9
 
     acceptance_path = draft / "acceptance.csv"
-    acceptance_path.write_text(
-        acceptance_path.read_text().replace(",350,4.5,", ",0,1.0,")
-    )
+    acceptance_path.write_text(acceptance_path.read_text().replace(",350,4.5,", ",0,1.0,"))
     zero_report = summarize_pair(baseline, draft, tensor_parallel_size=2)
     assert zero_report["aggregate"]["acceptance_rate"] == 0
 
@@ -284,8 +346,8 @@ def test_split_runtime_pair_wiring_is_mandatory_for_matched_dflash2() -> None:
         "SERVER_RUNTIME_ARCHIVE",
         "SERVER_RUNTIME_ARCHIVE_SHA256",
         "SERVER_RUNTIME_RECEIPT_SHA256",
-        'dflash2:8:7',
-        'correctness:1:200:2|performance:32:200:2',
+        "dflash2:8:7",
+        "correctness:1:200:2|performance:32:200:2",
     ):
         assert required in pair
     assert 'SPECULATORS_CLIENT_RUNTIME="${JOB_CLIENT_RUNTIME}"' in pair
@@ -301,11 +363,14 @@ def test_exact_matched_matrix_requires_c1_c32_200_and_tp2() -> None:
     pair = _PAIR.read_text()
 
     assert 'case "${PAIR_PHASE}:${concurrency}:${max_requests}:${tp_size}"' in pair
-    assert 'correctness:1:200:2|performance:32:200:2' in pair
-    assert 'baseline:0:0' in pair
-    assert 'dflash2:8:7' in pair
-    assert 'c1-performance-report.json' in pair
-    assert 'c32-performance-report.json' in pair
+    assert "correctness:1:200:2|performance:32:200:2" in pair
+    assert "baseline:0:0" in pair
+    assert "dflash2:8:7" in pair
+    assert "c1-performance-report.json" in pair
+    assert "c32-performance-report.json" in pair
+    assert '"${STUDY_HELPER}" materialize-prompts' in pair
+    assert 'DATASET_MANIFEST_PATH="${MATCHED_DATASET_MANIFEST_PATH}"' in pair
+    assert 'HF_HOME_DURABLE="${MATCHED_HF_HOME}"' in pair
     equivalence_run = pair.index("run_pair_cells 1")
     correctness_gate = pair.index("compare-outputs", equivalence_run)
     performance_run = pair.index("run_pair_cells 0", correctness_gate)

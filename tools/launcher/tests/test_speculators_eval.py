@@ -715,14 +715,16 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
 
     for required in (
         "#SBATCH --nodes=1",
-        "#SBATCH --gpus-per-node=4",
         "#SBATCH --segment=1",
         'JOB_ROOT="${MARS_SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
         'readonly JOB_CLIENT_RUNTIME="${JOB_ROOT}/speculators-client-runtime"',
         'JOB_SERVER_RUNTIME="${JOB_CLIENT_RUNTIME}"',
         'JOB_SERVER_RUNTIME="${JOB_ROOT}/dflash2-server-runtime"',
         "EVAL_MODE=throughput",
-        'srun --exclusive --nodes=1 --ntasks=1 --gpus="${tp_size}"',
+        'srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task=72 --mem=450G',
+        'CUDA_VISIBLE_DEVICES="${visible_devices}"',
+        'visible_a="$(gpu_range 0 "${tp_a}")"',
+        'visible_b="$(gpu_range "${tp_a}" "${tp_b}")"',
         'run_cell "${CELL_A}" 8000',
         'run_cell "${CELL_B}" 8010',
         'SPECULATORS_RUNTIME_ARCHIVE_SHA256="${CLIENT_RUNTIME_ARCHIVE_SHA256}"',
@@ -745,6 +747,8 @@ def test_paired_evaluator_uses_full_node_without_reintroducing_sweep() -> None:
         "trap 'terminate_children; exit 143' TERM",
     ):
         assert required in runner
+    assert "#SBATCH --gpus-per-node" not in runner
+    assert 'srun --exclusive --nodes=1 --ntasks=1 --gpus=' not in runner
     assert "EVAL_MODE=sweep" not in runner
     assert "readonly SPECULATORS_RUNTIME=" not in runner
     assert "pip install" not in runner
@@ -760,7 +764,8 @@ def test_paired_evaluator_supports_tp_compatibility_cells_without_oversubscripti
         'tp_size="${tp_size:-2}"',
         'case "${tp_size}" in',
         "1|2|4)",
-        '--gpus="${tp_size}"',
+        'CUDA_VISIBLE_DEVICES="${visible_devices}"',
+        'gpu_range() {',
         'TP_SIZE="${tp_size}"',
         'cell_tp "${CELL_A}"',
         'cell_tp "${CELL_B}"',

@@ -8,7 +8,6 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=72
-#SBATCH --gpus-per-node=4
 #SBATCH --segment=1
 #SBATCH --mem=900G
 #SBATCH --time=03:55:00
@@ -50,6 +49,10 @@ readonly CLIENT_STAGER="${MODELOPT_REPO}/tools/launcher/common/specdec/stage_spe
 readonly SERVER_STAGER="${MODELOPT_REPO}/tools/launcher/common/specdec/stage_speculators_eval_server_runtime.sh"
 readonly STUDY_HELPER="${MODELOPT_REPO}/tools/launcher/common/specdec/dflash2_speculators_eval.py"
 readonly RESULT_ROOT="${EVAL_OUTPUT_ROOT%/}/${PAIR_LABEL}"
+readonly SOURCE_DATASET_MANIFEST_PATH="${DATASET_MANIFEST_PATH}"
+readonly SOURCE_HF_HOME_DURABLE="${HF_HOME_DURABLE}"
+readonly MATCHED_HF_HOME="${JOB_ROOT}/matched-hf"
+readonly MATCHED_DATASET_MANIFEST_PATH="${JOB_ROOT}/matched-dataset-manifest.json"
 ARTIFACT_IDENTITY_PATH=""
 ARTIFACT_IDENTITY_SHA256=""
 EQUIVALENCE_ONLY_MODE=0
@@ -81,7 +84,6 @@ if [[ -n "${SERVER_RUNTIME_RECEIPT_SHA256:-}" ]]; then
     MARS_SCRATCH_ROOT="${MARS_SCRATCH_ROOT}" \
     bash "${SERVER_STAGER}"
 fi
-
 validate_cell() {
     local descriptor="$1"
     local method block_size spec_tokens concurrency max_requests draft label tp_size
@@ -111,7 +113,7 @@ validate_cell() {
 }
 
 run_cell() {
-    local descriptor="$1" port="$2"
+    local descriptor="$1" port="$2" visible_devices="$3"
     local method block_size spec_tokens concurrency max_requests draft label tp_size
     validate_cell "${descriptor}"
     IFS='|' read -r method block_size spec_tokens concurrency max_requests draft label tp_size \
@@ -131,6 +133,8 @@ run_cell() {
     mounts+=",${JOB_CLIENT_RUNTIME}:${JOB_CLIENT_RUNTIME},${JOB_SERVER_RUNTIME}:${JOB_SERVER_RUNTIME}"
     mounts+=",${HF_MODEL_CKPT}:${HF_MODEL_CKPT}"
     mounts+=",${HF_HOME_DURABLE}:${HF_HOME_DURABLE},${DATASET_MANIFEST_PATH}:${DATASET_MANIFEST_PATH}"
+    mounts+=",${SOURCE_HF_HOME_DURABLE}:${SOURCE_HF_HOME_DURABLE}"
+    mounts+=",${SOURCE_DATASET_MANIFEST_PATH}:${SOURCE_DATASET_MANIFEST_PATH}"
     mounts+=",${CONTAINER_IDENTITY_PATH}:${CONTAINER_IDENTITY_PATH},${CONTAINER_IMAGE}:${CONTAINER_IMAGE}"
     mounts+=",${EVAL_CONFIG_PATH}:${EVAL_CONFIG_PATH},${output_root}:${output_root},${cell_root}:${cell_root}"
     mounts+=",${CLUSTER_PROFILE}:${CLUSTER_PROFILE}"
@@ -142,13 +146,14 @@ run_cell() {
         mounts+=",${draft}:${draft}"
     fi
 
-    exec srun --exclusive --nodes=1 --ntasks=1 --gpus="${tp_size}" --cpus-per-task=72 --mem=450G \
+    exec srun --exclusive --nodes=1 --ntasks=1 --cpus-per-task=72 --mem=450G \
         --kill-on-bad-exit=1 \
         --container-image="${CONTAINER_IMAGE}" \
         --container-mounts="${mounts}" \
         --container-workdir="${MODELOPT_REPO}/tools/launcher" \
         --no-container-mount-home \
         env \
+        CUDA_VISIBLE_DEVICES="${visible_devices}" \
         SPECULATORS_CLIENT_RUNTIME="${JOB_CLIENT_RUNTIME}" \
         SPECULATORS_RUNTIME_ARCHIVE_SHA256="${CLIENT_RUNTIME_ARCHIVE_SHA256}" \
         VLLM_SERVER_RUNTIME="${JOB_SERVER_RUNTIME}" \
@@ -217,8 +222,8 @@ terminate_children() {
 }
 
 run_supervised_cell() {
-    local descriptor="$1" port="$2" log="$3" pid status
-    run_cell "${descriptor}" "${port}" >"${log}" 2>&1 &
+    local descriptor="$1" port="$2" log="$3" visible_devices="$4" pid status
+    run_cell "${descriptor}" "${port}" "${visible_devices}" >"${log}" 2>&1 &
     pid=$!
     CHILD_PIDS=("${pid}")
     set +e
@@ -227,6 +232,15 @@ run_supervised_cell() {
     set -e
     CHILD_PIDS=()
     return "${status}"
+}
+
+gpu_range() {
+    local start="$1" count="$2" index visible=""
+    for ((index = start; index < start + count; index++)); do
+        [[ -z "${visible}" ]] || visible+=,
+        visible+="${index}"
+    done
+    printf '%s\n' "${visible}"
 }
 trap terminate_children EXIT
 trap 'terminate_children; exit 130' INT
@@ -255,6 +269,13 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 ]]; then
             *) echo "ERROR: matched DFlash2 cells require C1/C32, 200 requests, and TP2" >&2; exit 2 ;;
         esac
     done
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" materialize-prompts \
+        --source-manifest "${SOURCE_DATASET_MANIFEST_PATH}" \
+        --source-hf-home "${SOURCE_HF_HOME_DURABLE}" \
+        --output-hf-home "${MATCHED_HF_HOME}" \
+        --output-manifest "${MATCHED_DATASET_MANIFEST_PATH}"
+    DATASET_MANIFEST_PATH="${MATCHED_DATASET_MANIFEST_PATH}"
+    HF_HOME_DURABLE="${MATCHED_HF_HOME}"
     dflash2_descriptor="${CELL_A}"
     [[ "${method_a}" == dflash2 ]] || dflash2_descriptor="${CELL_B}"
     IFS='|' read -r _ _ _ _ _ dflash2_export _ _ <<<"${dflash2_descriptor}"
@@ -285,16 +306,18 @@ cell_label() {
 
 run_pair_cells() {
     local equivalence_only="$1" suffix=""
-    local tp_a tp_b pid_a pid_b status completed_pid
+    local tp_a tp_b visible_a visible_b pid_a pid_b status completed_pid
     local -a active_pids remaining_pids
     EQUIVALENCE_ONLY_MODE="${equivalence_only}"
     [[ "${equivalence_only}" == 0 ]] || suffix="-equivalence"
     tp_a="$(cell_tp "${CELL_A}")"
     tp_b="$(cell_tp "${CELL_B}")"
+    visible_a="$(gpu_range 0 "${tp_a}")"
+    visible_b="$(gpu_range "${tp_a}" "${tp_b}")"
     if ((tp_a + tp_b <= 4)); then
-        run_cell "${CELL_A}" 8000 >"${RESULT_ROOT}/cell-a${suffix}.log" 2>&1 &
+        run_cell "${CELL_A}" 8000 "${visible_a}" >"${RESULT_ROOT}/cell-a${suffix}.log" 2>&1 &
         pid_a=$!
-        run_cell "${CELL_B}" 8010 >"${RESULT_ROOT}/cell-b${suffix}.log" 2>&1 &
+        run_cell "${CELL_B}" 8010 "${visible_b}" >"${RESULT_ROOT}/cell-b${suffix}.log" 2>&1 &
         pid_b=$!
         CHILD_PIDS=("${pid_a}" "${pid_b}")
         active_pids=("${CHILD_PIDS[@]}")
@@ -312,8 +335,10 @@ run_pair_cells() {
             [[ ${status} -eq 0 ]] || return "${status}"
         done
     else
-        run_supervised_cell "${CELL_A}" 8000 "${RESULT_ROOT}/cell-a${suffix}.log"
-        run_supervised_cell "${CELL_B}" 8010 "${RESULT_ROOT}/cell-b${suffix}.log"
+        run_supervised_cell "${CELL_A}" 8000 "${RESULT_ROOT}/cell-a${suffix}.log" \
+            "$(gpu_range 0 "${tp_a}")"
+        run_supervised_cell "${CELL_B}" 8010 "${RESULT_ROOT}/cell-b${suffix}.log" \
+            "$(gpu_range 0 "${tp_b}")"
     fi
     CHILD_PIDS=()
 }
