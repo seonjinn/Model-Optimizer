@@ -9,6 +9,7 @@
 #SBATCH --cpus-per-task=96
 
 set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
 required=(A_CANARY_MANIFEST A_CANARY_CHECKPOINT A_CANARY_EXPORT A_CANARY_GPU_EVIDENCE
     A_CANARY_EVALUATION_RECEIPT A_CANARY_JOB_COMPLETION A_CANARY_SUBMISSION_RECEIPT
@@ -72,7 +73,7 @@ values = {
     "A_CANARY_OUTPUT": manifest.builder_output_path,
     "HF_MODEL_CKPT": manifest.runtime.target_path,
     "WANDB_PROJECT": manifest.runtime.wandb_project,
-    "WANDB_RUN_ID": f"q4a-repair-{manifest.runtime.source_commit[:12]}",
+    "WANDB_RUN_ID": f"q4a-repair-{manifest.runtime.source_commit[:12]}-{job_id}",
     **{name: str(path) for name, path in wandb_paths.items()},
 }
 for key, value in values.items():

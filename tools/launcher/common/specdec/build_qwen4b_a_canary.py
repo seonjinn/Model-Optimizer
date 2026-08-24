@@ -240,21 +240,26 @@ def load_task8_a_publication(
         raise ValueError("Task9 A selection SHA-256 mismatch")
     selection = _canonical_object(selection_raw, "Task9 A selection")
     identity = selection.get("selection_identity")
-    expected_repair = dict(_expected_repair) if _expected_repair is not None else {
-        "stem": 200_000,
-        "ja": 125_000,
-        "es": 125_000,
-        "fr": 125_000,
-        "it": 125_000,
-        "de": 0,
-    }
+    expected_repair = (
+        dict(_expected_repair)
+        if _expected_repair is not None
+        else {
+            "stem": 200_000,
+            "ja": 125_000,
+            "es": 125_000,
+            "fr": 125_000,
+            "it": 125_000,
+            "de": 0,
+        }
+    )
     if set(selection) != _PTV2_A_SELECTION_KEYS:
         raise ValueError("Task9 schema-v3 A selection does not have the exact schema")
     if not isinstance(identity, dict) or set(identity) != _PTV2_SELECTION_IDENTITY_KEYS:
         raise ValueError("Task9 schema-v3 A selection identity does not have the exact schema")
-    if selection.get("selection_sha256") != hashlib.sha256(
-        _canonical_json(identity).encode()
-    ).hexdigest():
+    if (
+        selection.get("selection_sha256")
+        != hashlib.sha256(_canonical_json(identity).encode()).hexdigest()
+    ):
         raise ValueError("Task9 A selection semantic identity mismatch")
     trust_roots = selection.get("trust_roots")
     expected_trust_roots = {
@@ -268,9 +273,10 @@ def load_task8_a_publication(
     for value in trust_roots.values():
         if not isinstance(value, str) or _SHA256.fullmatch(value) is None or value == "0" * 64:
             raise ValueError("Task9 A selection trust-root preimage is invalid")
-    if identity.get("trust_root_sha256") != hashlib.sha256(
-        _canonical_json(trust_roots).encode()
-    ).hexdigest():
+    if (
+        identity.get("trust_root_sha256")
+        != hashlib.sha256(_canonical_json(trust_roots).encode()).hexdigest()
+    ):
         raise ValueError("Task9 A selection trust-root identity mismatch")
     policy_path, policy_file_sha = _authenticated_declared_file(
         root / "inputs/selection/files", selection.get("policy"), "Task9 selection policy"
@@ -298,7 +304,11 @@ def load_task8_a_publication(
         raise ValueError("Task9 schema-v3 A selection semantics are invalid")
     descriptors = manifest.get("shards")
     files = manifest.get("files")
-    if not isinstance(descriptors, list) or len(descriptors) != _expected_shards or not isinstance(files, list):
+    if (
+        not isinstance(descriptors, list)
+        or len(descriptors) != _expected_shards
+        or not isinstance(files, list)
+    ):
         raise ValueError(f"Task8 A publication must declare exactly {_expected_shards} shards")
     declared_files = {
         item.get("path"): (item.get("bytes"), item.get("sha256"))
@@ -382,8 +392,7 @@ def _replay_task9_task8(
     if (
         shard_count != expected_occurrences
         or shard_digest.hexdigest() != selection.get("shard_semantic_sha256")
-        or selection.get("shard_semantic_sha256")
-        != selection.get("ordered_occurrences_sha256")
+        or selection.get("shard_semantic_sha256") != selection.get("ordered_occurrences_sha256")
     ):
         raise ValueError("Task9 occurrence shards do not match selection semantics")
 
@@ -413,8 +422,7 @@ def _replay_task9_task8(
         or tokenized.get("occurrence_count") != expected_occurrences
         or tokenized.get("selection_sha256") != selection.get("selection_sha256")
         or not isinstance(identity, dict)
-        or tokenized.get("ordered_occurrences_sha256")
-        != identity.get("ordered_occurrences_sha256")
+        or tokenized.get("ordered_occurrences_sha256") != identity.get("ordered_occurrences_sha256")
         or tokenized.get("source_response_root_sha256")
         != identity.get("source_response_root_sha256")
     ):
@@ -448,13 +456,11 @@ def _replay_task9_task8(
             "SELECT ordinal,prompt_uuid,input_ids_json,loss_mask_json,assistant_tokens "
             "FROM records ORDER BY ordinal"
         )
-        task8_rows = (
-            row
-            for shard in shards
-            for row in _authenticated_shard_rows(shard)
-        )
+        task8_rows = (row for shard in shards for row in _authenticated_shard_rows(shard))
         count = 0
-        for count, triple in enumerate(zip(selection_rows, token_rows, task8_rows, strict=True), start=1):
+        for count, triple in enumerate(
+            zip(selection_rows, token_rows, task8_rows, strict=True), start=1
+        ):
             occurrence, tokenized_row, task8_raw = triple
             ordinal = count - 1
             if occurrence[0] != ordinal or tokenized_row[0] != ordinal:
@@ -485,7 +491,10 @@ def _replay_task9_task8(
             occurrence_digest.update((_canonical_json(occurrence_identity) + "\n").encode())
             prompt_digest.update((_canonical_json(occurrence[1]) + "\n").encode())
             response_digest.update(
-                (_canonical_json([occurrence[2], occurrence[3], occurrence[6], occurrence[7]]) + "\n").encode()
+                (
+                    _canonical_json([occurrence[2], occurrence[3], occurrence[6], occurrence[7]])
+                    + "\n"
+                ).encode()
             )
             cell = str(occurrence[4])
             language = str(occurrence[10])
@@ -594,7 +603,11 @@ def _producer_matches_source(
     tools = producer.get("tools", [])
     if not isinstance(messages, list) or not isinstance(tools, list):
         return False
-    assistants = [message for message in messages if isinstance(message, dict) and message.get("role") == "assistant"]
+    assistants = [
+        message
+        for message in messages
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
     if not assistants:
         return False
     return (

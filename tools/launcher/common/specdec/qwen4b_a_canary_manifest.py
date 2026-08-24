@@ -333,7 +333,10 @@ def training_phase_boundaries(topology: ACanaryTopology) -> dict[str, int]:
     """Return the exact source-order phase boundary for the 200-step A canary."""
     historical_occurrences = 66_560
     complement_occurrences = 35_840
-    if historical_occurrences % topology.global_batch_size or complement_occurrences % topology.global_batch_size:
+    if (
+        historical_occurrences % topology.global_batch_size
+        or complement_occurrences % topology.global_batch_size
+    ):
         raise ValueError("A phase quotas must align to global batches")
     historical_steps = historical_occurrences // topology.global_batch_size
     complement_steps = complement_occurrences // topology.global_batch_size
@@ -377,7 +380,9 @@ def snapshot_target_identity(
         "intermediate_size": 9728,
         "vocab_size": 151936,
     }
-    if not isinstance(config, dict) or any(config.get(key) != value for key, value in exact_dims.items()):
+    if not isinstance(config, dict) or any(
+        config.get(key) != value for key, value in exact_dims.items()
+    ):
         raise ValueError("target snapshot is not the exact Qwen3-4B configuration")
     revision = expected.target_revision if expected is not None else target_revision
     if revision is not None:
@@ -409,7 +414,9 @@ def snapshot_target_identity(
     for artifact in tokenizer_files:
         tokenizer_digest.update(artifact.name.encode())
         tokenizer_digest.update(b"\0")
-        tokenizer_digest.update(bytes.fromhex(hashlib.sha256(_stable_file_bytes(artifact)).hexdigest()))
+        tokenizer_digest.update(
+            bytes.fromhex(hashlib.sha256(_stable_file_bytes(artifact)).hexdigest())
+        )
     weight_digest = _target_weight_set_sha256(target_path)
     actual = {
         "target_snapshot_sha256": _directory_sha256(target_path),
@@ -419,7 +426,9 @@ def snapshot_target_identity(
         "chat_template_sha256": hashlib.sha256(template_raw).hexdigest(),
         "container_sha256": hashlib.sha256(_stable_file_bytes(container_path)).hexdigest(),
     }
-    if expected is not None and any(getattr(expected, key) != value for key, value in actual.items()):
+    if expected is not None and any(
+        getattr(expected, key) != value for key, value in actual.items()
+    ):
         raise ValueError("target snapshot or container identity mismatch")
     return actual
 
@@ -499,8 +508,7 @@ def validate_runtime_mounts(
     if "/scratch/" not in Path(runtime.wandb_cache_dir).as_posix():
         raise ValueError("W&B cache must use the separately bound scratch root")
     expected_dirs = {
-        name: str(Path(root) / "jobs" / job_id / leaf)
-        for name, (root, leaf) in roots.items()
+        name: str(Path(root) / "jobs" / job_id / leaf) for name, (root, leaf) in roots.items()
     }
     repo = repository_root.resolve()
     for name, expected_path in expected_dirs.items():
@@ -643,13 +651,17 @@ def validate_supervisor_completion(
         "export_model_path": str(checkpoint_path),
         "checkpoint_reloaded_by_exporter": True,
         "evaluation_receipt_path": str(evaluation_receipt_path),
-        "evaluation_receipt_sha256": hashlib.sha256(_stable_file_bytes(evaluation_receipt_path)).hexdigest(),
+        "evaluation_receipt_sha256": hashlib.sha256(
+            _stable_file_bytes(evaluation_receipt_path)
+        ).hexdigest(),
     }
     started_at, finished_at = body.get("started_at"), body.get("finished_at")
     if not isinstance(started_at, str) or not isinstance(finished_at, str):
         raise ValueError("A supervisor completion timing is missing")
     _validate_job_times(started_at, finished_at)
-    if claim != _sha256_json(body) or any(body.get(key) != value for key, value in expected.items()):
+    if claim != _sha256_json(body) or any(
+        body.get(key) != value for key, value in expected.items()
+    ):
         raise ValueError("A supervisor completion receipt mismatch")
     validate_evaluator_receipt(
         evaluation_receipt_path,
@@ -980,7 +992,9 @@ def finalize_a_authorization(
         submission.get("slurm_output_path"),
     ):
         raise ValueError("A controller sacct identity or terminal state mismatch")
-    _validate_enclosing_times(start, str(completion.get("started_at")), str(completion.get("finished_at")), end)
+    _validate_enclosing_times(
+        start, str(completion.get("started_at")), str(completion.get("finished_at")), end
+    )
     observation: dict[str, Any] = {
         "schema_version": 2,
         "producer": "sacct-a-repair-controller-v2",
@@ -1038,7 +1052,10 @@ def _load_self_hashed(path: Path, label: str) -> dict[str, Any]:
 
 def _validate_enclosing_times(start: str, work_start: str, work_end: str, end: str) -> None:
     try:
-        values = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in (start, work_start, work_end, end)]
+        values = [
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            for value in (start, work_start, work_end, end)
+        ]
     except ValueError as error:
         raise ValueError("A controller timing is invalid") from error
     if any(value.tzinfo is None for value in values) or values != sorted(values):
@@ -1117,10 +1134,18 @@ def _directory_sha256(root: Path) -> str:
 
 
 def _tree_sha256(root: Path) -> str:
-    """Hash regular files and symlink texts without following runtime-tree links."""
+    """Hash executable tree content while ignoring runtime-generated metadata."""
     if not root.is_dir() or root.is_symlink():
         raise ValueError("runtime tree is invalid")
-    entries = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    entries = sorted(
+        (
+            path
+            for path in root.rglob("*")
+            if not ({".git", "__pycache__"} & set(path.relative_to(root).parts))
+            and path.suffix not in {".pyc", ".pyo"}
+        ),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
     if not entries:
         raise ValueError("runtime tree is empty")
     digest = hashlib.sha256()

@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -22,6 +25,7 @@ from common.specdec.qwen4b_a_canary_manifest import (
     ACanaryManifest,
     ACanaryRuntimeIdentity,
     ACanaryTopology,
+    _tree_sha256,
     finalize_a_authorization,
     last_finite_training_loss,
     load_a_canary_manifest,
@@ -161,11 +165,13 @@ def test_production_a_quotas_and_cpu_parallelism_are_pinned() -> None:
 
 def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -> tuple[str, str]:
     """Write a tiny schema-v3 Task9 selection/token view and Task8 publication."""
+
     def canonical(value: object) -> str:
         return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     def digest(raw: bytes) -> str:
         return sha256(raw).hexdigest()
+
     selection_files = root / "inputs/selection/files"
     token_files = root / "inputs/tokenized/files"
     shards = root / "shards"
@@ -211,7 +217,9 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
         "INSERT INTO source_rows VALUES(?,?,?,?,?,?)",
         (source_identity, 7, "stem", "", conversation, response),
     )
-    connection.execute("INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", ("A-repair", *occurrence))
+    connection.execute(
+        "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", ("A-repair", *occurrence)
+    )
     connection.commit()
     connection.close()
     occurrence_shard = selection_files / "occurrences-000000.jsonl"
@@ -227,12 +235,14 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
     import yaml
 
     policy_path.write_text(yaml.safe_dump(policy, sort_keys=True))
+
     def descriptor(path: Path) -> dict[str, object]:
         return {
             "path": path.name,
             "bytes": path.stat().st_size,
             "sha256": digest(path.read_bytes()),
         }
+
     policy_sha = digest(canonical(policy).encode())
     trust_roots = {
         "source_inventory_sha256": "4" * 64,
@@ -253,7 +263,9 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
         "ordered_occurrences_sha256": occurrence_root,
         "ordered_prompt_uuids_sha256": digest((canonical(prompt_uuid) + "\n").encode()),
         "source_response_root_sha256": response_root,
-        "occurrence_multiplicity_sha256": digest((canonical([prompt_uuid, source_identity, 7, 1]) + "\n").encode()),
+        "occurrence_multiplicity_sha256": digest(
+            (canonical([prompt_uuid, source_identity, 7, 1]) + "\n").encode()
+        ),
         "trust_root_sha256": digest(canonical(trust_roots).encode()),
     }
     selection = {
@@ -309,9 +321,7 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
     (root / "inputs/tokenized/receipt.json").write_text(canonical(token) + "\n")
 
     producer_messages = (
-        [messages[0], {"role": "assistant", "content": "forged"}]
-        if substitute
-        else messages
+        [messages[0], {"role": "assistant", "content": "forged"}] if substitute else messages
     )
     producer = {
         "prompt_uuid": prompt_uuid,
@@ -348,9 +358,7 @@ def _write_task9_task8_replay_fixture(root: Path, *, substitute: bool = False) -
         "artifact_source_commit": "a" * 40,
         "selection_manifest_sha256": selection_receipt_sha,
         "shards": [shard_descriptor],
-        "files": [
-            {key: value for key, value in shard_descriptor.items() if key != "row_count"}
-        ],
+        "files": [{key: value for key, value in shard_descriptor.items() if key != "row_count"}],
     }
     manifest_path = root / "CORPUS_MANIFEST.json"
     manifest_path.write_text(canonical(manifest) + "\n")
@@ -421,7 +429,9 @@ def test_task9_selection_rejects_invented_or_removed_schema_fields(tmp_path: Pat
     publication_body = json.loads(publication.read_text())
     publication_body["selection_manifest_sha256"] = forged_sha
     publication_body["corpus_manifest_sha256"] = sha256(corpus_manifest.read_bytes()).hexdigest()
-    publication.write_text(json.dumps(publication_body, sort_keys=True, separators=(",", ":")) + "\n")
+    publication.write_text(
+        json.dumps(publication_body, sort_keys=True, separators=(",", ":")) + "\n"
+    )
     forged_publication_sha = sha256(publication.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="exact schema"):
         load_task8_a_publication(
@@ -656,7 +666,7 @@ def test_submitter_tests_both_jobs_before_cpu_then_afterok_gpu() -> None:
     assert "--wandb-config-dir" in submitter
     assert "--wandb-artifact-dir" in submitter
     assert '--container-mounts="$container_mounts"' in submitter
-    assert 'A_CANARY_JOB_COMPLETION=$job_completion' in submitter
+    assert "A_CANARY_JOB_COMPLETION=$job_completion" in submitter
     assert '--dependency="afterok:${gpu_id}"' in submitter
     controller = (_LAUNCHER_ROOT / "common/specdec/finalize_qwen4b_a_canary.sh").read_text()
     assert 'sacct -X -j "$job_id"' in controller
@@ -665,6 +675,7 @@ def test_submitter_tests_both_jobs_before_cpu_then_afterok_gpu() -> None:
 
 def test_controller_rejects_locally_fabricated_scheduler_identity(tmp_path: Path) -> None:
     """Self-hashed local JSON cannot replace exact submission/completion/sacct agreement."""
+
     def write_receipt(path: Path, body: dict[str, object]) -> None:
         body["receipt_sha256"] = sha256(
             json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
@@ -746,7 +757,9 @@ def test_target_weight_set_rejects_missing_extra_and_mutated_shards(tmp_path: Pa
     with pytest.raises(ValueError, match="weight shard"):
         snapshot_target_identity(target, container_path=Path(manifest.runtime.container_path))
     second.write_bytes(b"two")
-    identity = snapshot_target_identity(target, container_path=Path(manifest.runtime.container_path))
+    identity = snapshot_target_identity(
+        target, container_path=Path(manifest.runtime.container_path)
+    )
     assert identity["target_weight_set_sha256"]
     (target / "orphan.safetensors").write_bytes(b"orphan")
     with pytest.raises(ValueError, match="extra model weight"):
@@ -754,9 +767,12 @@ def test_target_weight_set_rejects_missing_extra_and_mutated_shards(tmp_path: Pa
     (target / "orphan.safetensors").unlink()
     previous = identity["target_weight_set_sha256"]
     second.write_bytes(b"mutated")
-    assert snapshot_target_identity(
-        target, container_path=Path(manifest.runtime.container_path)
-    )["target_weight_set_sha256"] != previous
+    assert (
+        snapshot_target_identity(target, container_path=Path(manifest.runtime.container_path))[
+            "target_weight_set_sha256"
+        ]
+        != previous
+    )
 
 
 def test_global_sequential_order_preserves_a_phase_boundary() -> None:
@@ -771,6 +787,37 @@ def test_global_sequential_order_preserves_a_phase_boundary() -> None:
     runner = (_LAUNCHER_ROOT / "common/specdec/run_qwen4b_a_canary.sbatch").read_text()
     assert "QWEN4B_A_SEQUENTIAL_SAMPLER=1" in runner
     assert "qwen4b_a_site" in runner
+
+
+def test_runtime_tree_identity_ignores_import_generated_bytecode(tmp_path: Path) -> None:
+    """Python cache files cannot invalidate an otherwise immutable runtime tree."""
+    runtime = tmp_path / "runtime"
+    modules = runtime / "lib/python/site-packages"
+    modules.mkdir(parents=True)
+    source = modules / "runtime_probe.py"
+    source.write_text("VALUE = 1\n")
+    before = _tree_sha256(runtime)
+
+    subprocess.run(
+        [sys.executable, "-c", "import runtime_probe"],
+        check=True,
+        env={
+            **{key: value for key, value in os.environ.items() if key != "PYTHONDONTWRITEBYTECODE"},
+            "PYTHONPATH": str(modules),
+        },
+    )
+
+    assert list(runtime.rglob("*.pyc"))
+    assert _tree_sha256(runtime) == before
+    source.write_text("VALUE = 2\n")
+    assert _tree_sha256(runtime) != before
+
+
+def test_wandb_run_identity_is_scoped_to_the_slurm_job() -> None:
+    """Retries at one source commit must not merge into the same W&B run."""
+    runner = (_LAUNCHER_ROOT / "common/specdec/run_qwen4b_a_canary.sbatch").read_text()
+    assert 'f"q4a-repair-{manifest.runtime.source_commit[:12]}-{job_id}"' in runner
+    assert "PYTHONDONTWRITEBYTECODE=1" in runner
 
 
 def test_runner_exports_exact_checkpoint_200_not_parent() -> None:
