@@ -1088,6 +1088,15 @@ def test_dflash_control_staging_and_live_gate_precede_every_gpu_server_launch() 
     assert "--staged-only" in wrapper[live_gate:server]
 
 
+def test_dflash_control_mounts_complete_staged_bundle_for_live_container_gate() -> None:
+    """The container needs the staged draft and its authenticated sibling manifest."""
+    pair = _PAIR.read_text()
+    run_cell = pair[pair.index("run_cell() {") : pair.index("run_supervised_cell() {")]
+
+    assert 'mounts+=",${OPB_DFLASH_STAGE_ROOT}:${OPB_DFLASH_STAGE_ROOT}"' in run_cell
+    assert 'mounts+=",${STAGED_OPB_DFLASH_PATH}:${STAGED_OPB_DFLASH_PATH}"' not in run_cell
+
+
 def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

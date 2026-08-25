@@ -160,7 +160,9 @@ run_cell() {
         }
         mounts+=",${OPB_DFLASH_STAGE_RECEIPT}:${OPB_DFLASH_STAGE_RECEIPT}"
     fi
-    if [[ "${method}" != baseline ]]; then
+    if [[ "${method}" == dflash && "${DFLASH2_INTERNAL_TARGET_MODE}" == 1 ]]; then
+        mounts+=",${OPB_DFLASH_STAGE_ROOT}:${OPB_DFLASH_STAGE_ROOT}"
+    elif [[ "${method}" != baseline ]]; then
         mounts+=",${draft}:${draft}"
     fi
 
