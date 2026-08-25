@@ -512,8 +512,23 @@ def test_tie_aware_receipt_replays_descriptors_and_rejects_job_or_port_mismatch(
         draft_launcher,
     ):
         path.write_text(path.name + "\n")
-    target_manifest_payload = {"slurm_job_id": "12345", "server_args": ["x"] * 7 + ["8000"]}
-    draft_manifest_payload = {"slurm_job_id": "12345", "server_args": ["x"] * 7 + ["8010"]}
+    target_manifest_payload = {
+        "slurm_job_id": "12345",
+        "server_args": ["serve", "target", "--tensor-parallel-size", "2", "--port", "8000"],
+    }
+    draft_manifest_payload = {
+        "slurm_job_id": "12345",
+        "server_args": [
+            "serve",
+            "target",
+            "--tensor-parallel-size",
+            "2",
+            "--port",
+            "8010",
+            "--speculative-config",
+            '{"method":"dflash"}',
+        ],
+    }
     monkeypatch.setattr(
         "common.specdec.dflash2_speculators_eval._validate_artifact_identity",
         lambda _path: identity_payload,
@@ -567,7 +582,7 @@ def test_tie_aware_receipt_replays_descriptors_and_rejects_job_or_port_mismatch(
         validate_tie_aware_pilot_receipt(receipt)
     target_rows.write_text(original_rows)
 
-    draft_manifest_payload["server_args"][-1] = "8000"
+    draft_manifest_payload["server_args"][5] = "8000"
     with pytest.raises(ValueError, match="ports"):
         build_tie_aware_pilot_receipt(
             target_rows,
@@ -578,7 +593,7 @@ def test_tie_aware_receipt_replays_descriptors_and_rejects_job_or_port_mismatch(
             allocation,
             tmp_path / "same-port.json",
         )
-    draft_manifest_payload["server_args"][-1] = "8010"
+    draft_manifest_payload["server_args"][5] = "8010"
     draft_manifest_payload["slurm_job_id"] = "99999"
     with pytest.raises(ValueError, match="job"):
         build_tie_aware_pilot_receipt(

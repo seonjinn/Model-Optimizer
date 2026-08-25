@@ -2421,6 +2421,16 @@ def _validate_tie_aware_rows_against_identity(
     return rows
 
 
+def _manifest_server_port(manifest: dict[str, Any]) -> str:
+    server_args = manifest.get("server_args")
+    if not isinstance(server_args, list) or server_args.count("--port") != 1:
+        raise ValueError("tie-aware pilot server port schema mismatch")
+    index = server_args.index("--port")
+    if index + 1 >= len(server_args) or server_args[index + 1] not in {"8000", "8010"}:
+        raise ValueError("tie-aware pilot server port schema mismatch")
+    return str(server_args[index + 1])
+
+
 def build_tie_aware_pilot_receipt(
     target_rows_path: Path,
     dflash2_rows_path: Path,
@@ -2468,8 +2478,8 @@ def build_tie_aware_pilot_receipt(
     ):
         raise ValueError("tie-aware pilot allocation job mismatch")
     if {
-        target_evidence[0]["server_args"][-1],
-        dflash_manifest["server_args"][-1],
+        _manifest_server_port(target_evidence[0]),
+        _manifest_server_port(dflash_manifest),
     } != {"8000", "8010"}:
         raise ValueError("tie-aware pilot server ports are not isolated")
     payload = summarize_tie_aware_pilot(target_rows_path, dflash2_rows_path)
@@ -2542,8 +2552,8 @@ def validate_tie_aware_pilot_receipt(path: Path) -> dict[str, Any]:
     ):
         raise ValueError("tie-aware pilot allocation replay mismatch")
     if {
-        target_evidence[0]["server_args"][-1],
-        dflash_manifest["server_args"][-1],
+        _manifest_server_port(target_evidence[0]),
+        _manifest_server_port(dflash_manifest),
     } != {"8000", "8010"}:
         raise ValueError("tie-aware pilot server ports are not isolated")
     if evidence["input_fingerprints"] != {
