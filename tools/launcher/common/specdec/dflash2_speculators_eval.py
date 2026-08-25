@@ -789,6 +789,12 @@ def _validate_opb_artifact_descriptor_identity(
         "config.json": OPB_DFLASH_CONFIG_SHA256,
         "model.safetensors": OPB_DFLASH_MODEL_SHA256,
     }
+    fixture_descriptor = value.get("identity_fixture")
+    fixture_path = (
+        Path(str(fixture_descriptor.get("path")))
+        if isinstance(fixture_descriptor, dict)
+        else Path("")
+    )
     if (
         value.get("tree_sha256") != _opb_artifact_tree_sha256(expected_files)
         or value.get("file_sha256") != expected_files
@@ -796,7 +802,11 @@ def _validate_opb_artifact_descriptor_identity(
         or value.get("block_size") != DFLASH2_BLOCK_SIZE
         or value.get("num_speculative_tokens") != DFLASH2_SPECULATIVE_TOKENS
         or value.get("target_layer_ids") != [1, 12, 23, 34, 45]
-        or value.get("identity_fixture") != {"path": fixture["path"], "sha256": fixture["sha256"]}
+        or not isinstance(fixture_descriptor, dict)
+        or set(fixture_descriptor) != {"path", "sha256"}
+        or not fixture_path.is_absolute()
+        or ".." in fixture_path.parts
+        or fixture_descriptor.get("sha256") != fixture["sha256"]
     ):
         raise ValueError("OPB DFlash production identity mismatch")
     source = value.get("source")

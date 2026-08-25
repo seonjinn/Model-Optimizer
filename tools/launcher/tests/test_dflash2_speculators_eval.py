@@ -104,13 +104,12 @@ def _write_test_opb_bundle(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple
         monkeypatch.setattr(evaluator, name, evaluator._sha256(path))
     fixture = root / "fixture.json"
     fixture.write_text("{}\n")
+    fixture_identity = {
+        "path": str(fixture.resolve()),
+        "sha256": evaluator._sha256(fixture),
+    }
     monkeypatch.setattr(
-        evaluator,
-        "load_opb_dflash_identity_fixture",
-        lambda: {
-            "path": str(fixture.resolve()),
-            "sha256": evaluator._sha256(fixture),
-        },
+        evaluator, "load_opb_dflash_identity_fixture", lambda: dict(fixture_identity)
     )
     return bundle, draft
 
@@ -882,13 +881,12 @@ def test_opb_stage_copies_exact_bytes_to_private_read_only_node_local_tree(
         monkeypatch.setattr(evaluator, name, evaluator._sha256(path))
     fixture = tmp_path / "fixture.json"
     fixture.write_text("{}\n")
+    fixture_identity = {
+        "path": str(fixture.resolve()),
+        "sha256": evaluator._sha256(fixture),
+    }
     monkeypatch.setattr(
-        evaluator,
-        "load_opb_dflash_identity_fixture",
-        lambda: {
-            "path": str(fixture.resolve()),
-            "sha256": evaluator._sha256(fixture),
-        },
+        evaluator, "load_opb_dflash_identity_fixture", lambda: dict(fixture_identity)
     )
 
     stage_root = tmp_path / "job" / "opb-dflash-control"
@@ -903,6 +901,11 @@ def test_opb_stage_copies_exact_bytes_to_private_read_only_node_local_tree(
     assert stage_root.stat().st_mode & 0o777 == 0o500
     assert (staged_draft / "model.safetensors").stat().st_mode & 0o777 == 0o400
     evaluator.validate_opb_dflash_stage_receipt(receipt_path, require_live_stage=True)
+
+    original_fixture_path = fixture_identity["path"]
+    fixture_identity["path"] = "/another/clean-worktree/q30_opb_dflash_s4166_identity.json"
+    evaluator.validate_opb_dflash_stage_receipt(receipt_path)
+    fixture_identity["path"] = original_fixture_path
 
     (draft / "model.safetensors").write_bytes(b"source-drift-after-stage")
     with pytest.raises(ValueError, match="source descriptor"):
