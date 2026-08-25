@@ -1007,8 +1007,11 @@ def build_artifact_identity(
     server_runtime_archive: Path,
     server_runtime_archive_sha256: str,
     server_runtime_receipt_sha256: str,
+    matrix_concurrencies: tuple[int, int] = (1, 32),
 ) -> dict[str, Any]:
-    """Rehash every immutable scientific input shared by C1 and C32."""
+    """Rehash every immutable scientific input shared by the requested matrix."""
+    if matrix_concurrencies not in {(1, 8), (1, 32)}:
+        raise ValueError("evaluation matrix must be exact C1/C8 or historical C1/C32")
     target_spec = validate_dflash2_target_snapshot(target_path, "q30-base")
     validate_artifact_receipt(
         target_receipt_path,
@@ -1069,7 +1072,7 @@ def build_artifact_identity(
             },
         },
         "matrix": {
-            "concurrencies": [1, 32],
+            "concurrencies": list(matrix_concurrencies),
             "requests_per_subset": 200,
             "tensor_parallel_size": {"baseline": 2, "dflash2": 2},
             "subsets": list(STANDARD_SUBSETS),
@@ -1519,7 +1522,13 @@ def _validate_artifact_identity(path: Path) -> dict[str, Any]:
     assert isinstance(runtimes, dict)
     client = runtimes.get("client")
     server = runtimes.get("server")
-    if not isinstance(client, dict) or not isinstance(server, dict):
+    matrix = identity.get("matrix")
+    if (
+        not isinstance(client, dict)
+        or not isinstance(server, dict)
+        or not isinstance(matrix, dict)
+        or matrix.get("concurrencies") not in ([1, 8], [1, 32])
+    ):
         raise ValueError("artifact identity runtime schema mismatch")
     dataset_manifest_path = Path(str(dataset.get("manifest_path", "")))
     dataset_manifest = _load_json(dataset_manifest_path)
@@ -1537,6 +1546,7 @@ def _validate_artifact_identity(path: Path) -> dict[str, Any]:
         server_runtime_archive=Path(str(server.get("archive_path", ""))),
         server_runtime_archive_sha256=str(server.get("archive_sha256", "")),
         server_runtime_receipt_sha256=str(server.get("receipt_sha256", "")),
+        matrix_concurrencies=tuple(matrix["concurrencies"]),
     )
     if identity != rebuilt:
         raise ValueError("artifact identity replay mismatch")
@@ -1592,6 +1602,51 @@ def _expected_dflash2_server_args(
     if disable_prefix_caching:
         args.append("--no-enable-prefix-caching")
     return args
+
+
+def _validate_performance_server_args(
+    manifest: dict[str, Any], method: str, artifact_identity: dict[str, Any]
+) -> None:
+    """Require the exact engine modes covered by the internal-target receipts."""
+    server_args = manifest.get("server_args")
+    target = manifest.get("target_model")
+    draft = manifest.get("draft_model")
+    target_identity = artifact_identity.get("target")
+    draft_identity = artifact_identity.get("draft")
+    if (
+        method not in {"baseline", "dflash2"}
+        or not isinstance(server_args, list)
+        or not all(isinstance(value, str) for value in server_args)
+        or not isinstance(target, str)
+        or server_args.count("--port") != 1
+    ):
+        raise ValueError(f"invalid {method} performance server arguments")
+    if (
+        not isinstance(target_identity, dict)
+        or target != target_identity.get("path")
+        or not isinstance(draft_identity, dict)
+        or (method == "baseline" and draft is not None)
+        or (method == "dflash2" and draft != draft_identity.get("export_path"))
+    ):
+        raise ValueError(f"{method} performance model path does not match artifact identity")
+    port_index = server_args.index("--port")
+    if port_index + 1 >= len(server_args) or server_args[port_index + 1] not in {"8000", "8010"}:
+        raise ValueError(f"invalid {method} performance server arguments")
+    port = server_args[port_index + 1]
+    if method == "baseline":
+        expected = _expected_target_server_args(target, port, disable_prefix_caching=True)
+    else:
+        if not isinstance(draft, str) or not draft:
+            raise ValueError("invalid dflash2 performance server arguments")
+        expected = _expected_dflash2_server_args(
+            target,
+            draft,
+            port,
+            enforce_eager=True,
+            disable_prefix_caching=True,
+        )
+    if server_args != expected:
+        raise ValueError(f"invalid {method} performance server arguments")
 
 
 def _validate_target_control_manifest(
@@ -1924,9 +1979,19 @@ def _metric_evidence(
     *,
     concurrency: int,
     artifact_identity_sha256: str,
+    validated_performance: bool = False,
+    artifact_identity_path: Path | None = None,
 ) -> dict[str, object]:
-    if concurrency not in {1, 32} or not _is_sha256(artifact_identity_sha256):
+    if concurrency not in {1, 8, 32} or not _is_sha256(artifact_identity_sha256):
         raise ValueError("invalid matched metric evidence request")
+    artifact_identity: dict[str, Any] | None = None
+    if validated_performance:
+        if (
+            artifact_identity_path is None
+            or _sha256(artifact_identity_path) != artifact_identity_sha256
+        ):
+            raise ValueError("validated performance artifact identity is missing")
+        artifact_identity = _validate_artifact_identity(artifact_identity_path)
     result: dict[str, object] = {}
     for method, run in (("baseline", baseline_run), ("dflash2", dflash2_run)):
         manifest_path = run / "manifest.json"
@@ -1952,6 +2017,9 @@ def _metric_evidence(
             or inputs.get("artifact_identity_sha256") != artifact_identity_sha256
         ):
             raise ValueError(f"invalid {method} cell evidence")
+        if validated_performance:
+            assert artifact_identity is not None
+            _validate_performance_server_args(manifest, method, artifact_identity)
         descriptors = {
             "manifest": _file_descriptor(manifest_path),
             "input_fingerprint": _file_descriptor(fingerprint_path),
@@ -2030,16 +2098,29 @@ def validate_report_receipt(path: Path) -> dict[str, Any]:
     if claim != _sha_json(payload):
         raise ValueError("metric report self-hash mismatch")
     artifact_path = _validate_file_descriptor(payload.get("artifact_identity"))
-    correctness_path = _validate_file_descriptor(payload.get("correctness_receipt"))
     artifact_sha = _sha256(artifact_path)
-    correctness = _load_json(correctness_path)
-    correctness_claim = correctness.pop("receipt_sha256", None)
-    if (
-        correctness_claim != _sha_json(correctness)
-        or correctness.get("status") != "passed"
-        or correctness.get("artifact_identity_sha256") != artifact_sha
-    ):
-        raise ValueError("metric report correctness gate mismatch")
+    performance_validation = payload.get("performance_eligibility_receipt")
+    eligibility: dict[str, Any] | None = None
+    if performance_validation is not None:
+        eligibility_path = _validate_file_descriptor(performance_validation)
+        eligibility = validate_performance_eligibility_receipt(eligibility_path)
+        _validate_performance_artifact_matrix(artifact_path)
+        if payload.get(
+            "validation_label"
+        ) != "eager-no-prefix-internal-target-valid" or eligibility.get(
+            "scientific_identity_sha256"
+        ) != _sha_json(_performance_artifact_signature_from_identity(artifact_path)):
+            raise ValueError("metric report performance eligibility mismatch")
+    else:
+        correctness_path = _validate_file_descriptor(payload.get("correctness_receipt"))
+        correctness = _load_json(correctness_path)
+        correctness_claim = correctness.pop("receipt_sha256", None)
+        if (
+            correctness_claim != _sha_json(correctness)
+            or correctness.get("status") != "passed"
+            or correctness.get("artifact_identity_sha256") != artifact_sha
+        ):
+            raise ValueError("metric report correctness gate mismatch")
     evidence = payload.get("evidence")
     if not isinstance(evidence, dict) or set(evidence) != {"baseline", "dflash2"}:
         raise ValueError("metric report evidence is incomplete")
@@ -2055,14 +2136,20 @@ def validate_report_receipt(path: Path) -> dict[str, Any]:
         runs[method] = paths["manifest"].parent
     baseline_manifest = _load_json(runs["baseline"] / "manifest.json")
     evaluation = baseline_manifest.get("evaluation")
-    if not isinstance(evaluation, dict) or evaluation.get("max_concurrency") not in {1, 32}:
+    if not isinstance(evaluation, dict) or evaluation.get("max_concurrency") not in {1, 8, 32}:
         raise ValueError("metric report concurrency is invalid")
     concurrency = int(evaluation["max_concurrency"])
+    if eligibility is not None:
+        validate_performance_concurrency(eligibility, concurrency)
+    elif concurrency not in {1, 32}:
+        raise ValueError("legacy correctness report concurrency is invalid")
     replayed_evidence = _metric_evidence(
         runs["baseline"],
         runs["dflash2"],
         concurrency=concurrency,
         artifact_identity_sha256=artifact_sha,
+        validated_performance=eligibility is not None,
+        artifact_identity_path=artifact_path if eligibility is not None else None,
     )
     replayed_metrics = summarize_pair(runs["baseline"], runs["dflash2"], tensor_parallel_size=2)
     for key, value in replayed_metrics.items():
@@ -4094,6 +4181,270 @@ def validate_dflash_internal_target_control_receipt(path: Path) -> dict[str, Any
     return {**payload, "receipt_sha256": claim}
 
 
+def _performance_classification_signature(
+    payload: dict[str, Any], role: str
+) -> list[dict[str, Any]]:
+    expected = {
+        "dflash": (2, "q30-opb-dflash-s4166-internal-target-control-v2"),
+        "dflash2": (1, "q30-dflash2-internal-target-diagnostic-v1"),
+    }
+    if role not in expected:
+        raise ValueError("invalid performance eligibility role")
+    schema_version, producer = expected[role]
+    acceptance = payload.get("acceptance")
+    counts = payload.get("counts")
+    classifications = payload.get("classifications")
+    if (
+        payload.get("schema_version") != schema_version
+        or payload.get("producer") != producer
+        or payload.get("engine_mode") != "eager-no-prefix"
+        or not _is_sha256(payload.get("source_pilot_receipt_sha256"))
+        or counts != {"exact": 5, "speculative-internal-argmax": 4}
+        or not isinstance(acceptance, dict)
+        or isinstance(acceptance.get("num_spec_steps"), bool)
+        or not isinstance(acceptance.get("num_spec_steps"), int)
+        or acceptance["num_spec_steps"] <= 0
+        or isinstance(acceptance.get("num_accepted_draft_tokens"), bool)
+        or not isinstance(acceptance.get("num_accepted_draft_tokens"), int)
+        or acceptance["num_accepted_draft_tokens"] <= 0
+        or isinstance(acceptance.get("num_draft_tokens"), bool)
+        or not isinstance(acceptance.get("num_draft_tokens"), int)
+        or acceptance["num_draft_tokens"] <= 0
+        or not isinstance(classifications, list)
+        or len(classifications) != len(INTERNAL_TARGET_DIAGNOSTIC_ROWS)
+    ):
+        raise ValueError(f"invalid {role} performance eligibility receipt")
+    if role == "dflash" and payload.get("control_outcome") != (
+        "shared-target-rejection-path-mismatch-reproduced"
+    ):
+        raise ValueError("DFlash shared-path control outcome mismatch")
+    normalized: list[dict[str, Any]] = []
+    for row, (expected_index, expected_reason) in zip(
+        classifications, INTERNAL_TARGET_DIAGNOSTIC_ROWS, strict=True
+    ):
+        if not isinstance(row, dict):
+            raise ValueError(f"invalid {role} performance classification")
+        core = {
+            "subset": row.get("subset"),
+            "index": row.get("index"),
+            "source_row": row.get("source_row"),
+            "selection_reason": row.get("selection_reason"),
+            "engine_mode": row.get("engine_mode"),
+            "class": row.get("class"),
+        }
+        if (
+            core["subset"] != "HumanEval"
+            or core["index"] != expected_index
+            or core["selection_reason"] != expected_reason
+            or core["engine_mode"] != "eager-no-prefix"
+            or core["class"] not in {"exact", "speculative-internal-argmax"}
+        ):
+            raise ValueError(f"invalid {role} performance classification")
+        if core["class"] == "speculative-internal-argmax":
+            token = row.get(f"{role}_token_id")
+            logprob = row.get(f"{role}_token_internal_logprob")
+            rank = row.get(f"{role}_token_internal_rank")
+            maximum = row.get("internal_target_max_logprob")
+            position = row.get("position")
+            if (
+                isinstance(token, bool)
+                or not isinstance(token, int)
+                or token < 0
+                or isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 0
+                or rank != 1
+                or not isinstance(logprob, (int, float))
+                or isinstance(logprob, bool)
+                or not math.isfinite(logprob)
+                or not isinstance(maximum, (int, float))
+                or isinstance(maximum, bool)
+                or not math.isfinite(maximum)
+                or float(logprob) != float(maximum)
+            ):
+                raise ValueError(f"invalid {role} internal-target classification")
+            core.update(
+                {
+                    "position": position,
+                    "target_only_token_id": row.get("target_only_token_id"),
+                    "speculative_token_id": token,
+                    "speculative_token_internal_logprob": float(logprob),
+                    "speculative_token_internal_rank": rank,
+                    "internal_target_max_logprob": float(maximum),
+                }
+            )
+        normalized.append(core)
+    return normalized
+
+
+def summarize_performance_eligibility(
+    dflash_control: dict[str, Any], dflash2_diagnostic: dict[str, Any]
+) -> dict[str, Any]:
+    """Authorize AR-relative speed cells only after both internal-target controls agree."""
+    dflash_rows = _performance_classification_signature(dflash_control, "dflash")
+    dflash2_rows = _performance_classification_signature(dflash2_diagnostic, "dflash2")
+    if dflash_rows != dflash2_rows:
+        raise ValueError("DFlash and DFlash2 internal-target classification mismatch")
+    source_sha = dflash_control["source_pilot_receipt_sha256"]
+    if dflash2_diagnostic.get("source_pilot_receipt_sha256") != source_sha:
+        raise ValueError("DFlash and DFlash2 RCA source receipt mismatch")
+    return {
+        "schema_version": 1,
+        "producer": "q30-dflash2-ar-speed-eligibility-v1",
+        "claim_scope": (
+            "AR-relative diagnostic-mode speed and latency for baseline compiled-no-prefix "
+            "versus DFlash2 eager-no-prefix only; no training-quality claim"
+        ),
+        "validation_label": "eager-no-prefix-internal-target-valid",
+        "block_size": DFLASH2_BLOCK_SIZE,
+        "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
+        "approved_concurrencies": [1, 8],
+        "performance_engine_modes": {
+            "baseline": "compiled-no-prefix",
+            "dflash2": "eager-no-prefix",
+        },
+        "selection": [
+            {"subset": str(row["subset"]), "index": int(row["index"])} for row in dflash_rows
+        ],
+        "counts": {"exact": 5, "speculative-internal-argmax": 4},
+        "source_pilot_receipt_sha256": source_sha,
+    }
+
+
+def validate_performance_concurrency(eligibility: dict[str, Any], concurrency: int) -> None:
+    """Reject any performance cell outside the exact receipt-authorized C1/C8 matrix."""
+    if (
+        eligibility.get("producer") != "q30-dflash2-ar-speed-eligibility-v1"
+        or eligibility.get("approved_concurrencies") != [1, 8]
+        or eligibility.get("performance_engine_modes")
+        != {"baseline": "compiled-no-prefix", "dflash2": "eager-no-prefix"}
+        or isinstance(concurrency, bool)
+        or not isinstance(concurrency, int)
+        or concurrency not in eligibility["approved_concurrencies"]
+    ):
+        raise ValueError("performance cell is not an approved concurrency")
+
+
+def _performance_artifact_signature_from_identity(artifact_path: Path) -> dict[str, Any]:
+    identity = _validate_artifact_identity(artifact_path)
+    dataset = identity.get("dataset")
+    files = dataset.get("files") if isinstance(dataset, dict) else None
+    if not isinstance(dataset, dict) or not isinstance(files, dict):
+        raise ValueError("performance artifact dataset identity mismatch")
+    file_signature: dict[str, dict[str, object]] = {}
+    for subset in STANDARD_SUBSETS:
+        entry = files.get(subset)
+        if not isinstance(entry, dict) or not _is_sha256(entry.get("sha256")):
+            raise ValueError("performance artifact dataset file mismatch")
+        file_signature[subset] = {
+            "sha256": entry["sha256"],
+            "available_rows": entry.get("available_rows"),
+        }
+    return {
+        "target": identity.get("target"),
+        "draft": identity.get("draft"),
+        "runtimes": identity.get("runtimes"),
+        "sampling": identity.get("sampling"),
+        "dataset": {
+            "dataset_id": dataset.get("dataset_id"),
+            "revision": dataset.get("revision"),
+            "prompt_sha256": dataset.get("prompt_sha256"),
+            "requests_per_subset": dataset.get("requests_per_subset"),
+            "total_requests": dataset.get("total_requests"),
+            "ordered_prompts": dataset.get("ordered_prompts"),
+            "files": file_signature,
+        },
+    }
+
+
+def _performance_artifact_signature(receipt: dict[str, Any]) -> dict[str, Any]:
+    artifact_path = _validate_file_descriptor(receipt.get("artifact_identity"))
+    return _performance_artifact_signature_from_identity(artifact_path)
+
+
+def _validate_performance_artifact_matrix(artifact_path: Path) -> None:
+    identity = _validate_artifact_identity(artifact_path)
+    matrix = identity.get("matrix")
+    if not isinstance(matrix, dict) or matrix.get("concurrencies") != [1, 8]:
+        raise ValueError("performance artifact identity must bind exact C1/C8 matrix")
+
+
+def build_performance_eligibility_receipt(
+    dflash_control_path: Path, dflash2_diagnostic_path: Path, output_path: Path
+) -> dict[str, Any]:
+    """Bind the two independently replayed diagnostics that authorize AR speed cells."""
+    dflash = validate_dflash_internal_target_control_receipt(dflash_control_path)
+    dflash2 = validate_internal_target_diagnostic_receipt(dflash2_diagnostic_path)
+    dflash_identity = _performance_artifact_signature(dflash)
+    dflash2_identity = _performance_artifact_signature(dflash2)
+    if dflash_identity != dflash2_identity:
+        raise ValueError("DFlash and DFlash2 scientific artifact identity mismatch")
+    payload = summarize_performance_eligibility(dflash, dflash2)
+    payload["scientific_identity_sha256"] = _sha_json(dflash_identity)
+    payload["diagnostic_receipts"] = {
+        "dflash": _file_descriptor(dflash_control_path),
+        "dflash2": _file_descriptor(dflash2_diagnostic_path),
+    }
+    payload["diagnostic_self_sha256"] = {
+        "dflash": dflash["receipt_sha256"],
+        "dflash2": dflash2["receipt_sha256"],
+    }
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def validate_performance_eligibility_receipt(path: Path) -> dict[str, Any]:
+    """Offline-replay both source diagnostics and the exact speed eligibility claim."""
+    payload = _load_json(path)
+    claim = payload.pop("receipt_sha256", None)
+    expected_keys = {
+        "schema_version",
+        "producer",
+        "claim_scope",
+        "validation_label",
+        "block_size",
+        "num_speculative_tokens",
+        "approved_concurrencies",
+        "performance_engine_modes",
+        "selection",
+        "counts",
+        "source_pilot_receipt_sha256",
+        "scientific_identity_sha256",
+        "diagnostic_receipts",
+        "diagnostic_self_sha256",
+    }
+    if set(payload) != expected_keys or claim != _sha_json(payload):
+        raise ValueError("performance eligibility receipt schema or self-hash mismatch")
+    descriptors = payload.get("diagnostic_receipts")
+    self_hashes = payload.get("diagnostic_self_sha256")
+    if (
+        not isinstance(descriptors, dict)
+        or set(descriptors) != {"dflash", "dflash2"}
+        or not isinstance(self_hashes, dict)
+        or set(self_hashes) != {"dflash", "dflash2"}
+    ):
+        raise ValueError("performance eligibility diagnostic receipt schema mismatch")
+    paths = {name: _validate_file_descriptor(value) for name, value in descriptors.items()}
+    dflash = validate_dflash_internal_target_control_receipt(paths["dflash"])
+    dflash2 = validate_internal_target_diagnostic_receipt(paths["dflash2"])
+    if self_hashes != {
+        "dflash": dflash["receipt_sha256"],
+        "dflash2": dflash2["receipt_sha256"],
+    }:
+        raise ValueError("performance eligibility diagnostic self-hash mismatch")
+    dflash_identity = _performance_artifact_signature(dflash)
+    if dflash_identity != _performance_artifact_signature(dflash2):
+        raise ValueError("performance eligibility scientific artifact mismatch")
+    replayed = summarize_performance_eligibility(dflash, dflash2)
+    replayed["scientific_identity_sha256"] = _sha_json(dflash_identity)
+    replayed["diagnostic_receipts"] = descriptors
+    replayed["diagnostic_self_sha256"] = self_hashes
+    if payload != replayed:
+        raise ValueError("performance eligibility receipt replay mismatch")
+    return {**payload, "receipt_sha256": claim}
+
+
 def _read_tie_aware_pilot_rows(path: Path, expected_role: str) -> list[dict[str, Any]]:
     expected_keys = {
         "schema_version",
@@ -4553,10 +4904,12 @@ def main() -> None:
     summary = commands.add_parser("summarize")
     summary.add_argument("--baseline-run", required=True)
     summary.add_argument("--dflash2-run", required=True)
-    summary.add_argument("--correctness-receipt", required=True)
+    validation = summary.add_mutually_exclusive_group(required=True)
+    validation.add_argument("--correctness-receipt")
+    validation.add_argument("--performance-eligibility-receipt")
     summary.add_argument("--output", required=True)
     summary.add_argument("--artifact-identity", required=True)
-    summary.add_argument("--concurrency", required=True, type=int, choices=(1, 32))
+    summary.add_argument("--concurrency", required=True, type=int, choices=(1, 8, 32))
 
     identity = commands.add_parser("artifact-identity")
     identity.add_argument("--output", required=True)
@@ -4573,6 +4926,9 @@ def main() -> None:
     identity.add_argument("--server-runtime-archive", required=True)
     identity.add_argument("--server-runtime-archive-sha256", required=True)
     identity.add_argument("--server-runtime-receipt-sha256", required=True)
+    identity.add_argument(
+        "--matrix-concurrencies", nargs=2, type=int, choices=(1, 8, 32), default=(1, 32)
+    )
 
     milestone = commands.add_parser("verify-milestone")
     milestone.add_argument("--manifest", required=True)
@@ -4645,6 +5001,14 @@ def main() -> None:
 
     dflash_verify = commands.add_parser("verify-dflash-control")
     dflash_verify.add_argument("--receipt", required=True)
+
+    performance_eligibility = commands.add_parser("build-performance-eligibility")
+    performance_eligibility.add_argument("--dflash-control-receipt", required=True)
+    performance_eligibility.add_argument("--dflash2-internal-receipt", required=True)
+    performance_eligibility.add_argument("--output", required=True)
+
+    performance_eligibility_verify = commands.add_parser("verify-performance-eligibility")
+    performance_eligibility_verify.add_argument("--receipt", required=True)
 
     args = parser.parse_args()
     if args.command == "prompt-set":
@@ -4782,16 +5146,40 @@ def main() -> None:
         )
     elif args.command == "verify-dflash-control":
         validate_dflash_internal_target_control_receipt(Path(args.receipt))
+    elif args.command == "build-performance-eligibility":
+        build_performance_eligibility_receipt(
+            Path(args.dflash_control_receipt),
+            Path(args.dflash2_internal_receipt),
+            Path(args.output),
+        )
+    elif args.command == "verify-performance-eligibility":
+        validate_performance_eligibility_receipt(Path(args.receipt))
     elif args.command == "summarize":
-        correctness = _load_json(Path(args.correctness_receipt))
-        claim = correctness.pop("receipt_sha256", None)
         artifact_identity_sha256 = _sha256(Path(args.artifact_identity))
-        if (
-            correctness.get("status") != "passed"
-            or correctness.get("artifact_identity_sha256") != artifact_identity_sha256
-            or claim != _sha_json(correctness)
-        ):
-            raise ValueError("correctness receipt is not a passing self-hashed receipt")
+        eligibility_path = (
+            Path(args.performance_eligibility_receipt)
+            if args.performance_eligibility_receipt
+            else None
+        )
+        if eligibility_path is not None:
+            eligibility = validate_performance_eligibility_receipt(eligibility_path)
+            validate_performance_concurrency(eligibility, args.concurrency)
+            _validate_performance_artifact_matrix(Path(args.artifact_identity))
+            if eligibility.get("scientific_identity_sha256") != _sha_json(
+                _performance_artifact_signature_from_identity(Path(args.artifact_identity))
+            ):
+                raise ValueError("performance eligibility artifact identity mismatch")
+        else:
+            if args.concurrency not in {1, 32}:
+                raise ValueError("legacy correctness report concurrency is invalid")
+            correctness = _load_json(Path(args.correctness_receipt))
+            claim = correctness.pop("receipt_sha256", None)
+            if (
+                correctness.get("status") != "passed"
+                or correctness.get("artifact_identity_sha256") != artifact_identity_sha256
+                or claim != _sha_json(correctness)
+            ):
+                raise ValueError("correctness receipt is not a passing self-hashed receipt")
         payload = summarize_pair(
             Path(args.baseline_run), Path(args.dflash2_run), tensor_parallel_size=2
         )
@@ -4800,8 +5188,16 @@ def main() -> None:
             Path(args.dflash2_run),
             concurrency=args.concurrency,
             artifact_identity_sha256=artifact_identity_sha256,
+            validated_performance=eligibility_path is not None,
+            artifact_identity_path=(
+                Path(args.artifact_identity) if eligibility_path is not None else None
+            ),
         )
-        payload["correctness_receipt"] = _file_descriptor(Path(args.correctness_receipt))
+        if eligibility_path is not None:
+            payload["performance_eligibility_receipt"] = _file_descriptor(eligibility_path)
+            payload["validation_label"] = "eager-no-prefix-internal-target-valid"
+        else:
+            payload["correctness_receipt"] = _file_descriptor(Path(args.correctness_receipt))
         payload["artifact_identity"] = _file_descriptor(Path(args.artifact_identity))
         payload["receipt_sha256"] = _sha_json(payload)
         _atomic_json(Path(args.output), payload, no_replace=True)
@@ -4820,6 +5216,7 @@ def main() -> None:
             server_runtime_archive=Path(args.server_runtime_archive),
             server_runtime_archive_sha256=args.server_runtime_archive_sha256,
             server_runtime_receipt_sha256=args.server_runtime_receipt_sha256,
+            matrix_concurrencies=tuple(args.matrix_concurrencies),
         )
         _atomic_json(Path(args.output), payload, no_replace=True)
     elif args.command == "verify-milestone":

@@ -65,6 +65,7 @@ TIE_AWARE_PILOT_MODE=0
 DFLASH2_INTERNAL_TARGET_MODE=0
 DFLASH2_ENFORCE_EAGER_MODE=0
 DFLASH2_DISABLE_PREFIX_CACHING_MODE=0
+VALIDATED_PERFORMANCE_MODE=0
 OPB_DFLASH_STAGE_RECEIPT=""
 STAGED_OPB_DFLASH_PATH=""
 
@@ -214,6 +215,7 @@ run_cell() {
         DFLASH2_INTERNAL_TARGET="${DFLASH2_INTERNAL_TARGET_MODE}" \
         DFLASH2_ENFORCE_EAGER="${DFLASH2_ENFORCE_EAGER_MODE}" \
         DFLASH2_DISABLE_PREFIX_CACHING="${DFLASH2_DISABLE_PREFIX_CACHING_MODE}" \
+        VALIDATED_PERFORMANCE="${VALIDATED_PERFORMANCE_MODE}" \
         OPB_DFLASH_STAGE_RECEIPT="${OPB_DFLASH_STAGE_RECEIPT}" \
         CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
         CONTAINER_IDENTITY_PATH="${CONTAINER_IDENTITY_PATH}" \
@@ -314,10 +316,18 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
         IFS='|' read -r _ _ _ concurrency max_requests _ _ tp_size <<<"${descriptor}"
         tp_size="${tp_size:-2}"
         case "${PAIR_PHASE}:${concurrency}:${max_requests}:${tp_size}" in
-            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2|mismatch:1:200:2|tie-pilot:1:200:2|internal-target:1:200:2|internal-target-eager:1:200:2|internal-target-eager-no-prefix:1:200:2|internal-target-dflash-eager-no-prefix:1:200:2) ;;
-            *) echo "ERROR: matched DFlash2 cells require C1/C32, 200 requests, and TP2" >&2; exit 2 ;;
+            correctness:1:200:2|performance:32:200:2|performance-validated:1:200:2|performance-validated:8:200:2|diagnostic:1:200:2|mismatch:1:200:2|tie-pilot:1:200:2|internal-target:1:200:2|internal-target-eager:1:200:2|internal-target-eager-no-prefix:1:200:2|internal-target-dflash-eager-no-prefix:1:200:2) ;;
+            *) echo "ERROR: matched DFlash2 cells require an approved C1/C8 validation cell, 200 requests, and TP2" >&2; exit 2 ;;
         esac
     done
+    if [[ "${PAIR_PHASE}" == performance-validated ]]; then
+        IFS='|' read -r _ _ _ concurrency_a _ _ _ _ <<<"${CELL_A}"
+        IFS='|' read -r _ _ _ concurrency_b _ _ _ _ <<<"${CELL_B}"
+        [[ "${concurrency_a}" == "${concurrency_b}" ]] || {
+            echo "ERROR: validated performance cell concurrency mismatch" >&2
+            exit 2
+        }
+    fi
     if [[ "${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix ]]; then
         dflash_descriptor="${CELL_A}"
         [[ "${method_a}" == dflash ]] || dflash_descriptor="${CELL_B}"
@@ -357,6 +367,10 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
     fi
     [[ "$(sha256sum "${DRAFT_MILESTONE_MANIFEST_PATH}" | cut -d' ' -f1)" == "${DRAFT_MILESTONE_MANIFEST_SHA256}" ]]
     ARTIFACT_IDENTITY_PATH="${RESULT_ROOT}/artifact-identity.json"
+    matrix_args=()
+    if [[ "${PAIR_PHASE}" == performance-validated ]]; then
+        matrix_args=(--matrix-concurrencies 1 8)
+    fi
     PYTHONPATH="${MODELOPT_REPO}/tools/launcher${PYTHONPATH:+:${PYTHONPATH}}" \
         "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" artifact-identity \
         --output "${ARTIFACT_IDENTITY_PATH}" \
@@ -370,8 +384,32 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
         --client-runtime-archive-sha256 "${CLIENT_RUNTIME_ARCHIVE_SHA256}" \
         --server-runtime-archive "${SERVER_RUNTIME_ARCHIVE}" \
         --server-runtime-archive-sha256 "${SERVER_RUNTIME_ARCHIVE_SHA256}" \
-        --server-runtime-receipt-sha256 "${SERVER_RUNTIME_RECEIPT_SHA256}"
+        --server-runtime-receipt-sha256 "${SERVER_RUNTIME_RECEIPT_SHA256}" \
+        "${matrix_args[@]}"
     ARTIFACT_IDENTITY_SHA256="$(sha256sum "${ARTIFACT_IDENTITY_PATH}" | cut -d' ' -f1)"
+fi
+
+PERFORMANCE_ELIGIBILITY_RECEIPT=""
+if [[ "${PAIR_PHASE}" == performance-validated ]]; then
+    for name in DFLASH_CONTROL_RECEIPT_PATH DFLASH_CONTROL_RECEIPT_SHA256 \
+        DFLASH2_INTERNAL_RECEIPT_PATH DFLASH2_INTERNAL_RECEIPT_SHA256; do
+        [[ -n "${!name:-}" ]] || {
+            echo "ERROR: ${name} is required for validated performance" >&2
+            exit 2
+        }
+    done
+    [[ "$(sha256sum "${DFLASH_CONTROL_RECEIPT_PATH}" | cut -d' ' -f1)" \
+        == "${DFLASH_CONTROL_RECEIPT_SHA256}" ]]
+    [[ "$(sha256sum "${DFLASH2_INTERNAL_RECEIPT_PATH}" | cut -d' ' -f1)" \
+        == "${DFLASH2_INTERNAL_RECEIPT_SHA256}" ]]
+    PERFORMANCE_ELIGIBILITY_RECEIPT="${RESULT_ROOT}/performance-eligibility-receipt.json"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" build-performance-eligibility \
+        --dflash-control-receipt "${DFLASH_CONTROL_RECEIPT_PATH}" \
+        --dflash2-internal-receipt "${DFLASH2_INTERNAL_RECEIPT_PATH}" \
+        --output "${PERFORMANCE_ELIGIBILITY_RECEIPT}"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-performance-eligibility \
+        --receipt "${PERFORMANCE_ELIGIBILITY_RECEIPT}" >/dev/null
+    VALIDATED_PERFORMANCE_MODE=1
 fi
 cell_label() {
     local descriptor="$1" method block_size spec_tokens concurrency max_requests draft label tp_size
@@ -613,7 +651,22 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 ]]; then
     fi
     baseline_run="${RESULT_ROOT}/${baseline_label}/${baseline_label}"
     dflash2_run="${RESULT_ROOT}/${dflash2_label}/${dflash2_label}"
-    if [[ "${PAIR_PHASE}" == correctness ]]; then
+    if [[ "${PAIR_PHASE}" == performance-validated ]]; then
+        IFS='|' read -r _ _ _ performance_concurrency _ _ _ _ <<<"${CELL_A}"
+        case "${performance_concurrency}" in
+            1) readonly PERFORMANCE_REPORT="${RESULT_ROOT}/c1-performance-report.json" ;;
+            8) readonly PERFORMANCE_REPORT="${RESULT_ROOT}/c8-performance-report.json" ;;
+            *) echo "ERROR: validated performance requires C1 or C8" >&2; exit 2 ;;
+        esac
+        "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" summarize \
+            --baseline-run "${baseline_run}" --dflash2-run "${dflash2_run}" \
+            --performance-eligibility-receipt "${PERFORMANCE_ELIGIBILITY_RECEIPT}" \
+            --artifact-identity "${ARTIFACT_IDENTITY_PATH}" \
+            --concurrency "${performance_concurrency}" \
+            --output "${PERFORMANCE_REPORT}"
+        "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-report \
+            --report "${PERFORMANCE_REPORT}" >/dev/null
+    elif [[ "${PAIR_PHASE}" == correctness ]]; then
         "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" summarize \
             --baseline-run "${baseline_run}" --dflash2-run "${dflash2_run}" \
             --correctness-receipt "${RESULT_ROOT}/correctness-receipt.json" \

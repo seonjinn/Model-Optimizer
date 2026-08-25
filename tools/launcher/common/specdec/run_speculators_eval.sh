@@ -475,19 +475,40 @@ if [[ "${SPEC_METHOD}" != "baseline" ]]; then
         "${DRAFT_MODEL}" "${NUM_SPEC_TOKENS}")"
     SERVER_ARGS+=(--speculative-config "${SPEC_CONFIG}")
 fi
-if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 \
-    && ("${SPEC_METHOD}" == dflash || "${SPEC_METHOD}" == dflash2) ]]; then
-    SERVER_ARGS+=(--per-request-spec-decode-metrics detailed)
-    if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]]; then
-        SERVER_ARGS+=(--enforce-eager)
-    fi
-fi
-if [[ "${DFLASH2_DISABLE_PREFIX_CACHING:-0}" == 1 ]]; then
-    [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 && "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]] || {
-        echo "ERROR: disabling prefix caching is restricted to eager internal-target diagnosis" >&2
+if [[ "${VALIDATED_PERFORMANCE:-0}" == 1 ]]; then
+    [[ "${DFLASH2_INTERNAL_TARGET:-0}:${CAPTURE_EQUIVALENCE:-0}:${EQUIVALENCE_ONLY:-0}" \
+        == "0:0:0" ]] || {
+        echo "ERROR: validated performance cannot enable diagnostic capture" >&2
         exit 2
     }
+    [[ "${SPEC_METHOD}" == baseline || "${SPEC_METHOD}" == dflash2 ]] || {
+        echo "ERROR: validated performance supports only baseline and DFlash2" >&2
+        exit 2
+    }
+    [[ "${MAX_CONCURRENCY}:${MAX_REQUESTS}" == "1:200" \
+        || "${MAX_CONCURRENCY}:${MAX_REQUESTS}" == "8:200" ]] || {
+        echo "ERROR: validated performance requires exact C1/C8 with 200 requests" >&2
+        exit 2
+    }
+    if [[ "${SPEC_METHOD}" == dflash2 ]]; then
+        SERVER_ARGS+=(--enforce-eager)
+    fi
     SERVER_ARGS+=(--no-enable-prefix-caching)
+else
+    if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 \
+        && ("${SPEC_METHOD}" == dflash || "${SPEC_METHOD}" == dflash2) ]]; then
+        SERVER_ARGS+=(--per-request-spec-decode-metrics detailed)
+        if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]]; then
+            SERVER_ARGS+=(--enforce-eager)
+        fi
+    fi
+    if [[ "${DFLASH2_DISABLE_PREFIX_CACHING:-0}" == 1 ]]; then
+        [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 && "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]] || {
+            echo "ERROR: disabling prefix caching is restricted to eager internal-target diagnosis" >&2
+            exit 2
+        }
+        SERVER_ARGS+=(--no-enable-prefix-caching)
+    fi
 fi
 if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
     [[ "${CAPTURE_EQUIVALENCE:-0}:${EQUIVALENCE_ONLY:-0}:${MAX_CONCURRENCY}:${MAX_REQUESTS}" \

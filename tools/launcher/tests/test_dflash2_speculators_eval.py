@@ -2729,7 +2729,9 @@ def test_target_control_receipt_replays_authenticated_job_evidence(
         server_runtime_archive=server_runtime,
         server_runtime_archive_sha256=_sha256(server_runtime),
         server_runtime_receipt_sha256="e" * 64,
+        matrix_concurrencies=(1, 8),
     )
+    assert identity_payload["matrix"]["concurrencies"] == [1, 8]
     identity = tmp_path / "identity.json"
     identity.write_text(json.dumps(identity_payload, indent=2, sort_keys=True) + "\n")
 
@@ -3068,6 +3070,298 @@ def test_pair_summary_reports_per_gpu_speed_latency_and_acceptance(tmp_path: Pat
     assert zero_report["aggregate"]["acceptance_rate"] == 0
 
 
+def test_performance_eligibility_requires_matching_internal_target_evidence() -> None:
+    """AR speed cells require the same nine-row internal-target verdict in both controls."""
+    shared_rows = [
+        {
+            "subset": "HumanEval",
+            "index": 0,
+            "source_row": 0,
+            "selection_reason": "exact-control",
+            "engine_mode": "eager-no-prefix",
+            "class": "exact",
+        },
+        {
+            "subset": "HumanEval",
+            "index": 1,
+            "source_row": 1,
+            "selection_reason": "source-1-first-invalid",
+            "engine_mode": "eager-no-prefix",
+            "class": "speculative-internal-argmax",
+            "position": 26,
+            "target_only_token_id": 5611,
+            "speculative_token_id": 1482,
+            "speculative_token_internal_logprob": -1.2200927734375,
+            "speculative_token_internal_rank": 1,
+            "internal_target_max_logprob": -1.2200927734375,
+        },
+        {
+            "subset": "HumanEval",
+            "index": 8,
+            "source_row": 8,
+            "selection_reason": "source-8-first-tied",
+            "engine_mode": "eager-no-prefix",
+            "class": "exact",
+        },
+        {
+            "subset": "HumanEval",
+            "index": 27,
+            "source_row": 27,
+            "selection_reason": "early-divergence-position-2",
+            "engine_mode": "eager-no-prefix",
+            "class": "exact",
+        },
+        {
+            "subset": "HumanEval",
+            "index": 41,
+            "source_row": 41,
+            "selection_reason": "early-divergence-position-1",
+            "engine_mode": "eager-no-prefix",
+            "class": "speculative-internal-argmax",
+            "position": 60,
+            "target_only_token_id": 982,
+            "speculative_token_id": 8,
+            "speculative_token_internal_logprob": -0.6940155029296875,
+            "speculative_token_internal_rank": 1,
+            "internal_target_max_logprob": -0.6940155029296875,
+        },
+        {
+            "subset": "HumanEval",
+            "index": 82,
+            "source_row": 82,
+            "selection_reason": "maximum-target-logprob-gap",
+            "engine_mode": "eager-no-prefix",
+            "class": "speculative-internal-argmax",
+            "position": 44,
+            "target_only_token_id": 4675,
+            "speculative_token_id": 1265,
+            "speculative_token_internal_logprob": -0.31326165795326233,
+            "speculative_token_internal_rank": 1,
+            "internal_target_max_logprob": -0.31326165795326233,
+        },
+        {
+            "subset": "HumanEval",
+            "index": 151,
+            "source_row": 151,
+            "selection_reason": "second-largest-target-logprob-gap",
+            "engine_mode": "eager-no-prefix",
+            "class": "exact",
+        },
+        {
+            "subset": "HumanEval",
+            "index": 165,
+            "source_row": 1,
+            "selection_reason": "source-1-repeat-tied",
+            "engine_mode": "eager-no-prefix",
+            "class": "speculative-internal-argmax",
+            "position": 26,
+            "target_only_token_id": 5611,
+            "speculative_token_id": 1482,
+            "speculative_token_internal_logprob": -1.2200927734375,
+            "speculative_token_internal_rank": 1,
+            "internal_target_max_logprob": -1.2200927734375,
+        },
+        {
+            "subset": "HumanEval",
+            "index": 172,
+            "source_row": 8,
+            "selection_reason": "source-8-repeat-invalid",
+            "engine_mode": "eager-no-prefix",
+            "class": "exact",
+        },
+    ]
+
+    def receipt(role: str) -> dict[str, Any]:
+        rows = []
+        for row in shared_rows:
+            current = dict(row)
+            if current["class"] == "speculative-internal-argmax":
+                prefix = "dflash" if role == "dflash" else "dflash2"
+                for suffix in (
+                    "token_id",
+                    "token_internal_logprob",
+                    "token_internal_rank",
+                ):
+                    current[f"{prefix}_{suffix}"] = current.pop(f"speculative_{suffix}")
+            rows.append(current)
+        payload: dict[str, Any] = {
+            "schema_version": 2 if role == "dflash" else 1,
+            "producer": (
+                "q30-opb-dflash-s4166-internal-target-control-v2"
+                if role == "dflash"
+                else "q30-dflash2-internal-target-diagnostic-v1"
+            ),
+            "engine_mode": "eager-no-prefix",
+            "source_pilot_receipt_sha256": "4" * 64,
+            "counts": {"exact": 5, "speculative-internal-argmax": 4},
+            "classifications": rows,
+            "acceptance": {
+                "num_spec_steps": 164,
+                "num_accepted_draft_tokens": 422,
+                "num_draft_tokens": 1148,
+                "draft_acceptance_rate": 422 / 1148,
+            },
+        }
+        if role == "dflash":
+            payload["control_outcome"] = "shared-target-rejection-path-mismatch-reproduced"
+        return payload
+
+    eligible = evaluator.summarize_performance_eligibility(receipt("dflash"), receipt("dflash2"))
+    assert eligible == {
+        "schema_version": 1,
+        "producer": "q30-dflash2-ar-speed-eligibility-v1",
+        "claim_scope": (
+            "AR-relative diagnostic-mode speed and latency for baseline compiled-no-prefix "
+            "versus DFlash2 eager-no-prefix only; no training-quality claim"
+        ),
+        "validation_label": "eager-no-prefix-internal-target-valid",
+        "block_size": 8,
+        "num_speculative_tokens": 7,
+        "approved_concurrencies": [1, 8],
+        "performance_engine_modes": {
+            "baseline": "compiled-no-prefix",
+            "dflash2": "eager-no-prefix",
+        },
+        "selection": [{"subset": "HumanEval", "index": row["index"]} for row in shared_rows],
+        "counts": {"exact": 5, "speculative-internal-argmax": 4},
+        "source_pilot_receipt_sha256": "4" * 64,
+    }
+    evaluator.validate_performance_concurrency(eligible, 1)
+    evaluator.validate_performance_concurrency(eligible, 8)
+    with pytest.raises(ValueError, match="approved concurrency"):
+        evaluator.validate_performance_concurrency(eligible, 32)
+
+    mismatched = receipt("dflash2")
+    mismatched["classifications"][1]["dflash2_token_id"] = 999
+    with pytest.raises(ValueError, match="classification mismatch"):
+        evaluator.summarize_performance_eligibility(receipt("dflash"), mismatched)
+
+    target_manifest = {
+        "target_model": "/target",
+        "draft_model": None,
+        "server_args": evaluator._expected_target_server_args(
+            "/target", "8000", disable_prefix_caching=True
+        ),
+    }
+    draft_manifest = {
+        "target_model": "/target",
+        "draft_model": "/draft",
+        "server_args": evaluator._expected_dflash2_server_args(
+            "/target",
+            "/draft",
+            "8010",
+            enforce_eager=True,
+            disable_prefix_caching=True,
+        ),
+    }
+    artifact_identity = {
+        "target": {"path": "/target"},
+        "draft": {"export_path": "/draft"},
+    }
+    evaluator._validate_performance_server_args(target_manifest, "baseline", artifact_identity)
+    evaluator._validate_performance_server_args(draft_manifest, "dflash2", artifact_identity)
+    draft_manifest["server_args"].remove("--enforce-eager")
+    with pytest.raises(ValueError, match="performance server arguments"):
+        evaluator._validate_performance_server_args(draft_manifest, "dflash2", artifact_identity)
+    forged = {
+        **draft_manifest,
+        "target_model": "/unbound-target",
+        "draft_model": "/unbound-draft",
+        "server_args": evaluator._expected_dflash2_server_args(
+            "/unbound-target",
+            "/unbound-draft",
+            "8010",
+            enforce_eager=True,
+            disable_prefix_caching=True,
+        ),
+    }
+    with pytest.raises(ValueError, match="artifact identity"):
+        evaluator._validate_performance_server_args(forged, "dflash2", artifact_identity)
+
+
+def test_validated_performance_evidence_binds_model_paths_to_artifact_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A self-consistent manifest/argv rewrite cannot escape the authenticated models."""
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text("{}\n")
+    artifact_sha = _sha256(artifact)
+    identity = {
+        "target": {"path": "/target"},
+        "draft": {"export_path": "/draft"},
+    }
+    monkeypatch.setattr(evaluator, "_validate_artifact_identity", lambda _path: identity)
+    runs: dict[str, Path] = {}
+    for method, port in (("baseline", "8000"), ("dflash2", "8010")):
+        run = tmp_path / method
+        run.mkdir()
+        server_args = (
+            evaluator._expected_target_server_args("/target", port, disable_prefix_caching=True)
+            if method == "baseline"
+            else evaluator._expected_dflash2_server_args(
+                "/target",
+                "/draft",
+                port,
+                enforce_eager=True,
+                disable_prefix_caching=True,
+            )
+        )
+        manifest = {
+            "status": "success",
+            "method": method,
+            "target_model": "/target",
+            "draft_model": None if method == "baseline" else "/draft",
+            "server_args": server_args,
+            "evaluation": {
+                "max_concurrency": 1,
+                "max_requests": 200,
+                "tensor_parallel_size": 2,
+                "temperature": 0,
+                "top_p": 1,
+            },
+            "artifact_identity": {"sha256": artifact_sha},
+        }
+        (run / "manifest.json").write_text(json.dumps(manifest) + "\n")
+        inputs = {"artifact_identity_sha256": artifact_sha}
+        (run / "input-fingerprint.json").write_text(
+            json.dumps({"sha256": evaluator._sha_json(inputs), "inputs": inputs}) + "\n"
+        )
+        _write_perf(run / "perf_results.csv", output_tps=100, latency=1)
+        if method == "dflash2":
+            _write_acceptance(run / "acceptance.csv")
+        runs[method] = run
+
+    evaluator._metric_evidence(
+        runs["baseline"],
+        runs["dflash2"],
+        concurrency=1,
+        artifact_identity_sha256=artifact_sha,
+        validated_performance=True,
+        artifact_identity_path=artifact,
+    )
+    draft_manifest_path = runs["dflash2"] / "manifest.json"
+    forged = json.loads(draft_manifest_path.read_text())
+    forged["target_model"] = "/unbound-target"
+    forged["draft_model"] = "/unbound-draft"
+    forged["server_args"] = evaluator._expected_dflash2_server_args(
+        "/unbound-target",
+        "/unbound-draft",
+        "8010",
+        enforce_eager=True,
+        disable_prefix_caching=True,
+    )
+    draft_manifest_path.write_text(json.dumps(forged) + "\n")
+    with pytest.raises(ValueError, match="artifact identity"):
+        evaluator._metric_evidence(
+            runs["baseline"],
+            runs["dflash2"],
+            concurrency=1,
+            artifact_identity_sha256=artifact_sha,
+            validated_performance=True,
+            artifact_identity_path=artifact,
+        )
+
+
 def test_split_runtime_pair_wiring_is_mandatory_for_matched_dflash2() -> None:
     """Server and GuideLLM client runtimes are independently pinned."""
     pair = _PAIR.read_text()
@@ -3091,25 +3385,30 @@ def test_split_runtime_pair_wiring_is_mandatory_for_matched_dflash2() -> None:
     assert "export VLLM_USE_V2_MODEL_RUNNER=1" in wrapper
 
 
-def test_exact_matched_matrix_requires_c1_c32_200_and_tp2() -> None:
-    """Only the approved C1/C32 TP2+TP2 matrix is accepted."""
+def test_exact_matched_matrix_requires_c1_c8_200_and_tp2() -> None:
+    """Only the approved AR-relative C1/C8 TP2+TP2 matrix is accepted."""
     pair = _PAIR.read_text()
 
     assert 'case "${PAIR_PHASE}:${concurrency}:${max_requests}:${tp_size}"' in pair
-    assert "correctness:1:200:2|performance:32:200:2" in pair
+    assert "performance-validated:1:200:2|performance-validated:8:200:2" in pair
     assert "baseline:0:0" in pair
     assert "dflash2:8:7" in pair
     assert "c1-performance-report.json" in pair
-    assert "c32-performance-report.json" in pair
+    assert "c8-performance-report.json" in pair
     assert '"${STUDY_HELPER}" materialize-prompts' in pair
     assert 'DATASET_MANIFEST_PATH="${MATCHED_DATASET_MANIFEST_PATH}"' in pair
     assert 'HF_HOME_DURABLE="${MATCHED_HF_HOME}"' in pair
-    equivalence_run = pair.index("run_pair_cells 1")
-    correctness_gate = pair.index("compare-outputs", equivalence_run)
-    performance_run = pair.index("run_pair_cells 0", correctness_gate)
-    assert equivalence_run < correctness_gate < performance_run
-    assert "--concurrency 1" in pair
-    assert "--concurrency 32" in pair
+    assert "--matrix-concurrencies 1 8" in pair
+    eligibility_gate = pair.index("verify-performance-eligibility")
+    performance_run = pair.index("run_pair_cells 0", eligibility_gate)
+    assert eligibility_gate < performance_run
+    concurrency_gate = pair.index("validated performance cell concurrency mismatch")
+    assert concurrency_gate < performance_run
+    assert '[[ "${concurrency_a}" == "${concurrency_b}" ]]' in pair
+    assert "VALIDATED_PERFORMANCE_MODE=1" in pair
+    assert 'VALIDATED_PERFORMANCE="${VALIDATED_PERFORMANCE_MODE}"' in pair
+    assert '"${VALIDATED_PERFORMANCE:-0}" == 1' in _WRAPPER.read_text()
+    assert '--concurrency "${performance_concurrency}"' in pair
 
 
 def test_server_runtime_stager_binds_archive_and_embedded_receipt(tmp_path: Path) -> None:
