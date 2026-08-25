@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import stat
 import sys
 import threading
 import weakref
@@ -903,6 +904,222 @@ def test_persisted_verification_trust_is_external_strict_and_no_replace(tmp_path
     receipt_path.write_text(module.canonical_json(tampered) + "\n")
     with pytest.raises(module.PilotError, match="verification trust receipt"):
         module.load_pilot_verification_trust(receipt_path)
+
+
+def test_trust_receipt_rejects_lexical_parent_rename_after_file_fsync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A durable receipt must remain bound to the caller's full lexical pathname."""
+    module = _load_module()
+    completion = module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=tmp_path / "pilot",
+        producer_source_commit="b" * 40,
+    )
+    receipt_parent = tmp_path / "external"
+    receipt_parent.mkdir()
+    receipt_path = receipt_parent / "pilot-trust.json"
+    displaced = tmp_path / "displaced-external"
+    real_fsync = os.fsync
+    raced = False
+
+    def rename_parent_after_file_fsync(descriptor: int) -> None:
+        nonlocal raced
+        metadata = os.fstat(descriptor)
+        real_fsync(descriptor)
+        if not raced and stat.S_ISREG(metadata.st_mode):
+            raced = True
+            receipt_parent.rename(displaced)
+            receipt_parent.mkdir()
+
+    monkeypatch.setattr(module.os, "fsync", rename_parent_after_file_fsync)
+
+    with pytest.raises(module.PilotError, match="changed during publication"):
+        module._write_pilot_verification_trust(
+            receipt_path, completion.verification_trust, output_root=completion.output_root
+        )
+
+    assert not receipt_path.exists()
+    assert (displaced / receipt_path.name).is_file()
+
+
+def test_trust_receipt_rejects_parent_replacement_with_forged_named_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Parent fsync may not authenticate a replacement pathname containing forged bytes."""
+    module = _load_module()
+    completion = module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=tmp_path / "pilot",
+        producer_source_commit="b" * 40,
+    )
+    receipt_parent = tmp_path / "external"
+    receipt_parent.mkdir()
+    receipt_path = receipt_parent / "pilot-trust.json"
+    displaced = tmp_path / "displaced-external"
+    forged = b'{"forged":true}\n'
+    real_fsync = os.fsync
+    raced = False
+
+    def replace_parent_at_directory_fsync(descriptor: int) -> None:
+        nonlocal raced
+        metadata = os.fstat(descriptor)
+        if not raced and stat.S_ISDIR(metadata.st_mode):
+            raced = True
+            receipt_parent.rename(displaced)
+            receipt_parent.mkdir()
+            receipt_path.write_bytes(forged)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(module.os, "fsync", replace_parent_at_directory_fsync)
+
+    with pytest.raises(module.PilotError, match="changed during publication"):
+        module._write_pilot_verification_trust(
+            receipt_path, completion.verification_trust, output_root=completion.output_root
+        )
+
+    assert receipt_path.read_bytes() == forged
+    assert (displaced / receipt_path.name).is_file()
+
+
+def test_trust_receipt_mode_is_exact_under_restrictive_umask(tmp_path: Path) -> None:
+    """Caller umask must not weaken the exact mode-0600 receipt contract."""
+    module = _load_module()
+    completion = module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=tmp_path / "pilot",
+        producer_source_commit="b" * 40,
+    )
+    receipt_path = tmp_path / "pilot-trust.json"
+    previous_umask = os.umask(0o777)
+    try:
+        module._write_pilot_verification_trust(
+            receipt_path, completion.verification_trust, output_root=completion.output_root
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
+
+
+def test_trust_first_crash_before_bundle_install_is_retryable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A persisted trust anchor without its bundle must allow exact retry completion."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    receipt_path = tmp_path / "pilot-trust.json"
+    arguments = {
+        "config": _tiny_config(module),
+        "tokenizer": _MaskTokenizer(),
+        "tokenizer_path": "/tokenizer",
+        "tokenizer_sha256": "a" * 64,
+        "output_root": output,
+        "verification_trust_path": receipt_path,
+        "producer_source_commit": "b" * 40,
+    }
+    original_rename = module._rename_noreplace
+
+    def crash_before_install(_source: Path, _destination: Path) -> None:
+        raise OSError(errno.EIO, "injected pre-install crash")
+
+    monkeypatch.setattr(module, "_rename_noreplace", crash_before_install)
+    with pytest.raises(module.PilotError, match="atomic pilot publication failed"):
+        module._build_pilot_bundles_for_test(_tiny_rows(), **arguments)
+
+    assert receipt_path.is_file()
+    assert not output.exists()
+    monkeypatch.setattr(module, "_rename_noreplace", original_rename)
+    completion = module._build_pilot_bundles_for_test(_tiny_rows(), **arguments)
+
+    assert completion.output_root == output
+    assert module.load_pilot_verification_trust(receipt_path) == completion.verification_trust
+
+
+def test_post_install_crash_adopts_exact_bundle_and_existing_trust(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A crash after no-replace install must be recoverable without replacing either artifact."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    receipt_path = tmp_path / "pilot-trust.json"
+    arguments = {
+        "config": _tiny_config(module),
+        "tokenizer": _MaskTokenizer(),
+        "tokenizer_path": "/tokenizer",
+        "tokenizer_sha256": "a" * 64,
+        "output_root": output,
+        "verification_trust_path": receipt_path,
+        "producer_source_commit": "b" * 40,
+    }
+    original_fsync_directory = module._fsync_directory
+    crashed = False
+
+    def crash_after_install(path: Path) -> None:
+        nonlocal crashed
+        original_fsync_directory(path)
+        if not crashed and path == output.parent and output.exists():
+            crashed = True
+            raise OSError("injected post-install crash")
+
+    monkeypatch.setattr(module, "_fsync_directory", crash_after_install)
+    with pytest.raises(OSError, match="injected post-install crash"):
+        module._build_pilot_bundles_for_test(_tiny_rows(), **arguments)
+
+    assert receipt_path.is_file()
+    assert output.is_dir()
+    installed_identity = (output.stat().st_dev, output.stat().st_ino)
+    monkeypatch.setattr(module, "_fsync_directory", original_fsync_directory)
+    completion = module._build_pilot_bundles_for_test(_tiny_rows(), **arguments)
+
+    assert completion.output_root == output
+    assert (output.stat().st_dev, output.stat().st_ino) == installed_identity
+
+
+def test_bundle_install_reauthenticates_external_trust_before_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A receipt replaced after trust-first creation must prevent successful publication."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    receipt_path = tmp_path / "pilot-trust.json"
+    original_rename = module._rename_noreplace
+
+    def install_then_forge_receipt(source: Path, destination: Path) -> None:
+        original_rename(source, destination)
+        forged = receipt_path.with_suffix(".forged")
+        forged.write_text('{"forged":true}\n')
+        forged.chmod(0o600)
+        forged.replace(receipt_path)
+
+    monkeypatch.setattr(module, "_rename_noreplace", install_then_forge_receipt)
+
+    with pytest.raises(module.PilotError, match="verification trust receipt"):
+        module._build_pilot_bundles_for_test(
+            _tiny_rows(),
+            config=_tiny_config(module),
+            tokenizer=_MaskTokenizer(),
+            tokenizer_path="/tokenizer",
+            tokenizer_sha256="a" * 64,
+            output_root=output,
+            verification_trust_path=receipt_path,
+            producer_source_commit="b" * 40,
+        )
+
+    assert output.is_dir()
+    assert receipt_path.read_bytes() == b'{"forged":true}\n'
 
 
 def test_public_verifier_rejects_nonproduction_bundle_even_when_self_hashed(tmp_path: Path) -> None:

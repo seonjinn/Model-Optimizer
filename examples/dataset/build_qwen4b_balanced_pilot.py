@@ -16,7 +16,7 @@ import stat
 import sys
 import tempfile
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass
@@ -31,6 +31,10 @@ TRAINING_SEQUENCE_LENGTH = 4_096
 
 class PilotError(ValueError):
     """The pilot's caller-pinned data or publication contract is invalid."""
+
+
+class _VerificationTrustExistsError(PilotError):
+    """The external no-replace trust receipt name is already occupied."""
 
 
 @dataclass(frozen=True)
@@ -783,8 +787,6 @@ def _build_pilot_bundles_for_test(
         verification_trust_path = _validate_external_trust_path(
             Path(verification_trust_path), output_root=output_root
         )
-        if os.path.lexists(verification_trust_path):
-            raise PilotError("verification trust receipt already exists")
     _validate_build_inputs(
         config=config,
         tokenizer_path=tokenizer_path,
@@ -793,7 +795,7 @@ def _build_pilot_bundles_for_test(
         output_root=output_root,
         workers=workers,
     )
-    if output_root.exists():
+    if verification_trust_path is None and output_root.exists():
         raise PilotError(f"publication destination already exists: {output_root}")
     scratch_parent = Path(scratch_root) if scratch_root is not None else output_root.parent
     if not scratch_parent.is_dir():
@@ -882,38 +884,45 @@ def _build_pilot_bundles_for_test(
             verification_trust=verification_trust,
         )
         _verify_bundle_file_evidence(partial, bundle_evidence)
+        if verification_trust_path is not None:
+            _ensure_pilot_verification_trust(
+                verification_trust_path,
+                verification_trust,
+                output_root=output_root,
+            )
         local_partial = output_root.parent / f".{output_root.name}.publish-{uuid.uuid4().hex}"
         shutil.copytree(partial, local_partial)
         os.chmod(local_partial, 0o700)
         _verify_bundle_file_evidence(local_partial, bundle_evidence)
         _fsync_tree(local_partial)
-        if output_root.exists():
-            raise PilotError(f"publication destination already exists: {output_root}")
         copied_stat = local_partial.lstat()
         copied_identity = (copied_stat.st_dev, copied_stat.st_ino)
+        installed_new = False
         try:
             _rename_noreplace(local_partial, output_root)
+            installed_new = True
         except OSError as error:
-            if error.errno == errno.EEXIST:
+            if error.errno != errno.EEXIST:
+                raise PilotError("atomic pilot publication failed") from error
+            if verification_trust_path is None:
                 raise PilotError(
                     f"publication destination already exists: {output_root}"
                 ) from error
-            raise PilotError("atomic pilot publication failed") from error
-        local_partial = None
-        _fsync_directory(output_root.parent)
+        if installed_new:
+            local_partial = None
+            _fsync_directory(output_root.parent)
         installed_stat = output_root.lstat()
-        if (installed_stat.st_dev, installed_stat.st_ino) != copied_identity:
+        if installed_new and (installed_stat.st_dev, installed_stat.st_ino) != copied_identity:
             raise PilotError("installed publication inode differs from its authenticated copy")
         _verify_bundle_file_evidence(output_root, bundle_evidence)
         complete, complete_raw = _read_json_stable(output_root / "COMPLETE.json")
         if hashlib.sha256(complete_raw).hexdigest() != verification_trust.complete_file_sha256:
             raise PilotError("installed bundle differs from caller-owned verification trust")
-        if verification_trust_path is not None:
-            _write_pilot_verification_trust(
-                verification_trust_path,
-                verification_trust,
-                output_root=output_root,
-            )
+        if (
+            verification_trust_path is not None
+            and load_pilot_verification_trust(verification_trust_path) != verification_trust
+        ):
+            raise PilotError("installed bundle verification trust receipt differs")
         return PilotCompletion(
             output_root=output_root,
             historical_proportion=arms[HISTORICAL_PROPORTION],
@@ -2021,6 +2030,100 @@ def _validate_external_trust_path(path: Path, *, output_root: Path) -> Path:
     return normalized
 
 
+def _open_nofollow_directory_chain(path: Path) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    """Hold every lexical directory component so later path replacement is detectable."""
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        raise PilotError("verification trust receipt requires no-follow directory support")
+    lexical = path.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        descriptors.append(os.open(lexical.anchor, flags))
+        for component in lexical.parts[1:]:
+            descriptors.append(os.open(component, flags, dir_fd=descriptors[-1]))
+        return tuple(descriptors), tuple(lexical.parts[1:])
+    except OSError as error:
+        for descriptor in reversed(descriptors):
+            with suppress(OSError):
+                os.close(descriptor)
+        raise PilotError(
+            "verification trust receipt path contains a symlink or changed during publication"
+        ) from error
+
+
+def _close_descriptors(descriptors: Sequence[int]) -> None:
+    for descriptor in reversed(descriptors):
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _rebind_nofollow_directory_chain(descriptors: Sequence[int], components: Sequence[str]) -> None:
+    if len(descriptors) != len(components) + 1:
+        raise PilotError("verification trust receipt directory chain is malformed")
+    try:
+        for parent_fd, child_fd, component in zip(
+            descriptors[:-1], descriptors[1:], components, strict=True
+        ):
+            opened = os.fstat(child_fd)
+            named = os.stat(component, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or stat.S_ISLNK(named.st_mode)
+                or _stable_stat_identity(opened) != _stable_stat_identity(named)
+            ):
+                raise PilotError("verification trust receipt path changed during publication")
+    except OSError as error:
+        raise PilotError("verification trust receipt path changed during publication") from error
+
+
+def _read_exact_descriptor(descriptor: int, expected: bytes) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    if b"".join(chunks) != expected:
+        raise PilotError("verification trust receipt changed during publication")
+
+
+def _read_bound_verification_trust(path: Path) -> bytes:
+    descriptors: tuple[int, ...] = ()
+    components: tuple[str, ...] = ()
+    receipt_fd: int | None = None
+    try:
+        descriptors, components = _open_nofollow_directory_chain(path.parent)
+        parent_fd = descriptors[-1]
+        receipt_fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        initial = os.fstat(receipt_fd)
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or stat.S_IMODE(initial.st_mode) != 0o600
+            or initial.st_nlink != 1
+        ):
+            raise PilotError("verification trust receipt identity is invalid")
+        os.lseek(receipt_fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while chunk := os.read(receipt_fd, 1024 * 1024):
+            chunks.append(chunk)
+        final = os.fstat(receipt_fd)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        _rebind_nofollow_directory_chain(descriptors, components)
+        if _stable_stat_identity(initial) != _stable_stat_identity(final) or _stable_stat_identity(
+            initial
+        ) != _stable_stat_identity(named):
+            raise PilotError("verification trust receipt identity is invalid")
+        return b"".join(chunks)
+    except OSError as error:
+        raise PilotError("verification trust receipt identity is invalid") from error
+    finally:
+        if receipt_fd is not None:
+            os.close(receipt_fd)
+        _close_descriptors(descriptors)
+
+
 def _quota_receipt(quotas: tuple[PilotQuota, ...]) -> list[dict[str, object]]:
     return [
         {"category": quota.category, "split": quota.split, "rows": quota.rows} for quota in quotas
@@ -2065,16 +2168,17 @@ def _write_pilot_verification_trust(
 ) -> None:
     path = _validate_external_trust_path(Path(path), output_root=Path(output_root))
     payload = (canonical_json(_verification_trust_receipt(trust)) + "\n").encode("utf-8")
-    parent_fd: int | None = None
+    directory_fds: tuple[int, ...] = ()
+    directory_components: tuple[str, ...] = ()
     descriptor: int | None = None
     created_identity: tuple[int, int] | None = None
     published = False
     try:
-        parent_fd = _open_nofollow_directory(path.parent)
-        parent_identity = os.fstat(parent_fd)
+        directory_fds, directory_components = _open_nofollow_directory_chain(path.parent)
+        parent_fd = directory_fds[-1]
         descriptor = os.open(
             path.name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
             dir_fd=parent_fd,
         )
@@ -2083,32 +2187,58 @@ def _write_pilot_verification_trust(
         offset = 0
         while offset < len(payload):
             offset += os.write(descriptor, payload[offset:])
+        os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
         completed = os.fstat(descriptor)
         named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if _stable_stat_identity(completed) != _stable_stat_identity(named) or (
-            os.fstat(parent_fd).st_dev,
-            os.fstat(parent_fd).st_ino,
-        ) != (parent_identity.st_dev, parent_identity.st_ino):
+        _read_exact_descriptor(descriptor, payload)
+        _rebind_nofollow_directory_chain(directory_fds, directory_components)
+        if (
+            not stat.S_ISREG(completed.st_mode)
+            or stat.S_IMODE(completed.st_mode) != 0o600
+            or completed.st_nlink != 1
+            or _stable_stat_identity(completed) != _stable_stat_identity(named)
+        ):
             raise PilotError("verification trust receipt changed during publication")
         os.fsync(parent_fd)
+        final = os.fstat(descriptor)
+        final_named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        _read_exact_descriptor(descriptor, payload)
+        _rebind_nofollow_directory_chain(directory_fds, directory_components)
+        if _stable_stat_identity(completed) != _stable_stat_identity(
+            final
+        ) or _stable_stat_identity(completed) != _stable_stat_identity(final_named):
+            raise PilotError("verification trust receipt changed during publication")
         published = True
     except FileExistsError as error:
-        raise PilotError("verification trust receipt already exists") from error
+        raise _VerificationTrustExistsError("verification trust receipt already exists") from error
     except OSError as error:
         raise PilotError("verification trust receipt publication failed") from error
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        if parent_fd is not None:
+        if directory_fds:
+            parent_fd = directory_fds[-1]
             if created_identity is not None and not published:
                 try:
+                    _rebind_nofollow_directory_chain(directory_fds, directory_components)
                     named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
                     if (named.st_dev, named.st_ino) == created_identity:
                         os.unlink(path.name, dir_fd=parent_fd)
-                except FileNotFoundError:
+                        os.fsync(parent_fd)
+                except (FileNotFoundError, PilotError):
                     pass
-            os.close(parent_fd)
+            _close_descriptors(directory_fds)
+
+
+def _ensure_pilot_verification_trust(
+    path: Path, trust: PilotVerificationTrust, *, output_root: Path
+) -> None:
+    try:
+        _write_pilot_verification_trust(path, trust, output_root=output_root)
+    except _VerificationTrustExistsError as error:
+        if load_pilot_verification_trust(path) != trust:
+            raise PilotError("existing verification trust receipt differs") from error
 
 
 def _quotas_from_receipt(value: object, *, arm: str) -> tuple[PilotQuota, ...]:
@@ -2136,7 +2266,8 @@ def _quotas_from_receipt(value: object, *, arm: str) -> tuple[PilotQuota, ...]:
 def load_pilot_verification_trust(path: Path) -> PilotVerificationTrust:
     """Load one strict caller-owned trust receipt for cross-job verification."""
     try:
-        receipt, _raw = _read_json_stable(Path(path))
+        raw = _read_bound_verification_trust(Path(path))
+        receipt = json.loads(raw)
         if (
             set(receipt)
             != {

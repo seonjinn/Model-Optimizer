@@ -219,3 +219,51 @@ Fresh local evidence on 2026-08-25:
 
 This round is local and unpushed; an independent non-Claude rereview is still
 required after the signed follow-up commit.
+
+## Final trust-publication transaction corrective round
+
+The independent review of signed HEAD `a954d2151` found that the external trust
+receipt could lose its requested lexical pathname during publication, that a
+restrictive caller umask could weaken its exact mode contract, and that the
+bundle was installed before the required external trust receipt. All production
+changes in this round were preceded by deterministic failing regressions:
+
+- Two receipt-path races renamed or replaced the lexical parent after file or
+  directory fsync. The old writer returned success; the new writer retains a
+  no-follow descriptor for every path component, retains the created file
+  descriptor, and rebinds the complete root-to-leaf directory chain plus the
+  named receipt inode before and after the final parent fsync. A forged receipt
+  at a replacement pathname is neither accepted nor deleted.
+- A mode test under umask `0777` observed mode `000` before the fix. Receipt
+  publication now applies `fchmod(0600)` through the held file descriptor and
+  verifies exact regular-file mode, link count, bytes, and stable identity.
+- An injected failure before bundle rename previously left no trust receipt.
+  Publication is now trust-first and create-or-authenticate: an exact existing
+  receipt is retryable, while a foreign or mismatched receipt is never replaced.
+- An injected failure after no-replace bundle installation now leaves an exact
+  trust/bundle pair that a rerun authenticates and adopts without replacing the
+  installed inode. A destination that does not match freshly recomputed bundle
+  evidence is rejected and is never deleted or overwritten.
+- A sixth RED replaced the receipt immediately after bundle rename. The builder
+  now reopens and authenticates the external receipt after installed bundle and
+  COMPLETE verification, before it can report success.
+
+Fresh local evidence on 2026-08-25:
+
+- Original five RED cases: `5 failed, 47 deselected`; after implementation:
+  `5 passed, 47 deselected`.
+- Post-install receipt replacement RED: `1 failed, 52 deselected`; after the
+  final reauthentication: GREEN.
+- Final publication/trust focused gate: `7 passed, 46 deselected in 0.52s`.
+- Dependency-available local suite: `51 passed, 1 skipped, 1 deselected in
+  2.67s`. The deselected genuine HF Qwen tokenizer integration is unchanged and
+  could not run because this host currently has neither `tokenizers` nor
+  `transformers`; the unfiltered command reported exactly that one
+  `ModuleNotFoundError`, alongside `51 passed, 1 skipped`.
+- Ruff check and format check: passed.
+- Pyright: `0 errors, 0 warnings, 0 informations`.
+- `py_compile` and `git diff --check`: passed.
+
+The final signed corrective HEAD and the frozen full binary diff SHA-256 are
+recorded in the independent-review handoff; a commit cannot embed its own object
+ID. No push, SSH session, build, or cluster job was performed.
