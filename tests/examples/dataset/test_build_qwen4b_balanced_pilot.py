@@ -226,6 +226,14 @@ class _Qwen3MaskTokenizer(_MaskTokenizer):
         return {"<|im_start|>": 151_644, "<|im_end|>": 151_645}[token]
 
 
+class _ForgedOneTokenQwenTokenizer(_Qwen3MaskTokenizer):
+    chat_template = "forged-qwen3-template"
+
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs["return_assistant_tokens_mask"] is True
+        return {"input_ids": [0], "assistant_masks": [1]}
+
+
 def _tiny_config(module, *, minimum_assistant_tokens: int = 1):
     quota = module.PilotQuota("chat", "chat", 2)
     return module.PilotConfig(
@@ -726,11 +734,83 @@ def _rehash_receipts(module, output: Path, arm: str) -> None:
     complete_path.write_text(module.canonical_json(complete) + "\n")
 
 
+def _forge_all_bundle_token_evidence(module, output: Path, tokenizer_source: Path) -> None:
+    for arm in ("historical-proportion", "balanced"):
+        data_path = output / arm / "data.jsonl"
+        rows = [json.loads(line) for line in data_path.read_text().splitlines()]
+        for row in rows:
+            assert row["assistant_tokens"] == 6
+            row["assistant_tokens"] = 1
+        data_path.write_text(
+            "".join(module.canonical_json(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        token_digest = hashlib.sha256()
+        for row in sorted(rows, key=lambda value: value["prompt_uuid"]):
+            token_digest.update(module.canonical_json([row["prompt_uuid"], 1]).encode("utf-8"))
+            token_digest.update(b"\n")
+        manifest_path = output / arm / "MANIFEST.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["data_file"] = {
+            "path": "data.jsonl",
+            "bytes": data_path.stat().st_size,
+            "sha256": hashlib.sha256(data_path.read_bytes()).hexdigest(),
+        }
+        manifest["assistant_tokens"] = len(rows)
+        manifest["token_evidence_sha256"] = token_digest.hexdigest()
+        manifest["tokenizer"] = {
+            "path": str(tokenizer_source),
+            "sha256": _tree_digest(tokenizer_source),
+            "chat_template_sha256": hashlib.sha256(
+                _ForgedOneTokenQwenTokenizer.chat_template.encode()
+            ).hexdigest(),
+        }
+        manifest["manifest_sha256"] = module._self_hash(manifest, "manifest_sha256")
+        manifest_path.write_text(module.canonical_json(manifest) + "\n")
+    complete_path = output / "COMPLETE.json"
+    complete = json.loads(complete_path.read_text())
+    for arm in ("historical-proportion", "balanced"):
+        manifest = json.loads((output / arm / "MANIFEST.json").read_text())
+        complete["arms"][arm]["manifest_sha256"] = manifest["manifest_sha256"]
+    complete["complete_sha256"] = module._self_hash(complete, "complete_sha256")
+    complete_path.write_text(module.canonical_json(complete) + "\n")
+
+
+def test_external_verification_trust_rejects_coordinated_bundle_and_tokenizer_rehash(
+    tmp_path: Path,
+) -> None:
+    """A self-consistent forged bundle must still differ from caller-owned build identity."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    tokenizer_source = tmp_path / "tokenizer"
+    tokenizer_source.mkdir()
+    (tokenizer_source / "tokenizer.json").write_text('{"identity":"original"}\n')
+    completion = module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path=tokenizer_source,
+        tokenizer_sha256=_tree_digest(tokenizer_source),
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+    caller_trust = completion.verification_trust
+    (tokenizer_source / "tokenizer.json").write_text('{"identity":"forged"}\n')
+    _forge_all_bundle_token_evidence(module, output, tokenizer_source)
+
+    with pytest.raises(module.PilotError, match="caller-owned verification trust"):
+        module._verify_bundle_root(
+            output,
+            production=False,
+            tokenizer=_ForgedOneTokenQwenTokenizer(),
+            verification_trust=caller_trust,
+        )
+
+
 def test_public_verifier_rejects_nonproduction_bundle_even_when_self_hashed(tmp_path: Path) -> None:
     """A valid tiny test receipt must never pass the production completion boundary."""
     module = _load_module()
     output = tmp_path / "pilot"
-    module._build_pilot_bundles_for_test(
+    completion = module._build_pilot_bundles_for_test(
         _tiny_rows(),
         config=_tiny_config(module),
         tokenizer=_MaskTokenizer(),
@@ -741,7 +821,7 @@ def test_public_verifier_rejects_nonproduction_bundle_even_when_self_hashed(tmp_
     )
 
     with pytest.raises(module.PilotError, match="production"):
-        module.verify_pilot_completion(output)
+        module.verify_pilot_completion(output, verification_trust=completion.verification_trust)
 
 
 @pytest.mark.parametrize(
@@ -971,6 +1051,56 @@ def test_execution_parallelism_does_not_change_scientific_bundle_bytes(tmp_path:
     ).read_bytes()
 
 
+def test_publication_tokenizes_each_arm_once_then_replays_only_authenticated_bytes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Copy and install verification must not repeat the full selected-row tokenizer pass."""
+    module = _load_module()
+    original = module._read_data_evidence
+    replayed_arms: list[str] = []
+
+    def record_replay(path: Path, **kwargs):
+        replayed_arms.append(path.parent.name)
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(module, "_read_data_evidence", record_replay)
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=tmp_path / "pilot",
+        producer_source_commit="b" * 40,
+    )
+
+    assert replayed_arms == ["historical-proportion", "balanced"]
+
+
+def test_copy_evidence_hashes_data_streamingly_without_materializing_file_bytes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The 200K-row copy check must never collect either JSONL file in memory."""
+    module = _load_module()
+    original = module._read_file_stable
+
+    def reject_data_materialization(path: Path) -> bytes:
+        if path.name == "data.jsonl":
+            raise AssertionError("data.jsonl was materialized for copy evidence")
+        return original(path)
+
+    monkeypatch.setattr(module, "_read_file_stable", reject_data_materialization)
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=tmp_path / "pilot",
+        producer_source_commit="b" * 40,
+    )
+
+
 def _tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     for path in sorted(path for path in root.rglob("*") if path.is_file()):
@@ -1182,9 +1312,25 @@ def test_public_failures_are_normalized_to_pilot_error(tmp_path: Path) -> None:
     """Filesystem and JSON scalar failures must not leak implementation exceptions."""
     module = _load_module()
     missing = tmp_path / "missing"
+    quota = module.PilotQuota("chat", "chat", 1)
+    trust = module.PilotVerificationTrust(
+        complete_file_sha256="0" * 64,
+        historical_manifest_sha256="1" * 64,
+        balanced_manifest_sha256="2" * 64,
+        source_repository="nvidia/Nemotron-Post-Training-Dataset-v2",
+        source_revision="3" * 40,
+        seed=module.SEED,
+        historical_quotas=(quota,),
+        balanced_quotas=(quota,),
+        tokenizer_sha256="4" * 64,
+        chat_template_sha256="5" * 64,
+        producer_source_commit="6" * 40,
+        minimum_assistant_tokens=1,
+        training_sequence_length=4_096,
+    )
 
     with pytest.raises(module.PilotError):
-        module.verify_pilot_completion(missing)
+        module.verify_pilot_completion(missing, verification_trust=trust)
     with pytest.raises(module.PilotError):
         module.select_pilot_rows({"chat": iter([object()])}, config=_tiny_config(module))
     with pytest.raises(module.PilotError):

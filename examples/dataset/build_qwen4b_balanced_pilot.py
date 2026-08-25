@@ -141,6 +141,58 @@ class PilotArmCompletion:
 
 
 @dataclass(frozen=True)
+class PilotVerificationTrust:
+    """Caller-owned identity that must be supplied to verify an installed bundle."""
+
+    complete_file_sha256: str
+    historical_manifest_sha256: str
+    balanced_manifest_sha256: str
+    source_repository: str
+    source_revision: str
+    seed: int
+    historical_quotas: tuple[PilotQuota, ...]
+    balanced_quotas: tuple[PilotQuota, ...]
+    tokenizer_sha256: str
+    chat_template_sha256: str
+    producer_source_commit: str
+    minimum_assistant_tokens: int
+    training_sequence_length: int
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("complete file", self.complete_file_sha256),
+            ("historical manifest", self.historical_manifest_sha256),
+            ("balanced manifest", self.balanced_manifest_sha256),
+            ("tokenizer", self.tokenizer_sha256),
+            ("chat template", self.chat_template_sha256),
+        ):
+            if not _is_sha256(value):
+                raise PilotError(f"{label} trust identity must be an exact lowercase SHA-256")
+        if not self.source_repository:
+            raise PilotError("source repository trust identity is required")
+        for label, value in (
+            ("source revision", self.source_revision),
+            ("producer source commit", self.producer_source_commit),
+        ):
+            if (
+                type(value) is not str
+                or len(value) not in (40, 64)
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise PilotError(f"{label} trust identity is invalid")
+        if type(self.seed) is not int:
+            raise PilotError("seed trust identity must be a strict integer")
+        _validate_quotas(HISTORICAL_PROPORTION, self.historical_quotas)
+        _validate_quotas(BALANCED, self.balanced_quotas)
+        for label, value in (
+            ("minimum assistant tokens", self.minimum_assistant_tokens),
+            ("training sequence length", self.training_sequence_length),
+        ):
+            if type(value) is not int or value < 1:
+                raise PilotError(f"{label} trust identity must be a positive integer")
+
+
+@dataclass(frozen=True)
 class PilotCompletion:
     """Receipt-bound aggregate completion for the two-arm publication root."""
 
@@ -148,6 +200,7 @@ class PilotCompletion:
     historical_proportion: PilotArmCompletion
     balanced: PilotArmCompletion
     complete_sha256: str
+    verification_trust: PilotVerificationTrust
 
 
 @dataclass(frozen=True)
@@ -787,14 +840,31 @@ def _build_pilot_bundles_for_test(
             effective_workers=effective_workers,
             execution=execution,
         )
-        _verify_bundle_root(partial, production=_production, tokenizer=tokenizer)
+        verification_trust = _build_verification_trust(
+            partial,
+            config=config,
+            arms=arms,
+            tokenizer_sha256=tokenizer_sha256,
+            chat_template_sha256=template_sha256,
+            producer_source_commit=producer_source_commit,
+        )
+        bundle_evidence = _bundle_file_evidence(partial)
+        _verify_bundle_root(
+            partial,
+            production=_production,
+            tokenizer=tokenizer,
+            verification_trust=verification_trust,
+        )
+        _verify_bundle_file_evidence(partial, bundle_evidence)
         local_partial = output_root.parent / f".{output_root.name}.publish-{uuid.uuid4().hex}"
         shutil.copytree(partial, local_partial)
         os.chmod(local_partial, 0o700)
-        _verify_bundle_root(local_partial, production=_production, tokenizer=tokenizer)
+        _verify_bundle_file_evidence(local_partial, bundle_evidence)
         _fsync_tree(local_partial)
         if output_root.exists():
             raise PilotError(f"publication destination already exists: {output_root}")
+        copied_stat = local_partial.lstat()
+        copied_identity = (copied_stat.st_dev, copied_stat.st_ino)
         try:
             _rename_noreplace(local_partial, output_root)
         except OSError as error:
@@ -805,13 +875,19 @@ def _build_pilot_bundles_for_test(
             raise PilotError("atomic pilot publication failed") from error
         local_partial = None
         _fsync_directory(output_root.parent)
-        _verify_bundle_root(output_root, production=_production, tokenizer=tokenizer)
-        complete = _read_json(output_root / "COMPLETE.json")
+        installed_stat = output_root.lstat()
+        if (installed_stat.st_dev, installed_stat.st_ino) != copied_identity:
+            raise PilotError("installed publication inode differs from its authenticated copy")
+        _verify_bundle_file_evidence(output_root, bundle_evidence)
+        complete, complete_raw = _read_json_stable(output_root / "COMPLETE.json")
+        if hashlib.sha256(complete_raw).hexdigest() != verification_trust.complete_file_sha256:
+            raise PilotError("installed bundle differs from caller-owned verification trust")
         return PilotCompletion(
             output_root=output_root,
             historical_proportion=arms[HISTORICAL_PROPORTION],
             balanced=arms[BALANCED],
             complete_sha256=str(complete["complete_sha256"]),
+            verification_trust=verification_trust,
         )
     finally:
         if connection is not None:
@@ -825,18 +901,29 @@ def _build_pilot_bundles_for_test(
 
 
 def verify_pilot_completion(
-    output_root: Path, *, scratch_root: Path | None = None
+    output_root: Path,
+    *,
+    verification_trust: PilotVerificationTrust,
+    scratch_root: Path | None = None,
 ) -> PilotCompletion:
     """Replay every file descriptor and receipt in an installed pilot root."""
     try:
         output_root = Path(output_root)
-        arms = _verify_bundle_root(output_root, production=True, scratch_root=scratch_root)
-        complete = _read_json(output_root / "COMPLETE.json")
+        arms = _verify_bundle_root(
+            output_root,
+            production=True,
+            scratch_root=scratch_root,
+            verification_trust=verification_trust,
+        )
+        complete, complete_raw = _read_json_stable(output_root / "COMPLETE.json")
+        if hashlib.sha256(complete_raw).hexdigest() != verification_trust.complete_file_sha256:
+            raise PilotError("installed bundle differs from caller-owned verification trust")
         return PilotCompletion(
             output_root=output_root,
             historical_proportion=arms[HISTORICAL_PROPORTION],
             balanced=arms[BALANCED],
             complete_sha256=str(complete["complete_sha256"]),
+            verification_trust=verification_trust,
         )
     except PilotError:
         raise
@@ -1334,6 +1421,33 @@ def _write_spooled_bundle_contents(
     return arms
 
 
+def _build_verification_trust(
+    root: Path,
+    *,
+    config: PilotConfig,
+    arms: Mapping[str, PilotArmCompletion],
+    tokenizer_sha256: str,
+    chat_template_sha256: str,
+    producer_source_commit: str,
+) -> PilotVerificationTrust:
+    """Capture the producer's immutable preimage for a separate verification caller."""
+    return PilotVerificationTrust(
+        complete_file_sha256=_sha256_file(root / "COMPLETE.json"),
+        historical_manifest_sha256=arms[HISTORICAL_PROPORTION].manifest_sha256,
+        balanced_manifest_sha256=arms[BALANCED].manifest_sha256,
+        source_repository=config.source_repository,
+        source_revision=config.source_revision,
+        seed=config.seed,
+        historical_quotas=config.historical_quotas,
+        balanced_quotas=config.balanced_quotas,
+        tokenizer_sha256=tokenizer_sha256,
+        chat_template_sha256=chat_template_sha256,
+        producer_source_commit=producer_source_commit,
+        minimum_assistant_tokens=config.minimum_assistant_tokens,
+        training_sequence_length=config.training_sequence_length,
+    )
+
+
 _MANIFEST_FIELDS = {
     "schema_version",
     "arm",
@@ -1362,6 +1476,7 @@ def _verify_bundle_root(
     production: bool = True,
     tokenizer: Any | None = None,
     scratch_root: Path | None = None,
+    verification_trust: PilotVerificationTrust | None = None,
 ) -> dict[str, PilotArmCompletion]:
     try:
         return _verify_bundle_root_impl(
@@ -1369,6 +1484,7 @@ def _verify_bundle_root(
             production=production,
             tokenizer=tokenizer,
             scratch_root=scratch_root,
+            verification_trust=verification_trust,
         )
     except PilotError:
         raise
@@ -1383,8 +1499,20 @@ def _verify_bundle_root_impl(
     production: bool,
     tokenizer: Any | None,
     scratch_root: Path | None,
+    verification_trust: PilotVerificationTrust | None,
 ) -> dict[str, PilotArmCompletion]:
-    complete = _read_json(root / "COMPLETE.json")
+    if production and not isinstance(verification_trust, PilotVerificationTrust):
+        raise PilotError("production verification requires caller-owned verification trust")
+    if verification_trust is not None and not isinstance(
+        verification_trust, PilotVerificationTrust
+    ):
+        raise PilotError("caller-owned verification trust has an invalid type")
+    complete, complete_raw = _read_json_stable(root / "COMPLETE.json")
+    if (
+        verification_trust is not None
+        and hashlib.sha256(complete_raw).hexdigest() != verification_trust.complete_file_sha256
+    ):
+        raise PilotError("bundle differs from caller-owned verification trust")
     if (
         set(complete) != {"schema_version", "arms", "complete_sha256"}
         or complete.get("schema_version") != "qwen3-4b-balanced-pilot-v1"
@@ -1409,7 +1537,7 @@ def _verify_bundle_root_impl(
         ):
             raise PilotError("aggregate completion manifest descriptor is invalid")
         manifest_path = root / f"{arm}/MANIFEST.json"
-        manifest = _read_json(manifest_path)
+        manifest, _manifest_raw = _read_json_stable(manifest_path)
         _validate_manifest_schema(manifest, arm=arm, production=production)
         if manifest["manifest_sha256"] != _self_hash(manifest, "manifest_sha256"):
             raise PilotError(f"{arm} manifest self-hash does not reconcile")
@@ -1418,6 +1546,8 @@ def _verify_bundle_root_impl(
         _verify_execution_receipt(manifest_path.parent / "EXECUTION.json")
         manifests[arm] = manifest
     _validate_cross_arm_pins(manifests)
+    if verification_trust is not None:
+        _validate_verification_trust(manifests, verification_trust)
     staged: Path | None = None
     owned_scratch: Path | None = None
     verified_tokenizer = tokenizer
@@ -1774,6 +1904,38 @@ def _validate_cross_arm_pins(manifests: Mapping[str, dict[str, Any]]) -> None:
         raise PilotError("cross-arm scientific pins do not reconcile")
 
 
+def _validate_verification_trust(
+    manifests: Mapping[str, dict[str, Any]], trust: PilotVerificationTrust
+) -> None:
+    historical = manifests[HISTORICAL_PROPORTION]
+    balanced = manifests[BALANCED]
+    expected_common = {
+        "source": {
+            "repository": trust.source_repository,
+            "revision": trust.source_revision,
+        },
+        "seed": trust.seed,
+        "tokenizer": {
+            "path": historical["tokenizer"]["path"],
+            "sha256": trust.tokenizer_sha256,
+            "chat_template_sha256": trust.chat_template_sha256,
+        },
+        "minimum_assistant_tokens": trust.minimum_assistant_tokens,
+        "training_sequence_length": trust.training_sequence_length,
+        "producer_source_commit": trust.producer_source_commit,
+    }
+    for manifest in (historical, balanced):
+        if any(manifest[field] != value for field, value in expected_common.items()):
+            raise PilotError("bundle differs from caller-owned verification trust")
+    if (
+        historical["manifest_sha256"] != trust.historical_manifest_sha256
+        or balanced["manifest_sha256"] != trust.balanced_manifest_sha256
+        or historical["quotas"] != {quota.split: quota.rows for quota in trust.historical_quotas}
+        or balanced["quotas"] != {quota.split: quota.rows for quota in trust.balanced_quotas}
+    ):
+        raise PilotError("bundle differs from caller-owned verification trust")
+
+
 def _quota_counts(config: PilotConfig, arm: str) -> dict[str, int]:
     quotas = config.historical_quotas if arm == HISTORICAL_PROPORTION else config.balanced_quotas
     return {quota.split: quota.rows for quota in quotas}
@@ -1794,6 +1956,139 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise PilotError(f"receipt must be a JSON object: {path}")
     return payload
+
+
+def _read_file_stable(path: Path) -> bytes:
+    parent_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        parent_fd = _open_nofollow_directory(path.parent)
+        parent_initial = os.fstat(parent_fd)
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        initial = os.fstat(descriptor)
+        if not stat.S_ISREG(initial.st_mode):
+            raise PilotError(f"receipt is not a regular file: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        final = os.fstat(descriptor)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        parent_final = os.fstat(parent_fd)
+        if (
+            _stable_stat_identity(initial) != _stable_stat_identity(final)
+            or _stable_stat_identity(initial) != _stable_stat_identity(named)
+            or _stable_stat_identity(parent_initial) != _stable_stat_identity(parent_final)
+        ):
+            raise PilotError(f"file changed during verification: {path}")
+        return b"".join(chunks)
+    except OSError as error:
+        raise PilotError(f"file changed during verification: {path}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _read_json_stable(path: Path) -> tuple[dict[str, Any], bytes]:
+    raw = _read_file_stable(path)
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PilotError(f"unable to read receipt: {path}") from error
+    if not isinstance(payload, dict):
+        raise PilotError(f"receipt must be a JSON object: {path}")
+    return payload, raw
+
+
+def _file_evidence_stable(path: Path) -> tuple[int, str]:
+    parent_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        parent_fd = _open_nofollow_directory(path.parent)
+        parent_initial = os.fstat(parent_fd)
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        initial = os.fstat(descriptor)
+        if not stat.S_ISREG(initial.st_mode):
+            raise PilotError(f"bundle component is not a regular file: {path}")
+        digest = hashlib.sha256()
+        size = 0
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+        final = os.fstat(descriptor)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        parent_final = os.fstat(parent_fd)
+        if (
+            _stable_stat_identity(initial) != _stable_stat_identity(final)
+            or _stable_stat_identity(initial) != _stable_stat_identity(named)
+            or _stable_stat_identity(parent_initial) != _stable_stat_identity(parent_final)
+        ):
+            raise PilotError(f"bundle component changed during verification: {path}")
+        return size, digest.hexdigest()
+    except OSError as error:
+        raise PilotError(f"bundle component changed during verification: {path}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+_BUNDLE_FILES = tuple(
+    [Path("COMPLETE.json")]
+    + [
+        Path(arm) / name
+        for arm in (HISTORICAL_PROPORTION, BALANCED)
+        for name in ("data.jsonl", "EXECUTION.json", "MANIFEST.json")
+    ]
+)
+
+
+def _stable_directory_names(path: Path) -> tuple[str, ...]:
+    descriptor = _open_nofollow_directory(path)
+    try:
+        initial = os.fstat(descriptor)
+        names = tuple(sorted(os.listdir(descriptor)))
+        final = os.fstat(descriptor)
+        if _stable_stat_identity(initial) != _stable_stat_identity(final):
+            raise PilotError(f"bundle directory changed during verification: {path}")
+        return names
+    finally:
+        os.close(descriptor)
+
+
+def _bundle_file_evidence(root: Path) -> dict[str, tuple[int, str]]:
+    if _stable_directory_names(root) != (
+        "COMPLETE.json",
+        BALANCED,
+        HISTORICAL_PROPORTION,
+    ):
+        raise PilotError("bundle root file set is invalid")
+    for arm in (HISTORICAL_PROPORTION, BALANCED):
+        if _stable_directory_names(root / arm) != (
+            "EXECUTION.json",
+            "MANIFEST.json",
+            "data.jsonl",
+        ):
+            raise PilotError(f"{arm} bundle file set is invalid")
+    evidence: dict[str, tuple[int, str]] = {}
+    for relative in _BUNDLE_FILES:
+        evidence[relative.as_posix()] = _file_evidence_stable(root / relative)
+    return evidence
+
+
+def _verify_bundle_file_evidence(root: Path, expected: Mapping[str, tuple[int, str]]) -> None:
+    if _bundle_file_evidence(root) != dict(expected):
+        raise PilotError("bundle copy differs from authenticated producer evidence")
 
 
 def _sha256_file(path: Path) -> str:
