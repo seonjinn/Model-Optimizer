@@ -1,0 +1,31 @@
+{
+  "artifact_directory_name": "dflash-s4166",
+  "artifact_file_sha256": {
+    "config.json": "d502e18b23ea01dd7f0763840cd91a4545518cf594ba925d45de94eb1a40d35a",
+    "model.safetensors": "8bc3f5608d5a0db4833cf7a972f886bb81c241620ff577149d85af7a14103d15"
+  },
+  "config": {
+    "architecture": "DFlashDraftModel",
+    "block_size": 8,
+    "mask_token_id": 151669,
+    "num_speculative_tokens": 7,
+    "target_layer_ids": [
+      1,
+      12,
+      23,
+      34,
+      45
+    ]
+  },
+  "producer": "q30-opb-dflash-s4166-identity-v1",
+  "schema_version": 1,
+  "source": {
+    "opb_training_milestone": 4166,
+    "q30_revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+    "speculators_sha": "0b08a89a83b92007be63f128e01497455b0209df"
+  },
+  "source_manifest_sha256": {
+    "manifest/dflash-s4166.sha256": "fc6b7a7ea0c48bb0b45bb3ec68fd6d4bd75be3b7308a462aeeba0da5b74ce9c3",
+    "manifest/identity.json": "dc86f88b28c12e749812b291f8ef6458dab8d2ee1d7171f585e60b20c62bad02"
+  }
+}

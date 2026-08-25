@@ -29,6 +29,10 @@ for name in CELL_A CELL_B CONTAINER_IDENTITY_PATH CONTAINER_IMAGE \
     SPECULATORS_REPO SPECULATORS_SHA; do
     [[ -n "${!name:-}" ]] || { echo "ERROR: ${name} is required" >&2; exit 2; }
 done
+if [[ "${CELL_A%%|*}" == ngram || "${CELL_B%%|*}" == ngram ]]; then
+    echo "ERROR: exact b389 Model Runner V2 does not support ngram/ngram_gpu speculative decoding" >&2
+    exit 2
+fi
 
 validate_label() {
     local label="$1"
@@ -61,6 +65,8 @@ TIE_AWARE_PILOT_MODE=0
 DFLASH2_INTERNAL_TARGET_MODE=0
 DFLASH2_ENFORCE_EAGER_MODE=0
 DFLASH2_DISABLE_PREFIX_CACHING_MODE=0
+OPB_DFLASH_STAGE_RECEIPT=""
+STAGED_OPB_DFLASH_PATH=""
 
 [[ "$(git -C "${MODELOPT_REPO}" rev-parse HEAD)" == "${MODELOPT_SHA}" ]]
 [[ -z "$(git -C "${MODELOPT_REPO}" status --porcelain)" ]]
@@ -97,7 +103,7 @@ validate_cell() {
     tp_size="${tp_size:-2}"
     validate_label "${label}"
     case "${method}:${block_size}:${spec_tokens}" in
-        baseline:0:0|ngram:0:7|dflash:8:7|dflash:16:15|dflash2:8:7|dspark:8:8|dspark:16:16) ;;
+        baseline:0:0|dflash:8:7|dflash:16:15|dflash2:8:7|dspark:8:8|dspark:16:16) ;;
         *) echo "ERROR: invalid cell descriptor: ${descriptor}" >&2; return 2 ;;
     esac
     case "${concurrency}" in
@@ -112,7 +118,7 @@ validate_cell() {
         echo "ERROR: C128 requires at least 512 requests" >&2
         return 2
     fi
-    if [[ "${method}" != baseline && "${method}" != ngram ]]; then
+    if [[ "${method}" != baseline ]]; then
         [[ -r "${draft}/config.json" && -r "${draft}/model.safetensors" ]]
     fi
 }
@@ -147,7 +153,14 @@ run_cell() {
     if [[ -n "${ARTIFACT_IDENTITY_PATH}" ]]; then
         mounts+=",${ARTIFACT_IDENTITY_PATH}:${ARTIFACT_IDENTITY_PATH}"
     fi
-    if [[ "${method}" != baseline && "${method}" != ngram ]]; then
+    if [[ "${method}" == dflash && "${DFLASH2_INTERNAL_TARGET_MODE}" == 1 ]]; then
+        [[ -r "${OPB_DFLASH_STAGE_RECEIPT}" && -n "${STAGED_OPB_DFLASH_PATH}" ]] || {
+            echo "ERROR: staged OPB DFlash control receipt is required" >&2
+            return 2
+        }
+        mounts+=",${OPB_DFLASH_STAGE_RECEIPT}:${OPB_DFLASH_STAGE_RECEIPT}"
+    fi
+    if [[ "${method}" != baseline ]]; then
         mounts+=",${draft}:${draft}"
     fi
 
@@ -199,6 +212,7 @@ run_cell() {
         DFLASH2_INTERNAL_TARGET="${DFLASH2_INTERNAL_TARGET_MODE}" \
         DFLASH2_ENFORCE_EAGER="${DFLASH2_ENFORCE_EAGER_MODE}" \
         DFLASH2_DISABLE_PREFIX_CACHING="${DFLASH2_DISABLE_PREFIX_CACHING_MODE}" \
+        OPB_DFLASH_STAGE_RECEIPT="${OPB_DFLASH_STAGE_RECEIPT}" \
         CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
         CONTAINER_IDENTITY_PATH="${CONTAINER_IDENTITY_PATH}" \
         bash "${WRAPPER}"
@@ -260,14 +274,9 @@ validate_cell "${CELL_A}"
 validate_cell "${CELL_B}"
 method_a="${CELL_A%%|*}"
 method_b="${CELL_B%%|*}"
-if [[ ("${method_a}" == ngram || "${method_b}" == ngram) \
-    && "${PAIR_PHASE}" != internal-target-ngram-eager-no-prefix ]]; then
-    echo "ERROR: ngram cells are restricted to the internal-target ngram diagnostic" >&2
-    exit 2
-fi
 if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
     || "${PAIR_PHASE}" == diagnostic \
-    || "${PAIR_PHASE}" == internal-target-ngram-eager-no-prefix ]]; then
+    || "${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix ]]; then
     for name in SERVER_RUNTIME_RECEIPT_SHA256 \
         DRAFT_MILESTONE_MANIFEST_PATH DRAFT_MILESTONE_MANIFEST_SHA256 \
         TARGET_RECEIPT_PATH TARGET_RECEIPT_SHA256 TARGET_SHA256; do
@@ -282,10 +291,10 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
             echo "ERROR: CONTROL_DRAFT_EXPORT_PATH is required for diagnostic identity" >&2
             exit 2
         }
-    elif [[ "${PAIR_PHASE}" == internal-target-ngram-eager-no-prefix ]]; then
-        [[ "${method_a}:${method_b}" == baseline:ngram \
-            || "${method_a}:${method_b}" == ngram:baseline ]] || {
-            echo "ERROR: ngram control must contain exactly baseline and ngram" >&2
+    elif [[ "${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix ]]; then
+        [[ "${method_a}:${method_b}" == baseline:dflash \
+            || "${method_a}:${method_b}" == dflash:baseline ]] || {
+            echo "ERROR: DFlash control must contain exactly baseline and dflash" >&2
             exit 2
         }
         [[ -n "${CONTROL_DRAFT_EXPORT_PATH:-}" ]] || {
@@ -303,10 +312,33 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
         IFS='|' read -r _ _ _ concurrency max_requests _ _ tp_size <<<"${descriptor}"
         tp_size="${tp_size:-2}"
         case "${PAIR_PHASE}:${concurrency}:${max_requests}:${tp_size}" in
-            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2|mismatch:1:200:2|tie-pilot:1:200:2|internal-target:1:200:2|internal-target-eager:1:200:2|internal-target-eager-no-prefix:1:200:2|internal-target-ngram-eager-no-prefix:1:200:2) ;;
+            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2|mismatch:1:200:2|tie-pilot:1:200:2|internal-target:1:200:2|internal-target-eager:1:200:2|internal-target-eager-no-prefix:1:200:2|internal-target-dflash-eager-no-prefix:1:200:2) ;;
             *) echo "ERROR: matched DFlash2 cells require C1/C32, 200 requests, and TP2" >&2; exit 2 ;;
         esac
     done
+    if [[ "${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix ]]; then
+        dflash_descriptor="${CELL_A}"
+        [[ "${method_a}" == dflash ]] || dflash_descriptor="${CELL_B}"
+        IFS='|' read -r dflash_method dflash_block dflash_tokens dflash_concurrency \
+            dflash_requests source_opb_draft dflash_label dflash_tp <<<"${dflash_descriptor}"
+        readonly OPB_DFLASH_STAGE_ROOT="${JOB_ROOT}/opb-dflash-control"
+        OPB_DFLASH_STAGE_RECEIPT="${RESULT_ROOT}/opb-dflash-stage-receipt.json"
+        STAGED_OPB_DFLASH_PATH="${OPB_DFLASH_STAGE_ROOT}/dflash-s4166"
+        "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" stage-opb-dflash-control \
+            --source-draft "${source_opb_draft}" \
+            --stage-root "${OPB_DFLASH_STAGE_ROOT}" \
+            --receipt "${OPB_DFLASH_STAGE_RECEIPT}"
+        "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-opb-dflash-stage \
+            --receipt "${OPB_DFLASH_STAGE_RECEIPT}" \
+            --expected-staged-draft "${STAGED_OPB_DFLASH_PATH}" \
+            --require-live-stage
+        staged_descriptor="${dflash_method}|${dflash_block}|${dflash_tokens}|${dflash_concurrency}|${dflash_requests}|${STAGED_OPB_DFLASH_PATH}|${dflash_label}|${dflash_tp}"
+        if [[ "${method_a}" == dflash ]]; then
+            CELL_A="${staged_descriptor}"
+        else
+            CELL_B="${staged_descriptor}"
+        fi
+    fi
     "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" materialize-prompts \
         --source-manifest "${SOURCE_DATASET_MANIFEST_PATH}" \
         --source-hf-home "${SOURCE_HF_HOME_DURABLE}" \
@@ -316,7 +348,7 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
     HF_HOME_DURABLE="${MATCHED_HF_HOME}"
     dflash2_export="${CONTROL_DRAFT_EXPORT_PATH:-}"
     if [[ "${PAIR_PHASE}" != diagnostic \
-        && "${PAIR_PHASE}" != internal-target-ngram-eager-no-prefix ]]; then
+        && "${PAIR_PHASE}" != internal-target-dflash-eager-no-prefix ]]; then
         dflash2_descriptor="${CELL_A}"
         [[ "${method_a}" == dflash2 ]] || dflash2_descriptor="${CELL_B}"
         IFS='|' read -r _ _ _ _ _ dflash2_export _ _ <<<"${dflash2_descriptor}"
@@ -389,15 +421,15 @@ if [[ "${PAIR_PHASE}" == diagnostic || "${PAIR_PHASE}" == mismatch \
     || "${PAIR_PHASE}" == tie-pilot || "${PAIR_PHASE}" == internal-target \
     || "${PAIR_PHASE}" == internal-target-eager \
     || "${PAIR_PHASE}" == internal-target-eager-no-prefix \
-    || "${PAIR_PHASE}" == internal-target-ngram-eager-no-prefix ]]; then
+    || "${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix ]]; then
     readonly ALLOCATION_RECEIPT_PATH="${RESULT_ROOT}/allocation-receipt.json"
     "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" allocation-receipt \
         --output "${ALLOCATION_RECEIPT_PATH}"
 fi
 
-if [[ "${PAIR_PHASE}" == internal-target-ngram-eager-no-prefix ]]; then
+if [[ "${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix ]]; then
     [[ -r "${SOURCE_TIE_PILOT_RECEIPT_PATH:-}" ]] || {
-        echo "ERROR: SOURCE_TIE_PILOT_RECEIPT_PATH is required for ngram control" >&2
+        echo "ERROR: SOURCE_TIE_PILOT_RECEIPT_PATH is required for DFlash control" >&2
         exit 2
     }
     DFLASH2_INTERNAL_TARGET_MODE=1
@@ -405,35 +437,36 @@ if [[ "${PAIR_PHASE}" == internal-target-ngram-eager-no-prefix ]]; then
     DFLASH2_DISABLE_PREFIX_CACHING_MODE=1
     run_pair_cells 1
     target_label="$(cell_label "${CELL_A}")"
-    ngram_label="$(cell_label "${CELL_B}")"
+    dflash_label="$(cell_label "${CELL_B}")"
     [[ "${method_a}" == baseline ]] || {
         target_label="$(cell_label "${CELL_B}")"
-        ngram_label="$(cell_label "${CELL_A}")"
+        dflash_label="$(cell_label "${CELL_A}")"
     }
     target_run="${RESULT_ROOT}/${target_label}/${target_label}"
-    ngram_run="${RESULT_ROOT}/${ngram_label}/${ngram_label}"
-    readonly NGRAM_CONTROL_RECEIPT="${RESULT_ROOT}/ngram-internal-target-control-receipt.json"
-    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" analyze-ngram-control \
+    dflash_run="${RESULT_ROOT}/${dflash_label}/${dflash_label}"
+    readonly DFLASH_CONTROL_RECEIPT="${RESULT_ROOT}/dflash-internal-target-control-receipt.json"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" analyze-dflash-control \
         --target-rows "${target_run}/internal-target.jsonl" \
-        --ngram-rows "${ngram_run}/internal-target.jsonl" \
+        --dflash-rows "${dflash_run}/internal-target.jsonl" \
         --source-pilot-receipt "${SOURCE_TIE_PILOT_RECEIPT_PATH}" \
         --target-manifest "${target_run}/manifest.json" \
-        --ngram-manifest "${ngram_run}/manifest.json" \
+        --dflash-manifest "${dflash_run}/manifest.json" \
         --artifact-identity "${ARTIFACT_IDENTITY_PATH}" \
         --allocation-receipt "${ALLOCATION_RECEIPT_PATH}" \
-        --output "${NGRAM_CONTROL_RECEIPT}"
-    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-ngram-control \
-        --receipt "${NGRAM_CONTROL_RECEIPT}" >/dev/null
-    "${JOB_CLIENT_RUNTIME}/bin/python3" - "${NGRAM_CONTROL_RECEIPT}" <<'PY'
+        --control-stage-receipt "${OPB_DFLASH_STAGE_RECEIPT}" \
+        --output "${DFLASH_CONTROL_RECEIPT}"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-dflash-control \
+        --receipt "${DFLASH_CONTROL_RECEIPT}" >/dev/null
+    "${JOB_CLIENT_RUNTIME}/bin/python3" - "${DFLASH_CONTROL_RECEIPT}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 receipt = json.loads(Path(sys.argv[1]).read_text())
-if receipt.get("control_outcome") != "ngram-exercised-path-exact":
-    raise SystemExit("ngram common-path control did not produce passing exercised evidence")
+if receipt.get("control_outcome") != "dflash-exercised-path-exact":
+    raise SystemExit("DFlash common-path control did not produce passing exercised evidence")
 if receipt.get("acceptance", {}).get("num_spec_steps", 0) <= 0:
-    raise SystemExit("ngram common-path control produced zero speculative steps")
+    raise SystemExit("DFlash common-path control produced zero speculative steps")
 PY
     exit 0
 fi

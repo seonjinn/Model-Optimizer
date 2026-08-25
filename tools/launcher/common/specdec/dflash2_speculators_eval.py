@@ -7,18 +7,24 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import csv
 import hashlib
 import json
 import math
 import os
 import re
+import shutil
+import stat
 import subprocess
 import tempfile
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 try:
     from common.specdec.dflash2_runtime_contract import (
@@ -67,9 +73,62 @@ RCA_SOURCE_PILOT_RECEIPT_SHA256 = "4b7c6254c7d52cf8da159d1bad261255790899e36068d
 EVALUATION_STEP = 4166
 DFLASH2_BLOCK_SIZE = 8
 DFLASH2_SPECULATIVE_TOKENS = 7
-NGRAM_SPECULATIVE_TOKENS = 7
-NGRAM_PROMPT_LOOKUP_MIN = 1
-NGRAM_PROMPT_LOOKUP_MAX = 3
+OPB_DFLASH_CONFIG_SHA256 = "d502e18b23ea01dd7f0763840cd91a4545518cf594ba925d45de94eb1a40d35a"
+OPB_DFLASH_MODEL_SHA256 = "8bc3f5608d5a0db4833cf7a972f886bb81c241620ff577149d85af7a14103d15"
+OPB_DFLASH_CHECKSUM_MANIFEST_SHA256 = (
+    "fc6b7a7ea0c48bb0b45bb3ec68fd6d4bd75be3b7308a462aeeba0da5b74ce9c3"
+)
+OPB_BUNDLE_IDENTITY_SHA256 = "dc86f88b28c12e749812b291f8ef6458dab8d2ee1d7171f585e60b20c62bad02"
+OPB_DFLASH_IDENTITY_FIXTURE_PATH = (
+    Path(__file__).resolve().parent / "fixtures/q30_opb_dflash_s4166_identity.json"
+)
+_OPB_STAGE_RECEIPT_KEYS = {
+    "schema_version",
+    "producer",
+    "source",
+    "staged",
+    "copy_identity_sha256",
+    "live_validation_scope",
+}
+_OPB_LIVE_VALIDATION_SCOPE = (
+    "source bytes verified during host staging and finalization; node-local staged bytes "
+    "reverified immediately before vLLM; offline verification authenticates exact descriptors"
+)
+_OPB_ARTIFACT_DESCRIPTOR_KEYS = {
+    "path",
+    "tree_sha256",
+    "file_sha256",
+    "architecture",
+    "block_size",
+    "num_speculative_tokens",
+    "target_layer_ids",
+    "source",
+    "identity_fixture",
+}
+_DFLASH_CONTROL_RECEIPT_V1_KEYS = {
+    "schema_version",
+    "producer",
+    "claim_scope",
+    "selection",
+    "engine_mode",
+    "counts",
+    "classifications",
+    "acceptance",
+    "next_action",
+    "control",
+    "control_outcome",
+    "source_pilot_receipt_sha256",
+    "allocation_evidence_scope",
+    "source_pilot_receipt",
+    "artifact_identity",
+    "control_artifact",
+    "allocation_receipt",
+    "rows",
+    "manifests",
+    "input_fingerprints",
+    "launcher_configs",
+}
+_DFLASH_CONTROL_RECEIPT_V2_KEYS = _DFLASH_CONTROL_RECEIPT_V1_KEYS | {"control_stage_receipt"}
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _GIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 _CONTROL_MANIFEST_KEYS = {
@@ -130,17 +189,20 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 def _atomic_json(path: Path, payload: dict[str, Any], *, no_replace: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if no_replace and path.exists():
-        raise FileExistsError(f"output already exists: {path}")
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w") as stream:
             stream.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        if no_replace and path.exists():
-            raise FileExistsError(f"output already exists: {path}")
-        os.replace(temporary, path)
+        if no_replace:
+            try:
+                os.link(temporary, path)
+            except FileExistsError as error:
+                raise FileExistsError(f"output already exists: {path}") from error
+            os.unlink(temporary)
+        else:
+            os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -332,6 +394,53 @@ def _regular_file_hashes(root: Path) -> dict[str, str]:
     }
 
 
+def load_opb_dflash_identity_fixture() -> dict[str, Any]:
+    """Load the checked-in trust anchor and reject production constant drift."""
+    path = OPB_DFLASH_IDENTITY_FIXTURE_PATH.resolve(strict=True)
+    payload = _load_json(path)
+    expected_keys = {
+        "schema_version",
+        "producer",
+        "artifact_directory_name",
+        "artifact_file_sha256",
+        "source_manifest_sha256",
+        "config",
+        "source",
+    }
+    if (
+        set(payload) != expected_keys
+        or payload.get("schema_version") != 1
+        or payload.get("producer") != "q30-opb-dflash-s4166-identity-v1"
+        or payload.get("artifact_directory_name") != "dflash-s4166"
+        or payload.get("artifact_file_sha256")
+        != {
+            "config.json": OPB_DFLASH_CONFIG_SHA256,
+            "model.safetensors": OPB_DFLASH_MODEL_SHA256,
+        }
+        or payload.get("source_manifest_sha256")
+        != {
+            "manifest/dflash-s4166.sha256": OPB_DFLASH_CHECKSUM_MANIFEST_SHA256,
+            "manifest/identity.json": OPB_BUNDLE_IDENTITY_SHA256,
+        }
+        or payload.get("config")
+        != {
+            "architecture": "DFlashDraftModel",
+            "block_size": DFLASH2_BLOCK_SIZE,
+            "mask_token_id": 151669,
+            "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
+            "target_layer_ids": [1, 12, 23, 34, 45],
+        }
+        or payload.get("source")
+        != {
+            "opb_training_milestone": EVALUATION_STEP,
+            "q30_revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+            "speculators_sha": "0b08a89a83b92007be63f128e01497455b0209df",
+        }
+    ):
+        raise ValueError("checked-in OPB DFlash identity fixture mismatch")
+    return {**payload, "path": str(path), "sha256": _sha256(path)}
+
+
 def validate_milestone_export(
     milestone_manifest_path: Path,
     export_path: Path,
@@ -378,6 +487,508 @@ def validate_milestone_export(
         "export_tree_sha256": artifact_tree_sha256(export_path),
         "export_file_sha256": actual_hashes,
     }
+
+
+def _opb_artifact_tree_sha256(file_sha256: dict[str, str]) -> str:
+    digest = hashlib.sha256()
+    for name in ("config.json", "model.safetensors"):
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(file_sha256[name]))
+    return digest.hexdigest()
+
+
+def _open_directory_componentwise_nofollow(path: Path) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("OPB DFlash source path must be absolute and symlink-free")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for component in path.parts[1:]:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except OSError as error:
+        os.close(descriptor)
+        raise ValueError("OPB DFlash source path must be absolute and symlink-free") from error
+    return descriptor
+
+
+def _assert_open_directory_path(path: Path, descriptor: int) -> None:
+    try:
+        path_stat = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("OPB DFlash authenticated directory moved during access") from error
+    opened_stat = os.fstat(descriptor)
+    if (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        stat.S_IFMT(path_stat.st_mode),
+    ) != (
+        opened_stat.st_dev,
+        opened_stat.st_ino,
+        stat.S_IFMT(opened_stat.st_mode),
+    ) or not stat.S_ISDIR(opened_stat.st_mode):
+        raise ValueError("OPB DFlash authenticated directory moved during access")
+
+
+def _assert_open_file_entry(parent_descriptor: int, name: str, descriptor: int) -> None:
+    try:
+        path_stat = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"OPB DFlash file entry changed during access: {name}") from error
+    opened_stat = os.fstat(descriptor)
+    if (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        stat.S_IFMT(path_stat.st_mode),
+    ) != (
+        opened_stat.st_dev,
+        opened_stat.st_ino,
+        stat.S_IFMT(opened_stat.st_mode),
+    ) or not stat.S_ISREG(opened_stat.st_mode):
+        raise ValueError(f"OPB DFlash file entry changed during access: {name}")
+
+
+@contextlib.contextmanager
+def _open_opb_dflash_bundle(draft_path: Path) -> Iterator[dict[str, Any]]:
+    lexical_draft = Path(os.path.abspath(draft_path))
+    if (
+        not draft_path.is_absolute()
+        or ".." in draft_path.parts
+        or lexical_draft.name != "dflash-s4166"
+    ):
+        raise ValueError("OPB DFlash control artifact path mismatch")
+    bundle_path = lexical_draft.parent
+    bundle_fd = _open_directory_componentwise_nofollow(bundle_path)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = [bundle_fd]
+    try:
+        draft_fd = os.open("dflash-s4166", directory_flags, dir_fd=bundle_fd)
+        manifest_fd = os.open("manifest", directory_flags, dir_fd=bundle_fd)
+        descriptors.extend((draft_fd, manifest_fd))
+        if set(os.listdir(draft_fd)) != {"config.json", "model.safetensors"} or set(
+            os.listdir(manifest_fd)
+        ) != {"dflash-s4166.sha256", "identity.json"}:
+            raise ValueError("OPB DFlash bundle file set mismatch")
+        files: dict[str, int] = {}
+        for name, parent_fd in (
+            ("config.json", draft_fd),
+            ("model.safetensors", draft_fd),
+            ("dflash-s4166.sha256", manifest_fd),
+            ("identity.json", manifest_fd),
+        ):
+            descriptor = os.open(name, file_flags, dir_fd=parent_fd)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                os.close(descriptor)
+                raise ValueError(f"OPB DFlash source is not a regular file: {name}")
+            descriptors.append(descriptor)
+            files[name] = descriptor
+        _assert_open_directory_path(bundle_path, bundle_fd)
+        _assert_open_directory_path(lexical_draft, draft_fd)
+        _assert_open_directory_path(bundle_path / "manifest", manifest_fd)
+        for name, descriptor in files.items():
+            parent_fd = draft_fd if name in {"config.json", "model.safetensors"} else manifest_fd
+            _assert_open_file_entry(parent_fd, name, descriptor)
+        opened = {
+            "draft_path": lexical_draft,
+            "bundle_path": bundle_path,
+            "bundle_fd": bundle_fd,
+            "draft_fd": draft_fd,
+            "manifest_fd": manifest_fd,
+            "files": files,
+        }
+        yield opened
+        _assert_open_directory_path(bundle_path, bundle_fd)
+        _assert_open_directory_path(lexical_draft, draft_fd)
+        _assert_open_directory_path(bundle_path / "manifest", manifest_fd)
+        for name, descriptor in files.items():
+            parent_fd = draft_fd if name in {"config.json", "model.safetensors"} else manifest_fd
+            _assert_open_file_entry(parent_fd, name, descriptor)
+    except OSError as error:
+        raise ValueError("OPB DFlash bundle must be componentwise symlink-free") from error
+    finally:
+        for descriptor in reversed(descriptors):
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+def _read_opb_file(descriptor: int, label: str, *, capture: bool) -> tuple[str, int, bytes]:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    before = os.fstat(descriptor)
+    digest = hashlib.sha256()
+    content = bytearray()
+    while chunk := os.read(descriptor, 8 * 1024 * 1024):
+        digest.update(chunk)
+        if capture:
+            content.extend(chunk)
+    after = os.fstat(descriptor)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if not stat.S_ISREG(before.st_mode) or any(
+        getattr(before, field) != getattr(after, field) for field in stable_fields
+    ):
+        raise ValueError(f"OPB DFlash file changed during access: {label}")
+    return digest.hexdigest(), before.st_size, bytes(content)
+
+
+def _validate_open_opb_dflash_bundle(opened: dict[str, Any]) -> dict[str, Any]:
+    files = opened["files"]
+    config_hash, _config_size, config_raw = _read_opb_file(
+        files["config.json"], "config.json", capture=True
+    )
+    model_hash, _model_size, _ = _read_opb_file(
+        files["model.safetensors"], "model.safetensors", capture=False
+    )
+    checksum_hash, checksum_size, checksum_raw = _read_opb_file(
+        files["dflash-s4166.sha256"], "dflash-s4166.sha256", capture=True
+    )
+    identity_hash, identity_size, identity_raw = _read_opb_file(
+        files["identity.json"], "identity.json", capture=True
+    )
+    hashes = {"config.json": config_hash, "model.safetensors": model_hash}
+    if hashes != {
+        "config.json": OPB_DFLASH_CONFIG_SHA256,
+        "model.safetensors": OPB_DFLASH_MODEL_SHA256,
+    }:
+        raise ValueError("OPB DFlash control artifact hash mismatch")
+    try:
+        config = json.loads(config_raw)
+        source_identity = json.loads(identity_raw)
+        checksum_lines = checksum_raw.decode().splitlines()
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("OPB DFlash control metadata parse mismatch") from error
+    dflash_config = config.get("dflash_config")
+    if (
+        config.get("architectures") != ["DFlashDraftModel"]
+        or config.get("block_size") != DFLASH2_BLOCK_SIZE
+        or not isinstance(dflash_config, dict)
+        or dflash_config.get("mask_token_id") != 151669
+        or dflash_config.get("target_layer_ids") != [1, 12, 23, 34, 45]
+    ):
+        raise ValueError("OPB DFlash control config mismatch")
+    if (
+        checksum_hash != OPB_DFLASH_CHECKSUM_MANIFEST_SHA256
+        or identity_hash != OPB_BUNDLE_IDENTITY_SHA256
+    ):
+        raise ValueError("OPB DFlash control source manifest hash mismatch")
+    if checksum_lines != [
+        f"{OPB_DFLASH_CONFIG_SHA256}  ./config.json",
+        f"{OPB_DFLASH_MODEL_SHA256}  ./model.safetensors",
+    ]:
+        raise ValueError("OPB DFlash control checksum manifest mismatch")
+    if (
+        source_identity.get("opb_training_milestone") != EVALUATION_STEP
+        or source_identity.get("q30_revision") != "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+        or source_identity.get("speculators_sha") != "0b08a89a83b92007be63f128e01497455b0209df"
+        or source_identity.get("dflash")
+        != {"block_size": DFLASH2_BLOCK_SIZE, "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS}
+    ):
+        raise ValueError("OPB DFlash control source identity mismatch")
+    draft_path = opened["draft_path"]
+    manifest_root = opened["bundle_path"] / "manifest"
+    return {
+        "path": str(draft_path),
+        "tree_sha256": _opb_artifact_tree_sha256(hashes),
+        "file_sha256": hashes,
+        "architecture": "DFlashDraftModel",
+        "block_size": DFLASH2_BLOCK_SIZE,
+        "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
+        "target_layer_ids": [1, 12, 23, 34, 45],
+        "source": {
+            "opb_training_milestone": EVALUATION_STEP,
+            "q30_revision": source_identity["q30_revision"],
+            "speculators_sha": source_identity["speculators_sha"],
+            "identity": {
+                "path": str(manifest_root / "identity.json"),
+                "bytes": identity_size,
+                "sha256": identity_hash,
+            },
+            "checksums": {
+                "path": str(manifest_root / "dflash-s4166.sha256"),
+                "bytes": checksum_size,
+                "sha256": checksum_hash,
+            },
+        },
+    }
+
+
+def _validate_opb_dflash_control_artifact(draft_path: Path) -> dict[str, Any]:
+    """Authenticate the exact OPB control through componentwise no-follow handles."""
+    with _open_opb_dflash_bundle(draft_path) as opened:
+        return _validate_open_opb_dflash_bundle(opened)
+
+
+def _copy_opb_regular_file(
+    source_descriptor: int, source_label: str, expected_sha256: str, destination: Path
+) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    digest = hashlib.sha256()
+    os.lseek(source_descriptor, 0, os.SEEK_SET)
+    with destination.open("xb") as output_stream:
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"OPB DFlash source is not a regular file: {source_label}")
+        while chunk := os.read(source_descriptor, 8 * 1024 * 1024):
+            output_stream.write(chunk)
+            digest.update(chunk)
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+        after_descriptor = os.fstat(source_descriptor)
+    os.lseek(source_descriptor, 0, os.SEEK_SET)
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    if any(getattr(before, field) != getattr(after_descriptor, field) for field in stable_fields):
+        raise ValueError(f"OPB DFlash source changed during copy: {source_label}")
+    if digest.hexdigest() != expected_sha256 or digest.hexdigest() != _sha256(destination):
+        raise ValueError(f"OPB DFlash copy hash mismatch: {source_label}")
+
+
+def _remove_opb_stage_tree(path: Path) -> None:
+    if not path.exists():
+        return
+    for item in path.rglob("*"):
+        with contextlib.suppress(FileNotFoundError):
+            os.chmod(item, 0o700 if item.is_dir() else 0o600)
+    os.chmod(path, 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _opb_copy_identity(source: dict[str, Any], staged: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "source_artifact_file_sha256": source["file_sha256"],
+        "staged_artifact_file_sha256": staged["file_sha256"],
+        "source_manifest_sha256": {
+            "checksums": source["source"]["checksums"]["sha256"],
+            "identity": source["source"]["identity"]["sha256"],
+        },
+        "staged_manifest_sha256": {
+            "checksums": staged["source"]["checksums"]["sha256"],
+            "identity": staged["source"]["identity"]["sha256"],
+        },
+    }
+
+
+def _validate_opb_artifact_descriptor_identity(
+    value: object, fixture: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _OPB_ARTIFACT_DESCRIPTOR_KEYS:
+        raise ValueError("OPB DFlash production identity descriptor mismatch")
+    raw_path = value.get("path")
+    if not isinstance(raw_path, str):
+        raise ValueError("OPB DFlash production identity path mismatch")
+    artifact_path = Path(raw_path)
+    if (
+        not artifact_path.is_absolute()
+        or ".." in artifact_path.parts
+        or artifact_path.name != "dflash-s4166"
+    ):
+        raise ValueError("OPB DFlash production identity path mismatch")
+    expected_files = {
+        "config.json": OPB_DFLASH_CONFIG_SHA256,
+        "model.safetensors": OPB_DFLASH_MODEL_SHA256,
+    }
+    if (
+        value.get("tree_sha256") != _opb_artifact_tree_sha256(expected_files)
+        or value.get("file_sha256") != expected_files
+        or value.get("architecture") != "DFlashDraftModel"
+        or value.get("block_size") != DFLASH2_BLOCK_SIZE
+        or value.get("num_speculative_tokens") != DFLASH2_SPECULATIVE_TOKENS
+        or value.get("target_layer_ids") != [1, 12, 23, 34, 45]
+        or value.get("identity_fixture") != {"path": fixture["path"], "sha256": fixture["sha256"]}
+    ):
+        raise ValueError("OPB DFlash production identity mismatch")
+    source = value.get("source")
+    if not isinstance(source, dict) or set(source) != {
+        "opb_training_milestone",
+        "q30_revision",
+        "speculators_sha",
+        "identity",
+        "checksums",
+    }:
+        raise ValueError("OPB DFlash production identity source mismatch")
+    if (
+        source.get("opb_training_milestone") != EVALUATION_STEP
+        or source.get("q30_revision") != "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
+        or source.get("speculators_sha") != "0b08a89a83b92007be63f128e01497455b0209df"
+    ):
+        raise ValueError("OPB DFlash production identity source mismatch")
+    manifest_root = artifact_path.parent / "manifest"
+    for name, expected_path, expected_hash in (
+        ("identity", manifest_root / "identity.json", OPB_BUNDLE_IDENTITY_SHA256),
+        (
+            "checksums",
+            manifest_root / "dflash-s4166.sha256",
+            OPB_DFLASH_CHECKSUM_MANIFEST_SHA256,
+        ),
+    ):
+        descriptor = source.get(name)
+        if (
+            not isinstance(descriptor, dict)
+            or set(descriptor) != {"path", "bytes", "sha256"}
+            or descriptor.get("path") != str(expected_path)
+            or not isinstance(descriptor.get("bytes"), int)
+            or isinstance(descriptor.get("bytes"), bool)
+            or descriptor["bytes"] < 0
+            or descriptor.get("sha256") != expected_hash
+        ):
+            raise ValueError("OPB DFlash production identity manifest mismatch")
+    return value
+
+
+def stage_opb_dflash_control(
+    source_draft_path: Path, stage_root: Path, receipt_path: Path
+) -> dict[str, Any]:
+    """Copy the exact OPB control to a private node-local immutable tree."""
+    fixture = load_opb_dflash_identity_fixture()
+    fixture_descriptor = {"path": fixture["path"], "sha256": fixture["sha256"]}
+    stage_root = stage_root.resolve(strict=False)
+    if stage_root.exists() or stage_root.is_symlink():
+        raise FileExistsError(f"OPB DFlash stage already exists: {stage_root}")
+    stage_root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(stage_root.parent, 0o700)
+    partial = Path(tempfile.mkdtemp(prefix=f".{stage_root.name}.", dir=stage_root.parent))
+    try:
+        with _open_opb_dflash_bundle(source_draft_path) as opened:
+            source = {
+                **_validate_open_opb_dflash_bundle(opened),
+                "identity_fixture": fixture_descriptor,
+            }
+            _validate_opb_artifact_descriptor_identity(source, fixture)
+            for name, relative, expected_hash in (
+                (
+                    "config.json",
+                    Path("dflash-s4166/config.json"),
+                    OPB_DFLASH_CONFIG_SHA256,
+                ),
+                (
+                    "model.safetensors",
+                    Path("dflash-s4166/model.safetensors"),
+                    OPB_DFLASH_MODEL_SHA256,
+                ),
+                (
+                    "dflash-s4166.sha256",
+                    Path("manifest/dflash-s4166.sha256"),
+                    OPB_DFLASH_CHECKSUM_MANIFEST_SHA256,
+                ),
+                (
+                    "identity.json",
+                    Path("manifest/identity.json"),
+                    OPB_BUNDLE_IDENTITY_SHA256,
+                ),
+            ):
+                _copy_opb_regular_file(
+                    opened["files"][name], name, expected_hash, partial / relative
+                )
+            post_source = {
+                **_validate_open_opb_dflash_bundle(opened),
+                "identity_fixture": fixture_descriptor,
+            }
+            if post_source != source:
+                raise ValueError("OPB DFlash source descriptor changed during staging")
+        staged = {
+            **_validate_opb_dflash_control_artifact(partial / "dflash-s4166"),
+            "identity_fixture": fixture_descriptor,
+        }
+        _validate_opb_artifact_descriptor_identity(staged, fixture)
+        copy_identity = _opb_copy_identity(source, staged)
+        if (
+            source["tree_sha256"] != staged["tree_sha256"]
+            or source["file_sha256"] != staged["file_sha256"]
+            or copy_identity["source_manifest_sha256"] != copy_identity["staged_manifest_sha256"]
+        ):
+            raise ValueError("OPB DFlash staged copy identity mismatch")
+        for path in sorted(partial.rglob("*"), reverse=True):
+            os.chmod(path, 0o500 if path.is_dir() else 0o400)
+        os.chmod(partial, 0o500)
+        os.rename(partial, stage_root)
+        staged = {
+            **_validate_opb_dflash_control_artifact(stage_root / "dflash-s4166"),
+            "identity_fixture": fixture_descriptor,
+        }
+        payload = {
+            "schema_version": 1,
+            "producer": "q30-opb-dflash-s4166-node-local-stage-v1",
+            "source": source,
+            "staged": staged,
+            "copy_identity_sha256": _sha_json(_opb_copy_identity(source, staged)),
+            "live_validation_scope": _OPB_LIVE_VALIDATION_SCOPE,
+        }
+        payload["receipt_sha256"] = _sha_json(payload)
+        _atomic_json(receipt_path, payload, no_replace=True)
+        return payload
+    except BaseException:
+        if partial.exists():
+            _remove_opb_stage_tree(partial)
+        if stage_root.exists():
+            _remove_opb_stage_tree(stage_root)
+        raise
+
+
+def validate_opb_dflash_stage_receipt(
+    path: Path,
+    *,
+    require_live_stage: bool = False,
+    require_live_source: bool = True,
+    expected_staged_draft: Path | None = None,
+) -> dict[str, Any]:
+    """Replay the source/staged copy chain and optionally rehash both live trees."""
+    payload = _load_json(path)
+    claim = payload.pop("receipt_sha256", None)
+    if set(payload) != _OPB_STAGE_RECEIPT_KEYS or claim != _sha_json(payload):
+        raise ValueError("OPB DFlash stage receipt mismatch")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("producer") != "q30-opb-dflash-s4166-node-local-stage-v1"
+        or payload.get("live_validation_scope") != _OPB_LIVE_VALIDATION_SCOPE
+    ):
+        raise ValueError("OPB DFlash stage receipt schema mismatch")
+    if not require_live_stage and not require_live_source:
+        raise ValueError("staged-only validation requires a live staged-byte check")
+    source = payload.get("source")
+    staged = payload.get("staged")
+    if not isinstance(source, dict) or not isinstance(staged, dict):
+        raise ValueError("OPB DFlash stage descriptor mismatch")
+    fixture = load_opb_dflash_identity_fixture()
+    _validate_opb_artifact_descriptor_identity(source, fixture)
+    _validate_opb_artifact_descriptor_identity(staged, fixture)
+    if source["path"] == staged["path"]:
+        raise ValueError("OPB DFlash source and staged paths must be distinct")
+    if expected_staged_draft is not None:
+        recorded_stage = Path(str(staged.get("path", ""))).resolve(strict=require_live_stage)
+        expected_stage = expected_staged_draft.resolve(strict=require_live_stage)
+        if recorded_stage != expected_stage:
+            raise ValueError("OPB DFlash staged path mismatch")
+    copy_identity = _opb_copy_identity(source, staged)
+    if (
+        payload.get("copy_identity_sha256") != _sha_json(copy_identity)
+        or source.get("tree_sha256") != staged.get("tree_sha256")
+        or source.get("file_sha256") != staged.get("file_sha256")
+        or copy_identity["source_manifest_sha256"] != copy_identity["staged_manifest_sha256"]
+    ):
+        raise ValueError("OPB DFlash stage copy identity mismatch")
+    if require_live_stage:
+        fixture_descriptor = {"path": fixture["path"], "sha256": fixture["sha256"]}
+        if require_live_source:
+            try:
+                live_source = {
+                    **_validate_opb_dflash_control_artifact(Path(str(source["path"]))),
+                    "identity_fixture": fixture_descriptor,
+                }
+            except (OSError, ValueError) as error:
+                raise ValueError("OPB DFlash source descriptor mismatch") from error
+            if live_source != source:
+                raise ValueError("OPB DFlash source descriptor mismatch")
+        try:
+            live_staged = {
+                **_validate_opb_dflash_control_artifact(Path(str(staged["path"]))),
+                "identity_fixture": fixture_descriptor,
+            }
+        except (OSError, ValueError) as error:
+            raise ValueError("OPB DFlash staged descriptor mismatch") from error
+        if live_staged != staged:
+            raise ValueError("OPB DFlash staged descriptor mismatch")
+    return {**payload, "receipt_sha256": claim}
 
 
 def build_artifact_identity(
@@ -982,28 +1593,6 @@ def _expected_dflash2_server_args(
     return args
 
 
-def _expected_ngram_server_args(target_path: str, port: str) -> list[str]:
-    args = _expected_target_server_args(target_path, port)
-    args.extend(
-        [
-            "--speculative-config",
-            _canonical(
-                {
-                    "method": "ngram",
-                    "num_speculative_tokens": NGRAM_SPECULATIVE_TOKENS,
-                    "prompt_lookup_max": NGRAM_PROMPT_LOOKUP_MAX,
-                    "prompt_lookup_min": NGRAM_PROMPT_LOOKUP_MIN,
-                }
-            ),
-            "--per-request-spec-decode-metrics",
-            "detailed",
-            "--enforce-eager",
-            "--no-enable-prefix-caching",
-        ]
-    )
-    return args
-
-
 def _validate_target_control_manifest(
     path: Path,
     artifact_identity_path: Path,
@@ -1560,9 +2149,7 @@ def _probe_choice(result: dict[str, Any]) -> dict[str, Any]:
     return choice
 
 
-def _validate_spec_decode_metrics_payload(
-    speculative: object, *, allow_zero_steps: bool = False
-) -> dict[str, Any]:
+def _validate_spec_decode_metrics_payload(speculative: object) -> dict[str, Any]:
     expected = {
         "mean_acceptance_length",
         "draft_acceptance_rate",
@@ -1617,9 +2204,7 @@ def _validate_spec_decode_metrics_payload(
             or rate != 0.0
         ):
             raise ValueError("detailed speculative metrics accounting mismatch")
-        if not allow_zero_steps:
-            raise ValueError("DFlash2 diagnostic requires nonzero speculative steps")
-        return speculative
+        raise ValueError("speculative diagnostic requires nonzero speculative steps")
     if (
         not isinstance(accepted, list)
         or not isinstance(drafted, list)
@@ -1657,12 +2242,10 @@ def _validate_spec_decode_metrics_payload(
     return speculative
 
 
-def _validated_spec_decode_metrics(
-    result: dict[str, Any], *, allow_zero_steps: bool = False
-) -> dict[str, Any]:
+def _validated_spec_decode_metrics(result: dict[str, Any]) -> dict[str, Any]:
     metrics = result.get("metrics")
     speculative = metrics.get("speculative_decoding") if isinstance(metrics, dict) else None
-    return _validate_spec_decode_metrics_payload(speculative, allow_zero_steps=allow_zero_steps)
+    return _validate_spec_decode_metrics_payload(speculative)
 
 
 def capture_divergence_probe(
@@ -2116,16 +2699,42 @@ def _validate_dflash2_probe_manifest(
     return manifest, launcher, fingerprint_path
 
 
-def _validate_ngram_probe_manifest(
+def _validate_dflash_control_manifest(
     path: Path,
     baseline: dict[str, Any],
     baseline_fingerprint: dict[str, Any],
     artifact_identity_path: Path,
     identity: dict[str, Any],
-) -> tuple[dict[str, Any], Path, Path]:
-    """Validate the exact model-free ngram K7 eager/no-prefix control manifest."""
+    control_stage_receipt_path: Path | None = None,
+    *,
+    require_live_stage: bool = False,
+) -> tuple[dict[str, Any], Path, Path, dict[str, Any]]:
+    """Validate the exact OPB DFlash B8/K7 eager/no-prefix control manifest."""
     manifest = _load_json(path)
     target = identity["target"]
+    draft_model = manifest.get("draft_model")
+    if not isinstance(draft_model, str):
+        raise ValueError("DFlash control manifest mismatch")
+    if control_stage_receipt_path is None:
+        control_artifact = _validate_opb_dflash_control_artifact(Path(draft_model))
+        draft_artifact = control_artifact
+    else:
+        stage_receipt = validate_opb_dflash_stage_receipt(
+            control_stage_receipt_path,
+            require_live_stage=require_live_stage,
+            expected_staged_draft=Path(draft_model),
+        )
+        draft_artifact = stage_receipt["staged"]
+        control_artifact = {
+            "source": stage_receipt["source"],
+            "staged": stage_receipt["staged"],
+            "stage_receipt": _file_descriptor(control_stage_receipt_path),
+        }
+    draft_config_sha256 = (
+        _sha256(Path(draft_artifact["path"]) / "config.json")
+        if control_stage_receipt_path is None or require_live_stage
+        else draft_artifact["file_sha256"]["config.json"]
+    )
     server_args = manifest.get("server_args")
     config = manifest.get("config_sha256")
     common = (
@@ -2145,32 +2754,37 @@ def _validate_ngram_probe_manifest(
         "evaluation",
         "artifact_identity",
     )
-    expected_server_args = _expected_ngram_server_args(
+    expected_server_args = _expected_dflash2_server_args(
         target["path"],
+        draft_artifact["path"],
         server_args[7] if isinstance(server_args, list) and len(server_args) > 7 else "",
+        detailed_metrics=True,
+        enforce_eager=True,
+        disable_prefix_caching=True,
     )
     if (
         set(manifest) != _CONTROL_MANIFEST_KEYS
         or manifest.get("status") != "success"
-        or manifest.get("method") != "ngram"
-        or manifest.get("block_size") != 0
-        or manifest.get("num_speculative_tokens") != NGRAM_SPECULATIVE_TOKENS
-        or manifest.get("draft_model") is not None
+        or manifest.get("method") != "dflash"
+        or manifest.get("block_size") != DFLASH2_BLOCK_SIZE
+        or manifest.get("num_speculative_tokens") != DFLASH2_SPECULATIVE_TOKENS
+        or manifest.get("draft_model") != draft_artifact["path"]
         or manifest.get("evaluator_args") != []
         or any(manifest.get(name) != baseline.get(name) for name in common)
         or not isinstance(server_args, list)
         or server_args != expected_server_args
         or server_args[7] not in {"8000", "8010"}
         or not isinstance(config, dict)
-        or set(config) != {"target", "launcher"}
+        or set(config) != {"target", "draft", "launcher"}
         or config.get("target") != _sha256(Path(target["path"]) / "config.json")
+        or config.get("draft") != draft_config_sha256
         or manifest.get("artifact_identity")
         != {
             "path": str(artifact_identity_path.resolve(strict=True)),
             "sha256": _sha256(artifact_identity_path),
         }
     ):
-        raise ValueError("ngram control manifest mismatch")
+        raise ValueError("DFlash control manifest mismatch")
     launcher = _validate_control_launcher(
         manifest.get("launcher_config"),
         Path(str(manifest["container"]["path"])),
@@ -2182,20 +2796,20 @@ def _validate_ngram_probe_manifest(
     if not isinstance(baseline_inputs, dict):
         raise ValueError("baseline control fingerprint mismatch")
     expected_inputs = json.loads(json.dumps(baseline_inputs))
-    expected_inputs["draft_config_sha256"] = None
+    expected_inputs["draft_config_sha256"] = config["draft"]
     expected_inputs["evaluation"] = {
         **expected_inputs["evaluation"],
-        "method": "ngram",
-        "block_size": 0,
-        "num_speculative_tokens": NGRAM_SPECULATIVE_TOKENS,
+        "method": "dflash",
+        "block_size": DFLASH2_BLOCK_SIZE,
+        "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
     }
     if (
         fingerprint.get("schema_version") != 1
         or fingerprint.get("inputs") != expected_inputs
         or fingerprint.get("sha256") != _sha_json(expected_inputs)
     ):
-        raise ValueError("ngram control input fingerprint mismatch")
-    return manifest, launcher, fingerprint_path
+        raise ValueError("DFlash control input fingerprint mismatch")
+    return manifest, launcher, fingerprint_path, control_artifact
 
 
 def build_divergence_probe_receipt(
@@ -2553,12 +3167,12 @@ def capture_internal_target_diagnostic(
     engine_mode: str,
 ) -> None:
     """Capture the fixed RCA rows with online logits and detailed acceptance evidence."""
-    if role not in {"target", "dflash2", "ngram"}:
-        raise ValueError("internal-target role must be target, dflash2, or ngram")
+    if role not in {"target", "dflash", "dflash2"}:
+        raise ValueError("internal-target role must be target, dflash, or dflash2")
     if (
         (role == "target" and engine_mode != "compiled")
+        or (role == "dflash" and engine_mode != "eager-no-prefix")
         or (role == "dflash2" and engine_mode not in {"compiled", "eager", "eager-no-prefix"})
-        or (role == "ngram" and engine_mode != "eager-no-prefix")
     ):
         raise ValueError("internal-target engine mode mismatch")
     prompt_set = compute_prompt_set(dataset_manifest_path, hf_home)
@@ -2603,11 +3217,7 @@ def capture_internal_target_diagnostic(
                     or not all(_valid_top_logprobs(distribution) for distribution in top)
                 ):
                     raise ValueError("internal-target completion evidence mismatch")
-                speculative = (
-                    _validated_spec_decode_metrics(result, allow_zero_steps=role == "ngram")
-                    if role != "target"
-                    else None
-                )
+                speculative = _validated_spec_decode_metrics(result) if role != "target" else None
                 if (
                     role == "target"
                     and isinstance(result.get("metrics"), dict)
@@ -2627,8 +3237,8 @@ def capture_internal_target_diagnostic(
                 record = {
                     "schema_version": 1,
                     "producer": (
-                        "q30-ngram-internal-target-row-v1"
-                        if role == "ngram"
+                        "q30-dflash-internal-target-row-v1"
+                        if role == "dflash"
                         else "q30-dflash2-internal-target-row-v1"
                     ),
                     "role": role,
@@ -2652,11 +3262,11 @@ def capture_internal_target_diagnostic(
 
 
 def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str, Any]]:
-    if expected_role not in {"target", "dflash2", "ngram"}:
+    if expected_role not in {"target", "dflash", "dflash2"}:
         raise ValueError("invalid internal-target role")
     expected_producer = (
-        "q30-ngram-internal-target-row-v1"
-        if expected_role == "ngram"
+        "q30-dflash-internal-target-row-v1"
+        if expected_role == "dflash"
         else "q30-dflash2-internal-target-row-v1"
     )
     expected_keys = {
@@ -2701,7 +3311,7 @@ def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str,
                 or value.get("role") != expected_role
                 or value.get("engine_mode") not in {"compiled", "eager", "eager-no-prefix"}
                 or (expected_role == "target" and value.get("engine_mode") != "compiled")
-                or (expected_role == "ngram" and value.get("engine_mode") != "eager-no-prefix")
+                or (expected_role == "dflash" and value.get("engine_mode") != "eager-no-prefix")
                 or value.get("subset") != "HumanEval"
                 or isinstance(value.get("index"), bool)
                 or not isinstance(value.get("index"), int)
@@ -2743,10 +3353,7 @@ def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str,
                 ):
                     raise ValueError("target-only row did not emit its online argmax")
             else:
-                _validate_spec_decode_metrics_payload(
-                    value.get("speculative_decoding"),
-                    allow_zero_steps=expected_role == "ngram",
-                )
+                _validate_spec_decode_metrics_payload(value.get("speculative_decoding"))
             rows.append(value)
     expected = list(INTERNAL_TARGET_DIAGNOSTIC_ROWS)
     if [(row["index"], row["selection_reason"]) for row in rows] != expected:
@@ -2945,42 +3552,43 @@ def summarize_internal_target_diagnostic(
     }
 
 
-def summarize_ngram_internal_target_control(target_path: Path, ngram_path: Path) -> dict[str, Any]:
-    """Classify the model-free ngram K7 common speculative-path control."""
+def summarize_dflash_internal_target_control(
+    target_path: Path, dflash_path: Path
+) -> dict[str, Any]:
+    """Classify the OPB DFlash B8/K7 control on the shared V2 verification path."""
     payload = summarize_internal_target_diagnostic(
         target_path,
-        ngram_path,
-        speculative_role="ngram",
-        token_label="ngram",
+        dflash_path,
+        speculative_role="dflash",
+        token_label="dflash",
     )
-    rows = _read_internal_target_rows(ngram_path, "ngram")
+    rows = _read_internal_target_rows(dflash_path, "dflash")
     rows_with_steps = sum(row["speculative_decoding"]["num_spec_steps"] > 0 for row in rows)
     counts = payload["counts"]
-    if payload["acceptance"]["num_spec_steps"] == 0:
-        outcome = "inconclusive-not-exercised"
-        next_action = "increase-ngram-exercising-prompt-coverage"
-    elif counts.get("internal-target-consistency-mismatch", 0) or counts.get(
+    if counts.get("internal-target-consistency-mismatch", 0) or counts.get(
         "speculative-internal-argmax", 0
     ):
-        outcome = "common-path-mismatch-reproduced"
-        next_action = "instrument-common-speculative-target-and-rejection-path"
+        outcome = "shared-target-rejection-path-mismatch-reproduced"
+        next_action = "instrument-shared-v2-target-rejection-and-dflash-parent-path"
     elif any(label.startswith("unresolved-") for label in counts):
         outcome = "inconclusive-unresolved"
         next_action = "capture-full-vocabulary-or-termination-evidence"
     else:
-        outcome = "ngram-exercised-path-exact"
-        next_action = "instrument-dflash2-context-kv-and-numerical-path"
+        outcome = "dflash-exercised-path-exact"
+        next_action = "instrument-dflash2-selector-and-draft-token-alignment"
     payload.update(
         {
-            "producer": "q30-ngram-k7-internal-target-control-v1",
+            "producer": "q30-opb-dflash-s4166-internal-target-control-v1",
             "claim_scope": (
-                "runtime correctness control only; no DFlash2 speedup or training-quality claim"
+                "shared V2 target/rejection-path correctness control only; "
+                "no DFlash2 speedup or training-quality claim"
             ),
             "control": {
-                "method": "ngram",
-                "num_speculative_tokens": NGRAM_SPECULATIVE_TOKENS,
-                "prompt_lookup_min": NGRAM_PROMPT_LOOKUP_MIN,
-                "prompt_lookup_max": NGRAM_PROMPT_LOOKUP_MAX,
+                "method": "dflash",
+                "architecture": "DFlashDraftModel",
+                "training_milestone": EVALUATION_STEP,
+                "block_size": DFLASH2_BLOCK_SIZE,
+                "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
                 "engine_mode": "eager-no-prefix",
             },
             "control_outcome": outcome,
@@ -3298,40 +3906,45 @@ def validate_internal_target_diagnostic_receipt(path: Path) -> dict[str, Any]:
     return {**payload, "receipt_sha256": claim}
 
 
-def build_ngram_internal_target_control_receipt(
+def build_dflash_internal_target_control_receipt(
     target_rows_path: Path,
-    ngram_rows_path: Path,
+    dflash_rows_path: Path,
     source_pilot_receipt_path: Path,
     target_manifest_path: Path,
-    ngram_manifest_path: Path,
+    dflash_manifest_path: Path,
     artifact_identity_path: Path,
     allocation_receipt_path: Path,
+    control_stage_receipt_path: Path,
     output_path: Path,
 ) -> dict[str, Any]:
-    """Publish live-job evidence for the model-free ngram common-path control."""
+    """Publish live-job evidence for the OPB DFlash shared-path control."""
     identity = _validate_artifact_identity(artifact_identity_path)
     source = _validate_rca_source_receipt(source_pilot_receipt_path, identity)
     target_rows = _validate_internal_rows_against_identity(target_rows_path, "target", identity)
-    ngram_rows = _validate_internal_rows_against_identity(ngram_rows_path, "ngram", identity)
+    dflash_rows = _validate_internal_rows_against_identity(dflash_rows_path, "dflash", identity)
     if any(
-        target["prompt_token_ids"] != ngram["prompt_token_ids"]
-        for target, ngram in zip(target_rows, ngram_rows, strict=True)
+        target["prompt_token_ids"] != dflash["prompt_token_ids"]
+        for target, dflash in zip(target_rows, dflash_rows, strict=True)
     ):
-        raise ValueError("ngram control paired prompt token IDs mismatch")
-    if any(row["engine_mode"] != "eager-no-prefix" for row in ngram_rows):
-        raise ValueError("ngram control requires eager-no-prefix rows")
+        raise ValueError("DFlash control paired prompt token IDs mismatch")
+    if any(row["engine_mode"] != "eager-no-prefix" for row in dflash_rows):
+        raise ValueError("DFlash control requires eager-no-prefix rows")
     target_evidence = _validate_target_control_manifest(
         target_manifest_path,
         artifact_identity_path,
         identity,
         disable_prefix_caching=True,
     )
-    ngram_manifest, ngram_launcher, ngram_fingerprint = _validate_ngram_probe_manifest(
-        ngram_manifest_path,
-        target_evidence[0],
-        target_evidence[2],
-        artifact_identity_path,
-        identity,
+    dflash_manifest, dflash_launcher, dflash_fingerprint, control_artifact = (
+        _validate_dflash_control_manifest(
+            dflash_manifest_path,
+            target_evidence[0],
+            target_evidence[2],
+            artifact_identity_path,
+            identity,
+            control_stage_receipt_path,
+            require_live_stage=True,
+        )
     )
     allocation = validate_target_control_allocation_receipt(allocation_receipt_path)
     current = _query_current_allocation()
@@ -3343,118 +3956,140 @@ def build_ngram_internal_target_control_receipt(
         "cell_visible_devices",
     ):
         if allocation.get(name) != current.get(name):
-            raise ValueError(f"ngram control live allocation mismatch: {name}")
+            raise ValueError(f"DFlash control live allocation mismatch: {name}")
     if any(
         manifest.get("slurm_job_id") != allocation["slurm_job_id"]
-        for manifest in (target_evidence[0], ngram_manifest)
+        for manifest in (target_evidence[0], dflash_manifest)
     ):
-        raise ValueError("ngram control allocation job mismatch")
+        raise ValueError("DFlash control allocation job mismatch")
     if {
         _manifest_server_port(target_evidence[0]),
-        _manifest_server_port(ngram_manifest),
+        _manifest_server_port(dflash_manifest),
     } != {"8000", "8010"}:
-        raise ValueError("ngram control server ports are not isolated")
-    payload = summarize_ngram_internal_target_control(target_rows_path, ngram_rows_path)
+        raise ValueError("DFlash control server ports are not isolated")
+    payload = summarize_dflash_internal_target_control(target_rows_path, dflash_rows_path)
+    payload["schema_version"] = 2
+    payload["producer"] = "q30-opb-dflash-s4166-internal-target-control-v2"
     payload["source_pilot_receipt_sha256"] = source["receipt_sha256"]
     payload["allocation_evidence_scope"] = (
         "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
     )
     payload["source_pilot_receipt"] = _file_descriptor(source_pilot_receipt_path)
     payload["artifact_identity"] = _file_descriptor(artifact_identity_path)
+    payload["control_artifact"] = control_artifact
+    payload["control_stage_receipt"] = _file_descriptor(control_stage_receipt_path)
     payload["allocation_receipt"] = _file_descriptor(allocation_receipt_path)
     payload["rows"] = {
         "target": _file_descriptor(target_rows_path),
-        "ngram": _file_descriptor(ngram_rows_path),
+        "dflash": _file_descriptor(dflash_rows_path),
     }
     payload["manifests"] = {
         "target": _file_descriptor(target_manifest_path),
-        "ngram": _file_descriptor(ngram_manifest_path),
+        "dflash": _file_descriptor(dflash_manifest_path),
     }
     payload["input_fingerprints"] = {
         "target": _file_descriptor(target_evidence[1]),
-        "ngram": _file_descriptor(ngram_fingerprint),
+        "dflash": _file_descriptor(dflash_fingerprint),
     }
     payload["launcher_configs"] = {
         "target": _file_descriptor(target_evidence[3]),
-        "ngram": _file_descriptor(ngram_launcher),
+        "dflash": _file_descriptor(dflash_launcher),
     }
     payload["receipt_sha256"] = _sha_json(payload)
     _atomic_json(output_path, payload, no_replace=True)
     return payload
 
 
-def validate_ngram_internal_target_control_receipt(path: Path) -> dict[str, Any]:
-    """Replay the durable ngram control evidence without scheduler-origin claims."""
+def validate_dflash_internal_target_control_receipt(path: Path) -> dict[str, Any]:
+    """Replay the durable OPB DFlash control evidence without scheduler-origin claims."""
     payload = _load_json(path)
     claim = payload.pop("receipt_sha256", None)
+    schema_version = payload.get("schema_version")
+    expected_producer = "q30-opb-dflash-s4166-internal-target-control-v2"
+    if schema_version != 2:
+        raise ValueError("DFlash control receipt schema v2 required; no historical v1 allowlist")
+    if set(payload) != _DFLASH_CONTROL_RECEIPT_V2_KEYS:
+        raise ValueError("DFlash control receipt schema mismatch")
+    if payload.get("producer") != expected_producer:
+        raise ValueError("DFlash control receipt producer mismatch")
     if claim != _sha_json(payload):
-        raise ValueError("ngram control receipt self-hash mismatch")
+        raise ValueError("DFlash control receipt self-hash mismatch")
     source_path = _validate_file_descriptor(payload.get("source_pilot_receipt"))
     artifact_path = _validate_file_descriptor(payload.get("artifact_identity"))
     allocation_path = _validate_file_descriptor(payload.get("allocation_receipt"))
+    control_stage_path = _validate_file_descriptor(payload.get("control_stage_receipt"))
     evidence: dict[str, dict[str, Path]] = {}
     for group in ("rows", "manifests", "input_fingerprints", "launcher_configs"):
         value = payload.get(group)
-        if not isinstance(value, dict) or set(value) != {"target", "ngram"}:
-            raise ValueError(f"ngram control {group} schema mismatch")
+        if not isinstance(value, dict) or set(value) != {"target", "dflash"}:
+            raise ValueError(f"DFlash control {group} schema mismatch")
         evidence[group] = {name: _validate_file_descriptor(item) for name, item in value.items()}
     identity = _validate_artifact_identity(artifact_path)
     source = _validate_rca_source_receipt(source_path, identity)
     target_rows = _validate_internal_rows_against_identity(
         evidence["rows"]["target"], "target", identity
     )
-    ngram_rows = _validate_internal_rows_against_identity(
-        evidence["rows"]["ngram"], "ngram", identity
+    dflash_rows = _validate_internal_rows_against_identity(
+        evidence["rows"]["dflash"], "dflash", identity
     )
     if any(
-        target["prompt_token_ids"] != ngram["prompt_token_ids"]
-        for target, ngram in zip(target_rows, ngram_rows, strict=True)
-    ) or any(row["engine_mode"] != "eager-no-prefix" for row in ngram_rows):
-        raise ValueError("ngram control paired row mismatch")
+        target["prompt_token_ids"] != dflash["prompt_token_ids"]
+        for target, dflash in zip(target_rows, dflash_rows, strict=True)
+    ) or any(row["engine_mode"] != "eager-no-prefix" for row in dflash_rows):
+        raise ValueError("DFlash control paired row mismatch")
     target_evidence = _validate_target_control_manifest(
         evidence["manifests"]["target"],
         artifact_path,
         identity,
         disable_prefix_caching=True,
     )
-    ngram_manifest, ngram_launcher, ngram_fingerprint = _validate_ngram_probe_manifest(
-        evidence["manifests"]["ngram"],
-        target_evidence[0],
-        target_evidence[2],
-        artifact_path,
-        identity,
+    dflash_manifest, dflash_launcher, dflash_fingerprint, control_artifact = (
+        _validate_dflash_control_manifest(
+            evidence["manifests"]["dflash"],
+            target_evidence[0],
+            target_evidence[2],
+            artifact_path,
+            identity,
+            control_stage_path,
+        )
     )
     allocation = validate_target_control_allocation_receipt(allocation_path)
     if any(
         manifest.get("slurm_job_id") != allocation["slurm_job_id"]
-        for manifest in (target_evidence[0], ngram_manifest)
+        for manifest in (target_evidence[0], dflash_manifest)
     ):
-        raise ValueError("ngram control allocation replay mismatch")
+        raise ValueError("DFlash control allocation replay mismatch")
     if {
         _manifest_server_port(target_evidence[0]),
-        _manifest_server_port(ngram_manifest),
+        _manifest_server_port(dflash_manifest),
     } != {"8000", "8010"}:
-        raise ValueError("ngram control server ports are not isolated")
+        raise ValueError("DFlash control server ports are not isolated")
     if evidence["input_fingerprints"] != {
         "target": target_evidence[1],
-        "ngram": ngram_fingerprint,
+        "dflash": dflash_fingerprint,
     } or evidence["launcher_configs"] != {
         "target": target_evidence[3],
-        "ngram": ngram_launcher,
+        "dflash": dflash_launcher,
     }:
-        raise ValueError("ngram control provenance descriptor mismatch")
-    replayed = summarize_ngram_internal_target_control(
-        evidence["rows"]["target"], evidence["rows"]["ngram"]
+        raise ValueError("DFlash control provenance descriptor mismatch")
+    if payload.get("control_artifact") != control_artifact:
+        raise ValueError("DFlash control artifact replay mismatch")
+    if control_artifact.get("stage_receipt") != payload.get("control_stage_receipt"):
+        raise ValueError("DFlash control stage receipt replay mismatch")
+    replayed = summarize_dflash_internal_target_control(
+        evidence["rows"]["target"], evidence["rows"]["dflash"]
     )
+    replayed["schema_version"] = schema_version
+    replayed["producer"] = expected_producer
     for name, value in replayed.items():
         if payload.get(name) != value:
-            raise ValueError(f"ngram control replay mismatch: {name}")
+            raise ValueError(f"DFlash control replay mismatch: {name}")
     if (
         payload.get("source_pilot_receipt_sha256") != source["receipt_sha256"]
         or payload.get("allocation_evidence_scope")
         != "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
     ):
-        raise ValueError("ngram control claim scope mismatch")
+        raise ValueError("DFlash control claim scope mismatch")
     return {**payload, "receipt_sha256": claim}
 
 
@@ -3891,7 +4526,7 @@ def main() -> None:
     internal_capture.add_argument("--output", required=True)
     internal_capture.add_argument("--endpoint", required=True)
     internal_capture.add_argument("--model", required=True)
-    internal_capture.add_argument("--role", required=True, choices=("target", "dflash2", "ngram"))
+    internal_capture.add_argument("--role", required=True, choices=("target", "dflash", "dflash2"))
     internal_capture.add_argument(
         "--engine-mode", required=True, choices=("compiled", "eager", "eager-no-prefix")
     )
@@ -3985,18 +4620,30 @@ def main() -> None:
     internal_verify = commands.add_parser("verify-internal-target")
     internal_verify.add_argument("--receipt", required=True)
 
-    ngram_analysis = commands.add_parser("analyze-ngram-control")
-    ngram_analysis.add_argument("--target-rows", required=True)
-    ngram_analysis.add_argument("--ngram-rows", required=True)
-    ngram_analysis.add_argument("--source-pilot-receipt", required=True)
-    ngram_analysis.add_argument("--target-manifest", required=True)
-    ngram_analysis.add_argument("--ngram-manifest", required=True)
-    ngram_analysis.add_argument("--artifact-identity", required=True)
-    ngram_analysis.add_argument("--allocation-receipt", required=True)
-    ngram_analysis.add_argument("--output", required=True)
+    opb_stage = commands.add_parser("stage-opb-dflash-control")
+    opb_stage.add_argument("--source-draft", required=True)
+    opb_stage.add_argument("--stage-root", required=True)
+    opb_stage.add_argument("--receipt", required=True)
 
-    ngram_verify = commands.add_parser("verify-ngram-control")
-    ngram_verify.add_argument("--receipt", required=True)
+    opb_stage_verify = commands.add_parser("verify-opb-dflash-stage")
+    opb_stage_verify.add_argument("--receipt", required=True)
+    opb_stage_verify.add_argument("--require-live-stage", action="store_true")
+    opb_stage_verify.add_argument("--staged-only", action="store_true")
+    opb_stage_verify.add_argument("--expected-staged-draft")
+
+    dflash_analysis = commands.add_parser("analyze-dflash-control")
+    dflash_analysis.add_argument("--target-rows", required=True)
+    dflash_analysis.add_argument("--dflash-rows", required=True)
+    dflash_analysis.add_argument("--source-pilot-receipt", required=True)
+    dflash_analysis.add_argument("--target-manifest", required=True)
+    dflash_analysis.add_argument("--dflash-manifest", required=True)
+    dflash_analysis.add_argument("--artifact-identity", required=True)
+    dflash_analysis.add_argument("--allocation-receipt", required=True)
+    dflash_analysis.add_argument("--control-stage-receipt", required=True)
+    dflash_analysis.add_argument("--output", required=True)
+
+    dflash_verify = commands.add_parser("verify-dflash-control")
+    dflash_verify.add_argument("--receipt", required=True)
 
     args = parser.parse_args()
     if args.command == "prompt-set":
@@ -4109,19 +4756,31 @@ def main() -> None:
         )
     elif args.command == "verify-internal-target":
         validate_internal_target_diagnostic_receipt(Path(args.receipt))
-    elif args.command == "analyze-ngram-control":
-        build_ngram_internal_target_control_receipt(
+    elif args.command == "stage-opb-dflash-control":
+        stage_opb_dflash_control(Path(args.source_draft), Path(args.stage_root), Path(args.receipt))
+    elif args.command == "verify-opb-dflash-stage":
+        validate_opb_dflash_stage_receipt(
+            Path(args.receipt),
+            require_live_stage=args.require_live_stage,
+            require_live_source=not args.staged_only,
+            expected_staged_draft=(
+                Path(args.expected_staged_draft) if args.expected_staged_draft else None
+            ),
+        )
+    elif args.command == "analyze-dflash-control":
+        build_dflash_internal_target_control_receipt(
             Path(args.target_rows),
-            Path(args.ngram_rows),
+            Path(args.dflash_rows),
             Path(args.source_pilot_receipt),
             Path(args.target_manifest),
-            Path(args.ngram_manifest),
+            Path(args.dflash_manifest),
             Path(args.artifact_identity),
             Path(args.allocation_receipt),
+            Path(args.control_stage_receipt),
             Path(args.output),
         )
-    elif args.command == "verify-ngram-control":
-        validate_ngram_internal_target_control_receipt(Path(args.receipt))
+    elif args.command == "verify-dflash-control":
+        validate_dflash_internal_target_control_receipt(Path(args.receipt))
     elif args.command == "summarize":
         correctness = _load_json(Path(args.correctness_receipt))
         claim = correctness.pop("receipt_sha256", None)

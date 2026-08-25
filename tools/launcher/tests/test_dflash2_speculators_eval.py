@@ -59,6 +59,60 @@ _WRAPPER = _LAUNCHER / "common/specdec/run_speculators_eval.sh"
 _PAIR = _LAUNCHER / "common/specdec/run_speculators_eval_pair.sbatch"
 _SERVER_STAGER = _LAUNCHER / "common/specdec/stage_speculators_eval_server_runtime.sh"
 _HELPER = _LAUNCHER / "common/specdec/dflash2_speculators_eval.py"
+_OPB_IDENTITY_FIXTURE = _LAUNCHER / "common/specdec/fixtures/q30_opb_dflash_s4166_identity.json"
+
+
+def _write_test_opb_bundle(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    bundle = root / "bundle"
+    draft = bundle / "dflash-s4166"
+    manifest = bundle / "manifest"
+    draft.mkdir(parents=True)
+    manifest.mkdir()
+    config = {
+        "architectures": ["DFlashDraftModel"],
+        "block_size": 8,
+        "dflash_config": {
+            "mask_token_id": 151669,
+            "target_layer_ids": [1, 12, 23, 34, 45],
+        },
+    }
+    (draft / "config.json").write_text(json.dumps(config) + "\n")
+    (draft / "model.safetensors").write_bytes(b"exact-stage-bytes")
+    identity_path = manifest / "identity.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "opb_training_milestone": 4166,
+                "q30_revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+                "speculators_sha": "0b08a89a83b92007be63f128e01497455b0209df",
+                "dflash": {"block_size": 8, "num_speculative_tokens": 7},
+            }
+        )
+        + "\n"
+    )
+    checksums_path = manifest / "dflash-s4166.sha256"
+    checksums_path.write_text(
+        f"{evaluator._sha256(draft / 'config.json')}  ./config.json\n"
+        f"{evaluator._sha256(draft / 'model.safetensors')}  ./model.safetensors\n"
+    )
+    for name, path in (
+        ("OPB_DFLASH_CONFIG_SHA256", draft / "config.json"),
+        ("OPB_DFLASH_MODEL_SHA256", draft / "model.safetensors"),
+        ("OPB_DFLASH_CHECKSUM_MANIFEST_SHA256", checksums_path),
+        ("OPB_BUNDLE_IDENTITY_SHA256", identity_path),
+    ):
+        monkeypatch.setattr(evaluator, name, evaluator._sha256(path))
+    fixture = root / "fixture.json"
+    fixture.write_text("{}\n")
+    monkeypatch.setattr(
+        evaluator,
+        "load_opb_dflash_identity_fixture",
+        lambda: {
+            "path": str(fixture.resolve()),
+            "sha256": evaluator._sha256(fixture),
+        },
+    )
+    return bundle, draft
 
 
 def test_target_control_allocation_receipt_rejects_spoofed_topology(tmp_path: Path) -> None:
@@ -438,10 +492,10 @@ def test_internal_target_diagnostic_captures_exact_rca_rows_and_detailed_metrics
         )
 
 
-def test_ngram_internal_target_capture_is_eager_no_prefix_only(
+def test_dflash_control_capture_is_eager_no_prefix_and_exercised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The ngram control records the fixed RCA rows and cannot claim another engine mode."""
+    """The OPB DFlash control records fixed RCA rows with nonzero detailed metrics."""
     manifest, hf_home = _write_prompt_snapshot(tmp_path / "prompts", rows=164)
     matched_hf = tmp_path / "matched-hf"
     matched_manifest = tmp_path / "matched-manifest.json"
@@ -462,55 +516,44 @@ def test_ngram_internal_target_capture_is_eager_no_prefix_only(
                 "speculative_decoding": {
                     "mean_acceptance_length": 1.0,
                     "draft_acceptance_rate": 0.0,
-                    "acceptance_histogram": [0] * 8,
-                    "num_spec_steps": 0,
+                    "acceptance_histogram": [1] + [0] * 7,
+                    "num_spec_steps": 1,
                     "num_accepted_draft_tokens": 0,
-                    "num_draft_tokens": 0,
+                    "num_draft_tokens": 7,
                     "num_spec_tokens": 7,
-                    "per_step_accepted": None,
-                    "per_step_drafted": None,
+                    "per_step_accepted": [0],
+                    "per_step_drafted": [7],
                 }
             },
         }
 
     monkeypatch.setattr("common.specdec.dflash2_speculators_eval._post_completion", fake_completion)
-    output = tmp_path / "ngram.jsonl"
+    output = tmp_path / "dflash.jsonl"
     capture_internal_target_diagnostic(
         matched_manifest,
         matched_hf,
         output,
-        endpoint="http://ngram/v1",
+        endpoint="http://dflash/v1",
         model="target",
-        role="ngram",
+        role="dflash",
         engine_mode="eager-no-prefix",
     )
 
     rows = [json.loads(line) for line in output.read_text().splitlines()]
     assert len(rows) == len(INTERNAL_TARGET_DIAGNOSTIC_ROWS)
-    assert {row["role"] for row in rows} == {"ngram"}
-    assert {row["producer"] for row in rows} == {"q30-ngram-internal-target-row-v1"}
+    assert {row["role"] for row in rows} == {"dflash"}
+    assert {row["producer"] for row in rows} == {"q30-dflash-internal-target-row-v1"}
     assert {row["engine_mode"] for row in rows} == {"eager-no-prefix"}
-    assert all(row["speculative_decoding"]["num_spec_steps"] == 0 for row in rows)
-
-    with pytest.raises(ValueError, match="nonzero speculative steps"):
-        capture_internal_target_diagnostic(
-            matched_manifest,
-            matched_hf,
-            tmp_path / "dflash2-zero-step.jsonl",
-            endpoint="http://dflash2/v1",
-            model="target",
-            role="dflash2",
-            engine_mode="compiled",
-        )
+    assert all(row["speculative_decoding"]["num_spec_steps"] == 1 for row in rows)
 
     with pytest.raises(ValueError, match="engine mode"):
         capture_internal_target_diagnostic(
             matched_manifest,
             matched_hf,
             tmp_path / "invalid.jsonl",
-            endpoint="http://ngram/v1",
+            endpoint="http://dflash/v1",
             model="target",
-            role="ngram",
+            role="dflash",
             engine_mode="compiled",
         )
 
@@ -628,24 +671,26 @@ def test_internal_target_summary_distinguishes_runtime_rejection_from_engine_dri
     assert mixed_summary["next_action"] == "rerun-internal-target-eager"
 
 
-def test_ngram_internal_target_summary_requires_exercised_common_path(tmp_path: Path) -> None:
-    """The control distinguishes an exact exercised path from a zero-draft non-result."""
+def test_dflash_internal_target_summary_requires_every_row_to_exercise_common_path(
+    tmp_path: Path,
+) -> None:
+    """The OPB control only passes when every selected row exercised V2 rejection."""
     target_path = tmp_path / "target.jsonl"
-    ngram_path = tmp_path / "ngram.jsonl"
+    dflash_path = tmp_path / "dflash.jsonl"
 
     def record(index: int, role: str, steps: int) -> dict[str, Any]:
         metrics = None
-        if role == "ngram":
+        if role == "dflash":
             metrics = {
                 "mean_acceptance_length": 1.0,
                 "draft_acceptance_rate": 0.0,
                 "acceptance_histogram": ([1] + [0] * 7) if steps else [0] * 8,
                 "num_spec_steps": steps,
                 "num_accepted_draft_tokens": 0,
-                "num_draft_tokens": 1 if steps else 0,
+                "num_draft_tokens": 7 if steps else 0,
                 "num_spec_tokens": 7,
                 "per_step_accepted": [0] if steps else None,
-                "per_step_drafted": [1] if steps else None,
+                "per_step_drafted": [7] if steps else None,
             }
         extracted = {
             "output_text": "x",
@@ -660,7 +705,7 @@ def test_ngram_internal_target_summary_requires_exercised_common_path(tmp_path: 
             "producer": (
                 "q30-dflash2-internal-target-row-v1"
                 if role == "target"
-                else "q30-ngram-internal-target-row-v1"
+                else "q30-dflash-internal-target-row-v1"
             ),
             "role": role,
             "engine_mode": "compiled" if role == "target" else "eager-no-prefix",
@@ -677,27 +722,344 @@ def test_ngram_internal_target_summary_requires_exercised_common_path(tmp_path: 
         }
 
     target_rows = [record(index, "target", 0) for index, _ in INTERNAL_TARGET_DIAGNOSTIC_ROWS]
-    ngram_rows = [record(index, "ngram", 0) for index, _ in INTERNAL_TARGET_DIAGNOSTIC_ROWS]
+    dflash_rows = [record(index, "dflash", 1) for index, _ in INTERNAL_TARGET_DIAGNOSTIC_ROWS]
     target_path.write_text("".join(json.dumps(row) + "\n" for row in target_rows))
-    ngram_path.write_text("".join(json.dumps(row) + "\n" for row in ngram_rows))
+    dflash_path.write_text("".join(json.dumps(row) + "\n" for row in dflash_rows))
 
-    unexercised = evaluator.summarize_ngram_internal_target_control(target_path, ngram_path)
-    assert unexercised["control_outcome"] == "inconclusive-not-exercised"
-    assert unexercised["acceptance"]["rows_without_spec_steps"] == 9
-
-    ngram_rows[0] = record(INTERNAL_TARGET_DIAGNOSTIC_ROWS[0][0], "ngram", 1)
-    ngram_path.write_text("".join(json.dumps(row) + "\n" for row in ngram_rows))
-    exercised = evaluator.summarize_ngram_internal_target_control(target_path, ngram_path)
-    assert exercised["producer"] == "q30-ngram-k7-internal-target-control-v1"
+    exercised = evaluator.summarize_dflash_internal_target_control(target_path, dflash_path)
+    assert exercised["producer"] == "q30-opb-dflash-s4166-internal-target-control-v1"
+    assert exercised["claim_scope"] == (
+        "shared V2 target/rejection-path correctness control only; "
+        "no DFlash2 speedup or training-quality claim"
+    )
     assert exercised["control"] == {
-        "method": "ngram",
+        "method": "dflash",
+        "architecture": "DFlashDraftModel",
+        "training_milestone": 4166,
+        "block_size": 8,
         "num_speculative_tokens": 7,
-        "prompt_lookup_min": 1,
-        "prompt_lookup_max": 3,
         "engine_mode": "eager-no-prefix",
     }
-    assert exercised["control_outcome"] == "ngram-exercised-path-exact"
-    assert exercised["acceptance"]["rows_with_spec_steps"] == 1
+    assert exercised["control_outcome"] == "dflash-exercised-path-exact"
+    assert exercised["acceptance"]["rows_with_spec_steps"] == len(INTERNAL_TARGET_DIAGNOSTIC_ROWS)
+
+    dflash_rows[0] = record(INTERNAL_TARGET_DIAGNOSTIC_ROWS[0][0], "dflash", 0)
+    dflash_path.write_text("".join(json.dumps(row) + "\n" for row in dflash_rows))
+    with pytest.raises(ValueError, match="nonzero speculative steps"):
+        evaluator.summarize_dflash_internal_target_control(target_path, dflash_path)
+
+
+def test_opb_dflash_control_artifact_binds_weights_config_and_source_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control identity rejects any drift in the exact OPB s4166 export."""
+    bundle = tmp_path / "bundle"
+    draft = bundle / "dflash-s4166"
+    manifest = bundle / "manifest"
+    draft.mkdir(parents=True)
+    manifest.mkdir()
+    config = {
+        "architectures": ["DFlashDraftModel"],
+        "block_size": 8,
+        "dflash_config": {
+            "mask_token_id": 151669,
+            "target_layer_ids": [1, 12, 23, 34, 45],
+        },
+    }
+    (draft / "config.json").write_text(json.dumps(config) + "\n")
+    (draft / "model.safetensors").write_bytes(b"exact-opb-dflash-s4166")
+    identity = {
+        "opb_training_milestone": 4166,
+        "q30_revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+        "speculators_sha": "0b08a89a83b92007be63f128e01497455b0209df",
+        "dflash": {"block_size": 8, "num_speculative_tokens": 7},
+    }
+    identity_path = manifest / "identity.json"
+    identity_path.write_text(json.dumps(identity) + "\n")
+    checksums_path = manifest / "dflash-s4166.sha256"
+    checksums_path.write_text(
+        f"{evaluator._sha256(draft / 'config.json')}  ./config.json\n"
+        f"{evaluator._sha256(draft / 'model.safetensors')}  ./model.safetensors\n"
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "OPB_DFLASH_CONFIG_SHA256",
+        evaluator._sha256(draft / "config.json"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "OPB_DFLASH_MODEL_SHA256",
+        evaluator._sha256(draft / "model.safetensors"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "OPB_DFLASH_CHECKSUM_MANIFEST_SHA256",
+        evaluator._sha256(checksums_path),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "OPB_BUNDLE_IDENTITY_SHA256",
+        evaluator._sha256(identity_path),
+        raising=False,
+    )
+
+    control = evaluator._validate_opb_dflash_control_artifact(draft)
+
+    assert control["path"] == str(draft.resolve())
+    assert control["tree_sha256"] == artifact_tree_sha256(draft)
+    assert control["file_sha256"] == {
+        "config.json": evaluator._sha256(draft / "config.json"),
+        "model.safetensors": evaluator._sha256(draft / "model.safetensors"),
+    }
+    assert control["source"]["opb_training_milestone"] == 4166
+    assert control["source"]["q30_revision"] == identity["q30_revision"]
+
+    (draft / "model.safetensors").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="OPB DFlash control artifact hash mismatch"):
+        evaluator._validate_opb_dflash_control_artifact(draft)
+
+
+def test_production_opb_identity_fixture_matches_unpatched_constants() -> None:
+    """The checked-in trust anchor catches production OPB hash typo or drift locally."""
+    identity = evaluator.load_opb_dflash_identity_fixture()
+
+    assert identity["path"] == str(_OPB_IDENTITY_FIXTURE.resolve(strict=True))
+    assert identity["artifact_file_sha256"] == {
+        "config.json": evaluator.OPB_DFLASH_CONFIG_SHA256,
+        "model.safetensors": evaluator.OPB_DFLASH_MODEL_SHA256,
+    }
+    assert identity["source_manifest_sha256"] == {
+        "manifest/dflash-s4166.sha256": evaluator.OPB_DFLASH_CHECKSUM_MANIFEST_SHA256,
+        "manifest/identity.json": evaluator.OPB_BUNDLE_IDENTITY_SHA256,
+    }
+
+
+def test_opb_stage_copies_exact_bytes_to_private_read_only_node_local_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only an exact pre/post-verified private copy may become the vLLM draft path."""
+    bundle = tmp_path / "bundle"
+    draft = bundle / "dflash-s4166"
+    manifest = bundle / "manifest"
+    draft.mkdir(parents=True)
+    manifest.mkdir()
+    config = {
+        "architectures": ["DFlashDraftModel"],
+        "block_size": 8,
+        "dflash_config": {
+            "mask_token_id": 151669,
+            "target_layer_ids": [1, 12, 23, 34, 45],
+        },
+    }
+    (draft / "config.json").write_text(json.dumps(config) + "\n")
+    (draft / "model.safetensors").write_bytes(b"exact-stage-bytes")
+    identity_path = manifest / "identity.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "opb_training_milestone": 4166,
+                "q30_revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+                "speculators_sha": "0b08a89a83b92007be63f128e01497455b0209df",
+                "dflash": {"block_size": 8, "num_speculative_tokens": 7},
+            }
+        )
+        + "\n"
+    )
+    checksums_path = manifest / "dflash-s4166.sha256"
+    checksums_path.write_text(
+        f"{evaluator._sha256(draft / 'config.json')}  ./config.json\n"
+        f"{evaluator._sha256(draft / 'model.safetensors')}  ./model.safetensors\n"
+    )
+    for name, path in (
+        ("OPB_DFLASH_CONFIG_SHA256", draft / "config.json"),
+        ("OPB_DFLASH_MODEL_SHA256", draft / "model.safetensors"),
+        ("OPB_DFLASH_CHECKSUM_MANIFEST_SHA256", checksums_path),
+        ("OPB_BUNDLE_IDENTITY_SHA256", identity_path),
+    ):
+        monkeypatch.setattr(evaluator, name, evaluator._sha256(path))
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text("{}\n")
+    monkeypatch.setattr(
+        evaluator,
+        "load_opb_dflash_identity_fixture",
+        lambda: {
+            "path": str(fixture.resolve()),
+            "sha256": evaluator._sha256(fixture),
+        },
+    )
+
+    stage_root = tmp_path / "job" / "opb-dflash-control"
+    receipt_path = tmp_path / "results" / "opb-stage-receipt.json"
+    receipt = evaluator.stage_opb_dflash_control(draft, stage_root, receipt_path)
+    staged_draft = Path(receipt["staged"]["path"])
+
+    assert staged_draft == stage_root / "dflash-s4166"
+    assert receipt["source"]["file_sha256"] == receipt["staged"]["file_sha256"]
+    assert receipt["source"]["tree_sha256"] == receipt["staged"]["tree_sha256"]
+    assert (staged_draft / "model.safetensors").read_bytes() == b"exact-stage-bytes"
+    assert stage_root.stat().st_mode & 0o777 == 0o500
+    assert (staged_draft / "model.safetensors").stat().st_mode & 0o777 == 0o400
+    evaluator.validate_opb_dflash_stage_receipt(receipt_path, require_live_stage=True)
+
+    (draft / "model.safetensors").write_bytes(b"source-drift-after-stage")
+    with pytest.raises(ValueError, match="source descriptor"):
+        evaluator.validate_opb_dflash_stage_receipt(receipt_path, require_live_stage=True)
+
+
+def test_offline_opb_stage_receipt_rejects_fabricated_nonexistent_descriptors(
+    tmp_path: Path,
+) -> None:
+    """Offline replay must authenticate production identity, not only matching forged hashes."""
+    source = {
+        "path": "/nonexistent/source/dflash-s4166",
+        "tree_sha256": "a" * 64,
+        "file_sha256": {"config.json": "b" * 64, "model.safetensors": "c" * 64},
+        "architecture": "ForgedDraftModel",
+        "block_size": 999,
+        "num_speculative_tokens": 999,
+        "target_layer_ids": [],
+        "source": {
+            "opb_training_milestone": 0,
+            "q30_revision": "d" * 40,
+            "speculators_sha": "e" * 40,
+            "identity": {
+                "path": "/nonexistent/source/identity.json",
+                "bytes": 1,
+                "sha256": "f" * 64,
+            },
+            "checksums": {"path": "/nonexistent/source/checksums", "bytes": 1, "sha256": "0" * 64},
+        },
+        "identity_fixture": {"path": "/nonexistent/fixture.json", "sha256": "1" * 64},
+    }
+    staged = json.loads(json.dumps(source))
+    staged["path"] = "/nonexistent/staged/dflash-s4166"
+    staged["source"]["identity"]["path"] = "/nonexistent/staged/identity.json"
+    staged["source"]["checksums"]["path"] = "/nonexistent/staged/checksums"
+    payload = {
+        "schema_version": 1,
+        "producer": "q30-opb-dflash-s4166-node-local-stage-v1",
+        "source": source,
+        "staged": staged,
+        "copy_identity_sha256": evaluator._sha_json(evaluator._opb_copy_identity(source, staged)),
+        "live_validation_scope": (
+            "source bytes verified during host staging and finalization; node-local staged bytes "
+            "reverified immediately before vLLM; offline verification authenticates exact descriptors"
+        ),
+    }
+    payload["receipt_sha256"] = evaluator._sha_json(payload)
+    receipt = tmp_path / "forged-stage.json"
+    receipt.write_text(json.dumps(payload) + "\n")
+
+    with pytest.raises(ValueError, match="production identity"):
+        evaluator.validate_opb_dflash_stage_receipt(receipt)
+
+
+def test_opb_stage_rejects_symlinked_source_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The authenticated bundle root must be opened componentwise without following links."""
+    bundle, _draft = _write_test_opb_bundle(tmp_path, monkeypatch)
+    alias = tmp_path / "bundle-alias"
+    alias.symlink_to(bundle, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink-free"):
+        evaluator.stage_opb_dflash_control(
+            alias / "dflash-s4166",
+            tmp_path / "job" / "stage",
+            tmp_path / "results" / "stage.json",
+        )
+
+
+def test_opb_validation_rejects_file_entry_swap_after_authenticated_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An opened exact inode cannot authenticate a different pathname installed mid-check."""
+    _bundle, draft = _write_test_opb_bundle(tmp_path, monkeypatch)
+    original_read = evaluator._read_opb_file
+    swapped = False
+
+    def swap_config_after_read(
+        descriptor: int, label: str, *, capture: bool
+    ) -> tuple[str, int, bytes]:
+        nonlocal swapped
+        result = original_read(descriptor, label, capture=capture)
+        if label == "config.json" and not swapped:
+            swapped = True
+            config_path = draft / "config.json"
+            config_path.unlink()
+            config_path.write_text('{"architectures":["Forged"]}\n')
+        return result
+
+    monkeypatch.setattr(evaluator, "_read_opb_file", swap_config_after_read)
+
+    with pytest.raises(ValueError, match="file entry changed"):
+        evaluator._validate_opb_dflash_control_artifact(draft)
+
+
+def test_in_container_stage_gate_rehashes_consumed_bytes_without_source_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The container may replay source identity offline but must rehash the staged draft."""
+    bundle, draft = _write_test_opb_bundle(tmp_path, monkeypatch)
+    stage_root = tmp_path / "job" / "stage"
+    receipt_path = tmp_path / "results" / "stage.json"
+    receipt = evaluator.stage_opb_dflash_control(draft, stage_root, receipt_path)
+    hidden_bundle = tmp_path / "source-not-mounted"
+    bundle.rename(hidden_bundle)
+
+    evaluator.validate_opb_dflash_stage_receipt(
+        receipt_path,
+        require_live_stage=True,
+        require_live_source=False,
+    )
+    staged_model = Path(receipt["staged"]["path"]) / "model.safetensors"
+    staged_model.chmod(0o600)
+    staged_model.write_bytes(b"tampered-consumed-stage")
+    with pytest.raises(ValueError, match="staged descriptor"):
+        evaluator.validate_opb_dflash_stage_receipt(
+            receipt_path,
+            require_live_stage=True,
+            require_live_source=False,
+        )
+
+
+def test_atomic_json_no_replace_cannot_overwrite_racing_publisher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No-replace receipt publication must remain atomic at the final filesystem operation."""
+    output = tmp_path / "receipt.json"
+    original_link = os.link
+
+    def publish_competitor_then_link(source: str, destination: str) -> None:
+        output.write_text("competitor\n")
+        original_link(source, destination)
+
+    monkeypatch.setattr(evaluator.os, "link", publish_competitor_then_link)
+
+    with pytest.raises(FileExistsError):
+        evaluator._atomic_json(output, {"producer": "ours"}, no_replace=True)
+    assert output.read_text() == "competitor\n"
+
+
+def test_dflash_control_staging_and_live_gate_precede_every_gpu_server_launch() -> None:
+    """The source copy and its in-container live check both fail before vLLM starts."""
+    pair = _PAIR.read_text()
+    wrapper = _WRAPPER.read_text()
+    branch = pair.index('"${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix')
+    stage = pair.index("stage-opb-dflash-control", branch)
+    capture = pair.index("run_pair_cells 1", stage)
+    assert stage < capture
+    assert "OPB_DFLASH_STAGE_RECEIPT" in pair[stage:capture]
+    assert "STAGED_OPB_DFLASH_PATH" in pair[stage:capture]
+
+    live_gate = wrapper.index("verify-opb-dflash-stage")
+    server = wrapper.index('"${SERVER_PYTHON}" "${SERVER_ARGS[@]}"')
+    assert live_gate < server
+    assert "OPB_DFLASH_STAGE_RECEIPT" in wrapper
+    assert "--staged-only" in wrapper[live_gate:server]
 
 
 def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
@@ -887,29 +1249,29 @@ def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
         validate_internal_target_diagnostic_receipt(receipt)
 
 
-def test_ngram_control_receipt_binds_distinct_evidence_and_rejects_tamper(
+def test_dflash_control_receipt_binds_both_artifacts_and_rejects_tamper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The model-free control receipt replays target/ngram evidence and its exercise result."""
+    """The receipt replays DFlash2-under-test and OPB DFlash control provenance."""
     target_rows_path = tmp_path / "target.jsonl"
-    ngram_rows_path = tmp_path / "ngram.jsonl"
+    dflash_rows_path = tmp_path / "dflash.jsonl"
 
     def rows(role: str) -> list[dict[str, Any]]:
         output = []
         for ordinal, (index, reason) in enumerate(INTERNAL_TARGET_DIAGNOSTIC_ROWS):
             metrics = None
-            if role == "ngram":
-                steps = int(ordinal == 0)
+            if role == "dflash":
+                steps = 1
                 metrics = {
                     "mean_acceptance_length": 1.0,
                     "draft_acceptance_rate": 0.0,
                     "acceptance_histogram": ([1] + [0] * 7) if steps else [0] * 8,
                     "num_spec_steps": steps,
                     "num_accepted_draft_tokens": 0,
-                    "num_draft_tokens": steps,
+                    "num_draft_tokens": 7,
                     "num_spec_tokens": 7,
                     "per_step_accepted": [0] if steps else None,
-                    "per_step_drafted": [1] if steps else None,
+                    "per_step_drafted": [7],
                 }
             extracted = {
                 "output_text": "x",
@@ -925,7 +1287,7 @@ def test_ngram_control_receipt_binds_distinct_evidence_and_rejects_tamper(
                     "producer": (
                         "q30-dflash2-internal-target-row-v1"
                         if role == "target"
-                        else "q30-ngram-internal-target-row-v1"
+                        else "q30-dflash-internal-target-row-v1"
                     ),
                     "role": role,
                     "engine_mode": "compiled" if role == "target" else "eager-no-prefix",
@@ -944,26 +1306,28 @@ def test_ngram_control_receipt_binds_distinct_evidence_and_rejects_tamper(
         return output
 
     target_rows = rows("target")
-    ngram_rows = rows("ngram")
+    dflash_rows = rows("dflash")
     target_rows_path.write_text("".join(json.dumps(row) + "\n" for row in target_rows))
-    ngram_rows_path.write_text("".join(json.dumps(row) + "\n" for row in ngram_rows))
+    dflash_rows_path.write_text("".join(json.dumps(row) + "\n" for row in dflash_rows))
     source = tmp_path / "source.json"
     identity = tmp_path / "identity.json"
     target_manifest = tmp_path / "target-manifest.json"
-    ngram_manifest = tmp_path / "ngram-manifest.json"
+    dflash_manifest = tmp_path / "dflash-manifest.json"
     target_fingerprint = tmp_path / "target-fingerprint.json"
-    ngram_fingerprint = tmp_path / "ngram-fingerprint.json"
+    dflash_fingerprint = tmp_path / "dflash-fingerprint.json"
     target_launcher = tmp_path / "target-launcher.yaml"
-    ngram_launcher = tmp_path / "ngram-launcher.yaml"
+    dflash_launcher = tmp_path / "dflash-launcher.yaml"
+    stage_receipt = tmp_path / "opb-stage-receipt.json"
     for path in (
         source,
         identity,
         target_manifest,
-        ngram_manifest,
+        dflash_manifest,
         target_fingerprint,
-        ngram_fingerprint,
+        dflash_fingerprint,
         target_launcher,
-        ngram_launcher,
+        dflash_launcher,
+        stage_receipt,
     ):
         path.write_text(path.name + "\n")
 
@@ -976,10 +1340,10 @@ def test_ngram_control_receipt_binds_distinct_evidence_and_rejects_tamper(
     monkeypatch.setattr(
         evaluator,
         "_validate_internal_rows_against_identity",
-        lambda _path, role, _identity: target_rows if role == "target" else ngram_rows,
+        lambda _path, role, _identity: target_rows if role == "target" else dflash_rows,
     )
     target_manifest_payload = {"slurm_job_id": "12345", "server_args": ["--port", "8000"]}
-    ngram_manifest_payload = {"slurm_job_id": "12345", "server_args": ["--port", "8010"]}
+    dflash_manifest_payload = {"slurm_job_id": "12345", "server_args": ["--port", "8010"]}
     monkeypatch.setattr(
         evaluator,
         "_validate_target_control_manifest",
@@ -990,10 +1354,20 @@ def test_ngram_control_receipt_binds_distinct_evidence_and_rejects_tamper(
             target_launcher,
         ),
     )
+    control_artifact = {
+        "source": {"path": "/durable/opb/dflash-s4166", "tree_sha256": "d" * 64},
+        "staged": {"path": "/raid/job/opb/dflash-s4166", "tree_sha256": "d" * 64},
+        "stage_receipt": evaluator._file_descriptor(stage_receipt),
+    }
     monkeypatch.setattr(
         evaluator,
-        "_validate_ngram_probe_manifest",
-        lambda *_args, **_kwargs: (ngram_manifest_payload, ngram_launcher, ngram_fingerprint),
+        "_validate_dflash_control_manifest",
+        lambda *_args, **_kwargs: (
+            dflash_manifest_payload,
+            dflash_launcher,
+            dflash_fingerprint,
+            control_artifact,
+        ),
     )
     monkeypatch.setattr(evaluator, "_manifest_server_port", lambda value: value["server_args"][-1])
     current = {
@@ -1014,25 +1388,57 @@ def test_ngram_control_receipt_binds_distinct_evidence_and_rejects_tamper(
     )
     receipt = tmp_path / "receipt.json"
 
-    evaluator.build_ngram_internal_target_control_receipt(
+    evaluator.build_dflash_internal_target_control_receipt(
         target_rows_path,
-        ngram_rows_path,
+        dflash_rows_path,
         source,
         target_manifest,
-        ngram_manifest,
+        dflash_manifest,
         identity,
         allocation,
+        stage_receipt,
         receipt,
     )
-    replayed = evaluator.validate_ngram_internal_target_control_receipt(receipt)
-    assert set(replayed["rows"]) == {"target", "ngram"}
-    assert replayed["control_outcome"] == "ngram-exercised-path-exact"
+    replayed = evaluator.validate_dflash_internal_target_control_receipt(receipt)
+    assert replayed["schema_version"] == 2
+    assert replayed["producer"] == "q30-opb-dflash-s4166-internal-target-control-v2"
+    assert set(replayed["rows"]) == {"target", "dflash"}
+    assert replayed["control_artifact"] == control_artifact
+    assert replayed["control_stage_receipt"] == evaluator._file_descriptor(stage_receipt)
+    assert replayed["control_outcome"] == "dflash-exercised-path-exact"
 
-    ngram_rows_path.write_text(
-        ngram_rows_path.read_text().replace('"output_text": "x"', '"output_text": "y"', 1)
+    downgraded = json.loads(receipt.read_text())
+    downgraded["schema_version"] = 1
+    downgraded["producer"] = "q30-opb-dflash-s4166-internal-target-control-v1"
+    downgraded.pop("control_stage_receipt")
+    downgraded.pop("receipt_sha256")
+    downgraded["receipt_sha256"] = evaluator._sha_json(downgraded)
+    receipt.write_text(json.dumps(downgraded) + "\n")
+    with pytest.raises(ValueError, match="schema v2 required"):
+        evaluator.validate_dflash_internal_target_control_receipt(receipt)
+    receipt.write_text(json.dumps(replayed, indent=2, sort_keys=True) + "\n")
+
+    original_receipt = receipt.read_text()
+    extra_field_receipt = json.loads(original_receipt)
+    extra_field_receipt["unexpected"] = "unsigned-schema-extension"
+    extra_field_receipt.pop("receipt_sha256")
+    extra_field_receipt["receipt_sha256"] = evaluator._sha_json(extra_field_receipt)
+    receipt.write_text(json.dumps(extra_field_receipt) + "\n")
+    with pytest.raises(ValueError, match="receipt schema mismatch"):
+        evaluator.validate_dflash_internal_target_control_receipt(receipt)
+    receipt.write_text(original_receipt)
+
+    original_stage_receipt = stage_receipt.read_text()
+    stage_receipt.write_text("tampered-stage-receipt\n")
+    with pytest.raises(ValueError, match="descriptor"):
+        evaluator.validate_dflash_internal_target_control_receipt(receipt)
+    stage_receipt.write_text(original_stage_receipt)
+
+    dflash_rows_path.write_text(
+        dflash_rows_path.read_text().replace('"output_text": "x"', '"output_text": "y"', 1)
     )
     with pytest.raises(ValueError, match="descriptor"):
-        evaluator.validate_ngram_internal_target_control_receipt(receipt)
+        evaluator.validate_dflash_internal_target_control_receipt(receipt)
 
 
 def test_internal_target_phase_is_bounded_and_routes_enforce_eager_without_speed() -> None:
@@ -1061,32 +1467,108 @@ def test_internal_target_phase_is_bounded_and_routes_enforce_eager_without_speed
     assert "SERVER_ARGS+=(--no-enable-prefix-caching)" in wrapper
 
 
-def test_ngram_control_phase_is_model_free_fail_closed_and_stops_before_speed() -> None:
-    """The ngram control has exact routing, runtime, receipt, and exercise gates."""
+def test_pair_rejects_ngram_before_exact_v2_runtime_staging(tmp_path: Path) -> None:
+    """Pinned b389 Runner V2 rejects ngram before any repository or runtime access."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\necho unexpected-git-access >&2\nexit 17\n")
+    fake_git.chmod(0o755)
+    required = {
+        "CELL_A": "baseline|0|0|1|200||target|2",
+        "CELL_B": "ngram|0|7|1|200||ngram-k7|2",
+        "CONTAINER_IDENTITY_PATH": str(tmp_path / "container.json"),
+        "CONTAINER_IMAGE": str(tmp_path / "image.sqsh"),
+        "CLIENT_RUNTIME_ARCHIVE": str(tmp_path / "client.tar.zst"),
+        "CLIENT_RUNTIME_ARCHIVE_SHA256": "a" * 64,
+        "CLUSTER_PROFILE": str(tmp_path / "cluster.toml"),
+        "CLUSTER_READINESS_RECEIPT": str(tmp_path / "cluster.json"),
+        "DATASET_MANIFEST_PATH": str(tmp_path / "dataset.json"),
+        "EVAL_CONFIG_PATH": str(tmp_path / "eval.yaml"),
+        "EVAL_OUTPUT_ROOT": str(tmp_path / "results"),
+        "HF_HOME_DURABLE": str(tmp_path / "hf"),
+        "HF_MODEL_CKPT": str(tmp_path / "target"),
+        "MODELOPT_REPO": str(tmp_path / "missing-modelopt"),
+        "MODELOPT_SHA": "b" * 40,
+        "PAIR_LABEL": "ngram-must-fail",
+        "PAIR_PHASE": "internal-target-ngram-eager-no-prefix",
+        "SERVER_RUNTIME_ARCHIVE": str(tmp_path / "server.tar.zst"),
+        "SERVER_RUNTIME_ARCHIVE_SHA256": "c" * 64,
+        "SERVER_RUNTIME_RECEIPT_SHA256": "d" * 64,
+        "SPECULATORS_REPO": str(tmp_path / "missing-speculators"),
+        "SPECULATORS_SHA": "e" * 40,
+        "SLURM_JOB_ID": "12345",
+    }
+
+    result = subprocess.run(
+        ["bash", str(_PAIR)],
+        env={**os.environ, **required, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == (
+        "ERROR: exact b389 Model Runner V2 does not support ngram/ngram_gpu speculative decoding"
+    )
+
+
+def test_wrapper_rejects_ngram_before_exact_v2_runtime_access(tmp_path: Path) -> None:
+    """A direct wrapper invocation cannot bypass the pinned Runner V2 ngram gate."""
+    required = {
+        "SPECULATORS_CLIENT_RUNTIME": str(tmp_path / "missing-client-runtime"),
+        "VLLM_SERVER_RUNTIME": str(tmp_path / "missing-server-runtime"),
+        "SPECULATORS_REPO": str(tmp_path / "missing-speculators"),
+        "HF_MODEL_CKPT": str(tmp_path / "target"),
+        "SPEC_METHOD": "ngram",
+        "HF_HOME": str(tmp_path / "hf"),
+        "EVAL_OUTPUT_ROOT": str(tmp_path / "results"),
+        "EVAL_CONFIG_PATH": str(tmp_path / "eval.yaml"),
+        "CONTAINER_IMAGE": str(tmp_path / "image.sqsh"),
+        "CONTAINER_IDENTITY_PATH": str(tmp_path / "container.json"),
+        "DATASET_MANIFEST_PATH": str(tmp_path / "dataset.json"),
+        "MODELOPT_REPO": str(tmp_path / "missing-modelopt"),
+        "VLLM_SERVER_RUNTIME_RECEIPT_SHA256": "d" * 64,
+    }
+
+    result = subprocess.run(
+        ["bash", str(_WRAPPER)],
+        env={**os.environ, **required},
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 2
+    assert result.stderr.strip() == (
+        "ERROR: exact b389 Model Runner V2 does not support ngram/ngram_gpu speculative decoding"
+    )
+
+
+def test_dflash_control_phase_is_bounded_fail_closed_and_stops_before_speed() -> None:
+    """The OPB DFlash shared-path control exits after its exercised receipt gate."""
     pair = _PAIR.read_text()
     wrapper = _WRAPPER.read_text()
 
-    assert "ngram:0:7" in pair
-    assert "internal-target-ngram-eager-no-prefix:1:200:2" in pair
-    assert '[[ "${method}" != baseline && "${method}" != ngram ]]' in pair
+    assert "internal-target-dflash-eager-no-prefix:1:200:2" in pair
+    assert '"${method_a}:${method_b}" == baseline:dflash' in pair
+    assert '"${method_a}:${method_b}" == dflash:baseline' in pair
     assert "CONTROL_DRAFT_EXPORT_PATH is required for diagnostic identity" in pair
-    assert "ngram cells are restricted to the internal-target ngram diagnostic" in pair
-    branch = pair.index('if [[ "${PAIR_PHASE}" == internal-target-ngram-eager-no-prefix ]]')
+    branch = pair.index('if [[ "${PAIR_PHASE}" == internal-target-dflash-eager-no-prefix ]]')
     capture = pair.index("run_pair_cells 1", branch)
-    analyze = pair.index("analyze-ngram-control", capture)
-    verify = pair.index("verify-ngram-control", analyze)
-    exercise = pair.index('control_outcome") != "ngram-exercised-path-exact"', verify)
-    stop = pair.index("exit 0", exercise)
+    analyze = pair.index("analyze-dflash-control", capture)
+    verify = pair.index("verify-dflash-control", analyze)
+    exercise = pair.index('control_outcome") != "dflash-exercised-path-exact"', verify)
+    nonzero = pair.index('acceptance", {}).get("num_spec_steps", 0) <= 0', exercise)
+    stop = pair.index("exit 0", nonzero)
     speed = pair.index("run_pair_cells 0", stop)
-    assert branch < capture < analyze < verify < exercise < stop < speed
+    assert branch < capture < analyze < verify < exercise < nonzero < stop < speed
 
-    assert '[[ "${SPEC_METHOD}" != "baseline" && "${SPEC_METHOD}" != "ngram" ]]' in wrapper
-    assert "ngram is restricted to the bounded internal-target diagnostic" in wrapper
-    assert 'if [[ "${SPEC_METHOD}" == ngram ]]; then' in wrapper
-    assert '"method":"ngram","num_speculative_tokens":7' in wrapper
-    assert '"prompt_lookup_max":3,"prompt_lookup_min":1' in wrapper
-    assert 'numba.__version__ != "0.65.0"' in wrapper
-    assert "from vllm.v1.spec_decode.ngram_proposer import NgramProposer" in wrapper
+    assert 'SPEC_METHOD}" == dflash' in wrapper
+    assert "--per-request-spec-decode-metrics detailed" in wrapper
+    assert "SERVER_ARGS+=(--enforce-eager)" in wrapper
+    assert "SERVER_ARGS+=(--no-enable-prefix-caching)" in wrapper
 
 
 def test_internal_target_no_prefix_manifest_args_are_exact_and_fail_closed() -> None:
@@ -1121,36 +1603,17 @@ def test_internal_target_no_prefix_manifest_args_are_exact_and_fail_closed() -> 
         )
 
 
-def test_ngram_internal_target_server_args_are_exact_and_model_free() -> None:
-    """The common-path control cannot drift from CPU ngram K7 with explicit lookup bounds."""
-    assert evaluator._expected_ngram_server_args("/target", "8010") == [
-        "-m",
-        "vllm.entrypoints.cli.main",
-        "serve",
-        "/target",
-        "--tensor-parallel-size",
-        "2",
-        "--port",
-        "8010",
-        "--speculative-config",
-        (
-            '{"method":"ngram","num_speculative_tokens":7,'
-            '"prompt_lookup_max":3,"prompt_lookup_min":1}'
-        ),
-        "--per-request-spec-decode-metrics",
-        "detailed",
-        "--enforce-eager",
-        "--no-enable-prefix-caching",
-    ]
-
-
-def test_ngram_manifest_is_model_free_and_fingerprint_exact(
+def test_dflash_control_manifest_binds_canonical_server_args_and_fingerprint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Receipt validation rejects draft identity or noncanonical ngram provenance."""
+    """Receipt validation rejects noncanonical OPB DFlash runtime provenance."""
     target = tmp_path / "target"
     target.mkdir()
     (target / "config.json").write_text("{}\n")
+    draft = tmp_path / "dflash-s4166"
+    draft.mkdir()
+    (draft / "config.json").write_text("{}\n")
+    (draft / "model.safetensors").write_bytes(b"draft")
     identity_path = tmp_path / "identity.json"
     identity_path.write_text("{}\n")
     launcher = tmp_path / "launcher.yaml"
@@ -1187,31 +1650,40 @@ def test_ngram_manifest_is_model_free_and_fingerprint_exact(
             "num_speculative_tokens": 0,
         },
     }
-    run = tmp_path / "ngram"
+    run = tmp_path / "dflash"
     run.mkdir()
     manifest_path = run / "manifest.json"
     manifest = {
         **baseline,
         "status": "success",
         "recorded_at": "2026-08-24T00:00:00+00:00",
-        "method": "ngram",
-        "block_size": 0,
+        "method": "dflash",
+        "block_size": 8,
         "num_speculative_tokens": 7,
-        "draft_model": None,
+        "draft_model": str(draft),
         "launcher_config": str(launcher),
         "config_sha256": {
             "target": evaluator._sha256(target / "config.json"),
+            "draft": evaluator._sha256(draft / "config.json"),
             "launcher": "c" * 64,
         },
-        "server_args": evaluator._expected_ngram_server_args(str(target), "8010"),
+        "server_args": expected_dflash2_server_args(
+            str(target),
+            str(draft),
+            "8010",
+            detailed_metrics=True,
+            enforce_eager=True,
+            disable_prefix_caching=True,
+        ),
         "evaluator_args": [],
     }
     manifest_path.write_text(json.dumps(manifest) + "\n")
     expected_inputs = {
         **baseline_inputs,
+        "draft_config_sha256": evaluator._sha256(draft / "config.json"),
         "evaluation": {
-            "method": "ngram",
-            "block_size": 0,
+            "method": "dflash",
+            "block_size": 8,
             "num_speculative_tokens": 7,
         },
     }
@@ -1226,20 +1698,24 @@ def test_ngram_manifest_is_model_free_and_fingerprint_exact(
         + "\n"
     )
     monkeypatch.setattr(evaluator, "_validate_control_launcher", lambda *_args: launcher)
+    control_artifact = {"path": str(draft.resolve()), "tree_sha256": "d" * 64}
+    monkeypatch.setattr(
+        evaluator, "_validate_opb_dflash_control_artifact", lambda _path: control_artifact
+    )
 
-    validated = evaluator._validate_ngram_probe_manifest(
+    validated = evaluator._validate_dflash_control_manifest(
         manifest_path,
         baseline,
         {"inputs": baseline_inputs},
         identity_path,
         {"target": {"path": str(target)}},
     )
-    assert validated[1:] == (launcher, run / "input-fingerprint.json")
+    assert validated[1:] == (launcher, run / "input-fingerprint.json", control_artifact)
 
-    manifest["draft_model"] = "/forbidden-draft"
+    manifest["method"] = "dflash2"
     manifest_path.write_text(json.dumps(manifest) + "\n")
-    with pytest.raises(ValueError, match="ngram control manifest mismatch"):
-        evaluator._validate_ngram_probe_manifest(
+    with pytest.raises(ValueError, match="DFlash control manifest mismatch"):
+        evaluator._validate_dflash_control_manifest(
             manifest_path,
             baseline,
             {"inputs": baseline_inputs},
@@ -1248,8 +1724,8 @@ def test_ngram_manifest_is_model_free_and_fingerprint_exact(
         )
 
 
-def test_zero_step_speculative_metrics_are_ngram_only_evidence() -> None:
-    """A zero-step response is valid for ngram but cannot satisfy a DFlash2 diagnostic."""
+def test_zero_step_speculative_metrics_cannot_satisfy_any_model_control() -> None:
+    """Schema-valid zero-step metrics remain non-evidence for DFlash and DFlash2."""
     payload = {
         "mean_acceptance_length": 1.0,
         "draft_acceptance_rate": 0.0,
@@ -1264,9 +1740,6 @@ def test_zero_step_speculative_metrics_are_ngram_only_evidence() -> None:
 
     with pytest.raises(ValueError, match="nonzero speculative steps"):
         evaluator._validate_spec_decode_metrics_payload(payload)
-    assert (
-        evaluator._validate_spec_decode_metrics_payload(payload, allow_zero_steps=True) == payload
-    )
 
     malformed = {**payload, "mean_acceptance_length": 2.0}
     with pytest.raises(ValueError, match="accounting mismatch"):
@@ -1315,10 +1788,10 @@ def test_internal_target_cli_accepts_no_prefix_mode_and_wrapper_propagates_failu
     assert "|| exit $?" in wrapper[output : output + 80]
 
 
-def test_internal_target_cli_routes_ngram_common_path_control(
+def test_internal_target_cli_routes_dflash_common_path_control(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The production CLI preserves the distinct ngram role and exact engine mode."""
+    """The production CLI preserves the distinct DFlash role and exact engine mode."""
     observed: dict[str, Any] = {}
 
     def capture(*_args: Any, **kwargs: Any) -> None:
@@ -1341,7 +1814,7 @@ def test_internal_target_cli_routes_ngram_common_path_control(
             "--model",
             "/target",
             "--role",
-            "ngram",
+            "dflash",
             "--engine-mode",
             "eager-no-prefix",
         ],
@@ -1349,11 +1822,11 @@ def test_internal_target_cli_routes_ngram_common_path_control(
 
     evaluator.main()
 
-    assert observed["role"] == "ngram"
+    assert observed["role"] == "dflash"
     assert observed["engine_mode"] == "eager-no-prefix"
 
 
-def test_ngram_control_receipt_cli_routes_build_and_verify(
+def test_dflash_control_receipt_cli_routes_build_and_verify(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The pair-script receipt commands route every bound evidence path."""
@@ -1361,24 +1834,25 @@ def test_ngram_control_receipt_cli_routes_build_and_verify(
     verified: list[Path] = []
     monkeypatch.setattr(
         evaluator,
-        "build_ngram_internal_target_control_receipt",
+        "build_dflash_internal_target_control_receipt",
         lambda *paths: built.append(paths),
     )
     monkeypatch.setattr(
         evaluator,
-        "validate_ngram_internal_target_control_receipt",
+        "validate_dflash_internal_target_control_receipt",
         lambda path: verified.append(path),
     )
     paths = [
         tmp_path / name
         for name in (
             "target.jsonl",
-            "ngram.jsonl",
+            "dflash.jsonl",
             "source.json",
             "target-manifest.json",
-            "ngram-manifest.json",
+            "dflash-manifest.json",
             "identity.json",
             "allocation.json",
+            "opb-stage-receipt.json",
             "receipt.json",
         )
     ]
@@ -1386,23 +1860,25 @@ def test_ngram_control_receipt_cli_routes_build_and_verify(
         "sys.argv",
         [
             "dflash2_speculators_eval.py",
-            "analyze-ngram-control",
+            "analyze-dflash-control",
             "--target-rows",
             str(paths[0]),
-            "--ngram-rows",
+            "--dflash-rows",
             str(paths[1]),
             "--source-pilot-receipt",
             str(paths[2]),
             "--target-manifest",
             str(paths[3]),
-            "--ngram-manifest",
+            "--dflash-manifest",
             str(paths[4]),
             "--artifact-identity",
             str(paths[5]),
             "--allocation-receipt",
             str(paths[6]),
-            "--output",
+            "--control-stage-receipt",
             str(paths[7]),
+            "--output",
+            str(paths[8]),
         ],
     )
     evaluator.main()
@@ -1410,10 +1886,10 @@ def test_ngram_control_receipt_cli_routes_build_and_verify(
 
     monkeypatch.setattr(
         "sys.argv",
-        ["dflash2_speculators_eval.py", "verify-ngram-control", "--receipt", str(paths[7])],
+        ["dflash2_speculators_eval.py", "verify-dflash-control", "--receipt", str(paths[8])],
     )
     evaluator.main()
-    assert verified == [paths[7]]
+    assert verified == [paths[8]]
 
 
 def test_tie_aware_pilot_summary_fails_closed_on_unresolved_rows(tmp_path: Path) -> None:
