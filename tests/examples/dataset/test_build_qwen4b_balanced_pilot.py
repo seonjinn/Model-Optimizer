@@ -7,6 +7,8 @@ import errno
 import hashlib
 import importlib.util
 import json
+import os
+import sqlite3
 import sys
 import threading
 from collections import Counter
@@ -217,6 +219,14 @@ class _FailingTokenizer(_MaskTokenizer):
         return super().apply_chat_template(messages, **kwargs)
 
 
+class _Qwen3MaskTokenizer(_MaskTokenizer):
+    eos_token_id = 151_645
+
+    @staticmethod
+    def convert_tokens_to_ids(token: str) -> int:
+        return {"<|im_start|>": 151_644, "<|im_end|>": 151_645}[token]
+
+
 def _tiny_config(module, *, minimum_assistant_tokens: int = 1):
     quota = module.PilotQuota("chat", "chat", 2)
     return module.PilotConfig(
@@ -254,13 +264,13 @@ def test_manifest_replay_binds_data_file_and_self_hash(tmp_path: Path) -> None:
     )
 
     assert completion.output_root == output
-    module._verify_bundle_root(output, production=False)
+    module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())
     manifest = output / "balanced" / "MANIFEST.json"
     assert manifest.is_file()
     data = output / "balanced" / "data.jsonl"
     data.write_text(data.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(module.PilotError, match="data file"):
-        module._verify_bundle_root(output, production=False)
+        module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())
 
 
 def test_publication_failure_for_insufficient_assistant_tokens_has_no_final_root(
@@ -446,7 +456,7 @@ def test_execution_receipt_tamper_is_rejected_independently(tmp_path: Path) -> N
     execution.write_text('{"effective_workers":99}\n', encoding="utf-8")
 
     with pytest.raises(module.PilotError, match="execution receipt"):
-        module._verify_bundle_root(output, production=False)
+        module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())
 
 
 def test_tokenization_keeps_inflight_work_bounded(monkeypatch, tmp_path: Path) -> None:
@@ -541,7 +551,12 @@ def test_bundle_builder_streams_selected_bodies_without_materialized_selection(
         workers=2,
     )
 
-    assert module._verify_bundle_root(output, production=False)["balanced"].row_count == 2
+    assert (
+        module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())[
+            "balanced"
+        ].row_count
+        == 2
+    )
 
 
 def test_cross_split_duplicate_assignment_preserves_feasible_quotas() -> None:
@@ -572,6 +587,43 @@ def test_cross_split_duplicate_assignment_preserves_feasible_quotas() -> None:
         "answer 0",
         "answer 7",
     }
+
+
+def test_capacitated_matching_uses_bounded_sql_operations(tmp_path: Path) -> None:
+    """Restoring per-candidate or per-occupant SQL lookups must violate this bound."""
+    module = _load_module()
+    quotas = (
+        module.PilotQuota("chat", "chat", 2_000),
+        module.PilotQuota("math", "math", 2_000),
+    )
+    config = module.PilotConfig(
+        historical_quotas=quotas,
+        balanced_quotas=quotas,
+        source_revision="c" * 40,
+    )
+    rows = {
+        split: [_row(split, index, duplicate_prompt=f"shared {index}") for index in range(12_000)]
+        for split in ("chat", "math")
+    }
+    connection = sqlite3.connect(tmp_path / "matching.sqlite")
+    module._prepare_selection_database(connection)
+    module._spool_candidates(connection, rows, config, set())
+    selects: list[str] = []
+    connection.set_trace_callback(
+        lambda statement: (
+            selects.append(statement)
+            if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+            else None
+        )
+    )
+
+    selected = module._select_arm_from_spool(
+        connection, "balanced", quotas, config, materialize=False
+    )
+
+    connection.close()
+    assert selected == ()
+    assert len(selects) <= 3
 
 
 def test_conflicting_response_tie_is_canonical_under_input_reversal() -> None:
@@ -673,7 +725,7 @@ def test_semantic_manifest_tamper_fails_after_attacker_rehashes_receipts(
     _rehash_receipts(module, output, "historical-proportion")
 
     with pytest.raises(module.PilotError, match=message):
-        module._verify_bundle_root(output, production=False)
+        module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())
 
 
 def test_cross_arm_tokenizer_pin_tamper_fails_after_full_rehash(tmp_path: Path) -> None:
@@ -696,7 +748,65 @@ def test_cross_arm_tokenizer_pin_tamper_fails_after_full_rehash(tmp_path: Path) 
     _rehash_receipts(module, output, "balanced")
 
     with pytest.raises(module.PilotError, match="cross-arm"):
+        module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())
+
+
+def test_verifier_recomputes_assistant_tokens_after_full_attacker_rehash(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Rehashing forged per-row token counts must not make fabricated evidence valid."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    tokenizer_source = tmp_path / "tokenizer"
+    tokenizer_source.mkdir()
+    (tokenizer_source / "tokenizer.json").write_text('{"model":"Qwen3-4B"}\n')
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path=tokenizer_source,
+        tokenizer_sha256=_tree_digest(tokenizer_source),
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+    arm = "balanced"
+    data_path = output / arm / "data.jsonl"
+    forged_rows = [json.loads(line) for line in data_path.read_text().splitlines()]
+    for row in forged_rows:
+        assert row["assistant_tokens"] == 6
+        row["assistant_tokens"] = 1
+    forged_data = "".join(module.canonical_json(row) + "\n" for row in forged_rows)
+    data_path.write_text(forged_data, encoding="utf-8")
+    token_digest = hashlib.sha256()
+    for row in sorted(forged_rows, key=lambda value: value["prompt_uuid"]):
+        token_digest.update(
+            module.canonical_json([row["prompt_uuid"], row["assistant_tokens"]]).encode()
+        )
+        token_digest.update(b"\n")
+    manifest_path = output / arm / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["data_file"] = {
+        "path": "data.jsonl",
+        "bytes": data_path.stat().st_size,
+        "sha256": hashlib.sha256(data_path.read_bytes()).hexdigest(),
+    }
+    manifest["assistant_tokens"] = 2
+    manifest["token_evidence_sha256"] = token_digest.hexdigest()
+    manifest_path.write_text(module.canonical_json(manifest) + "\n")
+    _rehash_receipts(module, output, arm)
+    loaded_snapshots: list[Path] = []
+
+    def load_snapshot(path: Path):
+        loaded_snapshots.append(path)
+        assert path != tokenizer_source
+        return _Qwen3MaskTokenizer()
+
+    monkeypatch.setattr(module, "_load_verified_qwen_tokenizer", load_snapshot)
+
+    with pytest.raises(module.PilotError, match="assistant-token"):
         module._verify_bundle_root(output, production=False)
+    assert len(loaded_snapshots) == 1
+    assert not loaded_snapshots[0].exists()
 
 
 def test_execution_parallelism_does_not_change_scientific_bundle_bytes(tmp_path: Path) -> None:
@@ -857,6 +967,82 @@ def test_genuine_minimal_qwen_chat_template_marks_only_assistant_boundary(
 
     assert loaded.chat_template == template
     assert module.count_assistant_tokens(loaded, messages) == 1
+
+
+def test_oci_preflight_authenticates_offline_qwen3_tokenizer_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The OCI gate must hash a detached tree and reject a non-Qwen tokenizer identity."""
+    module = _load_module()
+    source = tmp_path / "qwen3-4b-tokenizer"
+    source.mkdir()
+    (source / "tokenizer.json").write_text('{"model":"Qwen3-4B"}\n')
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    loaded_paths: list[Path] = []
+
+    class _WrongTokenizer(_Qwen3MaskTokenizer):
+        @staticmethod
+        def convert_tokens_to_ids(token: str) -> int:
+            return {"<|im_start|>": 1, "<|im_end|>": 2}[token]
+
+    tokenizer_to_load: list[_Qwen3MaskTokenizer] = [_WrongTokenizer()]
+
+    def load_snapshot(path: Path):
+        loaded_paths.append(path)
+        assert path != source
+        assert (path / "tokenizer.json").read_text() == '{"model":"Qwen3-4B"}\n'
+        return tokenizer_to_load[0]
+
+    monkeypatch.setattr(module, "_load_verified_qwen_tokenizer", load_snapshot)
+    with pytest.raises(module.PilotError, match="Qwen3 tokenizer identity"):
+        module.preflight_qwen3_4b_tokenizer_snapshot(source, _tree_digest(source), scratch)
+    tokenizer_to_load[0] = _Qwen3MaskTokenizer()
+    evidence = module.preflight_qwen3_4b_tokenizer_snapshot(source, _tree_digest(source), scratch)
+
+    assert evidence.sha256 == _tree_digest(source)
+    assert evidence.im_start_token_id == 151_644
+    assert evidence.im_end_token_id == 151_645
+    assert evidence.probe_assistant_tokens == 6
+    assert len(loaded_paths) == 2
+    assert all(not path.exists() for path in loaded_paths)
+    assert list(scratch.iterdir()) == []
+
+
+def test_publication_fsyncs_entire_copied_tree_before_atomic_rename(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Renaming a copied tree before syncing every inode can publish non-durable receipts."""
+    module = _load_module()
+    synced: set[tuple[int, int]] = set()
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        observed = os.fstat(descriptor)
+        synced.add((observed.st_dev, observed.st_ino))
+        real_fsync(descriptor)
+
+    def assert_durable_then_rename(source: Path, destination: Path) -> None:
+        copied = [source, *source.rglob("*")]
+        expected = {
+            (path.stat().st_dev, path.stat().st_ino)
+            for path in copied
+            if path.is_file() or path.is_dir()
+        }
+        assert expected <= synced
+        source.rename(destination)
+
+    monkeypatch.setattr(module.os, "fsync", record_fsync)
+    monkeypatch.setattr(module, "_rename_noreplace", assert_durable_then_rename)
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=tmp_path / "pilot",
+        producer_source_commit="b" * 40,
+    )
 
 
 def test_public_failures_are_normalized_to_pilot_error(tmp_path: Path) -> None:

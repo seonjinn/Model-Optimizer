@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import heapq
 import json
 import os
 import shutil
@@ -147,6 +148,17 @@ class PilotCompletion:
     historical_proportion: PilotArmCompletion
     balanced: PilotArmCompletion
     complete_sha256: str
+
+
+@dataclass(frozen=True)
+class QwenTokenizerPreflight:
+    """Authenticated offline identity required before an OCI production build."""
+
+    sha256: str
+    chat_template_sha256: str
+    im_start_token_id: int
+    im_end_token_id: int
+    probe_assistant_tokens: int
 
 
 @dataclass(frozen=True)
@@ -447,53 +459,96 @@ def _select_arm_from_spool(
     category = {quota.split: quota.category for quota in quotas}
     members: dict[str, set[str]] = {split: set() for split in capacity}
     assignment: dict[str, str] = {}
+    edge_cache: dict[str, tuple[tuple[str, str], ...]] = {}
+    residual_heaps: dict[tuple[str, str], list[tuple[int, str]]] = {}
 
-    def edges(prompt_uuid: str) -> tuple[tuple[str, str], ...]:
-        return tuple(
-            (str(split), str(rank))
-            for split, rank in connection.execute(
-                "SELECT split, rank FROM candidates WHERE prompt_uuid = ? ORDER BY rank, split",
-                (prompt_uuid,),
-            )
-            if split in capacity
-        )
+    def cache_residual_edges(prompt_uuid: str, assigned_split: str) -> None:
+        rank_by_split = dict(edge_cache[prompt_uuid])
+        displacement_key = -int(rank_by_split[assigned_split], 16)
+        for target_split in rank_by_split:
+            if target_split != assigned_split:
+                heapq.heappush(
+                    residual_heaps.setdefault((assigned_split, target_split), []),
+                    (displacement_key, prompt_uuid),
+                )
 
-    def place(prompt_uuid: str, visited_splits: set[str]) -> bool:
-        for split, _rank_value in edges(prompt_uuid):
-            if split in visited_splits:
-                continue
-            visited_splits.add(split)
-            occupants = members[split]
-            if len(occupants) < capacity[split]:
-                previous = assignment.get(prompt_uuid)
-                if previous is not None:
-                    members[previous].remove(prompt_uuid)
-                occupants.add(prompt_uuid)
-                assignment[prompt_uuid] = split
-                return True
-            ranked_occupants = sorted(
-                occupants,
-                key=lambda value: next(rank for edge, rank in edges(value) if edge == split),
-                reverse=True,
-            )
-            for occupant in ranked_occupants:
-                if place(occupant, visited_splits):
-                    occupants.add(prompt_uuid)
-                    assignment[prompt_uuid] = split
-                    return True
-        return False
+    def move(prompt_uuid: str, destination: str) -> None:
+        previous = assignment.get(prompt_uuid)
+        if previous is not None:
+            members[previous].remove(prompt_uuid)
+        members[destination].add(prompt_uuid)
+        assignment[prompt_uuid] = destination
+        cache_residual_edges(prompt_uuid, destination)
+
+    def movable_occupant(source: str, destination: str) -> str | None:
+        heap = residual_heaps.get((source, destination), [])
+        while heap and assignment.get(heap[0][1]) != source:
+            heapq.heappop(heap)
+        return heap[0][1] if heap else None
+
+    def place(prompt_uuid: str, candidate_edges: tuple[tuple[str, str], ...]) -> bool:
+        edge_cache[prompt_uuid] = candidate_edges
+        queue = [split for split, _rank_value in candidate_edges]
+        parent: dict[str, tuple[str, str] | None] = dict.fromkeys(queue)
+        cursor_index = 0
+        free_split: str | None = None
+        while cursor_index < len(queue):
+            source = queue[cursor_index]
+            cursor_index += 1
+            if len(members[source]) < capacity[source]:
+                free_split = source
+                break
+            for destination in sorted(capacity):
+                if destination in parent or destination == source:
+                    continue
+                occupant = movable_occupant(source, destination)
+                if occupant is None:
+                    continue
+                parent[destination] = (source, occupant)
+                queue.append(destination)
+        if free_split is None:
+            edge_cache.pop(prompt_uuid)
+            return False
+        destination = free_split
+        link = parent[destination]
+        while link is not None:
+            source, occupant = link
+            move(occupant, destination)
+            destination = source
+            link = parent[destination]
+        move(prompt_uuid, destination)
+        return True
 
     target = sum(capacity.values())
-    cursor = connection.execute(
+    placeholders = ",".join("?" for _ in capacity)
+    ranked_edges = connection.execute(
+        "WITH candidate_order AS ("
         "SELECT prompt_uuid, MIN(rank) AS first_rank FROM candidates "
-        f"WHERE split IN ({','.join('?' for _ in capacity)}) "
-        "GROUP BY prompt_uuid ORDER BY first_rank, prompt_uuid",
-        tuple(capacity),
+        f"WHERE split IN ({placeholders}) GROUP BY prompt_uuid) "
+        "SELECT candidates.prompt_uuid, candidates.split, candidates.rank "
+        "FROM candidate_order JOIN candidates USING(prompt_uuid) "
+        f"WHERE candidates.split IN ({placeholders}) "
+        "ORDER BY candidate_order.first_rank, candidates.prompt_uuid, "
+        "candidates.rank, candidates.split",
+        (*capacity, *capacity),
     )
-    for prompt_uuid, _first_rank in cursor:
-        place(str(prompt_uuid), set())
-        if len(assignment) == target:
-            break
+    current_uuid: str | None = None
+    current_edges: list[tuple[str, str]] = []
+    try:
+        for raw_uuid, raw_split, raw_rank in ranked_edges:
+            prompt_uuid = str(raw_uuid)
+            if current_uuid is not None and prompt_uuid != current_uuid:
+                place(current_uuid, tuple(current_edges))
+                if len(assignment) == target:
+                    break
+                current_edges.clear()
+            current_uuid = prompt_uuid
+            current_edges.append((str(raw_split), str(raw_rank)))
+        else:
+            if current_uuid is not None and len(assignment) < target:
+                place(current_uuid, tuple(current_edges))
+    finally:
+        ranked_edges.close()
     for quota in quotas:
         filled = len(members[quota.split])
         if filled != quota.rows:
@@ -503,23 +558,37 @@ def _select_arm_from_spool(
             )
     selected_identities: list[tuple[str, str, str]] = []
     for prompt_uuid, split in assignment.items():
-        rank = next(value for edge, value in edges(prompt_uuid) if edge == split)
+        rank = next(value for edge, value in edge_cache[prompt_uuid] if edge == split)
         selected_identities.append((rank, prompt_uuid, split))
     selected_identities.sort()
-    batch: list[tuple[str, int, str, str, str, str, None]] = []
+    connection.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS current_assignment ("
+        "ordinal INTEGER PRIMARY KEY, prompt_uuid TEXT NOT NULL, split TEXT NOT NULL, "
+        "category TEXT NOT NULL)"
+    )
+    connection.execute("DELETE FROM current_assignment")
+    batch: list[tuple[int, str, str, str]] = []
     for ordinal, (_rank_value, prompt_uuid, split) in enumerate(selected_identities):
-        payload = connection.execute(
-            "SELECT messages_json FROM candidates WHERE prompt_uuid = ? AND split = ?",
-            (prompt_uuid, split),
-        ).fetchone()
-        if payload is None:
-            raise PilotError("quota-aware assignment lost a selected candidate")
-        batch.append((arm, ordinal, prompt_uuid, split, category[split], str(payload[0]), None))
+        batch.append((ordinal, prompt_uuid, split, category[split]))
         if len(batch) == 1_024:
-            connection.executemany("INSERT INTO selected VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+            connection.executemany("INSERT INTO current_assignment VALUES (?, ?, ?, ?)", batch)
             batch.clear()
     if batch:
-        connection.executemany("INSERT INTO selected VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
+        connection.executemany("INSERT INTO current_assignment VALUES (?, ?, ?, ?)", batch)
+    connection.execute(
+        "INSERT INTO selected "
+        "SELECT ?, assignment.ordinal, assignment.prompt_uuid, assignment.split, "
+        "assignment.category, candidates.messages_json, NULL "
+        "FROM current_assignment AS assignment JOIN candidates "
+        "ON candidates.prompt_uuid = assignment.prompt_uuid "
+        "AND candidates.split = assignment.split ORDER BY assignment.ordinal",
+        (arm,),
+    )
+    inserted = connection.execute("SELECT COUNT(*) FROM selected WHERE arm = ?", (arm,)).fetchone()[
+        0
+    ]
+    if inserted != target:
+        raise PilotError("quota-aware assignment lost a selected candidate")
     connection.commit()
     if not materialize:
         return ()
@@ -596,6 +665,7 @@ def build_pilot_bundles(
             Path(tokenizer_path), tokenizer_sha256, scratch_parent
         )
         tokenizer = _load_verified_qwen_tokenizer(staged)
+        _qwen3_tokenizer_preflight_evidence(tokenizer, tokenizer_sha256)
         return _build_pilot_bundles_for_test(
             split_rows,
             config=config,
@@ -715,11 +785,12 @@ def _build_pilot_bundles_for_test(
             effective_workers=effective_workers,
             execution=execution,
         )
-        _verify_bundle_root(partial, production=_production)
+        _verify_bundle_root(partial, production=_production, tokenizer=tokenizer)
         local_partial = output_root.parent / f".{output_root.name}.publish-{uuid.uuid4().hex}"
         shutil.copytree(partial, local_partial)
         os.chmod(local_partial, 0o700)
-        _verify_bundle_root(local_partial, production=_production)
+        _verify_bundle_root(local_partial, production=_production, tokenizer=tokenizer)
+        _fsync_tree(local_partial)
         if output_root.exists():
             raise PilotError(f"publication destination already exists: {output_root}")
         try:
@@ -732,7 +803,7 @@ def _build_pilot_bundles_for_test(
             raise PilotError("atomic pilot publication failed") from error
         local_partial = None
         _fsync_directory(output_root.parent)
-        _verify_bundle_root(output_root, production=_production)
+        _verify_bundle_root(output_root, production=_production, tokenizer=tokenizer)
         complete = _read_json(output_root / "COMPLETE.json")
         return PilotCompletion(
             output_root=output_root,
@@ -955,6 +1026,64 @@ def _load_verified_qwen_tokenizer(path: Path) -> Any:
     if not isinstance(getattr(tokenizer, "chat_template", None), str):
         raise PilotError("pinned Qwen3-4B tokenizer has no chat template")
     return tokenizer
+
+
+def _qwen3_tokenizer_preflight_evidence(
+    tokenizer: Any, authenticated_sha256: str
+) -> QwenTokenizerPreflight:
+    try:
+        im_start_token_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        eos_token_id = tokenizer.eos_token_id
+    except Exception as error:
+        raise PilotError(
+            "pinned tokenizer does not expose the Qwen3 special-token contract"
+        ) from error
+    if (
+        type(im_start_token_id) is not int
+        or im_start_token_id != 151_644
+        or type(im_end_token_id) is not int
+        or im_end_token_id != 151_645
+        or type(eos_token_id) is not int
+        or eos_token_id != im_end_token_id
+    ):
+        raise PilotError("pinned tokenizer is not the approved Qwen3 tokenizer identity")
+    probe_assistant_tokens = count_assistant_tokens(
+        tokenizer,
+        [
+            {"role": "system", "content": "You are useful."},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+    )
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(template, str) or not template:
+        raise PilotError("pinned Qwen3 tokenizer has no chat template")
+    return QwenTokenizerPreflight(
+        sha256=authenticated_sha256,
+        chat_template_sha256=hashlib.sha256(template.encode("utf-8")).hexdigest(),
+        im_start_token_id=im_start_token_id,
+        im_end_token_id=im_end_token_id,
+        probe_assistant_tokens=probe_assistant_tokens,
+    )
+
+
+def preflight_qwen3_4b_tokenizer_snapshot(
+    tokenizer_path: str | Path,
+    tokenizer_sha256: str,
+    scratch_root: Path,
+) -> QwenTokenizerPreflight:
+    """Authenticate and exercise the exact offline Qwen3-4B tokenizer used on OCI."""
+    snapshot: Path | None = None
+    try:
+        snapshot, digest = _stage_verified_tokenizer_snapshot(
+            Path(tokenizer_path), tokenizer_sha256, Path(scratch_root)
+        )
+        tokenizer = _load_verified_qwen_tokenizer(snapshot)
+        return _qwen3_tokenizer_preflight_evidence(tokenizer, digest)
+    finally:
+        if snapshot is not None and snapshot.exists():
+            shutil.rmtree(snapshot)
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
@@ -1223,9 +1352,11 @@ _MANIFEST_FIELDS = {
 }
 
 
-def _verify_bundle_root(root: Path, *, production: bool = True) -> dict[str, PilotArmCompletion]:
+def _verify_bundle_root(
+    root: Path, *, production: bool = True, tokenizer: Any | None = None
+) -> dict[str, PilotArmCompletion]:
     try:
-        return _verify_bundle_root_impl(Path(root), production=production)
+        return _verify_bundle_root_impl(Path(root), production=production, tokenizer=tokenizer)
     except PilotError:
         raise
     except Exception as error:
@@ -1233,7 +1364,9 @@ def _verify_bundle_root(root: Path, *, production: bool = True) -> dict[str, Pil
         raise PilotError(f"{scope}pilot completion verification failed") from error
 
 
-def _verify_bundle_root_impl(root: Path, *, production: bool) -> dict[str, PilotArmCompletion]:
+def _verify_bundle_root_impl(
+    root: Path, *, production: bool, tokenizer: Any | None
+) -> dict[str, PilotArmCompletion]:
     complete = _read_json(root / "COMPLETE.json")
     if (
         set(complete) != {"schema_version", "arms", "complete_sha256"}
@@ -1249,8 +1382,6 @@ def _verify_bundle_root_impl(root: Path, *, production: bool) -> dict[str, Pilot
     }:
         raise PilotError("aggregate completion arm descriptors are invalid")
     manifests: dict[str, dict[str, Any]] = {}
-    evidence_by_arm: dict[str, _DataEvidence] = {}
-    arms: dict[str, PilotArmCompletion] = {}
     for arm in (HISTORICAL_PROPORTION, BALANCED):
         descriptor = descriptors[arm]
         if (
@@ -1272,19 +1403,48 @@ def _verify_bundle_root_impl(root: Path, *, production: bool) -> dict[str, Pilot
         if data["bytes"] != data_path.stat().st_size or data["sha256"] != _sha256_file(data_path):
             raise PilotError(f"{arm} data file descriptor does not reconcile")
         _verify_execution_receipt(manifest_path.parent / "EXECUTION.json")
-        evidence = _read_data_evidence(
-            data_path, training_sequence_length=manifest["training_sequence_length"]
-        )
-        _reconcile_manifest_evidence(manifest, evidence, arm=arm, production=production)
         manifests[arm] = manifest
-        evidence_by_arm[arm] = evidence
-        arms[arm] = PilotArmCompletion(
-            arm=arm,
-            row_count=evidence.row_count,
-            assistant_tokens=evidence.assistant_tokens,
-            manifest_sha256=manifest["manifest_sha256"],
-        )
     _validate_cross_arm_pins(manifests)
+    staged: Path | None = None
+    verified_tokenizer = tokenizer
+    try:
+        tokenizer_pin = manifests[HISTORICAL_PROPORTION]["tokenizer"]
+        if verified_tokenizer is None:
+            staged, digest = _stage_verified_tokenizer_snapshot(
+                Path(tokenizer_pin["path"]),
+                tokenizer_pin["sha256"],
+                Path(tempfile.gettempdir()),
+            )
+            verified_tokenizer = _load_verified_qwen_tokenizer(staged)
+            preflight = _qwen3_tokenizer_preflight_evidence(verified_tokenizer, digest)
+            if preflight.chat_template_sha256 != tokenizer_pin["chat_template_sha256"]:
+                raise PilotError("authenticated Qwen3 tokenizer template does not reconcile")
+        else:
+            template = getattr(verified_tokenizer, "chat_template", None)
+            if (
+                not isinstance(template, str)
+                or hashlib.sha256(template.encode("utf-8")).hexdigest()
+                != tokenizer_pin["chat_template_sha256"]
+            ):
+                raise PilotError("test tokenizer template does not reconcile")
+        arms: dict[str, PilotArmCompletion] = {}
+        for arm in (HISTORICAL_PROPORTION, BALANCED):
+            manifest = manifests[arm]
+            evidence = _read_data_evidence(
+                root / arm / "data.jsonl",
+                training_sequence_length=manifest["training_sequence_length"],
+                tokenizer=verified_tokenizer,
+            )
+            _reconcile_manifest_evidence(manifest, evidence, arm=arm, production=production)
+            arms[arm] = PilotArmCompletion(
+                arm=arm,
+                row_count=evidence.row_count,
+                assistant_tokens=evidence.assistant_tokens,
+                manifest_sha256=manifest["manifest_sha256"],
+            )
+    finally:
+        if staged is not None and staged.exists():
+            shutil.rmtree(staged)
     return arms
 
 
@@ -1412,7 +1572,9 @@ def _verify_execution_receipt(path: Path) -> None:
         raise PilotError("execution receipt schema or self-hash does not reconcile")
 
 
-def _read_data_evidence(path: Path, *, training_sequence_length: int) -> _DataEvidence:
+def _read_data_evidence(
+    path: Path, *, training_sequence_length: int, tokenizer: Any
+) -> _DataEvidence:
     row_count = 0
     split_counts: dict[str, int] = {}
     category_counts: dict[str, int] = {}
@@ -1435,8 +1597,12 @@ def _read_data_evidence(path: Path, *, training_sequence_length: int) -> _DataEv
                 if type(split) is not str:
                     raise PilotError("data JSONL split is invalid")
                 row = _normalize_row(split, payload)
-                count = payload["assistant_tokens"]
-                if type(count) is not int or count < 1 or count > training_sequence_length:
+                declared_count = payload["assistant_tokens"]
+                if (
+                    type(declared_count) is not int
+                    or declared_count < 1
+                    or declared_count > training_sequence_length
+                ):
                     raise PilotError("data JSONL assistant-token evidence is invalid")
             except (KeyError, TypeError, json.JSONDecodeError, PilotError) as error:
                 raise PilotError("data JSONL row is malformed") from error
@@ -1446,6 +1612,15 @@ def _read_data_evidence(path: Path, *, training_sequence_length: int) -> _DataEv
                 or row.prompt_uuid in prompt_uuids
             ):
                 raise PilotError("data JSONL identity or global UUID uniqueness does not reconcile")
+            count = count_assistant_tokens(
+                tokenizer,
+                row.messages,
+                training_sequence_length=training_sequence_length,
+            )
+            if declared_count != count:
+                raise PilotError(
+                    "data JSONL assistant-token evidence does not match authenticated tokenizer"
+                )
             prompt_uuids.add(row.prompt_uuid)
             token_pairs.append((row.prompt_uuid, count))
             row_count += 1
@@ -1546,3 +1721,23 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _fsync_tree(root: Path) -> None:
+    """Make every copied file and directory durable before the root is renamed."""
+    directories = [root]
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            raise PilotError("publication copy unexpectedly contains a symlink")
+        if path.is_dir():
+            directories.append(path)
+            continue
+        if not path.is_file():
+            raise PilotError("publication copy contains a non-regular component")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    for directory in sorted(directories, key=lambda value: len(value.parts), reverse=True):
+        _fsync_directory(directory)
