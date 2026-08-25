@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib.util
 import json
 import sys
+import threading
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -251,13 +254,13 @@ def test_manifest_replay_binds_data_file_and_self_hash(tmp_path: Path) -> None:
     )
 
     assert completion.output_root == output
-    module.verify_pilot_completion(output)
+    module._verify_bundle_root(output, production=False)
     manifest = output / "balanced" / "MANIFEST.json"
     assert manifest.is_file()
     data = output / "balanced" / "data.jsonl"
     data.write_text(data.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     with pytest.raises(module.PilotError, match="data file"):
-        module.verify_pilot_completion(output)
+        module._verify_bundle_root(output, production=False)
 
 
 def test_publication_failure_for_insufficient_assistant_tokens_has_no_final_root(
@@ -327,7 +330,6 @@ def test_public_build_rejects_nonproduction_scientific_identity(tmp_path: Path) 
         module.build_pilot_bundles(
             _tiny_rows(),
             config=_tiny_config(module),
-            tokenizer=_MaskTokenizer(),
             tokenizer_path="/tokenizer",
             tokenizer_sha256="a" * 64,
             output_root=tmp_path / "pilot",
@@ -444,10 +446,10 @@ def test_execution_receipt_tamper_is_rejected_independently(tmp_path: Path) -> N
     execution.write_text('{"effective_workers":99}\n', encoding="utf-8")
 
     with pytest.raises(module.PilotError, match="execution receipt"):
-        module.verify_pilot_completion(output)
+        module._verify_bundle_root(output, production=False)
 
 
-def test_tokenization_keeps_inflight_work_bounded(monkeypatch) -> None:
+def test_tokenization_keeps_inflight_work_bounded(monkeypatch, tmp_path: Path) -> None:
     """Eagerly submitting every selected row must overflow this bounded executor."""
     module = _load_module()
 
@@ -484,11 +486,420 @@ def test_tokenization_keeps_inflight_work_bounded(monkeypatch) -> None:
 
     monkeypatch.setattr(module, "ThreadPoolExecutor", _BoundedExecutor)
     monkeypatch.setattr(module, "wait", complete_one)
-    rows = tuple(
-        module.PilotRow(
-            "a" * 63 + str(index), "chat", "chat", json.dumps(_row("chat", index)["messages"])
-        )
-        for index in range(6)
+    import sqlite3
+
+    connection = sqlite3.connect(tmp_path / "selected.sqlite")
+    module._prepare_selection_database(connection)
+    connection.executemany(
+        "INSERT INTO selected VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "balanced",
+                index,
+                "a" * 63 + str(index),
+                "chat",
+                "chat",
+                json.dumps(_row("chat", index)["messages"]),
+                None,
+            )
+            for index in range(6)
+        ],
     )
 
-    assert module._count_selected_rows(_MaskTokenizer(), rows, workers=2) == (6,) * 6
+    assert (
+        module._count_spooled_rows(
+            connection, _MaskTokenizer(), "balanced", workers=2, training_sequence_length=4_096
+        )
+        == 36
+    )
+    assert (
+        connection.execute("SELECT COUNT(*) FROM selected WHERE assistant_tokens = 6").fetchone()[0]
+        == 6
+    )
+    connection.close()
+
+
+def test_bundle_builder_streams_selected_bodies_without_materialized_selection(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The builder must stream its verified output even if tuple selection is unavailable."""
+    module = _load_module()
+
+    def forbid_materialized_selection(*_args, **_kwargs):
+        raise AssertionError("materialized selected messages")
+
+    monkeypatch.setattr(module, "select_pilot_rows", forbid_materialized_selection)
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        producer_source_commit="b" * 40,
+        workers=2,
+    )
+
+    assert module._verify_bundle_root(output, production=False)["balanced"].row_count == 2
+
+
+def test_cross_split_duplicate_assignment_preserves_feasible_quotas() -> None:
+    """Assigning a shared prompt greedily to chat must not starve math."""
+    module = _load_module()
+    shared_chat = _row("chat", 7, duplicate_prompt="a")
+    shared_math = _row("math", 7, duplicate_prompt="a")
+    chat_only = _row("chat", 0, duplicate_prompt="b")
+    quotas = (
+        module.PilotQuota("chat", "chat", 1),
+        module.PilotQuota("math", "math", 1),
+    )
+    config = module.PilotConfig(
+        historical_quotas=quotas,
+        balanced_quotas=quotas,
+        source_revision="c" * 40,
+    )
+
+    selection = module.select_pilot_rows(
+        {"chat": [shared_chat, chat_only], "math": [shared_math]}, config=config
+    )
+
+    assert Counter(row.split for row in selection.historical_proportion) == {
+        "chat": 1,
+        "math": 1,
+    }
+    assert {row.messages[-1]["content"] for row in selection.historical_proportion} == {
+        "answer 0",
+        "answer 7",
+    }
+
+
+def test_conflicting_response_tie_is_canonical_under_input_reversal() -> None:
+    """A same-split prompt with two responses must publish input-order-independent bytes."""
+    module = _load_module()
+    first = _row("chat", 0, duplicate_prompt="same prompt")
+    second = _row("chat", 1, duplicate_prompt="same prompt")
+    quota = module.PilotQuota("chat", "chat", 1)
+    config = module.PilotConfig(
+        historical_quotas=(quota,),
+        balanced_quotas=(quota,),
+        source_revision="c" * 40,
+    )
+
+    forward = module.select_pilot_rows({"chat": [first, second]}, config=config)
+    reverse = module.select_pilot_rows({"chat": [second, first]}, config=config)
+
+    assert forward.historical_proportion == reverse.historical_proportion
+    assert forward.historical_proportion[0].messages[-1]["content"] == "answer 0"
+
+
+class _LongMaskTokenizer(_MaskTokenizer):
+    def apply_chat_template(self, messages, **kwargs):
+        assert kwargs["return_assistant_tokens_mask"] is True
+        return {
+            "input_ids": list(range(4_100)),
+            "assistant_masks": [0] * 4_095 + [1] * 5,
+        }
+
+
+def test_token_count_matches_trainer_left_to_right_4096_truncation() -> None:
+    """Assistant tokens beyond the trainer's first 4096 positions must not satisfy the gate."""
+    module = _load_module()
+
+    assert (
+        module.count_assistant_tokens(_LongMaskTokenizer(), _tiny_rows()["chat"][0]["messages"])
+        == 1
+    )
+
+
+def _rehash_receipts(module, output: Path, arm: str) -> None:
+    manifest_path = output / arm / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["manifest_sha256"] = module._self_hash(manifest, "manifest_sha256")
+    manifest_path.write_text(module.canonical_json(manifest) + "\n")
+    complete_path = output / "COMPLETE.json"
+    complete = json.loads(complete_path.read_text())
+    complete["arms"][arm]["manifest_sha256"] = manifest["manifest_sha256"]
+    complete["complete_sha256"] = module._self_hash(complete, "complete_sha256")
+    complete_path.write_text(module.canonical_json(complete) + "\n")
+
+
+def test_public_verifier_rejects_nonproduction_bundle_even_when_self_hashed(tmp_path: Path) -> None:
+    """A valid tiny test receipt must never pass the production completion boundary."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+
+    with pytest.raises(module.PilotError, match="production"):
+        module.verify_pilot_completion(output)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("seed", True, "seed"),
+        ("arm", "balanced", "arm"),
+        ("assistant_tokens", True, "assistant-token"),
+        ("minimum_assistant_tokens", 0, "assistant-token"),
+    ],
+)
+def test_semantic_manifest_tamper_fails_after_attacker_rehashes_receipts(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    """Self-hashes must not make semantically invalid typed manifest values acceptable."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+    manifest_path = output / "historical-proportion" / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest[field] = value
+    manifest_path.write_text(module.canonical_json(manifest) + "\n")
+    _rehash_receipts(module, output, "historical-proportion")
+
+    with pytest.raises(module.PilotError, match=message):
+        module._verify_bundle_root(output, production=False)
+
+
+def test_cross_arm_tokenizer_pin_tamper_fails_after_full_rehash(tmp_path: Path) -> None:
+    """Two independently valid manifests must not disagree on the tokenizer identity."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+    manifest_path = output / "balanced" / "MANIFEST.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["tokenizer"]["sha256"] = "f" * 64
+    manifest_path.write_text(module.canonical_json(manifest) + "\n")
+    _rehash_receipts(module, output, "balanced")
+
+    with pytest.raises(module.PilotError, match="cross-arm"):
+        module._verify_bundle_root(output, production=False)
+
+
+def test_execution_parallelism_does_not_change_scientific_bundle_bytes(tmp_path: Path) -> None:
+    """Changing CPU workers may change EXECUTION only, never data/manifest/completion identity."""
+    module = _load_module()
+    roots = [tmp_path / "serial", tmp_path / "parallel"]
+    for root, workers in zip(roots, (1, 96), strict=True):
+        module._build_pilot_bundles_for_test(
+            _tiny_rows(),
+            config=_tiny_config(module),
+            tokenizer=_MaskTokenizer(),
+            tokenizer_path="/tokenizer",
+            tokenizer_sha256="a" * 64,
+            output_root=root,
+            producer_source_commit="b" * 40,
+            workers=workers,
+        )
+
+    for relative in (
+        Path("COMPLETE.json"),
+        Path("balanced/data.jsonl"),
+        Path("balanced/MANIFEST.json"),
+        Path("historical-proportion/data.jsonl"),
+        Path("historical-proportion/MANIFEST.json"),
+    ):
+        assert (roots[0] / relative).read_bytes() == (roots[1] / relative).read_bytes()
+    assert (roots[0] / "balanced/EXECUTION.json").read_bytes() != (
+        roots[1] / "balanced/EXECUTION.json"
+    ).read_bytes()
+
+
+def _tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(path for path in root.rglob("*") if path.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def test_tokenizer_snapshot_is_private_nofollow_and_detached_from_source(tmp_path: Path) -> None:
+    """Authentication and loading must use one private copy immune to later source mutation."""
+    module = _load_module()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "tokenizer.json").write_text('{"version":"1"}\n')
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    staged, digest = module._stage_verified_tokenizer_snapshot(
+        source, _tree_digest(source), scratch
+    )
+    (source / "tokenizer.json").write_text('{"version":"forged"}\n')
+
+    assert digest == _tree_digest(staged)
+    assert (staged / "tokenizer.json").read_text() == '{"version":"1"}\n'
+    assert staged.stat().st_mode & 0o777 == 0o700
+    assert (staged / "tokenizer.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_tokenizer_snapshot_rejects_nested_symlink(tmp_path: Path) -> None:
+    """Following a symlink in any tokenizer component would authenticate foreign bytes."""
+    module = _load_module()
+    source = tmp_path / "source"
+    source.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("foreign")
+    (source / "nested").mkdir()
+    (source / "nested/tokenizer.json").symlink_to(outside)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    with pytest.raises(module.PilotError, match=r"symlink|no-follow"):
+        module._stage_verified_tokenizer_snapshot(source, "0" * 64, scratch)
+
+
+def test_genuine_minimal_qwen_chat_template_marks_only_assistant_boundary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The authenticated real HF tokenizer must preserve Qwen ChatML generation masking."""
+    monkeypatch.setenv("USE_TORCH", "0")
+    monkeypatch.setenv("USE_TF", "0")
+    monkeypatch.setenv("USE_FLAX", "0")
+    import importlib.metadata
+
+    class _DistributionMap(dict):
+        def __getitem__(self, name: str) -> list[str]:
+            return [name.replace("_", "-")]
+
+    monkeypatch.setattr(importlib.metadata, "packages_distributions", _DistributionMap)
+    pinned_versions = {
+        "tqdm": "4.67.1",
+        "regex": "2026.1.15",
+        "packaging": "25.0",
+        "filelock": "3.20.0",
+        "numpy": "2.3.0",
+        "tokenizers": "0.22.2",
+        "huggingface-hub": "1.5.0",
+        "safetensors": "0.8.0",
+        "pyyaml": "6.0.2",
+        "accelerate": "1.10.0",
+    }
+
+    def pinned_version(name: str) -> str:
+        return pinned_versions.get(name.lower(), "1.0.0")
+
+    monkeypatch.setattr(importlib.metadata, "version", pinned_version)
+    from tokenizers import Tokenizer  # pyright: ignore[reportMissingImports]
+    from tokenizers.models import WordLevel  # pyright: ignore[reportMissingImports]
+    from tokenizers.pre_tokenizers import WhitespaceSplit  # pyright: ignore[reportMissingImports]
+    from transformers import PreTrainedTokenizerFast  # pyright: ignore[reportMissingImports]
+
+    module = _load_module()
+    source = tmp_path / "qwen-tokenizer"
+    backend = Tokenizer(
+        WordLevel(
+            {
+                "[UNK]": 0,
+                "<|im_start|>": 1,
+                "<|im_end|>": 2,
+                "system": 3,
+                "user": 4,
+                "assistant": 5,
+                "You": 6,
+                "are": 7,
+                "useful.": 8,
+                "question": 9,
+                "answer": 10,
+            },
+            unk_token="[UNK]",
+        )
+    )
+    backend.pre_tokenizer = WhitespaceSplit()
+    template = (
+        "{% for message in messages %}<|im_start|> {{ message['role'] }} "
+        "{% if message['role'] == 'assistant' %}{% generation %}{{ message['content'] }}"
+        "{% endgeneration %}{% else %}{{ message['content'] }}{% endif %} <|im_end|>\n"
+        "{% endfor %}"
+    )
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        chat_template=template,
+    )
+    tokenizer.save_pretrained(source)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    snapshot, _digest = module._stage_verified_tokenizer_snapshot(
+        source, _tree_digest(source), scratch
+    )
+
+    loaded = module._load_verified_qwen_tokenizer(snapshot)
+    messages = [
+        {"role": "system", "content": "You are useful."},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+
+    assert loaded.chat_template == template
+    assert module.count_assistant_tokens(loaded, messages) == 1
+
+
+def test_public_failures_are_normalized_to_pilot_error(tmp_path: Path) -> None:
+    """Filesystem and JSON scalar failures must not leak implementation exceptions."""
+    module = _load_module()
+    missing = tmp_path / "missing"
+
+    with pytest.raises(module.PilotError):
+        module.verify_pilot_completion(missing)
+    with pytest.raises(module.PilotError):
+        module.select_pilot_rows({"chat": iter([object()])}, config=_tiny_config(module))
+    with pytest.raises(module.PilotError):
+        module.load_held_out_prompt_uuids(None)
+
+    class _ExplodingMessage(dict):
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("malformed mapping")
+
+    with pytest.raises(module.PilotError):
+        module.prompt_uuid_from_messages([_ExplodingMessage()])
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="renameat2 is Linux-only")
+def test_real_linux_rename_noreplace_has_exactly_one_race_winner(tmp_path: Path) -> None:
+    """The real kernel primitive must allow one publisher and return EEXIST to the loser."""
+    module = _load_module()
+    sources = [tmp_path / "one", tmp_path / "two"]
+    for index, source in enumerate(sources):
+        source.mkdir()
+        (source / "value").write_text(str(index))
+    destination = tmp_path / "published"
+    barrier = threading.Barrier(2)
+
+    def publish(source: Path) -> int:
+        barrier.wait()
+        try:
+            module._rename_noreplace(source, destination)
+        except OSError as error:
+            return error.errno or -1
+        return 0
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(publish, sources))
+
+    assert sorted(outcomes) == [0, errno.EEXIST]
+    assert (destination / "value").read_text() in {"0", "1"}
