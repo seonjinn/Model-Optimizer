@@ -2476,12 +2476,11 @@ def _spool_compact_candidates(
 ) -> None:
     connection.executescript(
         "CREATE TABLE candidate_rows("
-        "source_ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+        "source_ordinal INTEGER NOT NULL,prompt_uuid TEXT NOT NULL,"
         "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,"
         "cell TEXT NOT NULL,language TEXT NOT NULL,conversation_sha256 TEXT NOT NULL,"
-        "assistant_response_sha256 TEXT NOT NULL,rank TEXT NOT NULL);"
-        "CREATE INDEX candidate_rows_cell_rank ON candidate_rows("
-        "cell,language,rank,source_identity_sha256,source_row,prompt_uuid);"
+        "assistant_response_sha256 TEXT NOT NULL,rank TEXT NOT NULL,"
+        "PRIMARY KEY(source_identity_sha256,source_row)) WITHOUT ROWID;"
     )
     connection.execute("ATTACH DATABASE ? AS authenticated", (str(source.storage_path),))
     try:
@@ -2496,6 +2495,10 @@ def _spool_compact_candidates(
     count = int(connection.execute("SELECT count(*) FROM candidate_rows").fetchone()[0])
     if count == 0 or count != source.count:
         raise PTV2StudyError("authenticated compact source inventory count changed")
+    connection.executescript(
+        "CREATE INDEX candidate_rows_cell_rank ON candidate_rows("
+        "cell,language,rank,source_identity_sha256,source_row,prompt_uuid);"
+    )
 
 
 def _capacity_counts(

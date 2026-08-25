@@ -361,16 +361,45 @@ def _write_exact_ptv2_inventory(
 def test_task9_exact_201_shard_serial_and_p96_are_byte_and_semantically_identical(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Compact serial and p96 selection preserve exact source order and output bytes."""
+    """The indexed p96 rejoin preserves the pre-index source order and output bytes."""
     inventory_receipt, _ = _write_exact_ptv2_inventory(tmp_path)
     policy = _scaled_policy()
     monkeypatch.setenv("SLURM_CPUS_PER_TASK", "96")
+
+    optimized_spool = study_module._spool_compact_candidates
+
+    def legacy_spool(connection: sqlite3.Connection, source: Any) -> None:
+        connection.executescript(
+            "CREATE TABLE candidate_rows("
+            "source_ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+            "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,"
+            "cell TEXT NOT NULL,language TEXT NOT NULL,conversation_sha256 TEXT NOT NULL,"
+            "assistant_response_sha256 TEXT NOT NULL,rank TEXT NOT NULL);"
+            "CREATE INDEX candidate_rows_cell_rank ON candidate_rows("
+            "cell,language,rank,source_identity_sha256,source_row,prompt_uuid);"
+        )
+        connection.execute("ATTACH DATABASE ? AS authenticated", (str(source.storage_path),))
+        try:
+            connection.execute(
+                "INSERT INTO candidate_rows SELECT ordinal,prompt_uuid,source_identity_sha256,"
+                "source_row,cell,language,conversation_sha256,assistant_response_sha256,rank "
+                "FROM authenticated.authenticated_rows ORDER BY ordinal"
+            )
+        finally:
+            connection.commit()
+            connection.execute("DETACH DATABASE authenticated")
+        assert (
+            connection.execute("SELECT count(*) FROM candidate_rows").fetchone()[0] == source.count
+        )
+
+    monkeypatch.setattr(study_module, "_spool_compact_candidates", legacy_spool)
     serial_view = select_authenticated_b_balanced_view(
         inventory_receipt,
         policy=policy,
         exclusions=ExclusionIndex(held_out=set()),
         output_root=tmp_path / "serial-selection",
     )
+    monkeypatch.setattr(study_module, "_spool_compact_candidates", optimized_spool)
     parallel_view = select_authenticated_b_balanced_view(
         inventory_receipt,
         policy=policy,
@@ -1492,6 +1521,78 @@ def test_authenticated_source_spool_is_byte_identical_across_arrow_batch_boundar
             outputs.append(source.storage_path.read_bytes())
 
     assert outputs[0] == outputs[1]
+
+
+def test_compact_task9_indexes_physical_rejoin_by_source_location(tmp_path: Path) -> None:
+    authenticated = tmp_path / "authenticated.sqlite3"
+    with sqlite3.connect(authenticated) as connection:
+        connection.execute(
+            "CREATE TABLE authenticated_rows(ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+            "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,cell TEXT NOT NULL,"
+            "language TEXT NOT NULL,conversation_sha256 TEXT NOT NULL,"
+            "assistant_response_sha256 TEXT NOT NULL,rank TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO authenticated_rows VALUES(?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    0,
+                    _digest("prompt-0"),
+                    _digest("source-0"),
+                    0,
+                    "math",
+                    "",
+                    _digest("c0"),
+                    _digest("r0"),
+                    _digest("rank-0"),
+                ),
+                (
+                    1,
+                    _digest("prompt-1"),
+                    _digest("source-1"),
+                    0,
+                    "code",
+                    "",
+                    _digest("c1"),
+                    _digest("r1"),
+                    _digest("rank-1"),
+                ),
+            ],
+        )
+
+    with sqlite3.connect(":memory:") as connection:
+        study_module._create_schema(connection)
+        study_module._spool_compact_candidates(
+            connection,
+            cast("Any", SimpleNamespace(storage_path=authenticated, count=2)),
+        )
+        candidate_indexes = {
+            row[1] for row in connection.execute("PRAGMA index_list(candidate_rows)")
+        }
+        connection.executescript(
+            "CREATE TEMP TABLE selected_sources("
+            "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,"
+            "PRIMARY KEY(source_identity_sha256,source_row)) WITHOUT ROWID;"
+        )
+        connection.execute("INSERT INTO selected_sources VALUES(?,?)", (_digest("source-0"), 0))
+        plan = " ".join(
+            str(row[3])
+            for row in connection.execute(
+                "EXPLAIN QUERY PLAN SELECT candidates.source_ordinal,"
+                "candidates.prompt_uuid,candidates.source_row,candidates.cell,"
+                "candidates.language,candidates.conversation_sha256,"
+                "candidates.assistant_response_sha256,candidates.rank "
+                "FROM candidate_rows AS candidates JOIN selected_sources AS selected ON "
+                "selected.source_identity_sha256=candidates.source_identity_sha256 AND "
+                "selected.source_row=candidates.source_row "
+                "WHERE candidates.source_identity_sha256=? ORDER BY candidates.source_row",
+                (_digest("source-0"),),
+            )
+        )
+
+    assert "candidate_rows_cell_rank" in candidate_indexes
+    assert "SEARCH candidates USING PRIMARY KEY" in plan
+    assert "SCAN candidates" not in plan
 
 
 def test_staged_inventory_rejects_undeclared_orphan_parquet(
