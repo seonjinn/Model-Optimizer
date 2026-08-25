@@ -18,18 +18,18 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
+import shutil
 import sqlite3
 import sys
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, replace
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
-from transformers import PreTrainedTokenizerFast
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DATASET_ROOT = REPO_ROOT / "examples/dataset"
@@ -116,6 +116,10 @@ class _FailingTask8Tokenizer(_Tokenizer):
         raise ValueError("injected Task8 worker failure")
 
 
+def _injected_ptv2_reader_failure(database_path: Path, start: int, stop: int):
+    raise RuntimeError("injected exposure reader failure")
+
+
 def _record(
     prompt_uuid: str,
     *,
@@ -179,8 +183,1067 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
 
 
-def test_ptv2_scientific_milestone_cannot_extend_past_the_2m_occurrence_pass() -> None:
-    """A 256M receipt is invalid until both authenticated one-pass totals reach it."""
+def _write_ptv2_v2_corpus(
+    module,
+    root: Path,
+    *,
+    strategy: str,
+    bucket_rows: list[tuple[str, str, int]],
+    assistant_tokens_per_row: int = 4,
+    historical_prefix_rows: int | None = None,
+):
+    if strategy == "H-historical-cyclic":
+        raise AssertionError("H fixtures must use derive_ptv2_historical_corpus")
+    bundle = root / f"{strategy.lower()}-tokenized"
+    bundle.mkdir(parents=True)
+    database = bundle / "records.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        "CREATE TABLE records("
+        "ordinal INTEGER PRIMARY KEY,prompt_uuid TEXT NOT NULL,"
+        "source_identity_sha256 TEXT NOT NULL,source_row INTEGER NOT NULL,"
+        "cell TEXT NOT NULL,language TEXT NOT NULL,reuse_index INTEGER NOT NULL,"
+        "input_ids_json TEXT NOT NULL,loss_mask_json TEXT NOT NULL,"
+        "assistant_tokens INTEGER NOT NULL)"
+    )
+    histogram: dict[str, dict[str, int]] = {}
+    occurrence_digest = hashlib.sha256()
+    multiplicity_digest = hashlib.sha256()
+    ordinal = 0
+    for cell, language, count in bucket_rows:
+        histogram.setdefault(cell, {})[language] = count * assistant_tokens_per_row
+        for source_row in range(count):
+            prompt_uuid = hashlib.sha256(
+                f"{strategy}:{cell}:{language}:{source_row}".encode()
+            ).hexdigest()
+            source_identity = hashlib.sha256(f"source:{cell}:{language}".encode()).hexdigest()
+            identity = [
+                ordinal,
+                prompt_uuid,
+                source_identity,
+                source_row,
+                cell,
+                language,
+                0,
+            ]
+            occurrence_digest.update(_canonical(identity) + b"\n")
+            multiplicity_digest.update(_canonical(identity[1:]) + b"\n")
+            ids = list(range(assistant_tokens_per_row))
+            mask = [1] * assistant_tokens_per_row
+            connection.execute(
+                "INSERT INTO records VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ordinal,
+                    prompt_uuid,
+                    source_identity,
+                    source_row,
+                    cell,
+                    language,
+                    0,
+                    _canonical(ids).decode(),
+                    _canonical(mask).decode(),
+                    assistant_tokens_per_row,
+                ),
+            )
+            ordinal += 1
+    connection.commit()
+    connection.close()
+    database_sha256 = hashlib.sha256(database.read_bytes()).hexdigest()
+    first_segment = ordinal if historical_prefix_rows is None else historical_prefix_rows
+    if first_segment < 1 or first_segment > ordinal:
+        raise AssertionError("historical prefix must be within the fixture corpus")
+    second_segment = ordinal - first_segment
+    first_steps = (first_segment + 511) // 512
+    second_steps = (second_segment + 511) // 512
+    receipt = {
+        "schema_version": 2,
+        "strategy": strategy,
+        "occurrence_count": ordinal,
+        "trainer_epochs": 1,
+        "assistant_tokens": ordinal * assistant_tokens_per_row,
+        "serialized_tokens": ordinal * assistant_tokens_per_row,
+        "packed_sequence_lower_bound": 1,
+        "unique_prompt_count": ordinal,
+        "natural_duplicate_count": 0,
+        "constructed_repeat_count": 0,
+        "milestone_occurrences": [ordinal],
+        "milestone_steps": [1],
+        "segment_occurrences": [first_segment, second_segment],
+        "segment_steps": [first_steps, second_steps],
+        "cumulative_segment_steps": [first_steps, first_steps + second_steps],
+        "segment_final_valid_occurrences": [first_segment % 512, second_segment % 512],
+        "tokenizer_sha256": "1" * 64,
+        "chat_template_sha256": "2" * 64,
+        "assistant_loss_target_sha256": "3" * 64,
+        "training_config_sha256": "4" * 64,
+        "source_response_root_sha256": "5" * 64,
+        "ordered_occurrences_sha256": occurrence_digest.hexdigest(),
+        "selection_sha256": "6" * 64,
+        "base_occurrence_multiplicity_sha256": multiplicity_digest.hexdigest(),
+        "bucket_assistant_token_histogram": histogram,
+        "database_path": "records.sqlite3",
+        "database_sha256": database_sha256,
+        "database_bytes": database.stat().st_size,
+    }
+    receipt_sha256 = hashlib.sha256(_canonical(receipt)).hexdigest()
+    receipt_path = bundle / "TOKENIZED.json"
+    receipt_path.write_bytes(_canonical(receipt | {"receipt_sha256": receipt_sha256}) + b"\n")
+    return module.PTV2OnePassCorpus(
+        strategy=strategy,
+        occurrence_count=ordinal,
+        trainer_epochs=1,
+        assistant_tokens=ordinal * assistant_tokens_per_row,
+        tokenizer_sha256="1" * 64,
+        chat_template_sha256="2" * 64,
+        assistant_loss_target_sha256="3" * 64,
+        training_config_sha256="4" * 64,
+        source_response_root_sha256="5" * 64,
+        ordered_occurrences_sha256=occurrence_digest.hexdigest(),
+        selection_sha256="6" * 64,
+        unique_prompt_count=ordinal,
+        serialized_tokens=ordinal * assistant_tokens_per_row,
+        packed_sequence_lower_bound=1,
+        tokenized_path=str(database),
+        tokenized_sha256=database_sha256,
+        receipt_path=str(receipt_path),
+        receipt_sha256=receipt_sha256,
+        milestone_occurrences=(ordinal,),
+        milestone_steps=(1,),
+        segment_occurrences=(first_segment, second_segment),
+        segment_steps=(first_steps, second_steps),
+        cumulative_segment_steps=(first_steps, first_steps + second_steps),
+        segment_final_valid_occurrences=(first_segment % 512, second_segment % 512),
+    )
+
+
+def _ptv2_exposure_bundle(corpus, target_tokens: int) -> Path:
+    return (
+        Path(corpus.tokenized_path).parent.parent
+        / f"{corpus.strategy.lower()}-exposures"
+        / f"{corpus.strategy.lower()}-{target_tokens}-assistant-tokens-v2"
+    )
+
+
+def _resign_ptv2_tokenized_database(module, corpus, column: str, value: object):
+    database = Path(corpus.tokenized_path)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            f"UPDATE records SET {column}=? WHERE ordinal=0", (_canonical(value).decode(),)
+        )
+        connection.commit()
+    database_sha256 = hashlib.sha256(database.read_bytes()).hexdigest()
+    receipt_path = Path(corpus.receipt_path)
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt.pop("receipt_sha256")
+    receipt["database_sha256"] = database_sha256
+    receipt["database_bytes"] = database.stat().st_size
+    receipt_sha256 = hashlib.sha256(_canonical(receipt)).hexdigest()
+    receipt_path.write_bytes(_canonical(receipt | {"receipt_sha256": receipt_sha256}) + b"\n")
+    return replace(corpus, tokenized_sha256=database_sha256, receipt_sha256=receipt_sha256)
+
+
+def _resign_ptv2_exposure_bundle(bundle: Path, field: str, value: object) -> None:
+    records_path = bundle / "records.jsonl"
+    rows = [json.loads(line) for line in records_path.read_text().splitlines()]
+    rows[0][field] = value
+    records_path.write_bytes(b"".join(_canonical(row) + b"\n" for row in rows))
+    records_sha256 = hashlib.sha256(records_path.read_bytes()).hexdigest()
+    scientific_path = bundle / "SCIENTIFIC.json"
+    scientific = json.loads(scientific_path.read_bytes())
+    scientific.pop("receipt_sha256")
+    scientific["records_bytes"] = records_path.stat().st_size
+    scientific["records_sha256"] = records_sha256
+    scientific_sha256 = hashlib.sha256(_canonical(scientific)).hexdigest()
+    scientific_path.write_bytes(
+        _canonical(scientific | {"receipt_sha256": scientific_sha256}) + b"\n"
+    )
+    execution_path = bundle / "EXECUTION.json"
+    execution = json.loads(execution_path.read_bytes())
+    execution.pop("receipt_sha256")
+    execution["records_sha256"] = records_sha256
+    execution["scientific_receipt_sha256"] = scientific_sha256
+    execution_sha256 = hashlib.sha256(_canonical(execution)).hexdigest()
+    execution_path.write_bytes(_canonical(execution | {"receipt_sha256": execution_sha256}) + b"\n")
+
+
+def _resign_ptv2_scientific_receipt(bundle: Path, field: str, value: object) -> str:
+    scientific_path = bundle / "SCIENTIFIC.json"
+    scientific = json.loads(scientific_path.read_bytes())
+    scientific.pop("receipt_sha256")
+    scientific[field] = value
+    scientific_sha256 = hashlib.sha256(_canonical(scientific)).hexdigest()
+    scientific_path.write_bytes(
+        _canonical(scientific | {"receipt_sha256": scientific_sha256}) + b"\n"
+    )
+    execution_path = bundle / "EXECUTION.json"
+    execution = json.loads(execution_path.read_bytes())
+    execution.pop("receipt_sha256")
+    execution["scientific_receipt_sha256"] = scientific_sha256
+    execution_sha256 = hashlib.sha256(_canonical(execution)).hexdigest()
+    execution_path.write_bytes(_canonical(execution | {"receipt_sha256": execution_sha256}) + b"\n")
+    return scientific_sha256
+
+
+def test_ptv2_v2_interleaver_removes_ordinal_prefix_cell_language_confound(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    buckets = [
+        ("chat", "en", 256),
+        ("code", "en", 256),
+        ("multilingual", "de", 256),
+        ("multilingual", "ja", 256),
+    ]
+    corpus = _write_ptv2_v2_corpus(
+        module, tmp_path / "input", strategy="B-balanced", bucket_rows=buckets
+    )
+    with sqlite3.connect(corpus.tokenized_path) as connection:
+        legacy_prefix = Counter(
+            connection.execute(
+                "SELECT cell || '/' || language FROM records ORDER BY ordinal LIMIT 512"
+            )
+        )
+    assert {value[0] for value in legacy_prefix} == {"chat/en", "code/en"}
+
+    module._materialize_ptv2_exposure(corpus, 2_048, workers=1)
+
+    bundle = _ptv2_exposure_bundle(corpus, 2_048)
+    rows = [json.loads(line) for line in (bundle / "records.jsonl").read_text().splitlines()]
+    realized = Counter((row["cell"], row["language"]) for row in rows)
+    receipt = json.loads((bundle / "SCIENTIFIC.json").read_bytes())
+    assert realized == Counter(
+        {
+            ("chat", "en"): 128,
+            ("code", "en"): 128,
+            ("multilingual", "de"): 128,
+            ("multilingual", "ja"): 128,
+        }
+    )
+    assert receipt["schema_version"] == 2
+    assert receipt["target_bucket_assistant_tokens"] == {
+        "chat": {"en": 512},
+        "code": {"en": 512},
+        "multilingual": {"de": 512, "ja": 512},
+    }
+    assert receipt["realized_bucket_assistant_tokens"] == receipt["target_bucket_assistant_tokens"]
+    assert receipt["batch_boundary_count"] == 1
+    assert receipt["max_prefix_discrepancy"]["denominator"] == 4_096
+
+
+def test_ptv2_v2_exact_boundary_preserves_identity_and_trims_only_final_batch(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="A-repair",
+        bucket_rows=[("math", "en", 512), ("stem", "en", 512)],
+    )
+
+    module._materialize_ptv2_exposure(corpus, 2_560, workers=1)
+
+    bundle = _ptv2_exposure_bundle(corpus, 2_560)
+    rows = [json.loads(line) for line in (bundle / "records.jsonl").read_text().splitlines()]
+    assert len(rows) % 512 == 0
+    assert sum(row["assistant_tokens"] for row in rows) == 2_560
+    assert all(row["assistant_tokens"] > 0 for row in rows)
+    assert all(row["loss_mask"] == [1, 1, 1, 1] for row in rows[:512])
+    assert all(row["loss_mask"] == [1, 0, 0, 0] for row in rows[512:])
+    assert Counter(row["base_ordinal"] for row in rows) == Counter(range(1_024))
+    assert {row["cycle_index"] for row in rows} == {0}
+
+
+def test_ptv2_v2_serial_and_parallel_publications_are_scientifically_identical(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    buckets = [("math", "en", 256), ("stem", "en", 256)]
+    serial = _write_ptv2_v2_corpus(
+        module, tmp_path / "serial", strategy="B-balanced", bucket_rows=buckets
+    )
+    parallel = _write_ptv2_v2_corpus(
+        module, tmp_path / "parallel", strategy="B-balanced", bucket_rows=buckets
+    )
+
+    serial_sha = module._materialize_ptv2_exposure(serial, 1_024, workers=1)
+    parallel_sha = module._materialize_ptv2_exposure(parallel, 1_024, workers=96)
+
+    serial_bundle = _ptv2_exposure_bundle(serial, 1_024)
+    parallel_bundle = _ptv2_exposure_bundle(parallel, 1_024)
+    assert serial_sha == parallel_sha
+    assert (serial_bundle / "records.jsonl").read_bytes() == (
+        parallel_bundle / "records.jsonl"
+    ).read_bytes()
+    assert (serial_bundle / "SCIENTIFIC.json").read_bytes() == (
+        parallel_bundle / "SCIENTIFIC.json"
+    ).read_bytes()
+    assert json.loads((parallel_bundle / "EXECUTION.json").read_bytes())["requested_workers"] == 96
+
+
+def test_ptv2_historical_producer_binds_exact_a_prefix_and_cycles_it(tmp_path: Path) -> None:
+    module = _load_module()
+    prefix = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "study",
+        strategy="A-repair",
+        bucket_rows=[("chat", "en", 512), ("math", "en", 512)],
+        assistant_tokens_per_row=2,
+        historical_prefix_rows=512,
+    )
+    corpus = module.derive_ptv2_historical_corpus(prefix, tmp_path / "study")
+    tokenized = json.loads(Path(corpus.receipt_path).read_bytes())
+
+    with (
+        sqlite3.connect(prefix.tokenized_path) as parent,
+        sqlite3.connect(corpus.tokenized_path) as historical,
+    ):
+        columns = (
+            "ordinal,prompt_uuid,source_identity_sha256,source_row,cell,language,reuse_index,"
+            "input_ids_json,loss_mask_json,assistant_tokens"
+        )
+        parent_rows = parent.execute(
+            f"SELECT {columns} FROM records WHERE ordinal<512 ORDER BY ordinal"
+        ).fetchall()
+        historical_rows = historical.execute(
+            f"SELECT {columns} FROM records ORDER BY ordinal"
+        ).fetchall()
+    assert historical_rows == parent_rows
+    assert corpus.occurrence_count == 512
+    assert tokenized["historical_parent_receipt_sha256"] == prefix.receipt_sha256
+    assert tokenized["historical_parent_tokenized_sha256"] == prefix.tokenized_sha256
+    assert tokenized["historical_prefix_occurrence_count"] == 512
+
+    module._materialize_ptv2_exposure(corpus, 2_048, workers=1)
+
+    bundle = _ptv2_exposure_bundle(corpus, 2_048)
+    rows = [json.loads(line) for line in (bundle / "records.jsonl").read_text().splitlines()]
+    receipt = json.loads((bundle / "SCIENTIFIC.json").read_bytes())
+    assert Counter(row["base_ordinal"] for row in rows) == Counter(dict.fromkeys(range(512), 2))
+    assert {row["cycle_index"] for row in rows} == {0, 1}
+    assert (
+        receipt["base_occurrence_multiplicity_sha256"]
+        == tokenized["base_occurrence_multiplicity_sha256"]
+    )
+
+
+def test_ptv2_historical_arm_cannot_be_rebound_to_an_unrelated_a_baseline(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    parent = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "parent",
+        strategy="A-repair",
+        bucket_rows=[("chat", "en", 512), ("math", "en", 512)],
+        historical_prefix_rows=512,
+    )
+    unrelated = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "unrelated",
+        strategy="A-repair",
+        bucket_rows=[("code", "en", 512), ("stem", "en", 512)],
+        historical_prefix_rows=512,
+    )
+    historical = module.derive_ptv2_historical_corpus(parent, tmp_path / "historical")
+
+    with pytest.raises(module.ExposureViewError, match="historical parent"):
+        module._require_ptv2_historical_parent(historical, unrelated)
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    [
+        ("trainer_epochs", 2),
+        ("serialized_tokens", 4_097),
+        ("packed_sequence_lower_bound", 2),
+        ("unique_prompt_count", 511),
+        ("natural_duplicate_count", 1),
+        ("constructed_repeat_count", 1),
+        ("milestone_occurrences", [511]),
+        ("milestone_steps", [2]),
+        ("segment_occurrences", [511, 1]),
+        ("segment_steps", [2, 1]),
+        ("cumulative_segment_steps", [2, 3]),
+        ("segment_final_valid_occurrences", [511, 1]),
+        ("tokenizer_sha256", "a" * 64),
+        ("chat_template_sha256", "b" * 64),
+        ("assistant_loss_target_sha256", "c" * 64),
+        ("training_config_sha256", "d" * 64),
+        ("source_response_root_sha256", "e" * 64),
+        ("ordered_occurrences_sha256", "f" * 64),
+        ("selection_sha256", "0" * 64),
+        ("database_path", "other.sqlite3"),
+        ("database_bytes", 1),
+    ],
+)
+def test_ptv2_source_rejects_self_rehashed_immutable_lineage_mismatch(
+    tmp_path: Path, field: str, forged: object
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    receipt_path = Path(corpus.receipt_path)
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt.pop("receipt_sha256")
+    receipt[field] = forged
+    forged_sha256 = hashlib.sha256(_canonical(receipt)).hexdigest()
+    receipt_path.write_bytes(_canonical(receipt | {"receipt_sha256": forged_sha256}) + b"\n")
+    forged_corpus = replace(corpus, receipt_sha256=forged_sha256)
+
+    with pytest.raises(module.ExposureViewError, match="claimed corpus"):
+        module._materialize_ptv2_exposure(forged_corpus, 1_024, workers=1)
+
+    assert not _ptv2_exposure_bundle(forged_corpus, 1_024).exists()
+
+
+def test_ptv2_source_file_entry_replacement_cannot_change_consumed_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    source = Path(corpus.tokenized_path)
+    authenticated = tmp_path / "authenticated.sqlite3"
+    replacement = tmp_path / "replacement.sqlite3"
+    shutil.copy2(source, authenticated)
+    shutil.copy2(source, replacement)
+    with sqlite3.connect(replacement) as connection:
+        connection.execute("UPDATE records SET input_ids_json='[99,99,99,99]' WHERE ordinal=0")
+        connection.commit()
+    real_sha256_file = module._sha256_file
+
+    def hash_then_replace(path: Path) -> str:
+        if Path(path) == source:
+            shutil.copy2(authenticated, source)
+        digest = real_sha256_file(path)
+        if Path(path) == source:
+            temporary = tmp_path / "replacement-copy.sqlite3"
+            shutil.copy2(replacement, temporary)
+            os.replace(temporary, source)
+        return digest
+
+    monkeypatch.setattr(module, "_sha256_file", hash_then_replace)
+    try:
+        module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+    except module.ExposureViewError:
+        return
+
+    rows = [
+        json.loads(line)
+        for line in (_ptv2_exposure_bundle(corpus, 1_024) / "records.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert rows[0]["input_ids"] == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("input_ids_json", [False, 1, 2, 3]),
+        ("input_ids_json", [0, 1.0, 2, 3]),
+        ("input_ids_json", [0, "1", 2, 3]),
+        ("loss_mask_json", [True, 1, 1, 1]),
+    ],
+)
+def test_ptv2_source_rejects_non_exact_integer_token_payloads(
+    tmp_path: Path, column: str, value: object
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    forged = _resign_ptv2_tokenized_database(module, corpus, column, value)
+
+    with pytest.raises(module.ExposureViewError, match=r"identity|payload"):
+        module._materialize_ptv2_exposure(forged, 1_024, workers=1)
+
+    assert not _ptv2_exposure_bundle(forged, 1_024).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("input_ids", [False, 1, 2, 3]), ("loss_mask", [True, 1, 1, 1])],
+)
+def test_ptv2_output_rejects_non_exact_integer_token_payloads(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+    bundle = _ptv2_exposure_bundle(corpus, 1_024)
+    _resign_ptv2_exposure_bundle(bundle, field, value)
+
+    with pytest.raises(module.ExposureViewError, match="mask semantics"):
+        module._validate_ptv2_exposure_bundle(bundle, corpus)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("unexpected", "self-hashed"), ("batch_boundary_count", True)],
+)
+def test_ptv2_scientific_receipt_requires_exact_schema2_json_types_and_keys(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+    bundle = _ptv2_exposure_bundle(corpus, 1_024)
+    _resign_ptv2_scientific_receipt(bundle, field, value)
+
+    with pytest.raises(module.ExposureViewError, match="scientific receipt schema"):
+        module._validate_ptv2_exposure_bundle(bundle, corpus)
+
+
+def test_ptv2_adoption_requires_an_authenticated_execution_receipt(tmp_path: Path) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+    bundle = _ptv2_exposure_bundle(corpus, 1_024)
+    (bundle / "EXECUTION.json").unlink()
+
+    with pytest.raises(module.ExposureViewError, match="execution"):
+        module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+
+
+def test_ptv2_v2_publication_is_no_replace_and_tamper_is_rejected(tmp_path: Path) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    first_sha256 = module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+    assert module._materialize_ptv2_exposure(corpus, 1_024, workers=1) == first_sha256
+
+    bundle = _ptv2_exposure_bundle(corpus, 1_024)
+    records = bundle / "records.jsonl"
+    records.write_bytes(records.read_bytes() + b"{}\n")
+    with pytest.raises(module.ExposureViewError, match="reconciliation"):
+        module._validate_ptv2_exposure_bundle(bundle, corpus)
+
+
+def test_ptv2_exposure_parent_fsync_failure_rolls_back_the_installed_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    destination = _ptv2_exposure_bundle(corpus, 1_024)
+    publication_root = destination.parent
+    real_fsync = module._fsync_directory
+
+    def fail_publication_parent(path: Path) -> None:
+        if path == publication_root:
+            raise OSError("injected exposure parent fsync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(module, "_fsync_directory", fail_publication_parent)
+    with pytest.raises(OSError, match="injected exposure parent fsync failure"):
+        module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+
+    assert not destination.exists()
+
+
+def test_ptv2_publication_rollback_never_deletes_a_replacement_inode(tmp_path: Path) -> None:
+    module = _load_module()
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "owned").write_text("installed")
+    identity = os.lstat(installed)
+    destination = tmp_path / "destination"
+    os.rename(installed, destination)
+    displaced = tmp_path / "displaced-installed"
+    os.rename(destination, displaced)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "sentinel").write_text("caller-owned")
+    os.rename(replacement, destination)
+
+    module._rollback_ptv2_publication(destination, identity)
+
+    assert (destination / "sentinel").read_text() == "caller-owned"
+    assert (displaced / "owned").read_text() == "installed"
+
+
+def test_ptv2_v2_parallel_reader_failure_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="B-balanced",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    monkeypatch.setattr(module, "_read_ptv2_source_range", _injected_ptv2_reader_failure)
+    with pytest.raises(RuntimeError, match="injected exposure reader failure"):
+        module._materialize_ptv2_exposure(corpus, 1_024, workers=96)
+
+    assert not _ptv2_exposure_bundle(corpus, 1_024).exists()
+    assert not (Path(corpus.tokenized_path).parent.parent / "b-balanced-exposures").exists()
+
+
+def test_ptv2_six_arm_failure_retries_by_authenticating_completed_publications(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    prefix = _write_ptv2_v2_corpus(
+        module,
+        study,
+        strategy="A-repair",
+        bucket_rows=[("math", "en", 512), ("stem", "en", 512)],
+        historical_prefix_rows=512,
+    )
+    balanced = _write_ptv2_v2_corpus(
+        module,
+        study,
+        strategy="B-balanced",
+        bucket_rows=[("chat", "en", 512), ("code", "en", 512)],
+        historical_prefix_rows=512,
+    )
+    historical = module.derive_ptv2_historical_corpus(prefix, study)
+    corpora = (prefix, balanced, historical)
+    real_rename = module._rename_no_replace
+    exposure_publications = 0
+
+    def fail_fourth_exposure(source: Path, destination: Path) -> None:
+        nonlocal exposure_publications
+        if destination.name.endswith("assistant-tokens-v2"):
+            exposure_publications += 1
+            if exposure_publications == 4:
+                raise RuntimeError("injected fourth exposure publication failure")
+        real_rename(source, destination)
+
+    monkeypatch.setattr(module, "_rename_no_replace", fail_fourth_exposure)
+    with pytest.raises(module.ExposureViewError, match="immutable"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+        )
+    completion = study / "ptv2-study-exposures" / "COMPLETE.json"
+    assert not completion.exists()
+
+    monkeypatch.setattr(module, "_rename_no_replace", real_rename)
+    runtime, scientific, completion_sha256 = module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+
+    assert set(runtime) == {"A-repair", "B-balanced", "H-historical-cyclic"}
+    assert set(scientific) == set(runtime)
+    receipt = json.loads(completion.read_bytes())
+    body = dict(receipt)
+    assert body.pop("receipt_sha256") == completion_sha256
+    assert completion_sha256 == hashlib.sha256(_canonical(body)).hexdigest()
+    assert receipt["runtime_artifacts"] == runtime
+    assert receipt["scientific_artifacts"] == scientific
+
+
+def _write_ptv2_three_arm_study(module, root: Path):
+    prefix = _write_ptv2_v2_corpus(
+        module,
+        root,
+        strategy="A-repair",
+        bucket_rows=[("math", "en", 512), ("stem", "en", 512)],
+        historical_prefix_rows=512,
+    )
+    balanced = _write_ptv2_v2_corpus(
+        module,
+        root,
+        strategy="B-balanced",
+        bucket_rows=[("chat", "en", 512), ("code", "en", 512)],
+        historical_prefix_rows=512,
+    )
+    historical = module.derive_ptv2_historical_corpus(prefix, root)
+    return prefix, balanced, historical
+
+
+def _resign_ptv2_completion(path: Path, mutate) -> str:
+    completion = json.loads(path.read_bytes())
+    completion.pop("receipt_sha256")
+    mutate(completion)
+    receipt_sha256 = hashlib.sha256(_canonical(completion)).hexdigest()
+    path.write_bytes(_canonical(completion | {"receipt_sha256": receipt_sha256}) + b"\n")
+    return receipt_sha256
+
+
+def _coordinate_ptv2_execution_and_completion_tamper(
+    module: Any, study: Path, corpora: tuple[Any, ...]
+) -> str:
+    completion_path = study / "ptv2-study-exposures/COMPLETE.json"
+    completion = json.loads(completion_path.read_bytes())
+    completion.pop("receipt_sha256")
+    for phase, target in (("runtime", 1_024), ("scientific", 2_048)):
+        for corpus in corpora:
+            bundle = _ptv2_exposure_bundle(corpus, target)
+            execution_path = bundle / "EXECUTION.json"
+            execution = json.loads(execution_path.read_bytes())
+            execution.pop("receipt_sha256")
+            execution["started_at_ns"] += 1
+            execution["finished_at_ns"] += 1
+            execution_sha256 = hashlib.sha256(_canonical(execution)).hexdigest()
+            raw = _canonical(execution | {"receipt_sha256": execution_sha256}) + b"\n"
+            execution_path.write_bytes(raw)
+            completion["execution_artifacts"][phase][corpus.strategy] = {
+                "path": "EXECUTION.json",
+                "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "receipt_sha256": execution_sha256,
+                "requested_workers": execution["requested_workers"],
+                "effective_workers": execution["effective_workers"],
+                "started_at_ns": execution["started_at_ns"],
+                "finished_at_ns": execution["finished_at_ns"],
+                "elapsed_seconds": execution["elapsed_seconds"],
+            }
+    receipt_sha256 = hashlib.sha256(_canonical(completion)).hexdigest()
+    completion_path.write_bytes(_canonical(completion | {"receipt_sha256": receipt_sha256}) + b"\n")
+    return receipt_sha256
+
+
+def test_ptv2_completion_replay_requires_a_caller_pinned_identity(tmp_path: Path) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+
+    with pytest.raises(module.ExposureViewError, match="caller-pinned"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+        )
+
+
+def test_ptv2_completion_same_identity_retry_is_idempotent(tmp_path: Path) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    first = module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+
+    second = module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+        expected_completion_receipt_sha256=first[2],
+    )
+
+    assert second == first
+
+
+def test_ptv2_completion_pin_rejects_coordinated_execution_and_receipt_tamper(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    _, _, trusted_sha256 = module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+    forged_sha256 = _coordinate_ptv2_execution_and_completion_tamper(module, study, corpora)
+    assert forged_sha256 != trusted_sha256
+
+    with pytest.raises(module.ExposureViewError, match="completion identity"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+            expected_completion_receipt_sha256=trusted_sha256,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["extra-key", "bool-worker"])
+def test_ptv2_completion_receipt_requires_exact_schema2_json_types_and_keys(
+    tmp_path: Path, mutation: str
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+    completion_path = study / "ptv2-study-exposures/COMPLETE.json"
+
+    def mutate(completion: dict[str, Any]) -> None:
+        if mutation == "extra-key":
+            completion["unexpected"] = "self-hashed"
+        else:
+            completion["execution_artifacts"]["runtime"]["A-repair"]["requested_workers"] = True
+
+    forged_sha256 = _resign_ptv2_completion(completion_path, mutate)
+
+    with pytest.raises(module.ExposureViewError, match="completion receipt schema"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+            expected_completion_receipt_sha256=forged_sha256,
+        )
+
+
+def test_ptv2_completion_parent_fsync_failure_rolls_back_only_complete_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    completion_root = study / "ptv2-study-exposures"
+    completion_path = completion_root / "COMPLETE.json"
+    real_fsync = module._fsync_directory
+
+    def fail_completion_parent(path: Path) -> None:
+        if path == completion_root:
+            raise OSError("injected completion parent fsync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(module, "_fsync_directory", fail_completion_parent)
+    with pytest.raises(OSError, match="injected completion parent fsync failure"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+        )
+
+    assert not completion_path.exists()
+    for corpus in corpora:
+        assert _ptv2_exposure_bundle(corpus, 1_024).is_dir()
+        assert _ptv2_exposure_bundle(corpus, 2_048).is_dir()
+
+
+def test_ptv2_new_exposure_root_fsyncs_its_parent_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        study,
+        strategy="A-repair",
+        bucket_rows=[("math", "en", 512), ("stem", "en", 512)],
+    )
+    observed: list[Path] = []
+    real_fsync = module._fsync_directory
+
+    def record_fsync(path: Path) -> None:
+        observed.append(path)
+        real_fsync(path)
+
+    monkeypatch.setattr(module, "_fsync_directory", record_fsync)
+    module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+
+    assert study in observed
+
+
+def test_ptv2_new_completion_root_fsyncs_its_parent_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    for corpus in corpora:
+        module._materialize_ptv2_exposure(corpus, 1_024, workers=1)
+        module._materialize_ptv2_exposure(corpus, 2_048, workers=1)
+    observed: list[Path] = []
+    real_fsync = module._fsync_directory
+
+    def record_fsync(path: Path) -> None:
+        observed.append(path)
+        real_fsync(path)
+
+    monkeypatch.setattr(module, "_fsync_directory", record_fsync)
+    module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+
+    assert study in observed
+
+
+def test_ptv2_completion_refuses_a_four_artifact_ab_scope_before_publication(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    prefix, balanced, _ = _write_ptv2_three_arm_study(module, tmp_path / "study")
+
+    with pytest.raises(module.ExposureViewError, match="exact A/B/H"):
+        module._materialize_ptv2_exposure_set(
+            (prefix, balanced),
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+        )
+
+    assert not (tmp_path / "study/a-repair-exposures").exists()
+    assert not (tmp_path / "study/b-balanced-exposures").exists()
+
+
+def test_ptv2_incompatible_completion_is_rejected_before_h_publication(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    completion_root = study / "ptv2-study-exposures"
+    completion_root.mkdir()
+    legacy = {
+        "schema_version": 1,
+        "arms": ["A-repair", "B-balanced"],
+        "runtime_screen_tokens": 1_024,
+        "scientific_tokens": 2_048,
+    }
+    legacy_sha256 = hashlib.sha256(_canonical(legacy)).hexdigest()
+    (completion_root / "COMPLETE.json").write_bytes(
+        _canonical(legacy | {"receipt_sha256": legacy_sha256}) + b"\n"
+    )
+
+    with pytest.raises(module.ExposureViewError, match="scope"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+        )
+
+    assert not (study / "h-historical-cyclic-exposures").exists()
+
+
+def test_ptv2_completion_symlink_is_rejected_before_target_read_or_h_publication(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    completion_root = study / "ptv2-study-exposures"
+    completion_root.mkdir()
+    target = tmp_path / "target.json"
+    target.write_text("{}\n")
+    (completion_root / "COMPLETE.json").symlink_to(target)
+
+    with pytest.raises(module.ExposureViewError, match="unsafe"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+        )
+
+    assert not (study / "h-historical-cyclic-exposures").exists()
+
+
+def test_ptv2_completion_detects_self_rehashed_execution_tamper(tmp_path: Path) -> None:
+    module = _load_module()
+    study = tmp_path / "study"
+    corpora = _write_ptv2_three_arm_study(module, study)
+    _, _, completion_sha256 = module._materialize_ptv2_exposure_set(
+        corpora,
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+    execution_path = _ptv2_exposure_bundle(corpora[1], 1_024) / "EXECUTION.json"
+    execution = json.loads(execution_path.read_bytes())
+    execution.pop("receipt_sha256")
+    execution["requested_workers"] = 96
+    execution["effective_workers"] = 96
+    execution_sha256 = hashlib.sha256(_canonical(execution)).hexdigest()
+    execution_path.write_bytes(_canonical(execution | {"receipt_sha256": execution_sha256}) + b"\n")
+
+    with pytest.raises(module.ExposureViewError, match="execution evidence"):
+        module._materialize_ptv2_exposure_set(
+            corpora,
+            runtime_screen_tokens=1_024,
+            scientific_tokens=2_048,
+            workers=1,
+            expected_completion_receipt_sha256=completion_sha256,
+        )
+
+
+def test_ptv2_legacy_tokenized_receipt_is_read_only_for_new_publication(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="A-repair",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+    )
+    receipt_path = Path(corpus.receipt_path)
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt.pop("receipt_sha256")
+    receipt["schema_version"] = 1
+    receipt_sha256 = hashlib.sha256(_canonical(receipt)).hexdigest()
+    receipt_path.write_bytes(_canonical(receipt | {"receipt_sha256": receipt_sha256}) + b"\n")
+    legacy = replace(corpus, receipt_sha256=receipt_sha256)
+
+    with pytest.raises(module.ExposureViewError, match="v2 tokenized receipt"):
+        module._materialize_ptv2_exposure(legacy, 1_024, workers=1)
+
+    assert not _ptv2_exposure_bundle(legacy, 1_024).exists()
+
+
+def test_ptv2_scientific_cycle_requires_authenticated_v2_occurrences() -> None:
+    """A scalar total alone cannot authorize cyclic exact-token publication."""
     module = _load_module()
     prefix = module.PTV2OnePassCorpus(
         strategy="A-repair",
@@ -207,8 +1270,47 @@ def test_ptv2_scientific_milestone_cannot_extend_past_the_2m_occurrence_pass() -
         ordered_occurrences_sha256="8" * 64,
     )
 
-    with pytest.raises(module.ExposureViewError, match="one-pass does not reach 256M"):
+    with pytest.raises(module.ExposureViewError, match=r"one-pass.*256M"):
         module.build_ptv2_study_exposures(prefix, balanced, scientific_tokens=256_000_000)
+
+
+def test_ptv2_ab_exposure_cannot_cycle_beyond_authenticated_one_pass(tmp_path: Path) -> None:
+    module = _load_module()
+    corpus = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "input",
+        strategy="A-repair",
+        bucket_rows=[("math", "en", 128), ("stem", "en", 128)],
+    )
+    assert corpus.assistant_tokens == 1_024
+
+    with pytest.raises(module.ExposureViewError, match="one-pass reachability"):
+        module._materialize_ptv2_exposure(corpus, 2_048, workers=1)
+
+    assert not _ptv2_exposure_bundle(corpus, 2_048).exists()
+
+
+def test_ptv2_authenticated_h_exposure_labels_its_explicit_cyclic_repeats(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    prefix = _write_ptv2_v2_corpus(
+        module,
+        tmp_path / "study",
+        strategy="A-repair",
+        bucket_rows=[("math", "en", 256), ("stem", "en", 256)],
+        historical_prefix_rows=512,
+    )
+    historical = module.derive_ptv2_historical_corpus(prefix, tmp_path / "study")
+    target_tokens = historical.assistant_tokens * 2
+
+    module._materialize_ptv2_exposure(historical, target_tokens, workers=1)
+
+    bundle = _ptv2_exposure_bundle(historical, target_tokens)
+    receipt = json.loads((bundle / "SCIENTIFIC.json").read_bytes())
+    records = [json.loads(line) for line in (bundle / "records.jsonl").read_text().splitlines()]
+    assert receipt["repeat_policy"] == "authenticated-historical-cyclic-v1"
+    assert {record["cycle_index"] for record in records} == {0, 1}
 
 
 def test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation(
@@ -233,13 +1335,13 @@ def test_ptv2_derivation_rejects_a_response_not_in_the_tokenized_conversation(
     connection = sqlite3.connect(index)
     connection.executescript(
         "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
-        "canonical_conversation TEXT,assistant_response TEXT);"
+        "language TEXT,canonical_conversation TEXT,assistant_response TEXT);"
         "CREATE TABLE occurrences(strategy TEXT,ordinal INTEGER,prompt_uuid TEXT,"
         "source_identity_sha256 TEXT,source_row INTEGER,cell TEXT,reuse_index INTEGER,"
         "conversation_sha256 TEXT,assistant_response_sha256 TEXT);"
     )
     connection.execute(
-        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 0, conversation, response)
+        "INSERT INTO source_rows VALUES(?,?,?,?,?)", ("b" * 64, 0, "en", conversation, response)
     )
     connection.execute(
         "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", ("B-balanced", *selected)
@@ -290,7 +1392,7 @@ def test_ptv2_derivation_publishes_an_authenticated_token_bundle_on_apfs(tmp_pat
     connection = sqlite3.connect(index)
     connection.executescript(
         "CREATE TABLE source_rows("
-        "source_identity_sha256 TEXT,source_row INTEGER,canonical_conversation TEXT,"
+        "source_identity_sha256 TEXT,source_row INTEGER,language TEXT,canonical_conversation TEXT,"
         "assistant_response TEXT);"
         "CREATE TABLE occurrences("
         "strategy TEXT,ordinal INTEGER,prompt_uuid TEXT,source_identity_sha256 TEXT,"
@@ -298,7 +1400,7 @@ def test_ptv2_derivation_publishes_an_authenticated_token_bundle_on_apfs(tmp_pat
         "assistant_response_sha256 TEXT);"
     )
     connection.execute(
-        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 0, conversation, response)
+        "INSERT INTO source_rows VALUES(?,?,?,?,?)", ("b" * 64, 0, "en", conversation, response)
     )
     connection.execute(
         "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)", ("B-balanced", *occurrence)
@@ -344,7 +1446,7 @@ def test_ptv2_task8_one_vs_96_is_byte_identical(
     connection = sqlite3.connect(index)
     connection.executescript(
         "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
-        "canonical_conversation TEXT,assistant_response TEXT);"
+        "language TEXT,canonical_conversation TEXT,assistant_response TEXT);"
         "CREATE TABLE occurrences(strategy TEXT,ordinal INTEGER,prompt_uuid TEXT,"
         "source_identity_sha256 TEXT,source_row INTEGER,cell TEXT,reuse_index INTEGER,"
         "conversation_sha256 TEXT,assistant_response_sha256 TEXT);"
@@ -375,8 +1477,8 @@ def test_ptv2_task8_one_vs_96_is_byte_identical(
             response_sha,
         )
         connection.execute(
-            "INSERT INTO source_rows VALUES(?,?,?,?)",
-            (source_identity, ordinal, conversation, response),
+            "INSERT INTO source_rows VALUES(?,?,?,?,?)",
+            (source_identity, ordinal, "en", conversation, response),
         )
         connection.execute(
             "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)",
@@ -411,9 +1513,7 @@ def test_ptv2_task8_one_vs_96_is_byte_identical(
         "milestone_occurrences": (201,),
         "milestone_steps": (1,),
     }
-    serial = module.derive_ptv2_one_pass_corpus(
-        view, output_root=tmp_path / "serial", **common
-    )
+    serial = module.derive_ptv2_one_pass_corpus(view, output_root=tmp_path / "serial", **common)
     real_pretokenize = module._pretokenize_task8
 
     def stage_then_mutate(**kwargs):
@@ -497,13 +1597,13 @@ def test_ptv2_task8_worker_failure_cleans_spools_and_publishes_nothing(tmp_path:
     connection = sqlite3.connect(index)
     connection.executescript(
         "CREATE TABLE source_rows(source_identity_sha256 TEXT,source_row INTEGER,"
-        "canonical_conversation TEXT,assistant_response TEXT);"
+        "language TEXT,canonical_conversation TEXT,assistant_response TEXT);"
         "CREATE TABLE occurrences(strategy TEXT,ordinal INTEGER,prompt_uuid TEXT,"
         "source_identity_sha256 TEXT,source_row INTEGER,cell TEXT,reuse_index INTEGER,"
         "conversation_sha256 TEXT,assistant_response_sha256 TEXT);"
     )
     connection.execute(
-        "INSERT INTO source_rows VALUES(?,?,?,?)", ("b" * 64, 0, conversation, response)
+        "INSERT INTO source_rows VALUES(?,?,?,?,?)", ("b" * 64, 0, "en", conversation, response)
     )
     connection.execute(
         "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)",
@@ -541,6 +1641,28 @@ def test_ptv2_token_bundle_publish_is_atomic_no_replace_and_apfs_safe(tmp_path: 
     assert (destination / "records.sqlite3").read_bytes() == b"sqlite"
     with pytest.raises(module.ExposureViewError, match="immutable"):
         module._prepare_ptv2_tokenized_bundle(tmp_path, destination)
+
+
+def test_ptv2_token_bundle_parent_fsync_failure_rolls_back_the_installed_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    destination = tmp_path / "b-balanced-tokenized"
+    temporary = module._prepare_ptv2_tokenized_bundle(tmp_path, destination)
+    (temporary / "records.sqlite3").write_bytes(b"sqlite")
+    (temporary / "TOKENIZED.json").write_bytes(b"{}\n")
+    real_fsync = module._fsync_directory
+
+    def fail_publication_parent(path: Path) -> None:
+        if path == destination.parent:
+            raise OSError("injected tokenized parent fsync failure")
+        real_fsync(path)
+
+    monkeypatch.setattr(module, "_fsync_directory", fail_publication_parent)
+    with pytest.raises(OSError, match="injected tokenized parent fsync failure"):
+        module._publish_ptv2_tokenized_bundle(temporary, destination)
+
+    assert not destination.exists()
 
 
 def test_ptv2_token_bundle_partial_requires_typed_recovery(tmp_path: Path) -> None:
@@ -1130,6 +2252,11 @@ def test_production_labels_require_exact_values_and_trainer_length(
 def test_production_view_authenticates_task5_task6_and_tokenizer_artifacts(
     tmp_path: Path,
 ) -> None:
+    from tokenizers import Tokenizer  # pyright: ignore[reportMissingImports]
+    from tokenizers.models import WordLevel  # pyright: ignore[reportMissingImports]
+    from tokenizers.pre_tokenizers import Whitespace  # pyright: ignore[reportMissingImports]
+    from transformers import PreTrainedTokenizerFast  # pyright: ignore[reportMissingImports]
+
     module = _load_module()
     manifest_path, manifest_sha256, selection_sha256, paired_sha256 = _write_selection_artifact(
         tmp_path / "selection"

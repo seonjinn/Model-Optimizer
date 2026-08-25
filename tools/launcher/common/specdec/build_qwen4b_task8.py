@@ -214,6 +214,146 @@ def _read_receipt(path: Path, expected_sha256: str, label: str) -> dict[str, Any
     return payload
 
 
+def _stage_schema2_exposure_input(
+    bundle: Path,
+    work_root: Path,
+    *,
+    strategy: str,
+    scientific_receipt_sha256: str,
+) -> tuple[Path, str]:
+    """Stage a generic role receipt over all three immutable schema-v2 bundle files."""
+    _require_digest(scientific_receipt_sha256, "scientific exposure receipt")
+    wrapper_root = work_root / "exposure-publication-input"
+    wrapper_root.mkdir(mode=0o700)
+    descriptors: list[dict[str, object]] = []
+    for name in ("SCIENTIFIC.json", "records.jsonl", "EXECUTION.json"):
+        source = bundle / name
+        before = os.lstat(source)
+        if source.is_symlink() or not stat.S_ISREG(before.st_mode):
+            raise Task8BuildError("schema2 exposure bundle contains an unsafe file")
+        destination = wrapper_root / name
+        try:
+            os.link(source, destination, follow_symlinks=False)
+        except OSError as error:
+            raise Task8BuildError(
+                "schema2 exposure wrapper requires one node-local immutable filesystem"
+            ) from error
+        linked = os.lstat(destination)
+        after = os.lstat(source)
+        if (before.st_dev, before.st_ino) != (linked.st_dev, linked.st_ino) or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ) != (after.st_dev, after.st_ino, after.st_size):
+            raise Task8BuildError("schema2 exposure bundle changed during authenticated staging")
+        descriptors.append(
+            {"path": name, "bytes": linked.st_size, "sha256": _sha256_file(destination)}
+        )
+    scientific = json.loads((wrapper_root / "SCIENTIFIC.json").read_bytes())
+    execution = json.loads((wrapper_root / "EXECUTION.json").read_bytes())
+    if (
+        not isinstance(scientific, dict)
+        or scientific.get("receipt_sha256") != scientific_receipt_sha256
+        or not isinstance(execution, dict)
+        or execution.get("scientific_receipt_sha256") != scientific_receipt_sha256
+    ):
+        raise Task8BuildError("schema2 exposure wrapper lineage is inconsistent")
+    body = {
+        "schema_version": 2,
+        "role": "exposure",
+        "contract": "ptv2-schema2-exposure-publication-v1",
+        "strategy": strategy,
+        "scientific_receipt_sha256": scientific_receipt_sha256,
+        "identity": {key: value for key, value in scientific.items() if key != "receipt_sha256"},
+        "files": descriptors,
+    }
+    self_sha256 = hashlib.sha256(_canonical_json(body)).hexdigest()
+    wrapper = wrapper_root / "EXPOSURE.json"
+    raw = _canonical_json(body | {"receipt_sha256": self_sha256}) + b"\n"
+    with wrapper.open("xb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(wrapper_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return wrapper, hashlib.sha256(raw).hexdigest()
+
+
+def _stage_schema2_tokenized_input(
+    corpus: Any,
+    work_root: Path,
+) -> tuple[Path, str]:
+    bundle = Path(corpus.receipt_path).parent
+    wrapper_root = work_root / "tokenized-publication-input"
+    wrapper_root.mkdir(mode=0o700)
+    names = ["TOKENIZED.json", "records.sqlite3"]
+    if (bundle / "EXECUTION_RECEIPT.json").is_file():
+        names.append("EXECUTION_RECEIPT.json")
+    descriptors: list[dict[str, object]] = []
+    for name in names:
+        source = bundle / name
+        before = os.lstat(source)
+        if source.is_symlink() or not stat.S_ISREG(before.st_mode):
+            raise Task8BuildError("schema2 tokenized bundle contains an unsafe file")
+        destination = wrapper_root / name
+        try:
+            os.link(source, destination, follow_symlinks=False)
+        except OSError as error:
+            raise Task8BuildError(
+                "schema2 tokenized wrapper requires one node-local immutable filesystem"
+            ) from error
+        linked = os.lstat(destination)
+        after = os.lstat(source)
+        if (before.st_dev, before.st_ino) != (linked.st_dev, linked.st_ino) or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ) != (after.st_dev, after.st_ino, after.st_size):
+            raise Task8BuildError("schema2 tokenized bundle changed during authenticated staging")
+        descriptors.append(
+            {"path": name, "bytes": linked.st_size, "sha256": _sha256_file(destination)}
+        )
+    tokenized = json.loads((wrapper_root / "TOKENIZED.json").read_bytes())
+    if (
+        not isinstance(tokenized, dict)
+        or tokenized.get("schema_version") != 2
+        or tokenized.get("receipt_sha256") != corpus.receipt_sha256
+        or tokenized.get("database_sha256") != corpus.tokenized_sha256
+    ):
+        raise Task8BuildError("schema2 tokenized wrapper lineage is inconsistent")
+    body = {
+        "schema_version": 2,
+        "role": "tokenized",
+        "contract": "ptv2-schema2-tokenized-publication-v1",
+        "strategy": corpus.strategy,
+        "tokenized_receipt_sha256": corpus.receipt_sha256,
+        "identity": {key: value for key, value in tokenized.items() if key != "receipt_sha256"},
+        "files": descriptors,
+    }
+    if "execution_receipt" in tokenized:
+        body["execution_receipt"] = next(
+            descriptor
+            for descriptor in descriptors
+            if descriptor["path"] == "EXECUTION_RECEIPT.json"
+        )
+    self_sha256 = hashlib.sha256(_canonical_json(body)).hexdigest()
+    wrapper = wrapper_root / "TOKENIZED_INPUT.json"
+    raw = _canonical_json(body | {"receipt_sha256": self_sha256}) + b"\n"
+    with wrapper.open("xb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    descriptor = os.open(wrapper_root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return wrapper, hashlib.sha256(raw).hexdigest()
+
+
 def _authenticate_declared_files(
     receipt_path: Path, payload: Mapping[str, Any], label: str
 ) -> tuple[Path, ...]:
@@ -537,6 +677,14 @@ def _publication_rows(
         }
 
 
+def _task8_production_exposure_target(view: Any) -> int:
+    """Return the exact reachable scientific boundary for a production 2M selection."""
+    occurrence_count = getattr(view, "occurrence_count", None)
+    if occurrence_count != 2_000_000 or isinstance(occurrence_count, bool):
+        raise Task8BuildError("production Task8 selection must contain exactly 2M occurrences")
+    return 256_000_000
+
+
 def materialize_task8_publication(
     *,
     view: Any,
@@ -611,20 +759,27 @@ def materialize_task8_publication(
         workers=workers,
         source_commit=source_commit,
     )
-    _materialize_ptv2_exposure(corpus, corpus.assistant_tokens)
+    exposure_target = _task8_production_exposure_target(view)
+    scientific_receipt_sha256 = _materialize_ptv2_exposure(corpus, exposure_target, workers=workers)
     exposure_root = (
         Path(corpus.tokenized_path).parent.parent / f"{corpus.strategy.lower()}-exposures"
     )
-    exposure_receipt = (
-        exposure_root / f"{corpus.strategy.lower()}-{corpus.assistant_tokens}-assistant-tokens.json"
+    exposure_bundle = exposure_root / (
+        f"{corpus.strategy.lower()}-{exposure_target}-assistant-tokens-v2"
     )
-    tokenized_receipt = Path(corpus.receipt_path)
+    exposure_receipt, exposure_receipt_sha256 = _stage_schema2_exposure_input(
+        exposure_bundle,
+        work_root,
+        strategy=corpus.strategy,
+        scientific_receipt_sha256=scientific_receipt_sha256,
+    )
+    tokenized_receipt, tokenized_receipt_sha256 = _stage_schema2_tokenized_input(corpus, work_root)
     artifacts = (
         InputArtifact("source", Path(source_receipt), source_receipt_sha256),
         InputArtifact("selection", Path(selection_receipt), selection_receipt_sha256),
         InputArtifact("response", Path(response_receipt), response_receipt_sha256),
-        InputArtifact("tokenized", tokenized_receipt, _sha256_file(tokenized_receipt)),
-        InputArtifact("exposure", exposure_receipt, _sha256_file(exposure_receipt)),
+        InputArtifact("tokenized", tokenized_receipt, tokenized_receipt_sha256),
+        InputArtifact("exposure", exposure_receipt, exposure_receipt_sha256),
         InputArtifact("rejection", Path(rejection_receipt), rejection_receipt_sha256),
     )
     return publish_bundle(
@@ -644,6 +799,336 @@ def materialize_task8_publication(
         rows_per_shard=publication_rows_per_shard(
             corpus.occurrence_count + role_evidence.rejection_count
         ),
+    )
+
+
+_PTV2_BASE_RECEIPT_KEYS = frozenset(
+    {
+        "schema_version",
+        "strategy",
+        "occurrence_count",
+        "trainer_epochs",
+        "assistant_tokens",
+        "serialized_tokens",
+        "packed_sequence_lower_bound",
+        "unique_prompt_count",
+        "natural_duplicate_count",
+        "constructed_repeat_count",
+        "milestone_occurrences",
+        "milestone_steps",
+        "segment_occurrences",
+        "segment_steps",
+        "cumulative_segment_steps",
+        "segment_final_valid_occurrences",
+        "tokenizer_sha256",
+        "chat_template_sha256",
+        "assistant_loss_target_sha256",
+        "training_config_sha256",
+        "source_response_root_sha256",
+        "ordered_occurrences_sha256",
+        "selection_sha256",
+        "base_occurrence_multiplicity_sha256",
+        "bucket_assistant_token_histogram",
+        "database_path",
+        "database_sha256",
+        "database_bytes",
+        "receipt_sha256",
+    }
+)
+_PTV2_PARALLEL_RECEIPT_KEYS = frozenset(
+    {"execution_receipt", "source_index_bytes", "source_index_sha256"}
+)
+_PTV2_HISTORICAL_RECEIPT_KEYS = frozenset(
+    {
+        "historical_parent_receipt_sha256",
+        "historical_parent_tokenized_sha256",
+        "historical_prefix_occurrence_count",
+        "historical_prefix_record_stream_sha256",
+    }
+)
+
+
+def _exact_positive_int(value: object, label: str, *, allow_zero: bool = False) -> int:
+    minimum = 0 if allow_zero else 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise Task8BuildError(f"{label} must be an exact integer")
+    return value
+
+
+def _exact_int_tuple(value: object, length: int, label: str) -> tuple[int, ...]:
+    if (
+        not isinstance(value, list)
+        or len(value) != length
+        or any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in value)
+    ):
+        raise Task8BuildError(f"{label} must be an exact integer list")
+    return tuple(value)
+
+
+def _load_pinned_ptv2_corpus(
+    *,
+    receipt_path: Path,
+    receipt_file_sha256: str,
+    expected_strategy: str,
+    study_root: Path,
+) -> Any:
+    """Load one immutable schema-v2 tokenized corpus from a caller-pinned file identity."""
+    from build_assistant_token_views import (  # pyright: ignore[reportMissingImports]
+        PTV2OnePassCorpus,
+    )
+
+    _require_digest(receipt_file_sha256, f"{expected_strategy} tokenized receipt file")
+    root = _canonical_absolute_path(study_root, "PTV2 study root")
+    expected_path = root / f"{expected_strategy.lower()}-tokenized" / "TOKENIZED.json"
+    if receipt_path != expected_path:
+        raise Task8BuildError(f"{expected_strategy} tokenized receipt path is outside its arm root")
+    raw = _read_regular_nofollow(
+        receipt_path, f"{expected_strategy} tokenized receipt", max_bytes=_MAX_RECEIPT_BYTES
+    )
+    if hashlib.sha256(raw).hexdigest() != receipt_file_sha256:
+        raise Task8BuildError(f"{expected_strategy} tokenized receipt file SHA-256 mismatch")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Task8BuildError(f"{expected_strategy} tokenized receipt is not JSON") from error
+    if not isinstance(payload, dict):
+        raise Task8BuildError(f"{expected_strategy} tokenized receipt must be an object")
+    optional = (
+        _PTV2_HISTORICAL_RECEIPT_KEYS
+        if expected_strategy == "H-historical-cyclic"
+        else _PTV2_PARALLEL_RECEIPT_KEYS
+        if "execution_receipt" in payload
+        else frozenset()
+    )
+    if set(payload) != _PTV2_BASE_RECEIPT_KEYS | optional:
+        raise Task8BuildError(f"{expected_strategy} tokenized receipt schema is not exact")
+    claimed = payload.get("receipt_sha256")
+    body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    if (
+        payload.get("schema_version") != 2
+        or payload.get("strategy") != expected_strategy
+        or not isinstance(claimed, str)
+        or _SHA256.fullmatch(claimed) is None
+        or hashlib.sha256(_canonical_json(body)).hexdigest() != claimed
+        or raw != _canonical_json(payload) + b"\n"
+    ):
+        raise Task8BuildError(f"{expected_strategy} tokenized receipt authentication failed")
+    integer_fields = (
+        "occurrence_count",
+        "trainer_epochs",
+        "assistant_tokens",
+        "serialized_tokens",
+        "packed_sequence_lower_bound",
+        "unique_prompt_count",
+        "natural_duplicate_count",
+        "constructed_repeat_count",
+        "database_bytes",
+    )
+    integers = {
+        name: _exact_positive_int(
+            payload.get(name),
+            f"{expected_strategy} {name}",
+            allow_zero=name
+            in {"trainer_epochs", "natural_duplicate_count", "constructed_repeat_count"},
+        )
+        for name in integer_fields
+    }
+    digest_fields = (
+        "tokenizer_sha256",
+        "chat_template_sha256",
+        "assistant_loss_target_sha256",
+        "training_config_sha256",
+        "source_response_root_sha256",
+        "ordered_occurrences_sha256",
+        "selection_sha256",
+        "base_occurrence_multiplicity_sha256",
+        "database_sha256",
+    )
+    for name in digest_fields:
+        value = payload.get(name)
+        if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+            raise Task8BuildError(f"{expected_strategy} {name} is invalid")
+    if payload.get("database_path") != "records.sqlite3":
+        raise Task8BuildError(f"{expected_strategy} tokenized database path is invalid")
+    database = _authenticate_descriptor(
+        receipt_path,
+        {
+            "path": "records.sqlite3",
+            "bytes": integers["database_bytes"],
+            "sha256": payload["database_sha256"],
+        },
+        f"{expected_strategy} tokenized database",
+    )
+    if optional == _PTV2_PARALLEL_RECEIPT_KEYS:
+        execution = payload.get("execution_receipt")
+        source_bytes = payload.get("source_index_bytes")
+        source_sha256 = payload.get("source_index_sha256")
+        if (
+            not isinstance(execution, Mapping)
+            or isinstance(source_bytes, bool)
+            or not isinstance(source_bytes, int)
+            or source_bytes < 1
+            or not isinstance(source_sha256, str)
+            or _SHA256.fullmatch(source_sha256) is None
+        ):
+            raise Task8BuildError(f"{expected_strategy} parallel lineage is malformed")
+        _authenticate_descriptor(receipt_path, execution, f"{expected_strategy} execution receipt")
+    raw_milestones = payload.get("milestone_occurrences")
+    milestone_count = len(raw_milestones) if isinstance(raw_milestones, list) else -1
+    milestones = _exact_int_tuple(
+        raw_milestones, milestone_count, f"{expected_strategy} milestone occurrences"
+    )
+    steps = _exact_int_tuple(
+        payload.get("milestone_steps"), len(milestones), f"{expected_strategy} milestone steps"
+    )
+    if not milestones or any(value < 1 for value in (*milestones, *steps)):
+        raise Task8BuildError(f"{expected_strategy} milestone schedule is invalid")
+    segment_occurrences = _exact_int_tuple(
+        payload.get("segment_occurrences"), 2, f"{expected_strategy} segment occurrences"
+    )
+    segment_steps = _exact_int_tuple(
+        payload.get("segment_steps"), 2, f"{expected_strategy} segment steps"
+    )
+    cumulative_steps = _exact_int_tuple(
+        payload.get("cumulative_segment_steps"),
+        2,
+        f"{expected_strategy} cumulative segment steps",
+    )
+    final_valid = _exact_int_tuple(
+        payload.get("segment_final_valid_occurrences"),
+        2,
+        f"{expected_strategy} final valid occurrences",
+    )
+    historical_values: dict[str, str | None] = {
+        "historical_parent_receipt_sha256": None,
+        "historical_parent_tokenized_sha256": None,
+        "historical_prefix_record_stream_sha256": None,
+    }
+    if expected_strategy == "H-historical-cyclic":
+        if payload.get("historical_prefix_occurrence_count") != integers["occurrence_count"]:
+            raise Task8BuildError("historical prefix occurrence count is inconsistent")
+        for name in historical_values:
+            value = payload.get(name)
+            if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
+                raise Task8BuildError(f"historical {name} is invalid")
+            historical_values[name] = value
+    return PTV2OnePassCorpus(
+        strategy=expected_strategy,
+        occurrence_count=integers["occurrence_count"],
+        trainer_epochs=integers["trainer_epochs"],
+        assistant_tokens=integers["assistant_tokens"],
+        tokenizer_sha256=str(payload["tokenizer_sha256"]),
+        chat_template_sha256=str(payload["chat_template_sha256"]),
+        assistant_loss_target_sha256=str(payload["assistant_loss_target_sha256"]),
+        training_config_sha256=str(payload["training_config_sha256"]),
+        source_response_root_sha256=str(payload["source_response_root_sha256"]),
+        ordered_occurrences_sha256=str(payload["ordered_occurrences_sha256"]),
+        selection_sha256=str(payload["selection_sha256"]),
+        unique_prompt_count=integers["unique_prompt_count"],
+        natural_duplicate_count=integers["natural_duplicate_count"],
+        constructed_repeat_count=integers["constructed_repeat_count"],
+        serialized_tokens=integers["serialized_tokens"],
+        packed_sequence_lower_bound=integers["packed_sequence_lower_bound"],
+        milestone_occurrences=milestones,
+        milestone_steps=steps,
+        segment_occurrences=segment_occurrences,
+        segment_steps=segment_steps,
+        cumulative_segment_steps=cumulative_steps,
+        segment_final_valid_occurrences=final_valid,
+        tokenized_path=str(database),
+        tokenized_sha256=str(payload["database_sha256"]),
+        receipt_path=str(receipt_path),
+        receipt_sha256=claimed,
+        **historical_values,
+    )
+
+
+def _verify_existing_historical_derivation(prefix: Any, historical: Any) -> None:
+    """Prove that an adopted H database is byte-for-byte the authenticated A prefix."""
+    if (
+        historical.historical_parent_receipt_sha256 != prefix.receipt_sha256
+        or historical.historical_parent_tokenized_sha256 != prefix.tokenized_sha256
+        or historical.occurrence_count != prefix.segment_occurrences[0]
+    ):
+        raise Task8BuildError("historical corpus is not derived from the pinned A baseline")
+    left = sqlite3.connect(f"file:{Path(prefix.tokenized_path)}?mode=ro", uri=True)
+    right = sqlite3.connect(f"file:{Path(historical.tokenized_path)}?mode=ro", uri=True)
+    digest = hashlib.sha256()
+    try:
+        query = (
+            "SELECT ordinal,prompt_uuid,source_identity_sha256,source_row,cell,language,"
+            "reuse_index,input_ids_json,loss_mask_json,assistant_tokens FROM records "
+            "WHERE ordinal<? ORDER BY ordinal"
+        )
+        expected = left.execute(query, (historical.occurrence_count,))
+        observed = right.execute(query, (historical.occurrence_count + 1,))
+        count = 0
+        for a_row, h_row in zip_longest(expected, observed, fillvalue=None):
+            if a_row is None or h_row is None or a_row != h_row:
+                raise Task8BuildError("historical corpus differs from the pinned A prefix")
+            digest.update(_canonical_json(list(a_row)) + b"\n")
+            count += 1
+        if (
+            count != historical.occurrence_count
+            or digest.hexdigest() != historical.historical_prefix_record_stream_sha256
+        ):
+            raise Task8BuildError("historical corpus record-stream lineage is invalid")
+    finally:
+        right.close()
+        left.close()
+
+
+def materialize_task8_ab_h_completion(
+    *,
+    a_tokenized_receipt: Path,
+    a_tokenized_receipt_sha256: str,
+    b_tokenized_receipt: Path,
+    b_tokenized_receipt_sha256: str,
+    study_root: Path,
+    workers: int = 96,
+    expected_completion_receipt_sha256: str | None = None,
+) -> Any:
+    """Build or authenticate the complete six-bundle A/B/H Task8 exposure study."""
+    from build_assistant_token_views import (  # pyright: ignore[reportMissingImports]
+        build_ptv2_study_exposures,
+        derive_ptv2_historical_corpus,
+    )
+
+    root = _canonical_absolute_path(study_root, "PTV2 study root")
+    prefix = _load_pinned_ptv2_corpus(
+        receipt_path=Path(a_tokenized_receipt),
+        receipt_file_sha256=a_tokenized_receipt_sha256,
+        expected_strategy="A-repair",
+        study_root=root,
+    )
+    balanced = _load_pinned_ptv2_corpus(
+        receipt_path=Path(b_tokenized_receipt),
+        receipt_file_sha256=b_tokenized_receipt_sha256,
+        expected_strategy="B-balanced",
+        study_root=root,
+    )
+    historical_receipt = root / "h-historical-cyclic-tokenized" / "TOKENIZED.json"
+    if os.path.lexists(historical_receipt.parent):
+        raw_h = _read_regular_nofollow(
+            historical_receipt, "historical tokenized receipt", max_bytes=_MAX_RECEIPT_BYTES
+        )
+        historical = _load_pinned_ptv2_corpus(
+            receipt_path=historical_receipt,
+            receipt_file_sha256=hashlib.sha256(raw_h).hexdigest(),
+            expected_strategy="H-historical-cyclic",
+            study_root=root,
+        )
+        _verify_existing_historical_derivation(prefix, historical)
+    else:
+        historical = derive_ptv2_historical_corpus(prefix, root)
+    return build_ptv2_study_exposures(
+        prefix,
+        balanced,
+        historical,
+        scientific_tokens=256_000_000,
+        runtime_screen_tokens=64_000_000,
+        workers=workers,
+        expected_completion_receipt_sha256=expected_completion_receipt_sha256,
     )
 
 
@@ -798,6 +1283,21 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _ab_h_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Materialize authenticated A/B/H Task8 views")
+    for name in (
+        "a-tokenized-receipt",
+        "a-tokenized-receipt-sha256",
+        "b-tokenized-receipt",
+        "b-tokenized-receipt-sha256",
+        "study-root",
+    ):
+        parser.add_argument(f"--{name}", required=True)
+    parser.add_argument("--expected-completion-receipt-sha256")
+    parser.add_argument("--workers", type=int, default=96)
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the fail-closed Task8 producer from command-line arguments."""
     effective_argv = sys.argv[1:] if argv is None else argv
@@ -805,6 +1305,30 @@ def main(argv: list[str] | None = None) -> int:
         if len(effective_argv) != 3:
             raise Task8BuildError("publication root validation requires path and prefix")
         validate_durable_publication_root(effective_argv[1], effective_argv[2])
+        return 0
+    if effective_argv and effective_argv[0] == "--materialize-ab-h":
+        args = _ab_h_parser().parse_args(effective_argv[1:])
+        views = materialize_task8_ab_h_completion(
+            a_tokenized_receipt=Path(args.a_tokenized_receipt),
+            a_tokenized_receipt_sha256=args.a_tokenized_receipt_sha256,
+            b_tokenized_receipt=Path(args.b_tokenized_receipt),
+            b_tokenized_receipt_sha256=args.b_tokenized_receipt_sha256,
+            study_root=Path(args.study_root),
+            workers=args.workers,
+            expected_completion_receipt_sha256=args.expected_completion_receipt_sha256,
+        )
+        print(
+            json.dumps(
+                {
+                    "completion_receipt_path": views.completion_receipt_path,
+                    "completion_receipt_sha256": views.completion_receipt_sha256,
+                    "runtime_artifacts": dict(views.runtime_artifacts),
+                    "scientific_artifacts": dict(views.scientific_artifacts),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
         return 0
     args = _parser().parse_args(effective_argv)
     selection_receipt = Path(args.selection_receipt)

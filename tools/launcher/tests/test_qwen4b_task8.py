@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +35,14 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_public_ab_h_api_has_no_arbitrary_exposure_boundary_override() -> None:
+    """Production A/B/H callers cannot select non-scientific token boundaries."""
+    parameters = inspect.signature(task8.materialize_task8_ab_h_completion).parameters
+
+    assert "_runtime_screen_tokens" not in parameters
+    assert "_scientific_tokens" not in parameters
+
+
 class _Tokenizer:
     tokenizer_sha256 = "1" * 64
     chat_template = "template"
@@ -43,13 +53,21 @@ class _Tokenizer:
         return {"input_ids": [10, 11, 12], "assistant_masks": [0, 1, 1]}
 
 
+class _FourTokenTokenizer(_Tokenizer):
+    def apply_chat_template(self, messages: object, **_: object) -> dict[str, list[int]]:
+        assert isinstance(messages, list)
+        return {"input_ids": [10, 11, 12, 13], "assistant_masks": [1, 1, 1, 1]}
+
+
 def test_exact_two_million_publication_partitions_into_201_shards() -> None:
     """A 200-shard default would be rejected by both Task10 canary consumers."""
     assert task8.publication_rows_per_shard(2_000_000) == 9_951
     assert (2_000_000 + 9_951 - 1) // 9_951 == 201
 
 
-def _selection(tmp_path: Path) -> tuple[SimpleNamespace, Path]:
+def _selection(
+    tmp_path: Path, *, occurrence_count: int = 2, strategy: str = "B-balanced"
+) -> tuple[SimpleNamespace, Path]:
     root = tmp_path / "selection"
     root.mkdir()
     index = root / "selection.sqlite3"
@@ -63,14 +81,16 @@ def _selection(tmp_path: Path) -> tuple[SimpleNamespace, Path]:
     )
     occurrence_digest = hashlib.sha256()
     response_digest = hashlib.sha256()
-    for ordinal, (cell, language) in enumerate((("math", ""), ("multilingual", "ja"))):
+    buckets = (("math", "en"), ("multilingual", "ja"))
+    for ordinal in range(occurrence_count):
+        cell, language = buckets[ordinal % len(buckets)]
         assistant = {"role": "assistant", "content": f"answer-{ordinal}"}
         conversation = _canonical(
             {"messages": [{"role": "user", "content": "q"}, assistant]}
         ).decode()
         response = _canonical(assistant).decode()
-        source_identity = str(ordinal + 3) * 64
-        prompt_uuid = str(ordinal + 5) * 64
+        source_identity = hashlib.sha256(f"source:{ordinal}".encode()).hexdigest()
+        prompt_uuid = hashlib.sha256(f"prompt:{ordinal}".encode()).hexdigest()
         conversation_sha = hashlib.sha256(conversation.encode()).hexdigest()
         response_sha = hashlib.sha256(response.encode()).hexdigest()
         connection.execute(
@@ -89,7 +109,7 @@ def _selection(tmp_path: Path) -> tuple[SimpleNamespace, Path]:
         )
         connection.execute(
             "INSERT INTO occurrences VALUES(?,?,?,?,?,?,?,?,?)",
-            ("B-balanced", *occurrence),
+            (strategy, *occurrence),
         )
         occurrence_digest.update(_canonical(list(occurrence)) + b"\n")
         response_digest.update(
@@ -99,10 +119,10 @@ def _selection(tmp_path: Path) -> tuple[SimpleNamespace, Path]:
     connection.close()
     return (
         SimpleNamespace(
-            strategy="B-balanced",
-            occurrence_count=2,
+            strategy=strategy,
+            occurrence_count=occurrence_count,
             trainer_epochs=1,
-            unique_prompt_count=2,
+            unique_prompt_count=occurrence_count,
             natural_duplicate_count=0,
             constructed_repeat_count=0,
             index_path=index,
@@ -224,78 +244,340 @@ def _rejection_artifact(
     return receipt, _digest(receipt)
 
 
-def test_small_genuine_selection_publishes_complete_six_role_bundle(tmp_path: Path) -> None:
-    """Dropping any role or the real selection/token join would make publication fail."""
-    view, _ = _selection(tmp_path)
-    source, source_sha = _artifact(
-        tmp_path / "source",
-        "source",
-        {"source_manifest_sha256": "8" * 64},
-    )
-    selection, selection_sha = _artifact(
-        tmp_path / "selection-artifact",
-        "selection",
-        {"selection_sha256": view.selection_sha256},
-    )
-    response, response_sha = _response_artifact(tmp_path / "response", view)
-    rejection, rejection_sha = _rejection_artifact(
-        tmp_path / "rejection",
-        view,
-        (
-            {
-                "ordinal": 0,
-                "prompt_uuid": "f" * 64,
-                "domain": "math",
-                "lane": "source-native",
-                "context_bucket": "ptv2-one-pass",
-                "source_identity_sha256": "e" * 64,
-                "source_row": 9,
-                "rejection_reason": "invalid-assistant-mask",
-            },
-        ),
+def test_authenticated_513_row_corpus_uses_one_reachable_noncycling_batch(tmp_path: Path) -> None:
+    """A non-batch-aligned corpus remains one-pass at a private reachable test boundary."""
+    from build_assistant_token_views import (  # pyright: ignore[reportMissingImports]
+        _materialize_ptv2_exposure,
+        derive_ptv2_one_pass_corpus,
     )
 
-    receipt = task8.materialize_task8_publication(
-        view=view,
-        task9_source_commit="a" * 40,
-        tokenizer=_Tokenizer(),
+    view, _ = _selection(tmp_path, occurrence_count=513, strategy="A-repair")
+    corpus = derive_ptv2_one_pass_corpus(
+        view,
         tokenizer_sha256=_Tokenizer.tokenizer_sha256,
         chat_template_sha256=hashlib.sha256(_Tokenizer.chat_template.encode()).hexdigest(),
         assistant_loss_target_sha256=_Tokenizer.assistant_loss_target_sha256,
         training_config_sha256="3" * 64,
-        source_receipt=source,
-        source_receipt_sha256=source_sha,
-        selection_receipt=selection,
-        selection_receipt_sha256=selection_sha,
-        response_receipt=response,
-        response_receipt_sha256=response_sha,
-        rejection_receipt=rejection,
-        rejection_receipt_sha256=rejection_sha,
-        work_root=tmp_path / "work",
-        materialization_root=tmp_path / "materialized",
-        publication_root=tmp_path / "published",
-        source_commit="b" * 40,
-        job_id="test-job",
+        tokenizer=_Tokenizer(),
+        output_root=tmp_path / "study",
         workers=1,
     )
+    receipt_sha256 = _materialize_ptv2_exposure(corpus, 1_024, workers=1)
+    bundle = tmp_path / "study/a-repair-exposures/a-repair-1024-assistant-tokens-v2"
+    receipt = json.loads((bundle / "SCIENTIFIC.json").read_bytes())
+    rows = [json.loads(line) for line in (bundle / "records.jsonl").read_bytes().splitlines()]
 
-    published = Path(receipt.published_path)
-    assert published.is_dir()
-    assert {path.name for path in (published / "inputs").iterdir()} == {
-        "source",
-        "selection",
-        "response",
-        "tokenized",
-        "exposure",
-        "rejection",
-    }
-    assert receipt.selection_manifest_sha256 == selection_sha
-    assert json.loads((published / "PUBLICATION.json").read_bytes())["artifact_source_commit"] == (
-        "b" * 40
+    assert corpus.occurrence_count == 513
+    assert corpus.assistant_tokens == 1_026
+    assert receipt["receipt_sha256"] == receipt_sha256
+    assert receipt["target_assistant_tokens"] == 1_024
+    assert len(rows) == 512
+    assert {row["cycle_index"] for row in rows} == {0}
+
+
+def test_production_two_million_caller_pins_the_exact_256m_scientific_boundary() -> None:
+    """The production caller never requests the unreachable non-batch-aligned corpus total."""
+    view = SimpleNamespace(occurrence_count=2_000_000)
+
+    assert task8._task8_production_exposure_target(view) == 256_000_000
+    with pytest.raises(task8.Task8BuildError, match="exactly 2M"):
+        task8._task8_production_exposure_target(SimpleNamespace(occurrence_count=1_999_999))
+
+
+def _small_task8_tokenized_pair(tmp_path: Path):
+    from build_assistant_token_views import (  # pyright: ignore[reportMissingImports]
+        derive_ptv2_one_pass_corpus,
     )
-    manifest = json.loads((published / "CORPUS_MANIFEST.json").read_bytes())
-    assert manifest["prompt_count"] == 2
-    assert manifest["quarantine_count"] == 1
+
+    study = tmp_path / "study"
+    corpora = []
+    for strategy in ("A-repair", "B-balanced"):
+        selection_root = tmp_path / strategy.lower()
+        selection_root.mkdir()
+        view, _ = _selection(
+            selection_root,
+            occurrence_count=512,
+            strategy=strategy,
+        )
+        corpus = derive_ptv2_one_pass_corpus(
+            view,
+            tokenizer_sha256=_Tokenizer.tokenizer_sha256,
+            chat_template_sha256=hashlib.sha256(_Tokenizer.chat_template.encode()).hexdigest(),
+            assistant_loss_target_sha256=_Tokenizer.assistant_loss_target_sha256,
+            training_config_sha256="3" * 64,
+            tokenizer=_FourTokenTokenizer(),
+            output_root=study,
+            workers=1,
+        )
+        receipt_path = Path(corpus.receipt_path)
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt.pop("receipt_sha256")
+        receipt.update(
+            {
+                "segment_occurrences": [512, 0],
+                "segment_steps": [1, 0],
+                "cumulative_segment_steps": [1, 1],
+                "segment_final_valid_occurrences": [0, 0],
+            }
+        )
+        receipt_sha256 = hashlib.sha256(_canonical(receipt)).hexdigest()
+        receipt_path.write_bytes(_canonical(receipt | {"receipt_sha256": receipt_sha256}) + b"\n")
+        corpora.append(
+            replace(
+                corpus,
+                receipt_sha256=receipt_sha256,
+                segment_occurrences=(512, 0),
+                segment_steps=(1, 0),
+                cumulative_segment_steps=(1, 1),
+                segment_final_valid_occurrences=(0, 0),
+            )
+        )
+    return study, tuple(corpora)
+
+
+def test_private_small_ab_h_mechanics_load_pinned_roots_and_replay(tmp_path: Path) -> None:
+    """Private small-boundary mechanics authenticate A/B, derive H, and replay COMPLETE."""
+    from build_assistant_token_views import (  # pyright: ignore[reportMissingImports]
+        _materialize_ptv2_exposure_set,
+        derive_ptv2_historical_corpus,
+    )
+
+    study, (prefix, balanced) = _small_task8_tokenized_pair(tmp_path)
+    loaded_prefix = task8._load_pinned_ptv2_corpus(
+        receipt_path=Path(prefix.receipt_path),
+        receipt_file_sha256=_digest(Path(prefix.receipt_path)),
+        expected_strategy="A-repair",
+        study_root=study,
+    )
+    loaded_balanced = task8._load_pinned_ptv2_corpus(
+        receipt_path=Path(balanced.receipt_path),
+        receipt_file_sha256=_digest(Path(balanced.receipt_path)),
+        expected_strategy="B-balanced",
+        study_root=study,
+    )
+    historical = derive_ptv2_historical_corpus(loaded_prefix, study)
+    first = _materialize_ptv2_exposure_set(
+        (loaded_prefix, loaded_balanced, historical),
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+    )
+    completion = study / "ptv2-study-exposures/COMPLETE.json"
+    assert _digest(completion)
+    assert (study / "h-historical-cyclic-tokenized/TOKENIZED.json").is_file()
+    assert all(
+        (
+            study / f"{arm}-exposures" / f"{arm}-{tokens}-assistant-tokens-v2/SCIENTIFIC.json"
+        ).is_file()
+        for arm in ("a-repair", "b-balanced", "h-historical-cyclic")
+        for tokens in (1_024, 2_048)
+    )
+
+    second = _materialize_ptv2_exposure_set(
+        (loaded_prefix, loaded_balanced, historical),
+        runtime_screen_tokens=1_024,
+        scientific_tokens=2_048,
+        workers=1,
+        expected_completion_receipt_sha256=first[2],
+    )
+    assert second == first
+
+
+def test_public_ab_h_two_million_caller_always_requests_exact_production_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The genuine public path dispatches exact 64M/256M defaults for authenticated 2M arms."""
+    dataset_module = importlib.import_module("build_assistant_token_views")
+    study = tmp_path / "study"
+    prefix = SimpleNamespace(
+        strategy="A-repair",
+        occurrence_count=2_000_000,
+        assistant_tokens=300_000_000,
+    )
+    balanced = SimpleNamespace(
+        strategy="B-balanced",
+        occurrence_count=2_000_000,
+        assistant_tokens=300_000_000,
+    )
+    historical = SimpleNamespace(
+        strategy="H-historical-cyclic",
+        occurrence_count=1_300_000,
+        assistant_tokens=200_000_000,
+    )
+    observed: list[tuple[int, int, int, str | None]] = []
+    marker = object()
+
+    def fake_load(**kwargs: object) -> SimpleNamespace:
+        return prefix if kwargs["expected_strategy"] == "A-repair" else balanced
+
+    def fake_build(
+        prefix_arg: SimpleNamespace,
+        balanced_arg: SimpleNamespace,
+        historical_arg: SimpleNamespace,
+        *,
+        scientific_tokens: int,
+        runtime_screen_tokens: int,
+        workers: int = 1,
+        expected_completion_receipt_sha256: str | None = None,
+    ) -> object:
+        assert (prefix_arg, balanced_arg, historical_arg) == (prefix, balanced, historical)
+        observed.append(
+            (
+                runtime_screen_tokens,
+                scientific_tokens,
+                workers,
+                expected_completion_receipt_sha256,
+            )
+        )
+        return marker
+
+    monkeypatch.setattr(task8, "_load_pinned_ptv2_corpus", fake_load)
+    monkeypatch.setattr(dataset_module, "derive_ptv2_historical_corpus", lambda *_: historical)
+    monkeypatch.setattr(dataset_module, "build_ptv2_study_exposures", fake_build)
+
+    result = task8.materialize_task8_ab_h_completion(
+        a_tokenized_receipt=study / "a-repair-tokenized/TOKENIZED.json",
+        a_tokenized_receipt_sha256="1" * 64,
+        b_tokenized_receipt=study / "b-balanced-tokenized/TOKENIZED.json",
+        b_tokenized_receipt_sha256="2" * 64,
+        study_root=study,
+        workers=96,
+        expected_completion_receipt_sha256="3" * 64,
+    )
+
+    assert result is marker
+    assert observed == [(64_000_000, 256_000_000, 96, "3" * 64)]
+
+
+def test_ab_h_cli_dispatches_only_exact_production_boundaries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The production CLI exposes no flags that can weaken the exact 64M/256M boundaries."""
+    study = tmp_path / "study"
+    a = study / "a-repair-tokenized/TOKENIZED.json"
+    b = study / "b-balanced-tokenized/TOKENIZED.json"
+    calls: list[dict[str, object]] = []
+
+    def fake_materialize(**kwargs: object) -> SimpleNamespace:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            completion_receipt_path=str(study / "ptv2-study-exposures/COMPLETE.json"),
+            completion_receipt_sha256="9" * 64,
+            runtime_artifacts={"A-repair": "1" * 64},
+            scientific_artifacts={"A-repair": "2" * 64},
+        )
+
+    monkeypatch.setattr(task8, "materialize_task8_ab_h_completion", fake_materialize)
+    assert (
+        task8.main(
+            [
+                "--materialize-ab-h",
+                "--a-tokenized-receipt",
+                str(a),
+                "--a-tokenized-receipt-sha256",
+                "3" * 64,
+                "--b-tokenized-receipt",
+                str(b),
+                "--b-tokenized-receipt-sha256",
+                "4" * 64,
+                "--study-root",
+                str(study),
+                "--workers",
+                "96",
+            ]
+        )
+        == 0
+    )
+    assert calls == [
+        {
+            "a_tokenized_receipt": a,
+            "a_tokenized_receipt_sha256": "3" * 64,
+            "b_tokenized_receipt": b,
+            "b_tokenized_receipt_sha256": "4" * 64,
+            "study_root": study,
+            "workers": 96,
+            "expected_completion_receipt_sha256": None,
+        }
+    ]
+    assert json.loads(capsys.readouterr().out)["completion_receipt_sha256"] == "9" * 64
+
+
+def test_ab_h_submitter_test_only_pins_both_roots_without_real_submission(tmp_path: Path) -> None:
+    """The production preflight authenticates both roots without issuing a writer job."""
+    submitter = _REPO_ROOT / "tools/launcher/common/specdec/submit_qwen4b_task8_ab_h.sh"
+    study = tmp_path / "study"
+    a = study / "a-repair-tokenized/TOKENIZED.json"
+    b = study / "b-balanced-tokenized/TOKENIZED.json"
+    a.parent.mkdir(parents=True)
+    b.parent.mkdir(parents=True)
+    a.write_bytes(b'{"arm":"A"}\n')
+    b.write_bytes(b'{"arm":"B"}\n')
+    image = tmp_path / "runtime.sqsh"
+    image.write_bytes(b"authenticated-runtime")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "sbatch.calls"
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        "  *'rev-parse --show-toplevel'*) printf '%s\\n' \"$FAKE_REPO_ROOT\" ;;\n"
+        "  *'status --porcelain'*) : ;;\n"
+        "  *'pull --ff-only'*) : ;;\n"
+        "  *'rev-parse HEAD'*) printf '%040d\\n' 0 | tr 0 a ;;\n"
+        "  *) exit 3 ;;\n"
+        "esac\n"
+    )
+    fake_sbatch = fake_bin / "sbatch"
+    fake_sbatch.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >>"$SBATCH_CALLS"\n')
+    fake_squeue = fake_bin / "squeue"
+    fake_squeue.write_text("#!/usr/bin/env bash\nexit 0\n")
+    for command in (fake_git, fake_sbatch, fake_squeue):
+        command.chmod(0o755)
+    result = subprocess.run(
+        [
+            "bash",
+            str(submitter),
+            "--test-only",
+            "--a-tokenized-receipt",
+            str(a),
+            "--a-tokenized-receipt-sha256",
+            _digest(a),
+            "--b-tokenized-receipt",
+            str(b),
+            "--b-tokenized-receipt-sha256",
+            _digest(b),
+            "--study-root",
+            str(study),
+            "--image-path",
+            str(image),
+            "--image-sha256",
+            _digest(image),
+            "--account",
+            "nemotron_n3_post",
+            "--partition",
+            "cpu_datamover",
+            "--time",
+            "03:00:00",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "FAKE_REPO_ROOT": str(_REPO_ROOT),
+            "SBATCH_CALLS": str(calls),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    submitted = calls.read_text().splitlines()
+    assert len(submitted) == 1
+    assert "--test-only" in submitted[0]
+    assert "--parsable" not in submitted[0]
+    assert "--cpus-per-task=96" in submitted[0]
+    assert f"A_TOKENIZED_RECEIPT={a}" in submitted[0]
+    assert f"B_TOKENIZED_RECEIPT={b}" in submitted[0]
 
 
 def test_missing_response_or_rejection_blocks_before_tokenization(tmp_path: Path) -> None:
