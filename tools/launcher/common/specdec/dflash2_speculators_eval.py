@@ -67,6 +67,9 @@ RCA_SOURCE_PILOT_RECEIPT_SHA256 = "4b7c6254c7d52cf8da159d1bad261255790899e36068d
 EVALUATION_STEP = 4166
 DFLASH2_BLOCK_SIZE = 8
 DFLASH2_SPECULATIVE_TOKENS = 7
+NGRAM_SPECULATIVE_TOKENS = 7
+NGRAM_PROMPT_LOOKUP_MIN = 1
+NGRAM_PROMPT_LOOKUP_MAX = 3
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _GIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 _CONTROL_MANIFEST_KEYS = {
@@ -979,6 +982,28 @@ def _expected_dflash2_server_args(
     return args
 
 
+def _expected_ngram_server_args(target_path: str, port: str) -> list[str]:
+    args = _expected_target_server_args(target_path, port)
+    args.extend(
+        [
+            "--speculative-config",
+            _canonical(
+                {
+                    "method": "ngram",
+                    "num_speculative_tokens": NGRAM_SPECULATIVE_TOKENS,
+                    "prompt_lookup_max": NGRAM_PROMPT_LOOKUP_MAX,
+                    "prompt_lookup_min": NGRAM_PROMPT_LOOKUP_MIN,
+                }
+            ),
+            "--per-request-spec-decode-metrics",
+            "detailed",
+            "--enforce-eager",
+            "--no-enable-prefix-caching",
+        ]
+    )
+    return args
+
+
 def _validate_target_control_manifest(
     path: Path,
     artifact_identity_path: Path,
@@ -1535,7 +1560,9 @@ def _probe_choice(result: dict[str, Any]) -> dict[str, Any]:
     return choice
 
 
-def _validate_spec_decode_metrics_payload(speculative: object) -> dict[str, Any]:
+def _validate_spec_decode_metrics_payload(
+    speculative: object, *, allow_zero_steps: bool = False
+) -> dict[str, Any]:
     expected = {
         "mean_acceptance_length",
         "draft_acceptance_rate",
@@ -1548,7 +1575,7 @@ def _validate_spec_decode_metrics_payload(speculative: object) -> dict[str, Any]
         "per_step_drafted",
     }
     if not isinstance(speculative, dict) or set(speculative) != expected:
-        raise ValueError("DFlash2 detailed speculative metrics schema mismatch")
+        raise ValueError("detailed speculative metrics schema mismatch")
     histogram = speculative["acceptance_histogram"]
     accepted = speculative["per_step_accepted"]
     drafted = speculative["per_step_drafted"]
@@ -1568,23 +1595,40 @@ def _validate_spec_decode_metrics_payload(speculative: object) -> dict[str, Any]
         or speculative["num_spec_tokens"] != DFLASH2_SPECULATIVE_TOKENS
         or not isinstance(histogram, list)
         or len(histogram) != DFLASH2_SPECULATIVE_TOKENS + 1
-        or not isinstance(accepted, list)
-        or not isinstance(drafted, list)
         or not all(
             isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            for value in (*histogram, *accepted, *drafted)
+            for value in histogram
         )
-        or len(accepted) != len(drafted)
-        or len(accepted) != speculative["num_spec_steps"]
     ):
-        raise ValueError("DFlash2 detailed speculative metrics values mismatch")
+        raise ValueError("detailed speculative metrics values mismatch")
     steps = speculative["num_spec_steps"]
     accepted_total = speculative["num_accepted_draft_tokens"]
     drafted_total = speculative["num_draft_tokens"]
     mean = speculative["mean_acceptance_length"]
     rate = speculative["draft_acceptance_rate"]
+    if steps == 0:
+        if (
+            accepted not in (None, [])
+            or drafted not in (None, [])
+            or any(histogram)
+            or accepted_total != 0
+            or drafted_total != 0
+            or mean != 1.0
+            or rate != 0.0
+        ):
+            raise ValueError("detailed speculative metrics accounting mismatch")
+        if not allow_zero_steps:
+            raise ValueError("DFlash2 diagnostic requires nonzero speculative steps")
+        return speculative
     if (
-        steps <= 0
+        not isinstance(accepted, list)
+        or not isinstance(drafted, list)
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (*accepted, *drafted)
+        )
+        or len(accepted) != len(drafted)
+        or len(accepted) != steps
         or sum(histogram) != steps
         or sum(index * count for index, count in enumerate(histogram)) != accepted_total
         or collections.Counter(accepted)
@@ -1609,14 +1653,16 @@ def _validate_spec_decode_metrics_payload(speculative: object) -> dict[str, Any]
             abs_tol=1e-12,
         )
     ):
-        raise ValueError("DFlash2 detailed speculative metrics accounting mismatch")
+        raise ValueError("detailed speculative metrics accounting mismatch")
     return speculative
 
 
-def _validated_spec_decode_metrics(result: dict[str, Any]) -> dict[str, Any]:
+def _validated_spec_decode_metrics(
+    result: dict[str, Any], *, allow_zero_steps: bool = False
+) -> dict[str, Any]:
     metrics = result.get("metrics")
     speculative = metrics.get("speculative_decoding") if isinstance(metrics, dict) else None
-    return _validate_spec_decode_metrics_payload(speculative)
+    return _validate_spec_decode_metrics_payload(speculative, allow_zero_steps=allow_zero_steps)
 
 
 def capture_divergence_probe(
@@ -2070,6 +2116,88 @@ def _validate_dflash2_probe_manifest(
     return manifest, launcher, fingerprint_path
 
 
+def _validate_ngram_probe_manifest(
+    path: Path,
+    baseline: dict[str, Any],
+    baseline_fingerprint: dict[str, Any],
+    artifact_identity_path: Path,
+    identity: dict[str, Any],
+) -> tuple[dict[str, Any], Path, Path]:
+    """Validate the exact model-free ngram K7 eager/no-prefix control manifest."""
+    manifest = _load_json(path)
+    target = identity["target"]
+    server_args = manifest.get("server_args")
+    config = manifest.get("config_sha256")
+    common = (
+        "target_model",
+        "speculators_repo",
+        "speculators_sha",
+        "modelopt_repo",
+        "modelopt_sha",
+        "modelopt_dirty",
+        "runtime",
+        "runtimes",
+        "container",
+        "dataset",
+        "provenance_error",
+        "slurm_job_id",
+        "versions",
+        "evaluation",
+        "artifact_identity",
+    )
+    expected_server_args = _expected_ngram_server_args(
+        target["path"],
+        server_args[7] if isinstance(server_args, list) and len(server_args) > 7 else "",
+    )
+    if (
+        set(manifest) != _CONTROL_MANIFEST_KEYS
+        or manifest.get("status") != "success"
+        or manifest.get("method") != "ngram"
+        or manifest.get("block_size") != 0
+        or manifest.get("num_speculative_tokens") != NGRAM_SPECULATIVE_TOKENS
+        or manifest.get("draft_model") is not None
+        or manifest.get("evaluator_args") != []
+        or any(manifest.get(name) != baseline.get(name) for name in common)
+        or not isinstance(server_args, list)
+        or server_args != expected_server_args
+        or server_args[7] not in {"8000", "8010"}
+        or not isinstance(config, dict)
+        or set(config) != {"target", "launcher"}
+        or config.get("target") != _sha256(Path(target["path"]) / "config.json")
+        or manifest.get("artifact_identity")
+        != {
+            "path": str(artifact_identity_path.resolve(strict=True)),
+            "sha256": _sha256(artifact_identity_path),
+        }
+    ):
+        raise ValueError("ngram control manifest mismatch")
+    launcher = _validate_control_launcher(
+        manifest.get("launcher_config"),
+        Path(str(manifest["container"]["path"])),
+        config["launcher"],
+    )
+    fingerprint_path = path.parent / "input-fingerprint.json"
+    fingerprint = _load_json(fingerprint_path)
+    baseline_inputs = baseline_fingerprint.get("inputs")
+    if not isinstance(baseline_inputs, dict):
+        raise ValueError("baseline control fingerprint mismatch")
+    expected_inputs = json.loads(json.dumps(baseline_inputs))
+    expected_inputs["draft_config_sha256"] = None
+    expected_inputs["evaluation"] = {
+        **expected_inputs["evaluation"],
+        "method": "ngram",
+        "block_size": 0,
+        "num_speculative_tokens": NGRAM_SPECULATIVE_TOKENS,
+    }
+    if (
+        fingerprint.get("schema_version") != 1
+        or fingerprint.get("inputs") != expected_inputs
+        or fingerprint.get("sha256") != _sha_json(expected_inputs)
+    ):
+        raise ValueError("ngram control input fingerprint mismatch")
+    return manifest, launcher, fingerprint_path
+
+
 def build_divergence_probe_receipt(
     baseline_probe_path: Path,
     dflash2_probe_path: Path,
@@ -2425,10 +2553,12 @@ def capture_internal_target_diagnostic(
     engine_mode: str,
 ) -> None:
     """Capture the fixed RCA rows with online logits and detailed acceptance evidence."""
-    if role not in {"target", "dflash2"}:
-        raise ValueError("internal-target role must be target or dflash2")
-    if engine_mode not in {"compiled", "eager", "eager-no-prefix"} or (
-        role == "target" and engine_mode != "compiled"
+    if role not in {"target", "dflash2", "ngram"}:
+        raise ValueError("internal-target role must be target, dflash2, or ngram")
+    if (
+        (role == "target" and engine_mode != "compiled")
+        or (role == "dflash2" and engine_mode not in {"compiled", "eager", "eager-no-prefix"})
+        or (role == "ngram" and engine_mode != "eager-no-prefix")
     ):
         raise ValueError("internal-target engine mode mismatch")
     prompt_set = compute_prompt_set(dataset_manifest_path, hf_home)
@@ -2473,7 +2603,11 @@ def capture_internal_target_diagnostic(
                     or not all(_valid_top_logprobs(distribution) for distribution in top)
                 ):
                     raise ValueError("internal-target completion evidence mismatch")
-                speculative = _validated_spec_decode_metrics(result) if role == "dflash2" else None
+                speculative = (
+                    _validated_spec_decode_metrics(result, allow_zero_steps=role == "ngram")
+                    if role != "target"
+                    else None
+                )
                 if (
                     role == "target"
                     and isinstance(result.get("metrics"), dict)
@@ -2492,7 +2626,11 @@ def capture_internal_target_diagnostic(
                 }
                 record = {
                     "schema_version": 1,
-                    "producer": "q30-dflash2-internal-target-row-v1",
+                    "producer": (
+                        "q30-ngram-internal-target-row-v1"
+                        if role == "ngram"
+                        else "q30-dflash2-internal-target-row-v1"
+                    ),
                     "role": role,
                     "engine_mode": engine_mode,
                     "subset": "HumanEval",
@@ -2514,6 +2652,13 @@ def capture_internal_target_diagnostic(
 
 
 def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str, Any]]:
+    if expected_role not in {"target", "dflash2", "ngram"}:
+        raise ValueError("invalid internal-target role")
+    expected_producer = (
+        "q30-ngram-internal-target-row-v1"
+        if expected_role == "ngram"
+        else "q30-dflash2-internal-target-row-v1"
+    )
     expected_keys = {
         "schema_version",
         "producer",
@@ -2552,10 +2697,11 @@ def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str,
             }
             if (
                 value.get("schema_version") != 1
-                or value.get("producer") != "q30-dflash2-internal-target-row-v1"
+                or value.get("producer") != expected_producer
                 or value.get("role") != expected_role
                 or value.get("engine_mode") not in {"compiled", "eager", "eager-no-prefix"}
                 or (expected_role == "target" and value.get("engine_mode") != "compiled")
+                or (expected_role == "ngram" and value.get("engine_mode") != "eager-no-prefix")
                 or value.get("subset") != "HumanEval"
                 or isinstance(value.get("index"), bool)
                 or not isinstance(value.get("index"), int)
@@ -2597,17 +2743,22 @@ def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str,
                 ):
                     raise ValueError("target-only row did not emit its online argmax")
             else:
-                _validate_spec_decode_metrics_payload(value.get("speculative_decoding"))
+                _validate_spec_decode_metrics_payload(
+                    value.get("speculative_decoding"),
+                    allow_zero_steps=expected_role == "ngram",
+                )
             rows.append(value)
     expected = list(INTERNAL_TARGET_DIAGNOSTIC_ROWS)
     if [(row["index"], row["selection_reason"]) for row in rows] != expected:
         raise ValueError("internal-target RCA selection mismatch")
-    if expected_role == "dflash2" and len({row["engine_mode"] for row in rows}) != 1:
-        raise ValueError("internal-target DFlash2 engine modes are mixed")
+    if expected_role != "target" and len({row["engine_mode"] for row in rows}) != 1:
+        raise ValueError("internal-target speculative engine modes are mixed")
     return rows
 
 
-def _emitted_token_verdict(row: dict[str, Any], position: int) -> dict[str, Any]:
+def _emitted_token_verdict(
+    row: dict[str, Any], position: int, *, token_label: str = "dflash2"
+) -> dict[str, Any]:
     tokens = row["token_ids"]
     distributions = row["top_logprobs"]
     if position >= len(tokens) or position >= len(distributions):
@@ -2621,7 +2772,7 @@ def _emitted_token_verdict(row: dict[str, Any], position: int) -> dict[str, Any]
         return {
             "class": "unresolved-internal-top20",
             "position": position,
-            "dflash2_token_id": token,
+            f"{token_label}_token_id": token,
             "internal_target_max_logprob": maximum,
         }
     value = float(logprob)
@@ -2633,15 +2784,19 @@ def _emitted_token_verdict(row: dict[str, Any], position: int) -> dict[str, Any]
             else "internal-target-consistency-mismatch"
         ),
         "position": position,
-        "dflash2_token_id": token,
-        "dflash2_token_internal_rank": rank,
+        f"{token_label}_token_id": token,
+        f"{token_label}_token_internal_rank": rank,
         "internal_target_max_logprob": maximum,
-        "dflash2_token_internal_logprob": value,
+        f"{token_label}_token_internal_logprob": value,
     }
 
 
 def _paired_target_verdict(
-    target_row: dict[str, Any], dflash2_token_id: int, position: int
+    target_row: dict[str, Any],
+    speculative_token_id: int,
+    position: int,
+    *,
+    token_label: str = "dflash2",
 ) -> dict[str, Any]:
     distributions = target_row["top_logprobs"]
     if position >= len(distributions):
@@ -2649,12 +2804,12 @@ def _paired_target_verdict(
     distribution = distributions[position]
     assert isinstance(distribution, dict)
     maximum = max(map(float, distribution.values()))
-    logprob = distribution.get(f"token_id:{dflash2_token_id}")
+    logprob = distribution.get(f"token_id:{speculative_token_id}")
     if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
         return {
             "class": "unresolved-target-top20",
             "position": position,
-            "dflash2_token_id": dflash2_token_id,
+            f"{token_label}_token_id": speculative_token_id,
             "paired_target_max_logprob": maximum,
         }
     value = float(logprob)
@@ -2662,17 +2817,23 @@ def _paired_target_verdict(
     return {
         "class": "target-rerun-argmax" if value == maximum else "paired-target-not-argmax",
         "position": position,
-        "dflash2_token_id": dflash2_token_id,
-        "dflash2_token_paired_target_rank": rank,
+        f"{token_label}_token_id": speculative_token_id,
+        f"{token_label}_token_paired_target_rank": rank,
         "paired_target_max_logprob": maximum,
-        "dflash2_token_paired_target_logprob": value,
+        f"{token_label}_token_paired_target_logprob": value,
     }
 
 
-def summarize_internal_target_diagnostic(target_path: Path, dflash2_path: Path) -> dict[str, Any]:
+def summarize_internal_target_diagnostic(
+    target_path: Path,
+    dflash2_path: Path,
+    *,
+    speculative_role: str = "dflash2",
+    token_label: str = "dflash2",
+) -> dict[str, Any]:
     """Classify selected outputs against target-only and speculative-engine logits."""
     target_rows = _read_internal_target_rows(target_path, "target")
-    dflash_rows = _read_internal_target_rows(dflash2_path, "dflash2")
+    dflash_rows = _read_internal_target_rows(dflash2_path, speculative_role)
     classifications: list[dict[str, Any]] = []
     accepted_total = 0
     drafted_total = 0
@@ -2717,7 +2878,7 @@ def summarize_internal_target_diagnostic(target_path: Path, dflash2_path: Path) 
                 continue
             mismatch = None
             for position in range(len(dflash_ids)):
-                verdict = _emitted_token_verdict(draft, position)
+                verdict = _emitted_token_verdict(draft, position, token_label=token_label)
                 if verdict["class"] != "speculative-internal-argmax":
                     mismatch = verdict
                     break
@@ -2728,11 +2889,13 @@ def summarize_internal_target_diagnostic(target_path: Path, dflash2_path: Path) 
                 {**base, "class": "unresolved-termination", "common_prefix_tokens": common}
             )
             continue
-        internal_verdict = _emitted_token_verdict(draft, common)
+        internal_verdict = _emitted_token_verdict(draft, common, token_label=token_label)
         if internal_verdict["class"] != "speculative-internal-argmax":
             verdict = internal_verdict
         else:
-            paired_target_verdict = _paired_target_verdict(target, dflash_ids[common], common)
+            paired_target_verdict = _paired_target_verdict(
+                target, dflash_ids[common], common, token_label=token_label
+            )
             verdict = (
                 paired_target_verdict
                 if paired_target_verdict["class"] != "paired-target-not-argmax"
@@ -2780,6 +2943,56 @@ def summarize_internal_target_diagnostic(target_path: Path, dflash2_path: Path) 
         },
         "next_action": next_action,
     }
+
+
+def summarize_ngram_internal_target_control(target_path: Path, ngram_path: Path) -> dict[str, Any]:
+    """Classify the model-free ngram K7 common speculative-path control."""
+    payload = summarize_internal_target_diagnostic(
+        target_path,
+        ngram_path,
+        speculative_role="ngram",
+        token_label="ngram",
+    )
+    rows = _read_internal_target_rows(ngram_path, "ngram")
+    rows_with_steps = sum(row["speculative_decoding"]["num_spec_steps"] > 0 for row in rows)
+    counts = payload["counts"]
+    if payload["acceptance"]["num_spec_steps"] == 0:
+        outcome = "inconclusive-not-exercised"
+        next_action = "increase-ngram-exercising-prompt-coverage"
+    elif counts.get("internal-target-consistency-mismatch", 0) or counts.get(
+        "speculative-internal-argmax", 0
+    ):
+        outcome = "common-path-mismatch-reproduced"
+        next_action = "instrument-common-speculative-target-and-rejection-path"
+    elif any(label.startswith("unresolved-") for label in counts):
+        outcome = "inconclusive-unresolved"
+        next_action = "capture-full-vocabulary-or-termination-evidence"
+    else:
+        outcome = "ngram-exercised-path-exact"
+        next_action = "instrument-dflash2-context-kv-and-numerical-path"
+    payload.update(
+        {
+            "producer": "q30-ngram-k7-internal-target-control-v1",
+            "claim_scope": (
+                "runtime correctness control only; no DFlash2 speedup or training-quality claim"
+            ),
+            "control": {
+                "method": "ngram",
+                "num_speculative_tokens": NGRAM_SPECULATIVE_TOKENS,
+                "prompt_lookup_min": NGRAM_PROMPT_LOOKUP_MIN,
+                "prompt_lookup_max": NGRAM_PROMPT_LOOKUP_MAX,
+                "engine_mode": "eager-no-prefix",
+            },
+            "control_outcome": outcome,
+            "next_action": next_action,
+        }
+    )
+    payload["acceptance"] = {
+        **payload["acceptance"],
+        "rows_with_spec_steps": rows_with_steps,
+        "rows_without_spec_steps": len(rows) - rows_with_steps,
+    }
+    return payload
 
 
 def _validate_rca_source_receipt(
@@ -3082,6 +3295,166 @@ def validate_internal_target_diagnostic_receipt(path: Path) -> dict[str, Any]:
         != "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
     ):
         raise ValueError("internal-target claim scope mismatch")
+    return {**payload, "receipt_sha256": claim}
+
+
+def build_ngram_internal_target_control_receipt(
+    target_rows_path: Path,
+    ngram_rows_path: Path,
+    source_pilot_receipt_path: Path,
+    target_manifest_path: Path,
+    ngram_manifest_path: Path,
+    artifact_identity_path: Path,
+    allocation_receipt_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Publish live-job evidence for the model-free ngram common-path control."""
+    identity = _validate_artifact_identity(artifact_identity_path)
+    source = _validate_rca_source_receipt(source_pilot_receipt_path, identity)
+    target_rows = _validate_internal_rows_against_identity(target_rows_path, "target", identity)
+    ngram_rows = _validate_internal_rows_against_identity(ngram_rows_path, "ngram", identity)
+    if any(
+        target["prompt_token_ids"] != ngram["prompt_token_ids"]
+        for target, ngram in zip(target_rows, ngram_rows, strict=True)
+    ):
+        raise ValueError("ngram control paired prompt token IDs mismatch")
+    if any(row["engine_mode"] != "eager-no-prefix" for row in ngram_rows):
+        raise ValueError("ngram control requires eager-no-prefix rows")
+    target_evidence = _validate_target_control_manifest(
+        target_manifest_path,
+        artifact_identity_path,
+        identity,
+        disable_prefix_caching=True,
+    )
+    ngram_manifest, ngram_launcher, ngram_fingerprint = _validate_ngram_probe_manifest(
+        ngram_manifest_path,
+        target_evidence[0],
+        target_evidence[2],
+        artifact_identity_path,
+        identity,
+    )
+    allocation = validate_target_control_allocation_receipt(allocation_receipt_path)
+    current = _query_current_allocation()
+    for name in (
+        "slurm_job_id",
+        "slurm_job_num_nodes",
+        "slurm_job_nodelist",
+        "gpu_count",
+        "cell_visible_devices",
+    ):
+        if allocation.get(name) != current.get(name):
+            raise ValueError(f"ngram control live allocation mismatch: {name}")
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"]
+        for manifest in (target_evidence[0], ngram_manifest)
+    ):
+        raise ValueError("ngram control allocation job mismatch")
+    if {
+        _manifest_server_port(target_evidence[0]),
+        _manifest_server_port(ngram_manifest),
+    } != {"8000", "8010"}:
+        raise ValueError("ngram control server ports are not isolated")
+    payload = summarize_ngram_internal_target_control(target_rows_path, ngram_rows_path)
+    payload["source_pilot_receipt_sha256"] = source["receipt_sha256"]
+    payload["allocation_evidence_scope"] = (
+        "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    )
+    payload["source_pilot_receipt"] = _file_descriptor(source_pilot_receipt_path)
+    payload["artifact_identity"] = _file_descriptor(artifact_identity_path)
+    payload["allocation_receipt"] = _file_descriptor(allocation_receipt_path)
+    payload["rows"] = {
+        "target": _file_descriptor(target_rows_path),
+        "ngram": _file_descriptor(ngram_rows_path),
+    }
+    payload["manifests"] = {
+        "target": _file_descriptor(target_manifest_path),
+        "ngram": _file_descriptor(ngram_manifest_path),
+    }
+    payload["input_fingerprints"] = {
+        "target": _file_descriptor(target_evidence[1]),
+        "ngram": _file_descriptor(ngram_fingerprint),
+    }
+    payload["launcher_configs"] = {
+        "target": _file_descriptor(target_evidence[3]),
+        "ngram": _file_descriptor(ngram_launcher),
+    }
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def validate_ngram_internal_target_control_receipt(path: Path) -> dict[str, Any]:
+    """Replay the durable ngram control evidence without scheduler-origin claims."""
+    payload = _load_json(path)
+    claim = payload.pop("receipt_sha256", None)
+    if claim != _sha_json(payload):
+        raise ValueError("ngram control receipt self-hash mismatch")
+    source_path = _validate_file_descriptor(payload.get("source_pilot_receipt"))
+    artifact_path = _validate_file_descriptor(payload.get("artifact_identity"))
+    allocation_path = _validate_file_descriptor(payload.get("allocation_receipt"))
+    evidence: dict[str, dict[str, Path]] = {}
+    for group in ("rows", "manifests", "input_fingerprints", "launcher_configs"):
+        value = payload.get(group)
+        if not isinstance(value, dict) or set(value) != {"target", "ngram"}:
+            raise ValueError(f"ngram control {group} schema mismatch")
+        evidence[group] = {name: _validate_file_descriptor(item) for name, item in value.items()}
+    identity = _validate_artifact_identity(artifact_path)
+    source = _validate_rca_source_receipt(source_path, identity)
+    target_rows = _validate_internal_rows_against_identity(
+        evidence["rows"]["target"], "target", identity
+    )
+    ngram_rows = _validate_internal_rows_against_identity(
+        evidence["rows"]["ngram"], "ngram", identity
+    )
+    if any(
+        target["prompt_token_ids"] != ngram["prompt_token_ids"]
+        for target, ngram in zip(target_rows, ngram_rows, strict=True)
+    ) or any(row["engine_mode"] != "eager-no-prefix" for row in ngram_rows):
+        raise ValueError("ngram control paired row mismatch")
+    target_evidence = _validate_target_control_manifest(
+        evidence["manifests"]["target"],
+        artifact_path,
+        identity,
+        disable_prefix_caching=True,
+    )
+    ngram_manifest, ngram_launcher, ngram_fingerprint = _validate_ngram_probe_manifest(
+        evidence["manifests"]["ngram"],
+        target_evidence[0],
+        target_evidence[2],
+        artifact_path,
+        identity,
+    )
+    allocation = validate_target_control_allocation_receipt(allocation_path)
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"]
+        for manifest in (target_evidence[0], ngram_manifest)
+    ):
+        raise ValueError("ngram control allocation replay mismatch")
+    if {
+        _manifest_server_port(target_evidence[0]),
+        _manifest_server_port(ngram_manifest),
+    } != {"8000", "8010"}:
+        raise ValueError("ngram control server ports are not isolated")
+    if evidence["input_fingerprints"] != {
+        "target": target_evidence[1],
+        "ngram": ngram_fingerprint,
+    } or evidence["launcher_configs"] != {
+        "target": target_evidence[3],
+        "ngram": ngram_launcher,
+    }:
+        raise ValueError("ngram control provenance descriptor mismatch")
+    replayed = summarize_ngram_internal_target_control(
+        evidence["rows"]["target"], evidence["rows"]["ngram"]
+    )
+    for name, value in replayed.items():
+        if payload.get(name) != value:
+            raise ValueError(f"ngram control replay mismatch: {name}")
+    if (
+        payload.get("source_pilot_receipt_sha256") != source["receipt_sha256"]
+        or payload.get("allocation_evidence_scope")
+        != "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    ):
+        raise ValueError("ngram control claim scope mismatch")
     return {**payload, "receipt_sha256": claim}
 
 
@@ -3518,7 +3891,7 @@ def main() -> None:
     internal_capture.add_argument("--output", required=True)
     internal_capture.add_argument("--endpoint", required=True)
     internal_capture.add_argument("--model", required=True)
-    internal_capture.add_argument("--role", required=True, choices=("target", "dflash2"))
+    internal_capture.add_argument("--role", required=True, choices=("target", "dflash2", "ngram"))
     internal_capture.add_argument(
         "--engine-mode", required=True, choices=("compiled", "eager", "eager-no-prefix")
     )
@@ -3611,6 +3984,19 @@ def main() -> None:
 
     internal_verify = commands.add_parser("verify-internal-target")
     internal_verify.add_argument("--receipt", required=True)
+
+    ngram_analysis = commands.add_parser("analyze-ngram-control")
+    ngram_analysis.add_argument("--target-rows", required=True)
+    ngram_analysis.add_argument("--ngram-rows", required=True)
+    ngram_analysis.add_argument("--source-pilot-receipt", required=True)
+    ngram_analysis.add_argument("--target-manifest", required=True)
+    ngram_analysis.add_argument("--ngram-manifest", required=True)
+    ngram_analysis.add_argument("--artifact-identity", required=True)
+    ngram_analysis.add_argument("--allocation-receipt", required=True)
+    ngram_analysis.add_argument("--output", required=True)
+
+    ngram_verify = commands.add_parser("verify-ngram-control")
+    ngram_verify.add_argument("--receipt", required=True)
 
     args = parser.parse_args()
     if args.command == "prompt-set":
@@ -3723,6 +4109,19 @@ def main() -> None:
         )
     elif args.command == "verify-internal-target":
         validate_internal_target_diagnostic_receipt(Path(args.receipt))
+    elif args.command == "analyze-ngram-control":
+        build_ngram_internal_target_control_receipt(
+            Path(args.target_rows),
+            Path(args.ngram_rows),
+            Path(args.source_pilot_receipt),
+            Path(args.target_manifest),
+            Path(args.ngram_manifest),
+            Path(args.artifact_identity),
+            Path(args.allocation_receipt),
+            Path(args.output),
+        )
+    elif args.command == "verify-ngram-control":
+        validate_ngram_internal_target_control_receipt(Path(args.receipt))
     elif args.command == "summarize":
         correctness = _load_json(Path(args.correctness_receipt))
         claim = correctness.pop("receipt_sha256", None)

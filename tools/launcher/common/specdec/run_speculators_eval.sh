@@ -57,7 +57,7 @@ for name in SPECULATORS_CLIENT_RUNTIME VLLM_SERVER_RUNTIME SPECULATORS_REPO HF_M
     CONTAINER_IDENTITY_PATH DATASET_MANIFEST_PATH MODELOPT_REPO; do
     require_var "$name"
 done
-if [[ "${SPEC_METHOD}" != "baseline" ]]; then
+if [[ "${SPEC_METHOD}" != "baseline" && "${SPEC_METHOD}" != "ngram" ]]; then
     require_var DRAFT_MODEL
 fi
 
@@ -208,7 +208,7 @@ trap 'handle_signal 15' TERM
 
 required_paths=("${SPECULATORS_REPO}/scripts/evaluate/evaluate.py"
     "${HF_MODEL_CKPT}/config.json" "${EVAL_CONFIG_PATH}")
-if [[ "${SPEC_METHOD}" != "baseline" ]]; then
+if [[ "${SPEC_METHOD}" != "baseline" && "${SPEC_METHOD}" != "ngram" ]]; then
     required_paths+=("${DRAFT_MODEL}/config.json")
 fi
 for path in "${required_paths[@]}"; do
@@ -219,12 +219,16 @@ for path in "${required_paths[@]}"; do
 done
 
 case "${SPEC_METHOD}:${DFLASH_BLOCK_SIZE}:${NUM_SPEC_TOKENS}" in
-    baseline:0:0|dflash:8:7|dflash:16:15|dflash2:8:7|dspark:8:8|dspark:16:16) ;;
+    baseline:0:0|ngram:0:7|dflash:8:7|dflash:16:15|dflash2:8:7|dspark:8:8|dspark:16:16) ;;
     *)
         echo "ERROR: invalid method/B/K mapping: ${SPEC_METHOD}/${DFLASH_BLOCK_SIZE}/${NUM_SPEC_TOKENS}" >&2
         exit 2
         ;;
 esac
+if [[ "${SPEC_METHOD}" == ngram && "${DFLASH2_INTERNAL_TARGET:-0}" != 1 ]]; then
+    echo "ERROR: ngram is restricted to the bounded internal-target diagnostic" >&2
+    exit 2
+fi
 case "${MAX_CONCURRENCY}" in
     1|8|32|128) ;;
     *) echo "ERROR: invalid MAX_CONCURRENCY: ${MAX_CONCURRENCY}; expected 1, 8, 32, or 128" >&2; exit 2 ;;
@@ -262,8 +266,10 @@ if [[ -n "$(git -C "${MODELOPT_REPO}" status --porcelain 2>/dev/null)" ]]; then
     exit 2
 fi
 MODELOPT_DIRTY="false"
-if [[ "${SPEC_METHOD}" == dflash2 && -z "${EVAL_ARTIFACT_IDENTITY_PATH:-}" ]]; then
-    echo "ERROR: DFlash2 evaluation requires an authenticated artifact identity" >&2
+if [[ "${SPEC_METHOD}" == dflash2 \
+    || "${SPEC_METHOD}:${DFLASH2_INTERNAL_TARGET:-0}" == ngram:1 ]] \
+    && [[ -z "${EVAL_ARTIFACT_IDENTITY_PATH:-}" ]]; then
+    echo "ERROR: diagnostic evaluation requires an authenticated artifact identity" >&2
     exit 2
 fi
 if [[ -n "${EVAL_ARTIFACT_IDENTITY_PATH:-}" ]]; then
@@ -307,9 +313,20 @@ verify_vllm_runtime(
 PY
 fi
 
+if [[ "${SPEC_METHOD}" == ngram ]]; then
+    "${SERVER_PYTHON}" - <<'PY'
+import numba
+
+if numba.__version__ != "0.65.0":
+    raise RuntimeError(f"ngram control requires numba==0.65.0, got {numba.__version__}")
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer  # noqa: F401, E402
+PY
+fi
+
 if ! "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" - "${RUN_DIR}/input-fingerprint.json" \
     "${HF_MODEL_CKPT}/config.json" \
-    "$([[ "${SPEC_METHOD}" == "baseline" ]] || printf '%s' "${DRAFT_MODEL}/config.json")" \
+    "$([[ "${SPEC_METHOD}" == "baseline" || "${SPEC_METHOD}" == "ngram" ]] \
+        || printf '%s' "${DRAFT_MODEL}/config.json")" \
     "${DATASET_MANIFEST_PATH}" "${CONTAINER_IDENTITY_PATH}" \
     "${SPECULATORS_CLIENT_RUNTIME}/.archive.sha256" \
     "${VLLM_SERVER_RUNTIME}/.archive.sha256" "${EVAL_ARTIFACT_IDENTITY_PATH:-}" \
@@ -445,13 +462,17 @@ fi
 SERVER_ARGS=(-m vllm.entrypoints.cli.main serve "${HF_MODEL_CKPT}"
     --tensor-parallel-size "${TP}"
     --port "${PORT}")
-if [[ "${SPEC_METHOD}" != "baseline" ]]; then
+if [[ "${SPEC_METHOD}" == ngram ]]; then
+    SPEC_CONFIG='{"method":"ngram","num_speculative_tokens":7,"prompt_lookup_max":3,"prompt_lookup_min":1}'
+    SERVER_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+elif [[ "${SPEC_METHOD}" != "baseline" ]]; then
     SPEC_CONFIG="$(printf '{\"method\":\"%s\",\"model\":\"%s\",\"num_speculative_tokens\":%s}' \
         "$([[ "${SPEC_METHOD}" == dflash2 ]] && printf dflash || printf '%s' "${SPEC_METHOD}")" \
         "${DRAFT_MODEL}" "${NUM_SPEC_TOKENS}")"
     SERVER_ARGS+=(--speculative-config "${SPEC_CONFIG}")
 fi
-if [[ "${SPEC_METHOD}" == dflash2 && "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
+if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 \
+    && ("${SPEC_METHOD}" == dflash2 || "${SPEC_METHOD}" == ngram) ]]; then
     SERVER_ARGS+=(--per-request-spec-decode-metrics detailed)
     if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]]; then
         SERVER_ARGS+=(--enforce-eager)
@@ -470,8 +491,9 @@ if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
         echo "ERROR: internal-target diagnostic requires bounded C1 equivalence-only mode" >&2
         exit 2
     }
-    [[ "${SPEC_METHOD}" == baseline || "${SPEC_METHOD}" == dflash2 ]] || {
-        echo "ERROR: internal-target diagnostic supports only target and DFlash2" >&2
+    [[ "${SPEC_METHOD}" == baseline || "${SPEC_METHOD}" == dflash2 \
+        || "${SPEC_METHOD}" == ngram ]] || {
+        echo "ERROR: internal-target diagnostic supports only target, DFlash2, and ngram" >&2
         exit 2
     }
 elif [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]]; then
@@ -511,16 +533,17 @@ fi
 
 if [[ "${CAPTURE_EQUIVALENCE:-0}" == 1 ]]; then
     if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
-        internal_role=dflash2
+        internal_role="${SPEC_METHOD}"
         internal_engine_mode=compiled
         if [[ "${SPEC_METHOD}" == baseline ]]; then
             internal_role=target
         fi
-        if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 && "${SPEC_METHOD}" == dflash2 ]]; then
+        if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 \
+            && ("${SPEC_METHOD}" == dflash2 || "${SPEC_METHOD}" == ngram) ]]; then
             internal_engine_mode=eager
         fi
         if [[ "${DFLASH2_DISABLE_PREFIX_CACHING:-0}" == 1 \
-            && "${SPEC_METHOD}" == dflash2 ]]; then
+            && ("${SPEC_METHOD}" == dflash2 || "${SPEC_METHOD}" == ngram) ]]; then
             internal_engine_mode=eager-no-prefix
         fi
         "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \

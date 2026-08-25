@@ -438,6 +438,83 @@ def test_internal_target_diagnostic_captures_exact_rca_rows_and_detailed_metrics
         )
 
 
+def test_ngram_internal_target_capture_is_eager_no_prefix_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ngram control records the fixed RCA rows and cannot claim another engine mode."""
+    manifest, hf_home = _write_prompt_snapshot(tmp_path / "prompts", rows=164)
+    matched_hf = tmp_path / "matched-hf"
+    matched_manifest = tmp_path / "matched-manifest.json"
+    materialize_prompt_set(manifest, hf_home, matched_hf, matched_manifest)
+
+    def fake_completion(_endpoint: str, _body: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "choices": [
+                {
+                    "text": "x",
+                    "finish_reason": "length",
+                    "token_ids": [10],
+                    "prompt_token_ids": [1, 2],
+                    "logprobs": {"top_logprobs": [{"token_id:10": -0.1}]},
+                }
+            ],
+            "metrics": {
+                "speculative_decoding": {
+                    "mean_acceptance_length": 1.0,
+                    "draft_acceptance_rate": 0.0,
+                    "acceptance_histogram": [0] * 8,
+                    "num_spec_steps": 0,
+                    "num_accepted_draft_tokens": 0,
+                    "num_draft_tokens": 0,
+                    "num_spec_tokens": 7,
+                    "per_step_accepted": None,
+                    "per_step_drafted": None,
+                }
+            },
+        }
+
+    monkeypatch.setattr("common.specdec.dflash2_speculators_eval._post_completion", fake_completion)
+    output = tmp_path / "ngram.jsonl"
+    capture_internal_target_diagnostic(
+        matched_manifest,
+        matched_hf,
+        output,
+        endpoint="http://ngram/v1",
+        model="target",
+        role="ngram",
+        engine_mode="eager-no-prefix",
+    )
+
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(rows) == len(INTERNAL_TARGET_DIAGNOSTIC_ROWS)
+    assert {row["role"] for row in rows} == {"ngram"}
+    assert {row["producer"] for row in rows} == {"q30-ngram-internal-target-row-v1"}
+    assert {row["engine_mode"] for row in rows} == {"eager-no-prefix"}
+    assert all(row["speculative_decoding"]["num_spec_steps"] == 0 for row in rows)
+
+    with pytest.raises(ValueError, match="nonzero speculative steps"):
+        capture_internal_target_diagnostic(
+            matched_manifest,
+            matched_hf,
+            tmp_path / "dflash2-zero-step.jsonl",
+            endpoint="http://dflash2/v1",
+            model="target",
+            role="dflash2",
+            engine_mode="compiled",
+        )
+
+    with pytest.raises(ValueError, match="engine mode"):
+        capture_internal_target_diagnostic(
+            matched_manifest,
+            matched_hf,
+            tmp_path / "invalid.jsonl",
+            endpoint="http://ngram/v1",
+            model="target",
+            role="ngram",
+            engine_mode="compiled",
+        )
+
+
 def test_internal_target_summary_distinguishes_runtime_rejection_from_engine_drift(
     tmp_path: Path,
 ) -> None:
@@ -549,6 +626,78 @@ def test_internal_target_summary_distinguishes_runtime_rejection_from_engine_dri
     assert mixed_summary["counts"]["target-rerun-argmax"] == 2
     assert mixed_summary["counts"]["speculative-internal-argmax"] > 0
     assert mixed_summary["next_action"] == "rerun-internal-target-eager"
+
+
+def test_ngram_internal_target_summary_requires_exercised_common_path(tmp_path: Path) -> None:
+    """The control distinguishes an exact exercised path from a zero-draft non-result."""
+    target_path = tmp_path / "target.jsonl"
+    ngram_path = tmp_path / "ngram.jsonl"
+
+    def record(index: int, role: str, steps: int) -> dict[str, Any]:
+        metrics = None
+        if role == "ngram":
+            metrics = {
+                "mean_acceptance_length": 1.0,
+                "draft_acceptance_rate": 0.0,
+                "acceptance_histogram": ([1] + [0] * 7) if steps else [0] * 8,
+                "num_spec_steps": steps,
+                "num_accepted_draft_tokens": 0,
+                "num_draft_tokens": 1 if steps else 0,
+                "num_spec_tokens": 7,
+                "per_step_accepted": [0] if steps else None,
+                "per_step_drafted": [1] if steps else None,
+            }
+        extracted = {
+            "output_text": "x",
+            "token_ids": [10],
+            "prompt_token_ids": [1, 2],
+            "finish_reason": "length",
+            "top_logprobs": [{"token_id:10": -0.1}],
+            "speculative_decoding": metrics,
+        }
+        return {
+            "schema_version": 1,
+            "producer": (
+                "q30-dflash2-internal-target-row-v1"
+                if role == "target"
+                else "q30-ngram-internal-target-row-v1"
+            ),
+            "role": role,
+            "engine_mode": "compiled" if role == "target" else "eager-no-prefix",
+            "subset": "HumanEval",
+            "index": index,
+            "source_row": index % 164,
+            "selection_reason": dict(INTERNAL_TARGET_DIAGNOSTIC_ROWS)[index],
+            "prompt_sha256": f"{index:064x}",
+            "request_sha256": "a" * 64,
+            **extracted,
+            "response_sha256": hashlib.sha256(
+                json.dumps(extracted, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+
+    target_rows = [record(index, "target", 0) for index, _ in INTERNAL_TARGET_DIAGNOSTIC_ROWS]
+    ngram_rows = [record(index, "ngram", 0) for index, _ in INTERNAL_TARGET_DIAGNOSTIC_ROWS]
+    target_path.write_text("".join(json.dumps(row) + "\n" for row in target_rows))
+    ngram_path.write_text("".join(json.dumps(row) + "\n" for row in ngram_rows))
+
+    unexercised = evaluator.summarize_ngram_internal_target_control(target_path, ngram_path)
+    assert unexercised["control_outcome"] == "inconclusive-not-exercised"
+    assert unexercised["acceptance"]["rows_without_spec_steps"] == 9
+
+    ngram_rows[0] = record(INTERNAL_TARGET_DIAGNOSTIC_ROWS[0][0], "ngram", 1)
+    ngram_path.write_text("".join(json.dumps(row) + "\n" for row in ngram_rows))
+    exercised = evaluator.summarize_ngram_internal_target_control(target_path, ngram_path)
+    assert exercised["producer"] == "q30-ngram-k7-internal-target-control-v1"
+    assert exercised["control"] == {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 3,
+        "engine_mode": "eager-no-prefix",
+    }
+    assert exercised["control_outcome"] == "ngram-exercised-path-exact"
+    assert exercised["acceptance"]["rows_with_spec_steps"] == 1
 
 
 def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
@@ -738,6 +887,154 @@ def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
         validate_internal_target_diagnostic_receipt(receipt)
 
 
+def test_ngram_control_receipt_binds_distinct_evidence_and_rejects_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The model-free control receipt replays target/ngram evidence and its exercise result."""
+    target_rows_path = tmp_path / "target.jsonl"
+    ngram_rows_path = tmp_path / "ngram.jsonl"
+
+    def rows(role: str) -> list[dict[str, Any]]:
+        output = []
+        for ordinal, (index, reason) in enumerate(INTERNAL_TARGET_DIAGNOSTIC_ROWS):
+            metrics = None
+            if role == "ngram":
+                steps = int(ordinal == 0)
+                metrics = {
+                    "mean_acceptance_length": 1.0,
+                    "draft_acceptance_rate": 0.0,
+                    "acceptance_histogram": ([1] + [0] * 7) if steps else [0] * 8,
+                    "num_spec_steps": steps,
+                    "num_accepted_draft_tokens": 0,
+                    "num_draft_tokens": steps,
+                    "num_spec_tokens": 7,
+                    "per_step_accepted": [0] if steps else None,
+                    "per_step_drafted": [1] if steps else None,
+                }
+            extracted = {
+                "output_text": "x",
+                "token_ids": [10],
+                "prompt_token_ids": [1, 2],
+                "finish_reason": "length",
+                "top_logprobs": [{"token_id:10": -0.1}],
+                "speculative_decoding": metrics,
+            }
+            output.append(
+                {
+                    "schema_version": 1,
+                    "producer": (
+                        "q30-dflash2-internal-target-row-v1"
+                        if role == "target"
+                        else "q30-ngram-internal-target-row-v1"
+                    ),
+                    "role": role,
+                    "engine_mode": "compiled" if role == "target" else "eager-no-prefix",
+                    "subset": "HumanEval",
+                    "index": index,
+                    "source_row": index % 164,
+                    "selection_reason": reason,
+                    "prompt_sha256": f"{index:064x}",
+                    "request_sha256": "a" * 64,
+                    **extracted,
+                    "response_sha256": hashlib.sha256(
+                        json.dumps(extracted, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                }
+            )
+        return output
+
+    target_rows = rows("target")
+    ngram_rows = rows("ngram")
+    target_rows_path.write_text("".join(json.dumps(row) + "\n" for row in target_rows))
+    ngram_rows_path.write_text("".join(json.dumps(row) + "\n" for row in ngram_rows))
+    source = tmp_path / "source.json"
+    identity = tmp_path / "identity.json"
+    target_manifest = tmp_path / "target-manifest.json"
+    ngram_manifest = tmp_path / "ngram-manifest.json"
+    target_fingerprint = tmp_path / "target-fingerprint.json"
+    ngram_fingerprint = tmp_path / "ngram-fingerprint.json"
+    target_launcher = tmp_path / "target-launcher.yaml"
+    ngram_launcher = tmp_path / "ngram-launcher.yaml"
+    for path in (
+        source,
+        identity,
+        target_manifest,
+        ngram_manifest,
+        target_fingerprint,
+        ngram_fingerprint,
+        target_launcher,
+        ngram_launcher,
+    ):
+        path.write_text(path.name + "\n")
+
+    monkeypatch.setattr(evaluator, "_validate_artifact_identity", lambda _path: {})
+    monkeypatch.setattr(
+        evaluator,
+        "_validate_rca_source_receipt",
+        lambda *_args: {"receipt_sha256": "f" * 64},
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_validate_internal_rows_against_identity",
+        lambda _path, role, _identity: target_rows if role == "target" else ngram_rows,
+    )
+    target_manifest_payload = {"slurm_job_id": "12345", "server_args": ["--port", "8000"]}
+    ngram_manifest_payload = {"slurm_job_id": "12345", "server_args": ["--port", "8010"]}
+    monkeypatch.setattr(
+        evaluator,
+        "_validate_target_control_manifest",
+        lambda *_args, **_kwargs: (
+            target_manifest_payload,
+            target_fingerprint,
+            {"inputs": {}},
+            target_launcher,
+        ),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_validate_ngram_probe_manifest",
+        lambda *_args, **_kwargs: (ngram_manifest_payload, ngram_launcher, ngram_fingerprint),
+    )
+    monkeypatch.setattr(evaluator, "_manifest_server_port", lambda value: value["server_args"][-1])
+    current = {
+        "slurm_job_id": "12345",
+        "slurm_job_num_nodes": 1,
+        "slurm_job_nodelist": "lyris0001",
+        "gpu_count": 4,
+        "cell_visible_devices": {"left": "0,1", "right": "2,3"},
+    }
+    monkeypatch.setattr(evaluator, "_query_current_allocation", lambda: current)
+    allocation = tmp_path / "allocation.json"
+    build_target_control_allocation_receipt(
+        allocation,
+        slurm_job_id="12345",
+        slurm_job_num_nodes=1,
+        slurm_job_nodelist="lyris0001",
+        gpu_count=4,
+    )
+    receipt = tmp_path / "receipt.json"
+
+    evaluator.build_ngram_internal_target_control_receipt(
+        target_rows_path,
+        ngram_rows_path,
+        source,
+        target_manifest,
+        ngram_manifest,
+        identity,
+        allocation,
+        receipt,
+    )
+    replayed = evaluator.validate_ngram_internal_target_control_receipt(receipt)
+    assert set(replayed["rows"]) == {"target", "ngram"}
+    assert replayed["control_outcome"] == "ngram-exercised-path-exact"
+
+    ngram_rows_path.write_text(
+        ngram_rows_path.read_text().replace('"output_text": "x"', '"output_text": "y"', 1)
+    )
+    with pytest.raises(ValueError, match="descriptor"):
+        evaluator.validate_ngram_internal_target_control_receipt(receipt)
+
+
 def test_internal_target_phase_is_bounded_and_routes_enforce_eager_without_speed() -> None:
     """Compiled/eager/KV-isolated diagnostics stop before every speed cell."""
     pair = _PAIR.read_text()
@@ -762,6 +1059,34 @@ def test_internal_target_phase_is_bounded_and_routes_enforce_eager_without_speed
     assert "--per-request-spec-decode-metrics detailed" in wrapper
     assert "SERVER_ARGS+=(--enforce-eager)" in wrapper
     assert "SERVER_ARGS+=(--no-enable-prefix-caching)" in wrapper
+
+
+def test_ngram_control_phase_is_model_free_fail_closed_and_stops_before_speed() -> None:
+    """The ngram control has exact routing, runtime, receipt, and exercise gates."""
+    pair = _PAIR.read_text()
+    wrapper = _WRAPPER.read_text()
+
+    assert "ngram:0:7" in pair
+    assert "internal-target-ngram-eager-no-prefix:1:200:2" in pair
+    assert '[[ "${method}" != baseline && "${method}" != ngram ]]' in pair
+    assert "CONTROL_DRAFT_EXPORT_PATH is required for diagnostic identity" in pair
+    assert "ngram cells are restricted to the internal-target ngram diagnostic" in pair
+    branch = pair.index('if [[ "${PAIR_PHASE}" == internal-target-ngram-eager-no-prefix ]]')
+    capture = pair.index("run_pair_cells 1", branch)
+    analyze = pair.index("analyze-ngram-control", capture)
+    verify = pair.index("verify-ngram-control", analyze)
+    exercise = pair.index('control_outcome") != "ngram-exercised-path-exact"', verify)
+    stop = pair.index("exit 0", exercise)
+    speed = pair.index("run_pair_cells 0", stop)
+    assert branch < capture < analyze < verify < exercise < stop < speed
+
+    assert '[[ "${SPEC_METHOD}" != "baseline" && "${SPEC_METHOD}" != "ngram" ]]' in wrapper
+    assert "ngram is restricted to the bounded internal-target diagnostic" in wrapper
+    assert 'if [[ "${SPEC_METHOD}" == ngram ]]; then' in wrapper
+    assert '"method":"ngram","num_speculative_tokens":7' in wrapper
+    assert '"prompt_lookup_max":3,"prompt_lookup_min":1' in wrapper
+    assert 'numba.__version__ != "0.65.0"' in wrapper
+    assert "from vllm.v1.spec_decode.ngram_proposer import NgramProposer" in wrapper
 
 
 def test_internal_target_no_prefix_manifest_args_are_exact_and_fail_closed() -> None:
@@ -794,6 +1119,158 @@ def test_internal_target_no_prefix_manifest_args_are_exact_and_fail_closed() -> 
             enforce_eager=False,
             disable_prefix_caching=True,
         )
+
+
+def test_ngram_internal_target_server_args_are_exact_and_model_free() -> None:
+    """The common-path control cannot drift from CPU ngram K7 with explicit lookup bounds."""
+    assert evaluator._expected_ngram_server_args("/target", "8010") == [
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        "/target",
+        "--tensor-parallel-size",
+        "2",
+        "--port",
+        "8010",
+        "--speculative-config",
+        (
+            '{"method":"ngram","num_speculative_tokens":7,'
+            '"prompt_lookup_max":3,"prompt_lookup_min":1}'
+        ),
+        "--per-request-spec-decode-metrics",
+        "detailed",
+        "--enforce-eager",
+        "--no-enable-prefix-caching",
+    ]
+
+
+def test_ngram_manifest_is_model_free_and_fingerprint_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Receipt validation rejects draft identity or noncanonical ngram provenance."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "config.json").write_text("{}\n")
+    identity_path = tmp_path / "identity.json"
+    identity_path.write_text("{}\n")
+    launcher = tmp_path / "launcher.yaml"
+    launcher.write_text("launcher\n")
+    baseline = dict.fromkeys(evaluator._CONTROL_MANIFEST_KEYS)
+    baseline.update(
+        {
+            "target_model": str(target),
+            "speculators_repo": "/speculators",
+            "speculators_sha": "a" * 40,
+            "modelopt_repo": "/modelopt",
+            "modelopt_sha": "b" * 40,
+            "modelopt_dirty": False,
+            "runtime": "/runtime",
+            "runtimes": {"client": "/runtime", "server": "/server"},
+            "container": {"path": str(tmp_path / "image.sqsh")},
+            "dataset": {"revision": "rev"},
+            "provenance_error": None,
+            "slurm_job_id": "12345",
+            "versions": {"python": "3", "vllm": "b389", "guidellm": "1"},
+            "evaluation": {"max_concurrency": 1, "max_requests": 200},
+            "artifact_identity": {
+                "path": str(identity_path.resolve()),
+                "sha256": evaluator._sha256(identity_path),
+            },
+        }
+    )
+    baseline_inputs = {
+        "target_config_sha256": evaluator._sha256(target / "config.json"),
+        "draft_config_sha256": None,
+        "evaluation": {
+            "method": "baseline",
+            "block_size": 0,
+            "num_speculative_tokens": 0,
+        },
+    }
+    run = tmp_path / "ngram"
+    run.mkdir()
+    manifest_path = run / "manifest.json"
+    manifest = {
+        **baseline,
+        "status": "success",
+        "recorded_at": "2026-08-24T00:00:00+00:00",
+        "method": "ngram",
+        "block_size": 0,
+        "num_speculative_tokens": 7,
+        "draft_model": None,
+        "launcher_config": str(launcher),
+        "config_sha256": {
+            "target": evaluator._sha256(target / "config.json"),
+            "launcher": "c" * 64,
+        },
+        "server_args": evaluator._expected_ngram_server_args(str(target), "8010"),
+        "evaluator_args": [],
+    }
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    expected_inputs = {
+        **baseline_inputs,
+        "evaluation": {
+            "method": "ngram",
+            "block_size": 0,
+            "num_speculative_tokens": 7,
+        },
+    }
+    (run / "input-fingerprint.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "inputs": expected_inputs,
+                "sha256": evaluator._sha_json(expected_inputs),
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(evaluator, "_validate_control_launcher", lambda *_args: launcher)
+
+    validated = evaluator._validate_ngram_probe_manifest(
+        manifest_path,
+        baseline,
+        {"inputs": baseline_inputs},
+        identity_path,
+        {"target": {"path": str(target)}},
+    )
+    assert validated[1:] == (launcher, run / "input-fingerprint.json")
+
+    manifest["draft_model"] = "/forbidden-draft"
+    manifest_path.write_text(json.dumps(manifest) + "\n")
+    with pytest.raises(ValueError, match="ngram control manifest mismatch"):
+        evaluator._validate_ngram_probe_manifest(
+            manifest_path,
+            baseline,
+            {"inputs": baseline_inputs},
+            identity_path,
+            {"target": {"path": str(target)}},
+        )
+
+
+def test_zero_step_speculative_metrics_are_ngram_only_evidence() -> None:
+    """A zero-step response is valid for ngram but cannot satisfy a DFlash2 diagnostic."""
+    payload = {
+        "mean_acceptance_length": 1.0,
+        "draft_acceptance_rate": 0.0,
+        "acceptance_histogram": [0] * 8,
+        "num_spec_steps": 0,
+        "num_accepted_draft_tokens": 0,
+        "num_draft_tokens": 0,
+        "num_spec_tokens": 7,
+        "per_step_accepted": None,
+        "per_step_drafted": None,
+    }
+
+    with pytest.raises(ValueError, match="nonzero speculative steps"):
+        evaluator._validate_spec_decode_metrics_payload(payload)
+    assert (
+        evaluator._validate_spec_decode_metrics_payload(payload, allow_zero_steps=True) == payload
+    )
+
+    malformed = {**payload, "mean_acceptance_length": 2.0}
+    with pytest.raises(ValueError, match="accounting mismatch"):
+        evaluator._validate_spec_decode_metrics_payload(malformed)
 
 
 def test_internal_target_cli_accepts_no_prefix_mode_and_wrapper_propagates_failure(
@@ -836,6 +1313,107 @@ def test_internal_target_cli_accepts_no_prefix_mode_and_wrapper_propagates_failu
     command = wrapper.index('"${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-internal-target')
     output = wrapper.index('--output "${RUN_DIR}/internal-target.jsonl"', command)
     assert "|| exit $?" in wrapper[output : output + 80]
+
+
+def test_internal_target_cli_routes_ngram_common_path_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production CLI preserves the distinct ngram role and exact engine mode."""
+    observed: dict[str, Any] = {}
+
+    def capture(*_args: Any, **kwargs: Any) -> None:
+        observed.update(kwargs)
+
+    monkeypatch.setattr(evaluator, "capture_internal_target_diagnostic", capture)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "dflash2_speculators_eval.py",
+            "capture-internal-target",
+            "--dataset-manifest",
+            str(tmp_path / "dataset.json"),
+            "--hf-home",
+            str(tmp_path / "hf"),
+            "--output",
+            str(tmp_path / "rows.jsonl"),
+            "--endpoint",
+            "http://127.0.0.1:8010/v1",
+            "--model",
+            "/target",
+            "--role",
+            "ngram",
+            "--engine-mode",
+            "eager-no-prefix",
+        ],
+    )
+
+    evaluator.main()
+
+    assert observed["role"] == "ngram"
+    assert observed["engine_mode"] == "eager-no-prefix"
+
+
+def test_ngram_control_receipt_cli_routes_build_and_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pair-script receipt commands route every bound evidence path."""
+    built: list[tuple[Path, ...]] = []
+    verified: list[Path] = []
+    monkeypatch.setattr(
+        evaluator,
+        "build_ngram_internal_target_control_receipt",
+        lambda *paths: built.append(paths),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "validate_ngram_internal_target_control_receipt",
+        lambda path: verified.append(path),
+    )
+    paths = [
+        tmp_path / name
+        for name in (
+            "target.jsonl",
+            "ngram.jsonl",
+            "source.json",
+            "target-manifest.json",
+            "ngram-manifest.json",
+            "identity.json",
+            "allocation.json",
+            "receipt.json",
+        )
+    ]
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "dflash2_speculators_eval.py",
+            "analyze-ngram-control",
+            "--target-rows",
+            str(paths[0]),
+            "--ngram-rows",
+            str(paths[1]),
+            "--source-pilot-receipt",
+            str(paths[2]),
+            "--target-manifest",
+            str(paths[3]),
+            "--ngram-manifest",
+            str(paths[4]),
+            "--artifact-identity",
+            str(paths[5]),
+            "--allocation-receipt",
+            str(paths[6]),
+            "--output",
+            str(paths[7]),
+        ],
+    )
+    evaluator.main()
+    assert built == [tuple(paths)]
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["dflash2_speculators_eval.py", "verify-ngram-control", "--receipt", str(paths[7])],
+    )
+    evaluator.main()
+    assert verified == [paths[7]]
 
 
 def test_tie_aware_pilot_summary_fails_closed_on_unresolved_rows(tmp_path: Path) -> None:
