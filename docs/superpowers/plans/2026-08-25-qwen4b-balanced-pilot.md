@@ -37,37 +37,46 @@
 - Consumes: pinned PTV2 split iterables, a JSON held-out UUID array, tokenizer path and SHA-256, seed, worker count, output root.
 - Produces: `build_pilot_bundles(...) -> PilotCompletion`, per-arm `data.jsonl`, `MANIFEST.json`, `EXECUTION.json`, and aggregate `COMPLETE.json`.
 
-- [ ] **Step 1: Write RED tests for the public selection API**
+- [x] **Step 1: Write RED tests for the public selection API**
 
   Add genuine synthetic rows that assert the exact 1/20-scaled historical and approved B-balanced quotas, multilingual language quotas, stable output under reversed input and worker counts 1/96, global duplicate refill, and different selected IDs for a changed seed.
 
-- [ ] **Step 2: Run the selection tests and record the expected missing-module/API failures**
+- [x] **Step 2: Run the selection tests and record the expected missing-module/API failures**
 
   Run: `/Users/sna/ModelOpt_SpecDec/worktrees/q4-ptv2-ab-integration/.venv/bin/python -m pytest -q tests/examples/dataset/test_build_qwen4b_balanced_pilot.py -k 'quota or seed or duplicate or parallel'`
 
-- [ ] **Step 3: Implement canonical prompt identity, validation, and deterministic bounded selection**
+- [x] **Step 3: Implement canonical prompt identity, validation, and deterministic bounded selection**
 
   Implement typed immutable quota/config/result dataclasses. Canonicalize messages, remove only the terminal assistant message for prompt identity, reject tool/tool-call rows, rank by SHA-256 of canonical `[seed, split, prompt_uuid]`, and refill each quota after global dedup/held-out filtering.
 
-- [ ] **Step 4: Run the focused selection tests to GREEN**
+- [x] **Step 4: Run the focused selection tests to GREEN**
 
   Run the Step 2 command and require all selected tests to pass.
 
-- [ ] **Step 5: Write RED tests for token counting and atomic publication**
+- [x] **Step 5: Write RED tests for token counting and atomic publication**
 
   Cover exact assistant-mask counting using the pinned Qwen3-4B chat template, manifest/file/self-hash replay, fewer-than-16M failure, tampered JSONL rejection, worker failure with no final root, and existing-destination no-replace behavior.
 
-- [ ] **Step 6: Run the publication tests and record the expected failures**
+- [x] **Step 6: Run the publication tests and record the expected failures**
 
   Run: `/Users/sna/ModelOpt_SpecDec/worktrees/q4-ptv2-ab-integration/.venv/bin/python -m pytest -q tests/examples/dataset/test_build_qwen4b_balanced_pilot.py -k 'token or manifest or publication or failure or no_replace'`
 
-- [ ] **Step 7: Implement selected-row token counting and receipt-bound publication**
+- [x] **Step 7: Implement selected-row token counting and receipt-bound publication**
 
   Tokenize only selected rows in bounded worker batches, compute exact assistant tokens, write into a mode-0700 private scratch bundle, replay every descriptor and receipt, then install the final root atomically without replacement and fsync the destination parent.
 
-- [ ] **Step 8: Run the full new module test file**
+- [x] **Step 8: Run the full new module test file**
 
   Run: `/Users/sna/ModelOpt_SpecDec/worktrees/q4-ptv2-ab-integration/.venv/bin/python -m pytest -q tests/examples/dataset/test_build_qwen4b_balanced_pilot.py`
+
+#### Task 1 implementation report
+
+- Review baseline: signed+DCO commit `fb0d0b48bd723a7d9d041b572ed5c7f9c96119be`.
+- Frozen bundle schema: `qwen3-4b-balanced-pilot-v2`. Both arm manifests and aggregate `COMPLETE.json` bind the canonical sorted held-out evaluator UUID digest and exact count.
+- External verifier anchor: `qwen3-4b-balanced-pilot-verification-trust-v1`, written outside the bundle with canonical self-hash, exclusive no-follow creation, mode `0600`, file fsync, and parent-directory fsync. Public verification requires this persisted receipt path.
+- Fresh dependency-equipped test evidence: `46 passed, 1 skipped`; the single skip is the Linux-only kernel `renameat2` race test on Darwin.
+- Static evidence: Ruff check/format, Pyright, `py_compile`, and `git diff --check` are required clean at the frozen review handoff.
+- Final signed commit and full binary diff SHA-256 are recorded in the immutable review handoff because a commit cannot contain its own Git object ID.
 
 ### Task 2: OCI-HSG 96-CPU producer contract
 

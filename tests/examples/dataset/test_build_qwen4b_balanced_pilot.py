@@ -350,6 +350,7 @@ def test_public_build_rejects_nonproduction_scientific_identity(tmp_path: Path) 
             tokenizer_path="/tokenizer",
             tokenizer_sha256="a" * 64,
             output_root=tmp_path / "pilot",
+            verification_trust_path=tmp_path / "pilot-trust.json",
             producer_source_commit="b" * 40,
         )
 
@@ -610,6 +611,10 @@ def test_bundle_writer_keeps_selected_rows_streaming_bounded(tmp_path: Path) -> 
         producer_source_commit="c" * 40,
         effective_workers=1,
         execution=None,
+        held_out_evaluator={
+            "count": 0,
+            "prompt_uuid_sha256": hashlib.sha256(b"[]").hexdigest(),
+        },
     )
 
     connection.close()
@@ -806,10 +811,62 @@ def test_external_verification_trust_rejects_coordinated_bundle_and_tokenizer_re
         )
 
 
-def test_public_verifier_rejects_nonproduction_bundle_even_when_self_hashed(tmp_path: Path) -> None:
-    """A valid tiny test receipt must never pass the production completion boundary."""
+def test_nonselected_held_out_identity_changes_bundle_and_persisted_trust(
+    tmp_path: Path,
+) -> None:
+    """Changing evaluator exclusions must change every externally trusted build identity."""
+    module = _load_module()
+    completions = []
+    for label, held_out in (("empty", set()), ("nonselected", {"f" * 64})):
+        (tmp_path / label).mkdir()
+        completions.append(
+            module._build_pilot_bundles_for_test(
+                _tiny_rows(),
+                config=_tiny_config(module),
+                held_out_prompt_uuids=held_out,
+                tokenizer=_MaskTokenizer(),
+                tokenizer_path="/tokenizer",
+                tokenizer_sha256="a" * 64,
+                output_root=tmp_path / label / "pilot",
+                verification_trust_path=tmp_path / label / "pilot-trust.json",
+                producer_source_commit="b" * 40,
+            )
+        )
+
+    empty, nonselected = completions
+    assert empty.verification_trust.held_out_evaluator_count == 0
+    assert empty.verification_trust.held_out_evaluator_sha256 == hashlib.sha256(b"[]").hexdigest()
+    assert nonselected.verification_trust.held_out_evaluator_count == 1
+    assert (
+        nonselected.verification_trust.held_out_evaluator_sha256
+        == hashlib.sha256(('["' + "f" * 64 + '"]').encode()).hexdigest()
+    )
+    assert empty.complete_sha256 != nonselected.complete_sha256
+    assert empty.verification_trust != nonselected.verification_trust
+    for label, completion in (("empty", empty), ("nonselected", nonselected)):
+        receipt_path = tmp_path / label / "pilot-trust.json"
+        receipt = json.loads(receipt_path.read_text())
+        assert receipt["schema_version"] == "qwen3-4b-balanced-pilot-verification-trust-v1"
+        assert receipt["verification_trust_sha256"] == module._self_hash(
+            receipt, "verification_trust_sha256"
+        )
+        assert module.load_pilot_verification_trust(receipt_path) == completion.verification_trust
+        complete = json.loads((completion.output_root / "COMPLETE.json").read_text())
+        assert complete["schema_version"] == "qwen3-4b-balanced-pilot-v2"
+        assert complete["held_out_evaluator"] == {
+            "count": completion.verification_trust.held_out_evaluator_count,
+            "prompt_uuid_sha256": completion.verification_trust.held_out_evaluator_sha256,
+        }
+        for arm in ("historical-proportion", "balanced"):
+            manifest = json.loads((completion.output_root / arm / "MANIFEST.json").read_text())
+            assert manifest["held_out_evaluator"] == complete["held_out_evaluator"]
+
+
+def test_persisted_verification_trust_is_external_strict_and_no_replace(tmp_path: Path) -> None:
+    """Cross-job verification must load one immutable external receipt, never reconstruct trust."""
     module = _load_module()
     output = tmp_path / "pilot"
+    receipt_path = tmp_path / "pilot-trust.json"
     completion = module._build_pilot_bundles_for_test(
         _tiny_rows(),
         config=_tiny_config(module),
@@ -817,11 +874,56 @@ def test_public_verifier_rejects_nonproduction_bundle_even_when_self_hashed(tmp_
         tokenizer_path="/tokenizer",
         tokenizer_sha256="a" * 64,
         output_root=output,
+        verification_trust_path=receipt_path,
+        producer_source_commit="b" * 40,
+    )
+
+    assert module.load_pilot_verification_trust(receipt_path) == completion.verification_trust
+    assert receipt_path.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(module.PilotError, match="outside"):
+        module._write_pilot_verification_trust(
+            output / "trust.json", completion.verification_trust, output_root=output
+        )
+    (output / "nested").mkdir()
+    redirected = tmp_path / "redirected-bundle"
+    redirected.symlink_to(output, target_is_directory=True)
+    with pytest.raises(module.PilotError, match=r"outside|symlink"):
+        module._write_pilot_verification_trust(
+            redirected / "nested" / "trust.json",
+            completion.verification_trust,
+            output_root=output,
+        )
+    with pytest.raises(module.PilotError, match="already exists"):
+        module._write_pilot_verification_trust(
+            receipt_path, completion.verification_trust, output_root=output
+        )
+    tampered = json.loads(receipt_path.read_text())
+    tampered["held_out_evaluator"]["count"] = True
+    tampered["verification_trust_sha256"] = module._self_hash(tampered, "verification_trust_sha256")
+    receipt_path.write_text(module.canonical_json(tampered) + "\n")
+    with pytest.raises(module.PilotError, match="verification trust receipt"):
+        module.load_pilot_verification_trust(receipt_path)
+
+
+def test_public_verifier_rejects_nonproduction_bundle_even_when_self_hashed(tmp_path: Path) -> None:
+    """A valid tiny test receipt must never pass the production completion boundary."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        verification_trust_path=tmp_path / "pilot-trust.json",
         producer_source_commit="b" * 40,
     )
 
     with pytest.raises(module.PilotError, match="production"):
-        module.verify_pilot_completion(output, verification_trust=completion.verification_trust)
+        module.verify_pilot_completion(
+            output, verification_trust_path=tmp_path / "pilot-trust.json"
+        )
 
 
 @pytest.mark.parametrize(
@@ -1312,25 +1414,11 @@ def test_public_failures_are_normalized_to_pilot_error(tmp_path: Path) -> None:
     """Filesystem and JSON scalar failures must not leak implementation exceptions."""
     module = _load_module()
     missing = tmp_path / "missing"
-    quota = module.PilotQuota("chat", "chat", 1)
-    trust = module.PilotVerificationTrust(
-        complete_file_sha256="0" * 64,
-        historical_manifest_sha256="1" * 64,
-        balanced_manifest_sha256="2" * 64,
-        source_repository="nvidia/Nemotron-Post-Training-Dataset-v2",
-        source_revision="3" * 40,
-        seed=module.SEED,
-        historical_quotas=(quota,),
-        balanced_quotas=(quota,),
-        tokenizer_sha256="4" * 64,
-        chat_template_sha256="5" * 64,
-        producer_source_commit="6" * 40,
-        minimum_assistant_tokens=1,
-        training_sequence_length=4_096,
-    )
 
     with pytest.raises(module.PilotError):
-        module.verify_pilot_completion(missing, verification_trust=trust)
+        module.verify_pilot_completion(
+            missing, verification_trust_path=tmp_path / "missing-trust.json"
+        )
     with pytest.raises(module.PilotError):
         module.select_pilot_rows({"chat": iter([object()])}, config=_tiny_config(module))
     with pytest.raises(module.PilotError):

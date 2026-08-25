@@ -157,6 +157,8 @@ class PilotVerificationTrust:
     producer_source_commit: str
     minimum_assistant_tokens: int
     training_sequence_length: int
+    held_out_evaluator_count: int
+    held_out_evaluator_sha256: str
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -165,10 +167,11 @@ class PilotVerificationTrust:
             ("balanced manifest", self.balanced_manifest_sha256),
             ("tokenizer", self.tokenizer_sha256),
             ("chat template", self.chat_template_sha256),
+            ("held-out evaluator", self.held_out_evaluator_sha256),
         ):
             if not _is_sha256(value):
                 raise PilotError(f"{label} trust identity must be an exact lowercase SHA-256")
-        if not self.source_repository:
+        if type(self.source_repository) is not str or not self.source_repository:
             raise PilotError("source repository trust identity is required")
         for label, value in (
             ("source revision", self.source_revision),
@@ -182,6 +185,8 @@ class PilotVerificationTrust:
                 raise PilotError(f"{label} trust identity is invalid")
         if type(self.seed) is not int:
             raise PilotError("seed trust identity must be a strict integer")
+        if type(self.held_out_evaluator_count) is not int or self.held_out_evaluator_count < 0:
+            raise PilotError("held-out evaluator count must be a nonnegative strict integer")
         _validate_quotas(HISTORICAL_PROPORTION, self.historical_quotas)
         _validate_quotas(BALANCED, self.balanced_quotas)
         for label, value in (
@@ -374,6 +379,15 @@ def _validate_held_out(values: Iterable[str]) -> set[str]:
     ):
         raise PilotError("held-out UUIDs must be SHA-256 strings")
     return result
+
+
+def _held_out_evaluator_identity(values: set[str]) -> dict[str, object]:
+    return {
+        "count": len(values),
+        "prompt_uuid_sha256": hashlib.sha256(
+            canonical_json(sorted(values)).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def _normalize_row(split: str, raw_row: Mapping[str, object]) -> PilotRow:
@@ -704,6 +718,7 @@ def build_pilot_bundles(
     tokenizer_path: str | Path,
     tokenizer_sha256: str,
     output_root: Path,
+    verification_trust_path: Path,
     producer_source_commit: str,
     workers: int | None = None,
     scratch_root: Path | None = None,
@@ -729,6 +744,7 @@ def build_pilot_bundles(
             tokenizer_path=tokenizer_path,
             tokenizer_sha256=tokenizer_sha256,
             output_root=output_root,
+            verification_trust_path=verification_trust_path,
             producer_source_commit=producer_source_commit,
             workers=workers,
             scratch_root=scratch_root,
@@ -753,6 +769,7 @@ def _build_pilot_bundles_for_test(
     tokenizer_path: str | Path,
     tokenizer_sha256: str,
     output_root: Path,
+    verification_trust_path: Path | None = None,
     producer_source_commit: str,
     workers: int | None = None,
     scratch_root: Path | None = None,
@@ -762,6 +779,12 @@ def _build_pilot_bundles_for_test(
     """Test-only generic publication helper; production callers use ``build_pilot_bundles``."""
     config = config or PilotConfig()
     output_root = Path(output_root)
+    if verification_trust_path is not None:
+        verification_trust_path = _validate_external_trust_path(
+            Path(verification_trust_path), output_root=output_root
+        )
+        if os.path.lexists(verification_trust_path):
+            raise PilotError("verification trust receipt already exists")
     _validate_build_inputs(
         config=config,
         tokenizer_path=tokenizer_path,
@@ -785,6 +808,7 @@ def _build_pilot_bundles_for_test(
         connection = sqlite3.connect(selection_root / "selection.sqlite")
         _prepare_selection_database(connection)
         held_out = _validate_held_out(held_out_prompt_uuids)
+        held_out_evaluator = _held_out_evaluator_identity(held_out)
         invalid, held_out_count, eligible_count = _spool_candidates(
             connection, split_rows, config, held_out
         )
@@ -839,6 +863,7 @@ def _build_pilot_bundles_for_test(
             producer_source_commit=producer_source_commit,
             effective_workers=effective_workers,
             execution=execution,
+            held_out_evaluator=held_out_evaluator,
         )
         verification_trust = _build_verification_trust(
             partial,
@@ -847,6 +872,7 @@ def _build_pilot_bundles_for_test(
             tokenizer_sha256=tokenizer_sha256,
             chat_template_sha256=template_sha256,
             producer_source_commit=producer_source_commit,
+            held_out_evaluator=held_out_evaluator,
         )
         bundle_evidence = _bundle_file_evidence(partial)
         _verify_bundle_root(
@@ -882,6 +908,12 @@ def _build_pilot_bundles_for_test(
         complete, complete_raw = _read_json_stable(output_root / "COMPLETE.json")
         if hashlib.sha256(complete_raw).hexdigest() != verification_trust.complete_file_sha256:
             raise PilotError("installed bundle differs from caller-owned verification trust")
+        if verification_trust_path is not None:
+            _write_pilot_verification_trust(
+                verification_trust_path,
+                verification_trust,
+                output_root=output_root,
+            )
         return PilotCompletion(
             output_root=output_root,
             historical_proportion=arms[HISTORICAL_PROPORTION],
@@ -903,12 +935,16 @@ def _build_pilot_bundles_for_test(
 def verify_pilot_completion(
     output_root: Path,
     *,
-    verification_trust: PilotVerificationTrust,
+    verification_trust_path: Path,
     scratch_root: Path | None = None,
 ) -> PilotCompletion:
     """Replay every file descriptor and receipt in an installed pilot root."""
     try:
         output_root = Path(output_root)
+        trust_path = _validate_external_trust_path(
+            Path(verification_trust_path), output_root=output_root
+        )
+        verification_trust = load_pilot_verification_trust(trust_path)
         arms = _verify_bundle_root(
             output_root,
             production=True,
@@ -1320,6 +1356,7 @@ def _write_spooled_bundle_contents(
     producer_source_commit: str,
     effective_workers: int,
     execution: Mapping[str, object] | None,
+    held_out_evaluator: Mapping[str, object],
 ) -> dict[str, PilotArmCompletion]:
     arms: dict[str, PilotArmCompletion] = {}
     for arm in (HISTORICAL_PROPORTION, BALANCED):
@@ -1365,7 +1402,7 @@ def _write_spooled_bundle_contents(
         execution_payload["execution_sha256"] = _self_hash(execution_payload, "execution_sha256")
         _write_json(arm_root / "EXECUTION.json", execution_payload)
         manifest = {
-            "schema_version": "qwen3-4b-balanced-pilot-v1",
+            "schema_version": "qwen3-4b-balanced-pilot-v2",
             "arm": arm,
             "selection_mode": "pilot-row-quota-v1",
             "source": {
@@ -1391,6 +1428,7 @@ def _write_spooled_bundle_contents(
             "assistant_tokens": tokens_by_arm[arm],
             "minimum_assistant_tokens": config.minimum_assistant_tokens,
             "training_sequence_length": config.training_sequence_length,
+            "held_out_evaluator": dict(held_out_evaluator),
             "exclusions": {
                 "held_out": selection_stats.excluded_held_out,
                 "invalid": selection_stats.excluded_invalid,
@@ -1407,7 +1445,8 @@ def _write_spooled_bundle_contents(
             manifest_sha256=str(manifest["manifest_sha256"]),
         )
     complete = {
-        "schema_version": "qwen3-4b-balanced-pilot-v1",
+        "schema_version": "qwen3-4b-balanced-pilot-v2",
+        "held_out_evaluator": dict(held_out_evaluator),
         "arms": {
             arm: {
                 "manifest_path": f"{arm}/MANIFEST.json",
@@ -1429,8 +1468,17 @@ def _build_verification_trust(
     tokenizer_sha256: str,
     chat_template_sha256: str,
     producer_source_commit: str,
+    held_out_evaluator: Mapping[str, object],
 ) -> PilotVerificationTrust:
     """Capture the producer's immutable preimage for a separate verification caller."""
+    held_out_count = held_out_evaluator.get("count")
+    held_out_sha256 = held_out_evaluator.get("prompt_uuid_sha256")
+    if (
+        type(held_out_count) is not int
+        or type(held_out_sha256) is not str
+        or not _is_sha256(held_out_sha256)
+    ):
+        raise PilotError("held-out evaluator identity is invalid")
     return PilotVerificationTrust(
         complete_file_sha256=_sha256_file(root / "COMPLETE.json"),
         historical_manifest_sha256=arms[HISTORICAL_PROPORTION].manifest_sha256,
@@ -1445,6 +1493,8 @@ def _build_verification_trust(
         producer_source_commit=producer_source_commit,
         minimum_assistant_tokens=config.minimum_assistant_tokens,
         training_sequence_length=config.training_sequence_length,
+        held_out_evaluator_count=held_out_count,
+        held_out_evaluator_sha256=held_out_sha256,
     )
 
 
@@ -1464,6 +1514,7 @@ _MANIFEST_FIELDS = {
     "assistant_tokens",
     "minimum_assistant_tokens",
     "training_sequence_length",
+    "held_out_evaluator",
     "exclusions",
     "producer_source_commit",
     "manifest_sha256",
@@ -1514,8 +1565,8 @@ def _verify_bundle_root_impl(
     ):
         raise PilotError("bundle differs from caller-owned verification trust")
     if (
-        set(complete) != {"schema_version", "arms", "complete_sha256"}
-        or complete.get("schema_version") != "qwen3-4b-balanced-pilot-v1"
+        set(complete) != {"schema_version", "held_out_evaluator", "arms", "complete_sha256"}
+        or complete.get("schema_version") != "qwen3-4b-balanced-pilot-v2"
         or not _is_sha256(complete.get("complete_sha256"))
         or complete["complete_sha256"] != _self_hash(complete, "complete_sha256")
     ):
@@ -1546,6 +1597,11 @@ def _verify_bundle_root_impl(
         _verify_execution_receipt(manifest_path.parent / "EXECUTION.json")
         manifests[arm] = manifest
     _validate_cross_arm_pins(manifests)
+    if any(
+        manifest["held_out_evaluator"] != complete["held_out_evaluator"]
+        for manifest in manifests.values()
+    ):
+        raise PilotError("aggregate held-out evaluator identity does not reconcile")
     if verification_trust is not None:
         _validate_verification_trust(manifests, verification_trust)
     staged: Path | None = None
@@ -1606,7 +1662,7 @@ def _validate_manifest_schema(manifest: dict[str, Any], *, arm: str, production:
     if set(manifest) != _MANIFEST_FIELDS:
         raise PilotError(f"{arm} manifest schema is invalid")
     if (
-        manifest.get("schema_version") != "qwen3-4b-balanced-pilot-v1"
+        manifest.get("schema_version") != "qwen3-4b-balanced-pilot-v2"
         or manifest.get("arm") != arm
         or manifest.get("selection_mode") != "pilot-row-quota-v1"
     ):
@@ -1672,6 +1728,15 @@ def _validate_manifest_schema(manifest: dict[str, Any], *, arm: str, production:
         if type(manifest.get(field)) is not int or manifest[field] < 1:
             label = "assistant-token" if "assistant" in field else field.replace("_", " ")
             raise PilotError(f"{arm} {label} evidence is invalid")
+    held_out_evaluator = manifest.get("held_out_evaluator")
+    if (
+        type(held_out_evaluator) is not dict
+        or set(held_out_evaluator) != {"count", "prompt_uuid_sha256"}
+        or type(held_out_evaluator.get("count")) is not int
+        or held_out_evaluator["count"] < 0
+        or not _is_sha256(held_out_evaluator.get("prompt_uuid_sha256"))
+    ):
+        raise PilotError(f"{arm} held-out evaluator identity is invalid")
     exclusions = manifest.get("exclusions")
     if (
         type(exclusions) is not dict
@@ -1896,6 +1961,7 @@ def _validate_cross_arm_pins(manifests: Mapping[str, dict[str, Any]]) -> None:
         "tokenizer",
         "minimum_assistant_tokens",
         "training_sequence_length",
+        "held_out_evaluator",
         "producer_source_commit",
     )
     historical = manifests[HISTORICAL_PROPORTION]
@@ -1922,6 +1988,10 @@ def _validate_verification_trust(
         },
         "minimum_assistant_tokens": trust.minimum_assistant_tokens,
         "training_sequence_length": trust.training_sequence_length,
+        "held_out_evaluator": {
+            "count": trust.held_out_evaluator_count,
+            "prompt_uuid_sha256": trust.held_out_evaluator_sha256,
+        },
         "producer_source_commit": trust.producer_source_commit,
     }
     for manifest in (historical, balanced):
@@ -1939,6 +2009,219 @@ def _validate_verification_trust(
 def _quota_counts(config: PilotConfig, arm: str) -> dict[str, int]:
     quotas = config.historical_quotas if arm == HISTORICAL_PROPORTION else config.balanced_quotas
     return {quota.split: quota.rows for quota in quotas}
+
+
+def _validate_external_trust_path(path: Path, *, output_root: Path) -> Path:
+    normalized = Path(os.path.abspath(path))
+    normalized_output = Path(os.path.abspath(output_root))
+    if normalized == normalized_output or normalized.is_relative_to(normalized_output):
+        raise PilotError("verification trust receipt must be stored outside the mutable bundle")
+    if not normalized.parent.is_dir():
+        raise PilotError("verification trust receipt parent must already exist")
+    return normalized
+
+
+def _quota_receipt(quotas: tuple[PilotQuota, ...]) -> list[dict[str, object]]:
+    return [
+        {"category": quota.category, "split": quota.split, "rows": quota.rows} for quota in quotas
+    ]
+
+
+def _verification_trust_receipt(trust: PilotVerificationTrust) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "schema_version": "qwen3-4b-balanced-pilot-verification-trust-v1",
+        "complete_file_sha256": trust.complete_file_sha256,
+        "manifest_sha256": {
+            HISTORICAL_PROPORTION: trust.historical_manifest_sha256,
+            BALANCED: trust.balanced_manifest_sha256,
+        },
+        "source": {
+            "repository": trust.source_repository,
+            "revision": trust.source_revision,
+        },
+        "seed": trust.seed,
+        "quotas": {
+            HISTORICAL_PROPORTION: _quota_receipt(trust.historical_quotas),
+            BALANCED: _quota_receipt(trust.balanced_quotas),
+        },
+        "tokenizer": {
+            "sha256": trust.tokenizer_sha256,
+            "chat_template_sha256": trust.chat_template_sha256,
+        },
+        "producer_source_commit": trust.producer_source_commit,
+        "minimum_assistant_tokens": trust.minimum_assistant_tokens,
+        "training_sequence_length": trust.training_sequence_length,
+        "held_out_evaluator": {
+            "count": trust.held_out_evaluator_count,
+            "prompt_uuid_sha256": trust.held_out_evaluator_sha256,
+        },
+    }
+    receipt["verification_trust_sha256"] = _self_hash(receipt, "verification_trust_sha256")
+    return receipt
+
+
+def _write_pilot_verification_trust(
+    path: Path, trust: PilotVerificationTrust, *, output_root: Path
+) -> None:
+    path = _validate_external_trust_path(Path(path), output_root=Path(output_root))
+    payload = (canonical_json(_verification_trust_receipt(trust)) + "\n").encode("utf-8")
+    parent_fd: int | None = None
+    descriptor: int | None = None
+    created_identity: tuple[int, int] | None = None
+    published = False
+    try:
+        parent_fd = _open_nofollow_directory(path.parent)
+        parent_identity = os.fstat(parent_fd)
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        created = os.fstat(descriptor)
+        created_identity = (created.st_dev, created.st_ino)
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+        completed = os.fstat(descriptor)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if _stable_stat_identity(completed) != _stable_stat_identity(named) or (
+            os.fstat(parent_fd).st_dev,
+            os.fstat(parent_fd).st_ino,
+        ) != (parent_identity.st_dev, parent_identity.st_ino):
+            raise PilotError("verification trust receipt changed during publication")
+        os.fsync(parent_fd)
+        published = True
+    except FileExistsError as error:
+        raise PilotError("verification trust receipt already exists") from error
+    except OSError as error:
+        raise PilotError("verification trust receipt publication failed") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent_fd is not None:
+            if created_identity is not None and not published:
+                try:
+                    named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (named.st_dev, named.st_ino) == created_identity:
+                        os.unlink(path.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(parent_fd)
+
+
+def _quotas_from_receipt(value: object, *, arm: str) -> tuple[PilotQuota, ...]:
+    if type(value) is not list or not value:
+        raise PilotError("verification trust receipt quotas are invalid")
+    quotas: list[PilotQuota] = []
+    for item in value:
+        if (
+            type(item) is not dict
+            or set(item) != {"category", "split", "rows"}
+            or type(item.get("category")) is not str
+            or not item["category"]
+            or type(item.get("split")) is not str
+            or not item["split"]
+            or type(item.get("rows")) is not int
+            or item["rows"] < 1
+        ):
+            raise PilotError("verification trust receipt quotas are invalid")
+        quotas.append(PilotQuota(item["category"], item["split"], item["rows"]))
+    result = tuple(quotas)
+    _validate_quotas(arm, result)
+    return result
+
+
+def load_pilot_verification_trust(path: Path) -> PilotVerificationTrust:
+    """Load one strict caller-owned trust receipt for cross-job verification."""
+    try:
+        receipt, _raw = _read_json_stable(Path(path))
+        if (
+            set(receipt)
+            != {
+                "schema_version",
+                "complete_file_sha256",
+                "manifest_sha256",
+                "source",
+                "seed",
+                "quotas",
+                "tokenizer",
+                "producer_source_commit",
+                "minimum_assistant_tokens",
+                "training_sequence_length",
+                "held_out_evaluator",
+                "verification_trust_sha256",
+            }
+            or receipt.get("schema_version") != "qwen3-4b-balanced-pilot-verification-trust-v1"
+            or not _is_sha256(receipt.get("verification_trust_sha256"))
+            or receipt["verification_trust_sha256"]
+            != _self_hash(receipt, "verification_trust_sha256")
+        ):
+            raise PilotError("verification trust receipt schema or self-hash is invalid")
+        manifests = receipt["manifest_sha256"]
+        source = receipt["source"]
+        quotas = receipt["quotas"]
+        tokenizer = receipt["tokenizer"]
+        held_out = receipt["held_out_evaluator"]
+        if (
+            type(manifests) is not dict
+            or set(manifests) != {HISTORICAL_PROPORTION, BALANCED}
+            or type(source) is not dict
+            or set(source) != {"repository", "revision"}
+            or type(quotas) is not dict
+            or set(quotas) != {HISTORICAL_PROPORTION, BALANCED}
+            or type(tokenizer) is not dict
+            or set(tokenizer) != {"sha256", "chat_template_sha256"}
+            or type(held_out) is not dict
+            or set(held_out) != {"count", "prompt_uuid_sha256"}
+            or not _is_sha256(receipt.get("complete_file_sha256"))
+            or any(not _is_sha256(value) for value in manifests.values())
+            or type(source.get("repository")) is not str
+            or not source["repository"]
+            or type(source.get("revision")) is not str
+            or len(source["revision"]) not in (40, 64)
+            or any(character not in "0123456789abcdef" for character in source["revision"])
+            or type(receipt.get("seed")) is not int
+            or any(not _is_sha256(value) for value in tokenizer.values())
+            or type(receipt.get("producer_source_commit")) is not str
+            or len(receipt["producer_source_commit"]) not in (40, 64)
+            or any(
+                character not in "0123456789abcdef"
+                for character in receipt["producer_source_commit"]
+            )
+            or type(receipt.get("minimum_assistant_tokens")) is not int
+            or receipt["minimum_assistant_tokens"] < 1
+            or type(receipt.get("training_sequence_length")) is not int
+            or receipt["training_sequence_length"] < 1
+            or type(held_out.get("count")) is not int
+            or held_out["count"] < 0
+            or not _is_sha256(held_out.get("prompt_uuid_sha256"))
+        ):
+            raise PilotError("verification trust receipt nested schema is invalid")
+        return PilotVerificationTrust(
+            complete_file_sha256=receipt["complete_file_sha256"],
+            historical_manifest_sha256=manifests[HISTORICAL_PROPORTION],
+            balanced_manifest_sha256=manifests[BALANCED],
+            source_repository=source["repository"],
+            source_revision=source["revision"],
+            seed=receipt["seed"],
+            historical_quotas=_quotas_from_receipt(
+                quotas[HISTORICAL_PROPORTION], arm=HISTORICAL_PROPORTION
+            ),
+            balanced_quotas=_quotas_from_receipt(quotas[BALANCED], arm=BALANCED),
+            tokenizer_sha256=tokenizer["sha256"],
+            chat_template_sha256=tokenizer["chat_template_sha256"],
+            producer_source_commit=receipt["producer_source_commit"],
+            minimum_assistant_tokens=receipt["minimum_assistant_tokens"],
+            training_sequence_length=receipt["training_sequence_length"],
+            held_out_evaluator_count=held_out["count"],
+            held_out_evaluator_sha256=held_out["prompt_uuid_sha256"],
+        )
+    except PilotError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise PilotError("verification trust receipt is invalid") from error
 
 
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:
