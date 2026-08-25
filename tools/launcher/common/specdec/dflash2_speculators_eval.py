@@ -568,9 +568,10 @@ def _open_opb_dflash_bundle(draft_path: Path) -> Iterator[dict[str, Any]]:
         draft_fd = os.open("dflash-s4166", directory_flags, dir_fd=bundle_fd)
         manifest_fd = os.open("manifest", directory_flags, dir_fd=bundle_fd)
         descriptors.extend((draft_fd, manifest_fd))
-        if set(os.listdir(draft_fd)) != {"config.json", "model.safetensors"} or set(
-            os.listdir(manifest_fd)
-        ) != {"dflash-s4166.sha256", "identity.json"}:
+        required_manifest_entries = {"dflash-s4166.sha256", "identity.json"}
+        if set(os.listdir(draft_fd)) != {"config.json", "model.safetensors"} or not (
+            required_manifest_entries <= set(os.listdir(manifest_fd))
+        ):
             raise ValueError("OPB DFlash bundle file set mismatch")
         files: dict[str, int] = {}
         for name, parent_fd in (

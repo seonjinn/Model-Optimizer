@@ -909,6 +909,32 @@ def test_opb_stage_copies_exact_bytes_to_private_read_only_node_local_tree(
         evaluator.validate_opb_dflash_stage_receipt(receipt_path, require_live_stage=True)
 
 
+def test_opb_stage_accepts_authenticated_files_in_production_manifest_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unrelated sibling evidence must not invalidate the authenticated DFlash files."""
+    bundle, draft = _write_test_opb_bundle(tmp_path, monkeypatch)
+    manifest = bundle / "manifest"
+    (manifest / "MANIFEST.SHA256").write_text("aggregate evidence\n")
+    (manifest / "dspark-s4166.sha256").write_text("unrelated sibling evidence\n")
+    (manifest / "q30-base.sha256").write_text("unrelated target evidence\n")
+
+    stage_root = tmp_path / "job" / "opb-dflash-control"
+    receipt_path = tmp_path / "results" / "opb-stage-receipt.json"
+    receipt = evaluator.stage_opb_dflash_control(draft, stage_root, receipt_path)
+
+    assert receipt["source"]["file_sha256"] == receipt["staged"]["file_sha256"]
+    evaluator.validate_opb_dflash_stage_receipt(receipt_path, require_live_stage=True)
+
+    (manifest / "identity.json").unlink()
+    with pytest.raises(ValueError, match="bundle file set mismatch"):
+        evaluator.stage_opb_dflash_control(
+            draft,
+            tmp_path / "job-missing-manifest" / "opb-dflash-control",
+            tmp_path / "results-missing-manifest" / "opb-stage-receipt.json",
+        )
+
+
 def test_offline_opb_stage_receipt_rejects_fabricated_nonexistent_descriptors(
     tmp_path: Path,
 ) -> None:
