@@ -10,11 +10,12 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -167,40 +168,40 @@ def select_pilot_rows(
     *,
     config: PilotConfig | None = None,
     held_out_prompt_uuids: Iterable[str] = (),
+    scratch_root: Path | None = None,
 ) -> PilotSelection:
-    """Select exact paired quotas after canonical validation and global deduplication."""
+    """Select exact paired quotas from a private SQLite spool without corpus materialization."""
     config = config or PilotConfig()
     if not isinstance(split_rows, Mapping):
         raise PilotError("split_rows must map PTV2 split names to iterables")
     held_out = _validate_held_out(held_out_prompt_uuids)
-    candidates: list[PilotRow] = []
-    invalid = 0
-    for split, rows in split_rows.items():
-        if not isinstance(split, str) or split not in _known_splits(config):
-            raise PilotError(f"unapproved PTV2 split: {split!r}")
+    scratch_parent = Path(scratch_root) if scratch_root is not None else Path(tempfile.gettempdir())
+    if not scratch_parent.is_dir():
+        raise PilotError("selection scratch root must be a directory")
+    spool_root = Path(tempfile.mkdtemp(prefix=".qwen4b-selection-", dir=scratch_parent))
+    os.chmod(spool_root, 0o700)
+    database = spool_root / "selection.sqlite"
+    try:
+        connection = sqlite3.connect(database)
         try:
-            iterator = iter(rows)
-        except TypeError as error:
-            raise PilotError(f"split {split!r} is not iterable") from error
-        for raw_row in iterator:
-            normalized = _try_normalize_row(split, raw_row)
-            if normalized is None:
-                invalid += 1
-            else:
-                candidates.append(normalized)
-
-    kept = [row for row in candidates if row.prompt_uuid not in held_out]
-    held_out_count = len(candidates) - len(kept)
-    duplicate_count = len(kept) - len({row.prompt_uuid for row in kept})
-    return PilotSelection(
-        historical_proportion=_select_arm(
-            HISTORICAL_PROPORTION, kept, config.historical_quotas, config
-        ),
-        balanced=_select_arm(BALANCED, kept, config.balanced_quotas, config),
-        excluded_held_out=held_out_count,
-        excluded_invalid=invalid,
-        excluded_duplicate_candidates=duplicate_count,
-    )
+            _prepare_selection_database(connection)
+            invalid, held_out_count = _spool_candidates(connection, split_rows, config, held_out)
+            duplicate_count = _duplicate_count(connection)
+            historical = _select_arm_from_spool(
+                connection, HISTORICAL_PROPORTION, config.historical_quotas, config
+            )
+            balanced = _select_arm_from_spool(connection, BALANCED, config.balanced_quotas, config)
+        finally:
+            connection.close()
+        return PilotSelection(
+            historical_proportion=historical,
+            balanced=balanced,
+            excluded_held_out=held_out_count,
+            excluded_invalid=invalid,
+            excluded_duplicate_candidates=duplicate_count,
+        )
+    finally:
+        shutil.rmtree(spool_root, ignore_errors=True)
 
 
 def _validate_quotas(arm: str, quotas: tuple[PilotQuota, ...]) -> None:
@@ -296,6 +297,95 @@ def _rank(row: PilotRow, seed: int) -> str:
     return hashlib.sha256(
         canonical_json([seed, row.split, row.prompt_uuid]).encode("utf-8")
     ).hexdigest()
+
+
+def _prepare_selection_database(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE TABLE candidates (prompt_uuid TEXT NOT NULL, split TEXT NOT NULL, "
+        "category TEXT NOT NULL, messages_json TEXT NOT NULL, rank TEXT NOT NULL)"
+    )
+    connection.execute("CREATE INDEX candidates_split_rank ON candidates(split, rank, prompt_uuid)")
+
+
+def _spool_candidates(
+    connection: sqlite3.Connection,
+    split_rows: Mapping[str, Iterable[Mapping[str, object]]],
+    config: PilotConfig,
+    held_out: set[str],
+) -> tuple[int, int]:
+    invalid = 0
+    held_out_count = 0
+    for split, rows in split_rows.items():
+        if not isinstance(split, str) or split not in _known_splits(config):
+            raise PilotError(f"unapproved PTV2 split: {split!r}")
+        try:
+            iterator = iter(rows)
+        except TypeError as error:
+            raise PilotError(f"split {split!r} is not iterable") from error
+        batch: list[tuple[str, str, str, str, str]] = []
+        for raw_row in iterator:
+            normalized = _try_normalize_row(split, raw_row)
+            if normalized is None:
+                invalid += 1
+                continue
+            if normalized.prompt_uuid in held_out:
+                held_out_count += 1
+                continue
+            batch.append(
+                (
+                    normalized.prompt_uuid,
+                    normalized.split,
+                    normalized.category,
+                    normalized.messages_json,
+                    _rank(normalized, config.seed),
+                )
+            )
+            if len(batch) == 1_024:
+                connection.executemany("INSERT INTO candidates VALUES (?, ?, ?, ?, ?)", batch)
+                batch.clear()
+        if batch:
+            connection.executemany("INSERT INTO candidates VALUES (?, ?, ?, ?, ?)", batch)
+    connection.commit()
+    return invalid, held_out_count
+
+
+def _duplicate_count(connection: sqlite3.Connection) -> int:
+    total = int(connection.execute("SELECT COUNT(*) FROM candidates").fetchone()[0])
+    unique = int(
+        connection.execute("SELECT COUNT(DISTINCT prompt_uuid) FROM candidates").fetchone()[0]
+    )
+    return total - unique
+
+
+def _select_arm_from_spool(
+    connection: sqlite3.Connection,
+    arm: str,
+    quotas: tuple[PilotQuota, ...],
+    config: PilotConfig,
+) -> tuple[PilotRow, ...]:
+    selected: list[PilotRow] = []
+    selected_uuids: set[str] = set()
+    for quota in quotas:
+        cursor = connection.execute(
+            "SELECT prompt_uuid, split, category, messages_json FROM candidates "
+            "WHERE split = ? ORDER BY rank, prompt_uuid",
+            (quota.split,),
+        )
+        filled = 0
+        for prompt_uuid, split, category, messages_json in cursor:
+            if prompt_uuid in selected_uuids:
+                continue
+            selected.append(PilotRow(prompt_uuid, split, category, messages_json))
+            selected_uuids.add(prompt_uuid)
+            filled += 1
+            if filled == quota.rows:
+                break
+        if filled != quota.rows:
+            raise PilotError(
+                f"{arm}/{quota.category}/{quota.split} has {filled} unique eligible rows, "
+                f"below exact quota {quota.rows}"
+            )
+    return tuple(sorted(selected, key=lambda row: (_rank(row, config.seed), row.prompt_uuid)))
 
 
 def _select_arm(
@@ -417,8 +507,14 @@ def _build_pilot_bundles_for_test(
     )
     if output_root.exists():
         raise PilotError(f"publication destination already exists: {output_root}")
+    scratch_parent = Path(scratch_root) if scratch_root is not None else output_root.parent
+    if not scratch_parent.is_dir():
+        raise PilotError(f"scratch parent is not a directory: {scratch_parent}")
     selected = select_pilot_rows(
-        split_rows, config=config, held_out_prompt_uuids=held_out_prompt_uuids
+        split_rows,
+        config=config,
+        held_out_prompt_uuids=held_out_prompt_uuids,
+        scratch_root=scratch_parent,
     )
     effective_workers = workers if workers is not None else config.workers
     tokens_by_arm = {
@@ -435,9 +531,6 @@ def _build_pilot_bundles_for_test(
                 f"but selected rows contain {sum(counts)}"
             )
 
-    scratch_parent = Path(scratch_root) if scratch_root is not None else output_root.parent
-    if not scratch_parent.is_dir():
-        raise PilotError(f"scratch parent is not a directory: {scratch_parent}")
     partial = Path(tempfile.mkdtemp(prefix=f".{output_root.name}.scratch-", dir=scratch_parent))
     os.chmod(partial, 0o700)
     local_partial: Path | None = None
@@ -599,7 +692,20 @@ def _count_selected_rows(
 
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            return tuple(executor.map(count, rows))
+            limit = max(1, workers * 2)
+            pending: dict[Future[int], int] = {}
+            results = [0] * len(rows)
+            next_index = 0
+            while next_index < len(rows) or pending:
+                while next_index < len(rows) and len(pending) < limit:
+                    future = executor.submit(count, rows[next_index])
+                    pending[future] = next_index
+                    next_index += 1
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index = pending.pop(future)
+                    results[index] = future.result()
+            return tuple(results)
     except PilotError:
         raise
     except Exception as error:

@@ -38,15 +38,15 @@ def _row(split: str, index: int, *, duplicate_prompt: str | None = None) -> dict
 
 def _all_split_rows(extra_per_split: int = 0) -> dict[str, list[dict]]:
     counts = {
-        "chat": 48_286,
-        "math": 25_000,
-        "code": 20_000,
-        "stem": 25_000,
-        "multilingual_de": 2_000,
-        "multilingual_es": 2_000,
-        "multilingual_fr": 2_000,
-        "multilingual_it": 2_000,
-        "multilingual_ja": 2_000,
+        "chat": 4,
+        "math": 4,
+        "code": 4,
+        "stem": 4,
+        "multilingual_de": 2,
+        "multilingual_es": 2,
+        "multilingual_fr": 2,
+        "multilingual_it": 2,
+        "multilingual_ja": 2,
     }
     return {
         split: [_row(split, index) for index in range(count + extra_per_split)]
@@ -58,45 +58,77 @@ def _category_counts(selection, arm: str) -> Counter[str]:
     return Counter(row.category for row in selection.rows_for(arm))
 
 
+def _scaled_config(module, *, seed: int = 20_260_822, workers: int = 1):
+    return module.PilotConfig(
+        seed=seed,
+        workers=workers,
+        historical_quotas=(
+            module.PilotQuota("chat", "chat", 4),
+            module.PilotQuota("math", "math", 2),
+            module.PilotQuota("code", "code", 2),
+            module.PilotQuota("stem", "stem", 2),
+        ),
+        balanced_quotas=(
+            module.PilotQuota("math", "math", 1),
+            module.PilotQuota("code", "code", 1),
+            module.PilotQuota("stem", "stem", 1),
+            module.PilotQuota("chat", "chat", 2),
+            module.PilotQuota("multilingual", "multilingual_de", 1),
+            module.PilotQuota("multilingual", "multilingual_es", 1),
+            module.PilotQuota("multilingual", "multilingual_fr", 1),
+            module.PilotQuota("multilingual", "multilingual_it", 1),
+            module.PilotQuota("multilingual", "multilingual_ja", 1),
+        ),
+    )
+
+
 def test_quota_selection_uses_exact_historical_and_balanced_quotas() -> None:
     """A changed quota or category mapping must change the selected row counts."""
     module = _load_module()
 
-    selection = module.select_pilot_rows(_all_split_rows(), config=module.PilotConfig())
+    config = _scaled_config(module)
+    selection = module.select_pilot_rows(_all_split_rows(), config=config)
+
+    assert tuple(quota.rows for quota in module.PilotConfig().historical_quotas) == (
+        48_286,
+        18_420,
+        13_462,
+        19_832,
+    )
 
     assert _category_counts(selection, "historical-proportion") == {
-        "chat": 48_286,
-        "math": 18_420,
-        "code": 13_462,
-        "stem": 19_832,
+        "chat": 4,
+        "math": 2,
+        "code": 2,
+        "stem": 2,
     }
     assert _category_counts(selection, "balanced") == {
-        "math": 25_000,
-        "code": 20_000,
-        "stem": 25_000,
-        "chat": 20_000,
-        "multilingual": 10_000,
+        "math": 1,
+        "code": 1,
+        "stem": 1,
+        "chat": 2,
+        "multilingual": 5,
     }
-    assert len(selection.rows_for("historical-proportion")) == 100_000
-    assert len(selection.rows_for("balanced")) == 100_000
+    assert len(selection.rows_for("historical-proportion")) == 10
+    assert len(selection.rows_for("balanced")) == 10
 
 
 def test_quota_selection_uses_exact_multilingual_language_quotas() -> None:
     """A language-quota regression must be visible in the selected balanced rows."""
     module = _load_module()
 
-    selection = module.select_pilot_rows(_all_split_rows(), config=module.PilotConfig())
+    selection = module.select_pilot_rows(_all_split_rows(), config=_scaled_config(module))
 
     assert Counter(row.split for row in selection.rows_for("balanced")) == {
-        "math": 25_000,
-        "code": 20_000,
-        "stem": 25_000,
-        "chat": 20_000,
-        "multilingual_de": 2_000,
-        "multilingual_es": 2_000,
-        "multilingual_fr": 2_000,
-        "multilingual_it": 2_000,
-        "multilingual_ja": 2_000,
+        "math": 1,
+        "code": 1,
+        "stem": 1,
+        "chat": 2,
+        "multilingual_de": 1,
+        "multilingual_es": 1,
+        "multilingual_fr": 1,
+        "multilingual_it": 1,
+        "multilingual_ja": 1,
     }
 
 
@@ -106,8 +138,10 @@ def test_parallel_selection_is_stable_when_input_is_reversed() -> None:
     rows = _all_split_rows(extra_per_split=5)
     reversed_rows = {split: list(reversed(values)) for split, values in rows.items()}
 
-    one_worker = module.select_pilot_rows(rows, config=module.PilotConfig(workers=1))
-    many_workers = module.select_pilot_rows(reversed_rows, config=module.PilotConfig(workers=96))
+    one_worker = module.select_pilot_rows(rows, config=_scaled_config(module, workers=1))
+    many_workers = module.select_pilot_rows(
+        reversed_rows, config=_scaled_config(module, workers=96)
+    )
 
     for arm in ("historical-proportion", "balanced"):
         assert [row.prompt_uuid for row in one_worker.rows_for(arm)] == [
@@ -123,7 +157,7 @@ def test_duplicate_refill_is_global_and_excludes_held_out_prompt() -> None:
     held_out = module.prompt_uuid_from_messages(rows["math"][1]["messages"])
 
     selection = module.select_pilot_rows(
-        rows, config=module.PilotConfig(), held_out_prompt_uuids={held_out}
+        rows, config=_scaled_config(module), held_out_prompt_uuids={held_out}
     )
 
     for arm in ("historical-proportion", "balanced"):
@@ -131,8 +165,8 @@ def test_duplicate_refill_is_global_and_excludes_held_out_prompt() -> None:
         identities = [row.prompt_uuid for row in selected]
         assert len(identities) == len(set(identities))
         assert held_out not in identities
-        assert len(selected) == 100_000
-    assert _category_counts(selection, "balanced")["math"] == 25_000
+        assert len(selected) == 10
+    assert _category_counts(selection, "balanced")["math"] == 1
 
 
 def test_seed_change_changes_selected_ids() -> None:
@@ -140,8 +174,8 @@ def test_seed_change_changes_selected_ids() -> None:
     module = _load_module()
     rows = _all_split_rows(extra_per_split=20)
 
-    baseline = module.select_pilot_rows(rows, config=module.PilotConfig(seed=20_260_822))
-    changed = module.select_pilot_rows(rows, config=module.PilotConfig(seed=7))
+    baseline = module.select_pilot_rows(rows, config=_scaled_config(module, seed=20_260_822))
+    changed = module.select_pilot_rows(rows, config=_scaled_config(module, seed=7))
 
     assert [row.prompt_uuid for row in baseline.rows_for("balanced")] != [
         row.prompt_uuid for row in changed.rows_for("balanced")
@@ -342,3 +376,119 @@ def test_linux_noreplace_maps_racing_destination_to_pilot_error(
             producer_source_commit="b" * 40,
         )
     assert not output.exists()
+
+
+class _OneShotRows:
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+        self.iterations = 0
+
+    def __iter__(self):
+        if self.iterations:
+            raise AssertionError("source was replayed")
+        self.iterations += 1
+        yield from self._rows
+
+
+def test_selection_spools_one_shot_input_privately_without_durable_partial(tmp_path: Path) -> None:
+    """A selector that lists/replays source rows or leaks its spool must fail this test."""
+    module = _load_module()
+    quota = module.PilotQuota("chat", "chat", 2)
+    config = module.PilotConfig(
+        historical_quotas=(quota,), balanced_quotas=(quota,), source_revision="c" * 40
+    )
+    source = _OneShotRows([_row("chat", index) for index in range(5)])
+
+    selection = module.select_pilot_rows({"chat": source}, config=config, scratch_root=tmp_path)
+
+    assert len(selection.historical_proportion) == 2
+    assert source.iterations == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_execution_metadata_cannot_override_worker_receipt(tmp_path: Path) -> None:
+    """Allowing caller metadata to replace worker evidence makes the receipt untrustworthy."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        producer_source_commit="b" * 40,
+        workers=2,
+        execution={"requested_workers": 999, "effective_workers": 999},
+    )
+
+    execution = json.loads((output / "balanced" / "EXECUTION.json").read_text())
+    assert execution["requested_workers"] == 1
+    assert execution["effective_workers"] == 2
+
+
+def test_execution_receipt_tamper_is_rejected_independently(tmp_path: Path) -> None:
+    """Skipping execution-descriptor replay accepts a modified allocation receipt."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+    execution = output / "balanced" / "EXECUTION.json"
+    execution.write_text('{"effective_workers":99}\n', encoding="utf-8")
+
+    with pytest.raises(module.PilotError, match="execution receipt"):
+        module.verify_pilot_completion(output)
+
+
+def test_tokenization_keeps_inflight_work_bounded(monkeypatch) -> None:
+    """Eagerly submitting every selected row must overflow this bounded executor."""
+    module = _load_module()
+
+    class _Future:
+        def __init__(self, value: int) -> None:
+            self._value = value
+
+        def result(self) -> int:
+            return self._value
+
+    executors = []
+
+    class _BoundedExecutor:
+        def __init__(self, *, max_workers: int) -> None:
+            self._max_workers = max_workers
+            self._submitted = 0
+            executors.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def submit(self, function, row):
+            self._submitted += 1
+            if self._submitted > self._max_workers * 2:
+                raise AssertionError("unbounded token work")
+            return _Future(function(row))
+
+    def complete_one(pending, **_kwargs):
+        executors[0]._submitted -= 1
+        return {next(iter(pending))}, set()
+
+    monkeypatch.setattr(module, "ThreadPoolExecutor", _BoundedExecutor)
+    monkeypatch.setattr(module, "wait", complete_one)
+    rows = tuple(
+        module.PilotRow(
+            "a" * 63 + str(index), "chat", "chat", json.dumps(_row("chat", index)["messages"])
+        )
+        for index in range(6)
+    )
+
+    assert module._count_selected_rows(_MaskTokenizer(), rows, workers=2) == (6,) * 6
