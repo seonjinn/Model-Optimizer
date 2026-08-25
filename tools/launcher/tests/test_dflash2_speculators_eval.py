@@ -45,6 +45,12 @@ from common.specdec.dflash2_speculators_eval import (
     validate_target_control_receipt,
     validate_tie_aware_pilot_receipt,
 )
+from common.specdec.dflash2_speculators_eval import (
+    _expected_dflash2_server_args as expected_dflash2_server_args,
+)
+from common.specdec.dflash2_speculators_eval import (
+    _expected_target_server_args as expected_target_server_args,
+)
 from common.specdec.dflash2_target_contract import dflash2_target_spec
 
 _LAUNCHER = Path(__file__).resolve().parents[1]
@@ -678,7 +684,7 @@ def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
     )
     monkeypatch.setattr(
         "common.specdec.dflash2_speculators_eval._validate_target_control_manifest",
-        lambda *_args: (
+        lambda *_args, **_kwargs: (
             target_manifest_payload,
             target_fingerprint,
             {"inputs": {}},
@@ -732,11 +738,15 @@ def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
 
 
 def test_internal_target_phase_is_bounded_and_routes_enforce_eager_without_speed() -> None:
-    """Compiled and eager diagnostics use detailed metrics and stop before speed cells."""
+    """Compiled/eager/KV-isolated diagnostics stop before every speed cell."""
     pair = _PAIR.read_text()
     wrapper = _WRAPPER.read_text()
 
-    for phase in ("internal-target", "internal-target-eager"):
+    for phase in (
+        "internal-target",
+        "internal-target-eager",
+        "internal-target-eager-no-prefix",
+    ):
         assert f"{phase}:1:200:2" in pair
     branch = pair.index('if [[ "${PAIR_PHASE}" == internal-target')
     capture = pair.index("run_pair_cells 1", branch)
@@ -747,8 +757,42 @@ def test_internal_target_phase_is_bounded_and_routes_enforce_eager_without_speed
     assert branch < capture < analyze < verify < stop < speed
     assert 'DFLASH2_INTERNAL_TARGET="${DFLASH2_INTERNAL_TARGET_MODE}"' in pair
     assert 'DFLASH2_ENFORCE_EAGER="${DFLASH2_ENFORCE_EAGER_MODE}"' in pair
+    assert 'DFLASH2_DISABLE_PREFIX_CACHING="${DFLASH2_DISABLE_PREFIX_CACHING_MODE}"' in pair
     assert "--per-request-spec-decode-metrics detailed" in wrapper
     assert "SERVER_ARGS+=(--enforce-eager)" in wrapper
+    assert "SERVER_ARGS+=(--no-enable-prefix-caching)" in wrapper
+
+
+def test_internal_target_no_prefix_manifest_args_are_exact_and_fail_closed() -> None:
+    """Receipt validation has one exact server-argument contract for KV isolation."""
+    target = expected_target_server_args("/target", "8000", disable_prefix_caching=True)
+    draft = expected_dflash2_server_args(
+        "/target",
+        "/draft",
+        "8010",
+        detailed_metrics=True,
+        enforce_eager=True,
+        disable_prefix_caching=True,
+    )
+
+    assert target[-1] == "--no-enable-prefix-caching"
+    assert draft[-2:] == ["--enforce-eager", "--no-enable-prefix-caching"]
+    assert expected_target_server_args("/target", "8000") == target[:-1]
+    assert (
+        expected_dflash2_server_args(
+            "/target", "/draft", "8010", detailed_metrics=True, enforce_eager=True
+        )
+        == draft[:-1]
+    )
+    with pytest.raises(ValueError, match="prefix caching requires eager"):
+        expected_dflash2_server_args(
+            "/target",
+            "/draft",
+            "8010",
+            detailed_metrics=True,
+            enforce_eager=False,
+            disable_prefix_caching=True,
+        )
 
 
 def test_tie_aware_pilot_summary_fails_closed_on_unresolved_rows(tmp_path: Path) -> None:

@@ -60,6 +60,7 @@ DIVERGENCE_PROBE_MODE=0
 TIE_AWARE_PILOT_MODE=0
 DFLASH2_INTERNAL_TARGET_MODE=0
 DFLASH2_ENFORCE_EAGER_MODE=0
+DFLASH2_DISABLE_PREFIX_CACHING_MODE=0
 
 [[ "$(git -C "${MODELOPT_REPO}" rev-parse HEAD)" == "${MODELOPT_SHA}" ]]
 [[ -z "$(git -C "${MODELOPT_REPO}" status --porcelain)" ]]
@@ -197,6 +198,7 @@ run_cell() {
         TIE_AWARE_PILOT="${TIE_AWARE_PILOT_MODE}" \
         DFLASH2_INTERNAL_TARGET="${DFLASH2_INTERNAL_TARGET_MODE}" \
         DFLASH2_ENFORCE_EAGER="${DFLASH2_ENFORCE_EAGER_MODE}" \
+        DFLASH2_DISABLE_PREFIX_CACHING="${DFLASH2_DISABLE_PREFIX_CACHING_MODE}" \
         CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
         CONTAINER_IDENTITY_PATH="${CONTAINER_IDENTITY_PATH}" \
         bash "${WRAPPER}"
@@ -285,7 +287,7 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
         IFS='|' read -r _ _ _ concurrency max_requests _ _ tp_size <<<"${descriptor}"
         tp_size="${tp_size:-2}"
         case "${PAIR_PHASE}:${concurrency}:${max_requests}:${tp_size}" in
-            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2|mismatch:1:200:2|tie-pilot:1:200:2|internal-target:1:200:2|internal-target-eager:1:200:2) ;;
+            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2|mismatch:1:200:2|tie-pilot:1:200:2|internal-target:1:200:2|internal-target-eager:1:200:2|internal-target-eager-no-prefix:1:200:2) ;;
             *) echo "ERROR: matched DFlash2 cells require C1/C32, 200 requests, and TP2" >&2; exit 2 ;;
         esac
     done
@@ -368,19 +370,23 @@ run_pair_cells() {
 
 if [[ "${PAIR_PHASE}" == diagnostic || "${PAIR_PHASE}" == mismatch \
     || "${PAIR_PHASE}" == tie-pilot || "${PAIR_PHASE}" == internal-target \
-    || "${PAIR_PHASE}" == internal-target-eager ]]; then
+    || "${PAIR_PHASE}" == internal-target-eager \
+    || "${PAIR_PHASE}" == internal-target-eager-no-prefix ]]; then
     readonly ALLOCATION_RECEIPT_PATH="${RESULT_ROOT}/allocation-receipt.json"
     "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" allocation-receipt \
         --output "${ALLOCATION_RECEIPT_PATH}"
 fi
 
-if [[ "${PAIR_PHASE}" == internal-target || "${PAIR_PHASE}" == internal-target-eager ]]; then
+if [[ "${PAIR_PHASE}" == internal-target || "${PAIR_PHASE}" == internal-target-eager \
+    || "${PAIR_PHASE}" == internal-target-eager-no-prefix ]]; then
     [[ -r "${SOURCE_TIE_PILOT_RECEIPT_PATH:-}" ]] || {
         echo "ERROR: SOURCE_TIE_PILOT_RECEIPT_PATH is required for internal-target diagnosis" >&2
         exit 2
     }
     DFLASH2_INTERNAL_TARGET_MODE=1
     [[ "${PAIR_PHASE}" == internal-target ]] || DFLASH2_ENFORCE_EAGER_MODE=1
+    [[ "${PAIR_PHASE}" != internal-target-eager-no-prefix ]] \
+        || DFLASH2_DISABLE_PREFIX_CACHING_MODE=1
     run_pair_cells 1
     baseline_label="$(cell_label "${CELL_A}")"
     dflash2_label="$(cell_label "${CELL_B}")"

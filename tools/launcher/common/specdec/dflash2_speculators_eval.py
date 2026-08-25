@@ -928,8 +928,63 @@ def _validate_artifact_identity(path: Path) -> dict[str, Any]:
     return identity
 
 
+def _expected_target_server_args(
+    target_path: str, port: str, *, disable_prefix_caching: bool = False
+) -> list[str]:
+    args = [
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        target_path,
+        "--tensor-parallel-size",
+        "2",
+        "--port",
+        port,
+    ]
+    if disable_prefix_caching:
+        args.append("--no-enable-prefix-caching")
+    return args
+
+
+def _expected_dflash2_server_args(
+    target_path: str,
+    draft_path: str,
+    port: str,
+    *,
+    detailed_metrics: bool = False,
+    enforce_eager: bool = False,
+    disable_prefix_caching: bool = False,
+) -> list[str]:
+    if disable_prefix_caching and not enforce_eager:
+        raise ValueError("disabling prefix caching requires eager DFlash2 diagnosis")
+    args = _expected_target_server_args(target_path, port)
+    args.extend(
+        [
+            "--speculative-config",
+            _canonical(
+                {
+                    "method": "dflash",
+                    "model": draft_path,
+                    "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
+                }
+            ),
+        ]
+    )
+    if detailed_metrics:
+        args.extend(["--per-request-spec-decode-metrics", "detailed"])
+    if enforce_eager:
+        args.append("--enforce-eager")
+    if disable_prefix_caching:
+        args.append("--no-enable-prefix-caching")
+    return args
+
+
 def _validate_target_control_manifest(
-    path: Path, artifact_identity_path: Path, identity: dict[str, Any]
+    path: Path,
+    artifact_identity_path: Path,
+    identity: dict[str, Any],
+    *,
+    disable_prefix_caching: bool = False,
 ) -> tuple[dict[str, Any], Path, dict[str, Any], Path]:
     manifest = _load_json(path)
     evaluation = manifest.get("evaluation")
@@ -958,6 +1013,11 @@ def _validate_target_control_manifest(
         recorded_at = datetime.fromisoformat(str(manifest.get("recorded_at", "")))
     except ValueError as error:
         raise ValueError("target control recorded_at is invalid") from error
+    expected_server_args = _expected_target_server_args(
+        target["path"],
+        server_args[7] if isinstance(server_args, list) and len(server_args) > 7 else "",
+        disable_prefix_caching=disable_prefix_caching,
+    )
     if (
         set(manifest) != _CONTROL_MANIFEST_KEYS
         or manifest.get("method") != "baseline"
@@ -978,17 +1038,7 @@ def _validate_target_control_manifest(
             value == "--speculative-config" or value.startswith("--speculative-config=")
             for value in server_args
         )
-        or server_args[:6]
-        != [
-            "-m",
-            "vllm.entrypoints.cli.main",
-            "serve",
-            target["path"],
-            "--tensor-parallel-size",
-            "2",
-        ]
-        or len(server_args) != 8
-        or server_args[6] != "--port"
+        or server_args != expected_server_args
         or server_args[7] not in {"8000", "8010"}
         or not isinstance(config_sha256, dict)
         or set(config_sha256) != {"launcher", "target"}
@@ -1936,6 +1986,7 @@ def _validate_dflash2_probe_manifest(
     *,
     detailed_metrics: bool = False,
     enforce_eager: bool = False,
+    disable_prefix_caching: bool = False,
 ) -> tuple[dict[str, Any], Path, Path]:
     manifest = _load_json(path)
     target = identity["target"]
@@ -1960,28 +2011,14 @@ def _validate_dflash2_probe_manifest(
         "evaluation",
         "artifact_identity",
     )
-    expected_server_args = [
-        "-m",
-        "vllm.entrypoints.cli.main",
-        "serve",
+    expected_server_args = _expected_dflash2_server_args(
         target["path"],
-        "--tensor-parallel-size",
-        "2",
-        "--port",
+        draft["export_path"],
         server_args[7] if isinstance(server_args, list) and len(server_args) > 7 else "",
-        "--speculative-config",
-        _canonical(
-            {
-                "method": "dflash",
-                "model": draft["export_path"],
-                "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
-            }
-        ),
-    ]
-    if detailed_metrics:
-        expected_server_args.extend(["--per-request-spec-decode-metrics", "detailed"])
-    if enforce_eager:
-        expected_server_args.append("--enforce-eager")
+        detailed_metrics=detailed_metrics,
+        enforce_eager=enforce_eager,
+        disable_prefix_caching=disable_prefix_caching,
+    )
     if (
         set(manifest) != _CONTROL_MANIFEST_KEYS
         or manifest.get("status") != "success"
@@ -2390,7 +2427,9 @@ def capture_internal_target_diagnostic(
     """Capture the fixed RCA rows with online logits and detailed acceptance evidence."""
     if role not in {"target", "dflash2"}:
         raise ValueError("internal-target role must be target or dflash2")
-    if engine_mode not in {"compiled", "eager"} or (role == "target" and engine_mode != "compiled"):
+    if engine_mode not in {"compiled", "eager", "eager-no-prefix"} or (
+        role == "target" and engine_mode != "compiled"
+    ):
         raise ValueError("internal-target engine mode mismatch")
     prompt_set = compute_prompt_set(dataset_manifest_path, hf_home)
     files = prompt_set.get("files")
@@ -2515,7 +2554,7 @@ def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str,
                 value.get("schema_version") != 1
                 or value.get("producer") != "q30-dflash2-internal-target-row-v1"
                 or value.get("role") != expected_role
-                or value.get("engine_mode") not in {"compiled", "eager"}
+                or value.get("engine_mode") not in {"compiled", "eager", "eager-no-prefix"}
                 or (expected_role == "target" and value.get("engine_mode") != "compiled")
                 or value.get("subset") != "HumanEval"
                 or isinstance(value.get("index"), bool)
@@ -2898,10 +2937,14 @@ def build_internal_target_diagnostic_receipt(
         for target, dflash in zip(target_rows, dflash_rows, strict=True)
     ):
         raise ValueError("internal-target paired prompt token IDs mismatch")
-    target_evidence = _validate_target_control_manifest(
-        target_manifest_path, artifact_identity_path, identity
-    )
     engine_mode = dflash_rows[0]["engine_mode"]
+    disable_prefix_caching = engine_mode == "eager-no-prefix"
+    target_evidence = _validate_target_control_manifest(
+        target_manifest_path,
+        artifact_identity_path,
+        identity,
+        disable_prefix_caching=disable_prefix_caching,
+    )
     dflash_manifest, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
         dflash2_manifest_path,
         target_evidence[0],
@@ -2909,7 +2952,8 @@ def build_internal_target_diagnostic_receipt(
         artifact_identity_path,
         identity,
         detailed_metrics=True,
-        enforce_eager=engine_mode == "eager",
+        enforce_eager=engine_mode in {"eager", "eager-no-prefix"},
+        disable_prefix_caching=disable_prefix_caching,
     )
     allocation = validate_target_control_allocation_receipt(allocation_receipt_path)
     current = _query_current_allocation()
@@ -2989,10 +3033,14 @@ def validate_internal_target_diagnostic_receipt(path: Path) -> dict[str, Any]:
         for target, dflash in zip(target_rows, dflash_rows, strict=True)
     ):
         raise ValueError("internal-target paired prompt token IDs mismatch")
-    target_evidence = _validate_target_control_manifest(
-        evidence["manifests"]["target"], artifact_path, identity
-    )
     engine_mode = dflash_rows[0]["engine_mode"]
+    disable_prefix_caching = engine_mode == "eager-no-prefix"
+    target_evidence = _validate_target_control_manifest(
+        evidence["manifests"]["target"],
+        artifact_path,
+        identity,
+        disable_prefix_caching=disable_prefix_caching,
+    )
     dflash_manifest, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
         evidence["manifests"]["dflash2"],
         target_evidence[0],
@@ -3000,7 +3048,8 @@ def validate_internal_target_diagnostic_receipt(path: Path) -> dict[str, Any]:
         artifact_path,
         identity,
         detailed_metrics=True,
-        enforce_eager=engine_mode == "eager",
+        enforce_eager=engine_mode in {"eager", "eager-no-prefix"},
+        disable_prefix_caching=disable_prefix_caching,
     )
     allocation = validate_target_control_allocation_receipt(allocation_path)
     if any(

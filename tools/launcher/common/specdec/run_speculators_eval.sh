@@ -457,6 +457,13 @@ if [[ "${SPEC_METHOD}" == dflash2 && "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; th
         SERVER_ARGS+=(--enforce-eager)
     fi
 fi
+if [[ "${DFLASH2_DISABLE_PREFIX_CACHING:-0}" == 1 ]]; then
+    [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 && "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]] || {
+        echo "ERROR: disabling prefix caching is restricted to eager internal-target diagnosis" >&2
+        exit 2
+    }
+    SERVER_ARGS+=(--no-enable-prefix-caching)
+fi
 if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
     [[ "${CAPTURE_EQUIVALENCE:-0}:${EQUIVALENCE_ONLY:-0}:${MAX_CONCURRENCY}:${MAX_REQUESTS}" \
         == "1:1:1:200" ]] || {
@@ -511,6 +518,10 @@ if [[ "${CAPTURE_EQUIVALENCE:-0}" == 1 ]]; then
         fi
         if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 && "${SPEC_METHOD}" == dflash2 ]]; then
             internal_engine_mode=eager
+        fi
+        if [[ "${DFLASH2_DISABLE_PREFIX_CACHING:-0}" == 1 \
+            && "${SPEC_METHOD}" == dflash2 ]]; then
+            internal_engine_mode=eager-no-prefix
         fi
         "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
             "${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-internal-target \
