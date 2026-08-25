@@ -2062,6 +2062,511 @@ def validate_divergence_probe_receipt(path: Path) -> dict[str, Any]:
     return {**payload, "receipt_sha256": claim}
 
 
+def classify_tie_aware_rows(target: dict[str, Any], dflash2: dict[str, Any]) -> dict[str, Any]:
+    """Classify one paired row using the target's online first-divergence distribution."""
+    identity_fields = (
+        "subset",
+        "index",
+        "source_row",
+        "prompt_sha256",
+        "request_core_sha256",
+        "prompt_token_ids",
+    )
+    if any(target.get(name) != dflash2.get(name) for name in identity_fields):
+        raise ValueError("tie-aware paired row identity mismatch")
+    target_ids = target.get("token_ids")
+    dflash_ids = dflash2.get("token_ids")
+    top_logprobs = target.get("top_logprobs")
+    if (
+        not isinstance(target_ids, list)
+        or not isinstance(dflash_ids, list)
+        or not isinstance(top_logprobs, list)
+    ):
+        return {
+            "subset": target.get("subset"),
+            "index": target.get("index"),
+            "source_row": target.get("source_row"),
+            "class": "unresolved-target-evidence",
+        }
+    common = 0
+    while (
+        common < min(len(target_ids), len(dflash_ids))
+        and target_ids[common] == dflash_ids[common]
+    ):
+        common += 1
+    base = {
+        "subset": target.get("subset"),
+        "index": target.get("index"),
+        "source_row": target.get("source_row"),
+    }
+    if common == len(target_ids) == len(dflash_ids):
+        if len(target_ids) != len(top_logprobs):
+            return {**base, "class": "unresolved-target-evidence"}
+        for position, (token, distribution) in enumerate(
+            zip(target_ids, top_logprobs, strict=True)
+        ):
+            if (
+                not isinstance(distribution, dict)
+                or not distribution
+                or any(
+                    not isinstance(key, str)
+                    or re.fullmatch(r"token_id:[0-9]+", key) is None
+                    or not isinstance(logprob, (int, float))
+                    or isinstance(logprob, bool)
+                    or not math.isfinite(logprob)
+                    for key, logprob in distribution.items()
+                )
+            ):
+                return {**base, "class": "unresolved-target-evidence", "position": position}
+            emitted = distribution.get(f"token_id:{token}")
+            if (
+                not isinstance(emitted, (int, float))
+                or isinstance(emitted, bool)
+                or float(emitted) != max(map(float, distribution.values()))
+            ):
+                return {**base, "class": "unresolved-target-evidence", "position": position}
+        if target.get("finish_reason") == dflash2.get("finish_reason"):
+            return {**base, "class": "exact"}
+        return {**base, "class": "unresolved-termination", "common_prefix_tokens": common}
+    if common >= len(target_ids) or common >= len(dflash_ids):
+        return {**base, "class": "unresolved-termination", "common_prefix_tokens": common}
+    if common >= len(top_logprobs):
+        return {**base, "class": "unresolved-target-evidence", "position": common}
+    top = top_logprobs[common]
+    target_token = target_ids[common]
+    draft_token = dflash_ids[common]
+    if not isinstance(top, dict) or not top:
+        return {**base, "class": "unresolved-target-evidence", "position": common}
+    if any(
+        not isinstance(key, str)
+        or not key.startswith("token_id:")
+        or not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        for key, value in top.items()
+    ):
+        return {**base, "class": "unresolved-target-evidence", "position": common}
+    maximum = max(float(value) for value in top.values())
+    target_value = top.get(f"token_id:{target_token}")
+    if (
+        not isinstance(target_value, (int, float))
+        or isinstance(target_value, bool)
+        or float(target_value) != maximum
+    ):
+        return {**base, "class": "unresolved-target-evidence", "position": common}
+    draft_value = top.get(f"token_id:{draft_token}")
+    if not isinstance(draft_value, (int, float)) or isinstance(draft_value, bool):
+        return {
+            **base,
+            "class": "unresolved-top20",
+            "position": common,
+            "target_token_id": target_token,
+            "dflash2_token_id": draft_token,
+        }
+    draft_float = float(draft_value)
+    rank = 1 + sum(float(value) > draft_float for value in top.values())
+    return {
+        **base,
+        "class": "tied-target-valid" if draft_float == maximum else "target-invalid",
+        "position": common,
+        "target_token_id": target_token,
+        "dflash2_token_id": draft_token,
+        "dflash2_token_target_rank": rank,
+        "target_max_logprob": maximum,
+        "dflash2_token_logprob": draft_float,
+    }
+
+
+def capture_tie_aware_pilot(
+    dataset_manifest_path: Path,
+    hf_home: Path,
+    output_path: Path,
+    *,
+    endpoint: str,
+    model: str,
+    role: str,
+) -> None:
+    """Stream the exact 200 HumanEval occurrences for the tie-aware pilot."""
+    if role not in {"target", "dflash2"}:
+        raise ValueError("tie-aware capture role must be target or dflash2")
+    prompt_set = compute_prompt_set(dataset_manifest_path, hf_home)
+    files = prompt_set.get("files")
+    if not isinstance(files, dict) or not isinstance(files.get("HumanEval"), dict):
+        raise ValueError("tie-aware HumanEval prompt evidence is missing")
+    prompts = _read_prompt_prefix(Path(str(files["HumanEval"]["path"])), 200)
+    if len(prompts) != 200:
+        raise ValueError("tie-aware pilot requires exactly 200 HumanEval occurrences")
+    if output_path.exists():
+        raise FileExistsError(f"tie-aware output exists: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{output_path.name}.", dir=output_path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            for index, (source_row, prompt) in enumerate(prompts):
+                core = {
+                    "model": model,
+                    "prompt": prompt,
+                    "max_tokens": 64,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "seed": 42,
+                    "request_id": f"specdec-tie-pilot-HumanEval-{index}",
+                }
+                body = {
+                    **core,
+                    "logprobs": 20 if role == "target" else 0,
+                    "return_tokens_as_token_ids": True,
+                    "return_token_ids": True,
+                }
+                choice = _probe_choice(_post_completion(endpoint, body))
+                finish = choice.get("finish_reason")
+                logprobs = choice["logprobs"]
+                assert isinstance(logprobs, dict)
+                top = logprobs["top_logprobs"]
+                if finish not in {"stop", "length"}:
+                    raise ValueError("tie-aware completion finish reason mismatch")
+                extracted = {
+                    "output_text": choice["text"],
+                    "token_ids": choice["token_ids"],
+                    "prompt_token_ids": choice["prompt_token_ids"],
+                    "finish_reason": finish,
+                    "top_logprobs": top if role == "target" else [],
+                }
+                record = {
+                    "schema_version": 1,
+                    "producer": "q30-tie-aware-online-row-v1",
+                    "role": role,
+                    "subset": "HumanEval",
+                    "index": index,
+                    "source_row": source_row,
+                    "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "request_core_sha256": _sha_json(core),
+                    "request_sha256": _sha_json(body),
+                    **extracted,
+                    "response_sha256": _sha_json(extracted),
+                }
+                stream.write(_canonical(record) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _read_tie_aware_pilot_rows(path: Path, expected_role: str) -> list[dict[str, Any]]:
+    expected_keys = {
+        "schema_version",
+        "producer",
+        "role",
+        "subset",
+        "index",
+        "source_row",
+        "prompt_sha256",
+        "request_core_sha256",
+        "request_sha256",
+        "output_text",
+        "token_ids",
+        "prompt_token_ids",
+        "finish_reason",
+        "top_logprobs",
+        "response_sha256",
+    }
+    rows: list[dict[str, Any]] = []
+    with path.open() as stream:
+        for line in stream:
+            value = json.loads(line)
+            if not isinstance(value, dict) or set(value) != expected_keys:
+                raise ValueError("tie-aware pilot row schema mismatch")
+            tokens = value.get("token_ids")
+            prompt_tokens = value.get("prompt_token_ids")
+            top = value.get("top_logprobs")
+            extracted = {
+                "output_text": value.get("output_text"),
+                "token_ids": tokens,
+                "prompt_token_ids": prompt_tokens,
+                "finish_reason": value.get("finish_reason"),
+                "top_logprobs": top,
+            }
+            if (
+                value.get("schema_version") != 1
+                or value.get("producer") != "q30-tie-aware-online-row-v1"
+                or value.get("role") != expected_role
+                or value.get("subset") != "HumanEval"
+                or isinstance(value.get("index"), bool)
+                or not isinstance(value.get("index"), int)
+                or isinstance(value.get("source_row"), bool)
+                or not isinstance(value.get("source_row"), int)
+                or value["source_row"] < 0
+                or not _is_sha256(value.get("prompt_sha256"))
+                or not _is_sha256(value.get("request_core_sha256"))
+                or not _is_sha256(value.get("request_sha256"))
+                or not _is_sha256(value.get("response_sha256"))
+                or value["response_sha256"] != _sha_json(extracted)
+                or not isinstance(value.get("output_text"), str)
+                or value.get("finish_reason") not in {"stop", "length"}
+                or not isinstance(tokens, list)
+                or not all(
+                    isinstance(token, int) and not isinstance(token, bool) and token >= 0
+                    for token in tokens
+                )
+                or not isinstance(prompt_tokens, list)
+                or not prompt_tokens
+                or not all(
+                    isinstance(token, int) and not isinstance(token, bool) and token >= 0
+                    for token in prompt_tokens
+                )
+                or not isinstance(top, list)
+            ):
+                raise ValueError("tie-aware pilot row evidence mismatch")
+            if expected_role != "target" and top:
+                raise ValueError("DFlash2 pilot must not claim target logprob evidence")
+            rows.append(value)
+    if len(rows) != 200 or [row["index"] for row in rows] != list(range(200)):
+        raise ValueError("tie-aware pilot requires exact ordered 200-row schedule")
+    return rows
+
+
+def summarize_tie_aware_pilot(target_path: Path, dflash2_path: Path) -> dict[str, Any]:
+    """Replay the 200-row set-valued greedy correctness classification."""
+    target_rows = _read_tie_aware_pilot_rows(target_path, "target")
+    dflash_rows = _read_tie_aware_pilot_rows(dflash2_path, "dflash2")
+    classifications = [
+        classify_tie_aware_rows(target, dflash)
+        for target, dflash in zip(target_rows, dflash_rows, strict=True)
+    ]
+    counts: dict[str, int] = {}
+    for row in classifications:
+        label = str(row["class"])
+        counts[label] = counts.get(label, 0) + 1
+    unresolved = sum(
+        count for label, count in counts.items() if label.startswith("unresolved-")
+    )
+    return {
+        "schema_version": 1,
+        "producer": "q30-dflash2-tie-aware-pilot-summary-v1",
+        "claim_scope": (
+            "set-valued greedy correctness pilot only; transport/schema capture failures abort "
+            "before receipt; no semantic correctness or speedup claim"
+        ),
+        "subset": "HumanEval",
+        "occurrences": len(classifications),
+        "unique_source_rows": len({row["source_row"] for row in target_rows}),
+        "counts": counts,
+        "status": (
+            "passed"
+            if counts.get("target-invalid", 0) == 0 and unresolved == 0
+            else "failed"
+        ),
+        "classifications": classifications,
+    }
+
+
+def _validate_tie_aware_rows_against_identity(
+    path: Path, role: str, identity: dict[str, Any]
+) -> list[dict[str, Any]]:
+    rows = _read_tie_aware_pilot_rows(path, role)
+    target = identity.get("target")
+    dataset = identity.get("dataset")
+    if not isinstance(target, dict) or not isinstance(dataset, dict):
+        raise ValueError("tie-aware artifact identity mismatch")
+    files = dataset.get("files")
+    schedule = dataset.get("ordered_prompts")
+    if not isinstance(files, dict) or not isinstance(schedule, list):
+        raise ValueError("tie-aware prompt schedule is missing")
+    entry = files.get("HumanEval")
+    if not isinstance(entry, dict):
+        raise ValueError("tie-aware HumanEval file is missing")
+    prompts = _read_prompt_prefix(Path(str(entry.get("path", ""))), 200)
+    expected_schedule = [
+        item
+        for item in schedule
+        if isinstance(item, dict) and item.get("subset") == "HumanEval"
+    ]
+    if len(prompts) != 200 or len(expected_schedule) != 200:
+        raise ValueError("tie-aware pilot needs the authenticated exact-200 schedule")
+    for index, (row, expected, prompt_entry) in enumerate(
+        zip(rows, expected_schedule, prompts, strict=True)
+    ):
+        source_row, prompt = prompt_entry
+        core = {
+            "model": target.get("path"),
+            "prompt": prompt,
+            "max_tokens": 64,
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 42,
+            "request_id": f"specdec-tie-pilot-HumanEval-{index}",
+        }
+        body = {
+            **core,
+            "logprobs": 20 if role == "target" else 0,
+            "return_tokens_as_token_ids": True,
+            "return_token_ids": True,
+        }
+        if (
+            expected
+            != {
+                "subset": "HumanEval",
+                "index": index,
+                "source_row": source_row,
+                "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            }
+            or row["source_row"] != source_row
+            or row["prompt_sha256"] != expected["prompt_sha256"]
+            or row["request_core_sha256"] != _sha_json(core)
+            or row["request_sha256"] != _sha_json(body)
+        ):
+            raise ValueError("tie-aware pilot row does not match artifact schedule")
+    return rows
+
+
+def build_tie_aware_pilot_receipt(
+    target_rows_path: Path,
+    dflash2_rows_path: Path,
+    target_manifest_path: Path,
+    dflash2_manifest_path: Path,
+    artifact_identity_path: Path,
+    allocation_receipt_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Publish the job-authenticated 200-row tie-aware pilot receipt."""
+    identity = _validate_artifact_identity(artifact_identity_path)
+    target_rows = _validate_tie_aware_rows_against_identity(target_rows_path, "target", identity)
+    dflash_rows = _validate_tie_aware_rows_against_identity(
+        dflash2_rows_path, "dflash2", identity
+    )
+    if any(
+        target["prompt_token_ids"] != dflash["prompt_token_ids"]
+        for target, dflash in zip(target_rows, dflash_rows, strict=True)
+    ):
+        raise ValueError("tie-aware paired prompt token IDs mismatch")
+    target_evidence = _validate_target_control_manifest(
+        target_manifest_path, artifact_identity_path, identity
+    )
+    dflash_manifest, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
+        dflash2_manifest_path,
+        target_evidence[0],
+        target_evidence[2],
+        artifact_identity_path,
+        identity,
+    )
+    allocation = validate_target_control_allocation_receipt(allocation_receipt_path)
+    current = _query_current_allocation()
+    for name in (
+        "slurm_job_id",
+        "slurm_job_num_nodes",
+        "slurm_job_nodelist",
+        "gpu_count",
+        "cell_visible_devices",
+    ):
+        if allocation.get(name) != current.get(name):
+            raise ValueError(f"tie-aware pilot live allocation mismatch: {name}")
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"]
+        for manifest in (target_evidence[0], dflash_manifest)
+    ):
+        raise ValueError("tie-aware pilot allocation job mismatch")
+    if {
+        target_evidence[0]["server_args"][-1],
+        dflash_manifest["server_args"][-1],
+    } != {"8000", "8010"}:
+        raise ValueError("tie-aware pilot server ports are not isolated")
+    payload = summarize_tie_aware_pilot(target_rows_path, dflash2_rows_path)
+    payload["allocation_evidence_scope"] = (
+        "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    )
+    payload["artifact_identity"] = _file_descriptor(artifact_identity_path)
+    payload["allocation_receipt"] = _file_descriptor(allocation_receipt_path)
+    payload["rows"] = {
+        "target": _file_descriptor(target_rows_path),
+        "dflash2": _file_descriptor(dflash2_rows_path),
+    }
+    payload["manifests"] = {
+        "target": _file_descriptor(target_manifest_path),
+        "dflash2": _file_descriptor(dflash2_manifest_path),
+    }
+    payload["input_fingerprints"] = {
+        "target": _file_descriptor(target_evidence[1]),
+        "dflash2": _file_descriptor(dflash_fingerprint),
+    }
+    payload["launcher_configs"] = {
+        "target": _file_descriptor(target_evidence[3]),
+        "dflash2": _file_descriptor(dflash_launcher),
+    }
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def validate_tie_aware_pilot_receipt(path: Path) -> dict[str, Any]:
+    """Offline tamper replay for every pilot input and classification."""
+    payload = _load_json(path)
+    claim = payload.pop("receipt_sha256", None)
+    if claim != _sha_json(payload):
+        raise ValueError("tie-aware pilot receipt self-hash mismatch")
+    artifact_path = _validate_file_descriptor(payload.get("artifact_identity"))
+    allocation_path = _validate_file_descriptor(payload.get("allocation_receipt"))
+    evidence: dict[str, dict[str, Path]] = {}
+    for group in ("rows", "manifests", "input_fingerprints", "launcher_configs"):
+        value = payload.get(group)
+        if not isinstance(value, dict) or set(value) != {"target", "dflash2"}:
+            raise ValueError(f"tie-aware pilot {group} schema mismatch")
+        evidence[group] = {name: _validate_file_descriptor(item) for name, item in value.items()}
+    identity = _validate_artifact_identity(artifact_path)
+    target_rows = _validate_tie_aware_rows_against_identity(
+        evidence["rows"]["target"], "target", identity
+    )
+    dflash_rows = _validate_tie_aware_rows_against_identity(
+        evidence["rows"]["dflash2"], "dflash2", identity
+    )
+    if any(
+        target["prompt_token_ids"] != dflash["prompt_token_ids"]
+        for target, dflash in zip(target_rows, dflash_rows, strict=True)
+    ):
+        raise ValueError("tie-aware paired prompt token IDs mismatch")
+    target_evidence = _validate_target_control_manifest(
+        evidence["manifests"]["target"], artifact_path, identity
+    )
+    dflash_manifest, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
+        evidence["manifests"]["dflash2"],
+        target_evidence[0],
+        target_evidence[2],
+        artifact_path,
+        identity,
+    )
+    allocation = validate_target_control_allocation_receipt(allocation_path)
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"]
+        for manifest in (target_evidence[0], dflash_manifest)
+    ):
+        raise ValueError("tie-aware pilot allocation replay mismatch")
+    if {
+        target_evidence[0]["server_args"][-1],
+        dflash_manifest["server_args"][-1],
+    } != {"8000", "8010"}:
+        raise ValueError("tie-aware pilot server ports are not isolated")
+    if evidence["input_fingerprints"] != {
+        "target": target_evidence[1],
+        "dflash2": dflash_fingerprint,
+    } or evidence["launcher_configs"] != {
+        "target": target_evidence[3],
+        "dflash2": dflash_launcher,
+    }:
+        raise ValueError("tie-aware pilot provenance descriptor mismatch")
+    replayed = summarize_tie_aware_pilot(
+        evidence["rows"]["target"], evidence["rows"]["dflash2"]
+    )
+    for name, value in replayed.items():
+        if payload.get(name) != value:
+            raise ValueError(f"tie-aware pilot replay mismatch: {name}")
+    if payload.get("allocation_evidence_scope") != (
+        "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    ):
+        raise ValueError("tie-aware pilot claim scope mismatch")
+    return {**payload, "receipt_sha256": claim}
+
+
 def capture_outputs(
     dataset_manifest_path: Path,
     hf_home: Path,
@@ -2168,6 +2673,14 @@ def main() -> None:
     probe.add_argument("--model", required=True)
     probe.add_argument("--method", required=True, choices=("baseline", "dflash2"))
 
+    tie_capture = commands.add_parser("capture-tie-pilot")
+    tie_capture.add_argument("--dataset-manifest", required=True)
+    tie_capture.add_argument("--hf-home", required=True)
+    tie_capture.add_argument("--output", required=True)
+    tie_capture.add_argument("--endpoint", required=True)
+    tie_capture.add_argument("--model", required=True)
+    tie_capture.add_argument("--role", required=True, choices=("target", "dflash2"))
+
     compare = commands.add_parser("compare-outputs")
     compare.add_argument("--baseline", required=True)
     compare.add_argument("--dflash2", required=True)
@@ -2232,6 +2745,18 @@ def main() -> None:
     verify_diagnosis = commands.add_parser("verify-divergence")
     verify_diagnosis.add_argument("--receipt", required=True)
 
+    tie_analysis = commands.add_parser("analyze-tie-pilot")
+    tie_analysis.add_argument("--target-rows", required=True)
+    tie_analysis.add_argument("--dflash2-rows", required=True)
+    tie_analysis.add_argument("--target-manifest", required=True)
+    tie_analysis.add_argument("--dflash2-manifest", required=True)
+    tie_analysis.add_argument("--artifact-identity", required=True)
+    tie_analysis.add_argument("--allocation-receipt", required=True)
+    tie_analysis.add_argument("--output", required=True)
+
+    tie_verify = commands.add_parser("verify-tie-pilot")
+    tie_verify.add_argument("--receipt", required=True)
+
     args = parser.parse_args()
     if args.command == "prompt-set":
         payload = compute_prompt_set(Path(args.dataset_manifest), Path(args.hf_home))
@@ -2260,6 +2785,15 @@ def main() -> None:
             endpoint=args.endpoint,
             model=args.model,
             method=args.method,
+        )
+    elif args.command == "capture-tie-pilot":
+        capture_tie_aware_pilot(
+            Path(args.dataset_manifest),
+            Path(args.hf_home),
+            Path(args.output),
+            endpoint=args.endpoint,
+            model=args.model,
+            role=args.role,
         )
     elif args.command == "compare-outputs":
         artifact_identity_sha256 = _sha256(Path(args.artifact_identity))
@@ -2299,6 +2833,18 @@ def main() -> None:
         )
     elif args.command == "verify-divergence":
         validate_divergence_probe_receipt(Path(args.receipt))
+    elif args.command == "analyze-tie-pilot":
+        build_tie_aware_pilot_receipt(
+            Path(args.target_rows),
+            Path(args.dflash2_rows),
+            Path(args.target_manifest),
+            Path(args.dflash2_manifest),
+            Path(args.artifact_identity),
+            Path(args.allocation_receipt),
+            Path(args.output),
+        )
+    elif args.command == "verify-tie-pilot":
+        validate_tie_aware_pilot_receipt(Path(args.receipt))
     elif args.command == "summarize":
         correctness = _load_json(Path(args.correctness_receipt))
         claim = correctness.pop("receipt_sha256", None)

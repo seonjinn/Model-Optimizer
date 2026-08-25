@@ -57,6 +57,7 @@ ARTIFACT_IDENTITY_PATH=""
 ARTIFACT_IDENTITY_SHA256=""
 EQUIVALENCE_ONLY_MODE=0
 DIVERGENCE_PROBE_MODE=0
+TIE_AWARE_PILOT_MODE=0
 
 [[ "$(git -C "${MODELOPT_REPO}" rev-parse HEAD)" == "${MODELOPT_SHA}" ]]
 [[ -z "$(git -C "${MODELOPT_REPO}" status --porcelain)" ]]
@@ -191,6 +192,7 @@ run_cell() {
         CAPTURE_EQUIVALENCE="${EQUIVALENCE_ONLY_MODE}" \
         EQUIVALENCE_ONLY="${EQUIVALENCE_ONLY_MODE}" \
         DIVERGENCE_PROBE="${DIVERGENCE_PROBE_MODE}" \
+        TIE_AWARE_PILOT="${TIE_AWARE_PILOT_MODE}" \
         CONTAINER_IMAGE="${CONTAINER_IMAGE}" \
         CONTAINER_IDENTITY_PATH="${CONTAINER_IDENTITY_PATH}" \
         bash "${WRAPPER}"
@@ -279,7 +281,7 @@ if [[ "${method_a}" == dflash2 || "${method_b}" == dflash2 \
         IFS='|' read -r _ _ _ concurrency max_requests _ _ tp_size <<<"${descriptor}"
         tp_size="${tp_size:-2}"
         case "${PAIR_PHASE}:${concurrency}:${max_requests}:${tp_size}" in
-            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2|mismatch:1:200:2) ;;
+            correctness:1:200:2|performance:32:200:2|diagnostic:1:200:2|mismatch:1:200:2|tie-pilot:1:200:2) ;;
             *) echo "ERROR: matched DFlash2 cells require C1/C32, 200 requests, and TP2" >&2; exit 2 ;;
         esac
     done
@@ -360,7 +362,8 @@ run_pair_cells() {
     CHILD_PIDS=()
 }
 
-if [[ "${PAIR_PHASE}" == diagnostic || "${PAIR_PHASE}" == mismatch ]]; then
+if [[ "${PAIR_PHASE}" == diagnostic || "${PAIR_PHASE}" == mismatch \
+    || "${PAIR_PHASE}" == tie-pilot ]]; then
     readonly ALLOCATION_RECEIPT_PATH="${RESULT_ROOT}/allocation-receipt.json"
     "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" allocation-receipt \
         --output "${ALLOCATION_RECEIPT_PATH}"
@@ -406,6 +409,39 @@ if [[ "${PAIR_PHASE}" == mismatch ]]; then
         --output "${RESULT_ROOT}/first-divergence-receipt.json"
     "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-divergence \
         --receipt "${RESULT_ROOT}/first-divergence-receipt.json" >/dev/null
+    exit 0
+fi
+
+if [[ "${PAIR_PHASE}" == tie-pilot ]]; then
+    TIE_AWARE_PILOT_MODE=1
+    run_pair_cells 1
+    baseline_label="$(cell_label "${CELL_A}")"
+    dflash2_label="$(cell_label "${CELL_B}")"
+    [[ "${method_a}" == baseline ]] || {
+        baseline_label="$(cell_label "${CELL_B}")"
+        dflash2_label="$(cell_label "${CELL_A}")"
+    }
+    baseline_run="${RESULT_ROOT}/${baseline_label}/${baseline_label}"
+    dflash2_run="${RESULT_ROOT}/${dflash2_label}/${dflash2_label}"
+    readonly TIE_PILOT_RECEIPT="${RESULT_ROOT}/tie-aware-pilot-receipt.json"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" analyze-tie-pilot \
+        --target-rows "${baseline_run}/tie-aware-pilot.jsonl" \
+        --dflash2-rows "${dflash2_run}/tie-aware-pilot.jsonl" \
+        --target-manifest "${baseline_run}/manifest.json" \
+        --dflash2-manifest "${dflash2_run}/manifest.json" \
+        --artifact-identity "${ARTIFACT_IDENTITY_PATH}" \
+        --allocation-receipt "${ALLOCATION_RECEIPT_PATH}" \
+        --output "${TIE_PILOT_RECEIPT}"
+    "${JOB_CLIENT_RUNTIME}/bin/python3" "${STUDY_HELPER}" verify-tie-pilot \
+        --receipt "${TIE_PILOT_RECEIPT}" >/dev/null
+    "${JOB_CLIENT_RUNTIME}/bin/python3" - "${TIE_PILOT_RECEIPT}" <<'PY'
+import json
+import sys
+
+receipt = json.load(open(sys.argv[1]))
+if receipt.get("status") != "passed":
+    raise SystemExit("tie-aware pilot did not pass fail-closed correctness gate")
+PY
     exit 0
 fi
 

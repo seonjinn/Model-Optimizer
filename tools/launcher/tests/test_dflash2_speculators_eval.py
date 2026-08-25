@@ -24,16 +24,21 @@ from common.specdec.dflash2_speculators_eval import (
     build_artifact_identity,
     build_target_control_allocation_receipt,
     build_target_control_receipt,
+    build_tie_aware_pilot_receipt,
     capture_divergence_probe,
     capture_outputs,
+    capture_tie_aware_pilot,
+    classify_tie_aware_rows,
     compute_prompt_set,
     materialize_prompt_set,
     summarize_pair,
     summarize_target_control,
+    summarize_tie_aware_pilot,
     validate_milestone_export,
     validate_output_equivalence,
     validate_target_control_allocation_receipt,
     validate_target_control_receipt,
+    validate_tie_aware_pilot_receipt,
 )
 from common.specdec.dflash2_target_contract import dflash2_target_spec
 
@@ -236,6 +241,355 @@ def test_capture_divergence_probe_uses_pinned_vllm_token_schema(
     assert calls[0]["return_token_ids"] is True
     assert calls[1]["prompt"] == [1, 2]
     assert calls[2]["prompt"] == [1, 2, 10]
+
+
+def test_tie_aware_classifier_is_fail_closed_for_top20_and_termination() -> None:
+    """The pilot accepts only exact rows or a DFlash token tied at target maximum."""
+
+    def row(tokens: list[int], finish: str, top: list[dict[str, float]]) -> dict[str, Any]:
+        return {
+            "subset": "HumanEval",
+            "index": 0,
+            "source_row": 0,
+            "prompt_sha256": "a" * 64,
+            "request_core_sha256": "b" * 64,
+            "prompt_token_ids": [1, 2],
+            "token_ids": tokens,
+            "output_text": "out",
+            "finish_reason": finish,
+            "top_logprobs": top,
+        }
+
+    target_top = [
+        {"token_id:10": -0.1},
+        {"token_id:11": -0.1, "token_id:99": -0.1, "token_id:77": -3.0},
+    ]
+    target = row([10, 11], "length", target_top)
+
+    assert classify_tie_aware_rows(target, row([10, 11], "length", []))["class"] == "exact"
+    tied = classify_tie_aware_rows(target, row([10, 99], "length", []))
+    assert tied["class"] == "tied-target-valid"
+    assert tied["dflash2_token_target_rank"] == 1
+    assert classify_tie_aware_rows(target, row([10, 77], "length", []))["class"] == (
+        "target-invalid"
+    )
+    assert classify_tie_aware_rows(target, row([10, 88], "length", []))["class"] == (
+        "unresolved-top20"
+    )
+    assert classify_tie_aware_rows(target, row([10], "length", []))["class"] == (
+        "unresolved-termination"
+    )
+    assert classify_tie_aware_rows(target, row([10, 11], "stop", []))["class"] == (
+        "unresolved-termination"
+    )
+    malformed = row([10, 11], "length", [])
+    malformed["top_logprobs"] = [{"token_id:10": -0.1}, {"token_id:11": float("nan")}]
+    assert classify_tie_aware_rows(target=malformed, dflash2=row([10, 11], "length", []))[
+        "class"
+    ] == "unresolved-target-evidence"
+    later_malformed = row(
+        [10, 11, 12],
+        "length",
+        [
+            {"token_id:10": -0.1},
+            {"token_id:11": -0.1, "token_id:99": -0.1},
+            {"token_id:12": float("nan")},
+        ],
+    )
+    earlier_tie = row([10, 99, 55], "length", [])
+    assert classify_tie_aware_rows(later_malformed, earlier_tie)["class"] == (
+        "tied-target-valid"
+    )
+
+
+def test_tie_aware_pilot_streams_exact_humaneval_schedule_and_online_target_logits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Capture cycles the authenticated source rows and preserves online target logits."""
+    manifest, hf_home = _write_prompt_snapshot(tmp_path / "prompts", rows=164)
+    matched_hf = tmp_path / "matched-hf"
+    matched_manifest = tmp_path / "matched-manifest.json"
+    materialize_prompt_set(manifest, hf_home, matched_hf, matched_manifest)
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(_endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+        calls.append(body)
+        return {
+            "choices": [
+                {
+                    "text": "x",
+                    "finish_reason": "length",
+                    "token_ids": [10],
+                    "prompt_token_ids": [1, 2],
+                    "logprobs": {"top_logprobs": [{"token_id:10": -0.1}]},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._post_completion", fake_completion
+    )
+    target_path = tmp_path / "target.jsonl"
+    capture_tie_aware_pilot(
+        matched_manifest,
+        matched_hf,
+        target_path,
+        endpoint="http://target/v1",
+        model="target",
+        role="target",
+    )
+    rows = [json.loads(line) for line in target_path.read_text().splitlines()]
+
+    assert len(rows) == 200
+    assert rows[164]["source_row"] == 0
+    assert rows[164]["prompt_sha256"] == rows[0]["prompt_sha256"]
+    assert all(call["logprobs"] == 20 for call in calls)
+    assert all(call["return_token_ids"] is True for call in calls)
+    assert rows[0]["top_logprobs"] == [{"token_id:10": -0.1}]
+    with pytest.raises(FileExistsError):
+        capture_tie_aware_pilot(
+            matched_manifest,
+            matched_hf,
+            target_path,
+            endpoint="http://target/v1",
+            model="target",
+            role="target",
+        )
+
+
+def test_tie_aware_pilot_summary_fails_closed_on_unresolved_rows(tmp_path: Path) -> None:
+    """Any invalid or unresolved occurrence prevents a passing pilot receipt."""
+    target_path = tmp_path / "target.jsonl"
+    draft_path = tmp_path / "draft.jsonl"
+
+    def record(index: int, role: str, token: int) -> dict[str, Any]:
+        top = [{"token_id:10": -0.1, "token_id:99": -0.1}] if role == "target" else []
+        extracted = {
+            "output_text": "x",
+            "token_ids": [token],
+            "prompt_token_ids": [1, 2],
+            "finish_reason": "length",
+            "top_logprobs": top,
+        }
+        return {
+            "schema_version": 1,
+            "producer": "q30-tie-aware-online-row-v1",
+            "role": role,
+            "subset": "HumanEval",
+            "index": index,
+            "source_row": index % 164,
+            "prompt_sha256": f"{index:064x}",
+            "request_core_sha256": "a" * 64,
+            "request_sha256": "b" * 64,
+            **extracted,
+            "response_sha256": hashlib.sha256(
+                json.dumps(extracted, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+
+    target_rows = [record(index, "target", 10) for index in range(200)]
+    draft_rows = [record(index, "dflash2", 99) for index in range(200)]
+    target_path.write_text("".join(json.dumps(row) + "\n" for row in target_rows))
+    draft_path.write_text("".join(json.dumps(row) + "\n" for row in draft_rows))
+    passed = summarize_tie_aware_pilot(target_path, draft_path)
+    assert passed["status"] == "passed"
+    assert passed["counts"] == {"tied-target-valid": 200}
+    assert passed["occurrences"] == 200
+    assert passed["unique_source_rows"] == 164
+
+    draft_rows[0]["token_ids"] = [88]
+    draft_rows[0]["response_sha256"] = hashlib.sha256(
+        json.dumps(
+            {
+                "output_text": "x",
+                "token_ids": [88],
+                "prompt_token_ids": [1, 2],
+                "finish_reason": "length",
+                "top_logprobs": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    draft_path.write_text("".join(json.dumps(row) + "\n" for row in draft_rows))
+    failed = summarize_tie_aware_pilot(target_path, draft_path)
+    assert failed["status"] == "failed"
+    assert failed["counts"]["unresolved-top20"] == 1
+
+
+def test_tie_aware_receipt_replays_descriptors_and_rejects_job_or_port_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Receipt composition binds rows, manifests, ports, job allocation, and replay bytes."""
+    prompt_file = tmp_path / "HumanEval.jsonl"
+    prompts = [
+        {"prompt": f"prompt {index % 164}", "_specdec_source_row": index % 164}
+        for index in range(200)
+    ]
+    prompt_file.write_text("".join(json.dumps(row) + "\n" for row in prompts))
+    schedule = [
+        {
+            "subset": "HumanEval",
+            "index": index,
+            "source_row": index % 164,
+            "prompt_sha256": hashlib.sha256(f"prompt {index % 164}".encode()).hexdigest(),
+        }
+        for index in range(200)
+    ]
+    identity_payload = {
+        "target": {"path": "target"},
+        "dataset": {
+            "files": {"HumanEval": {"path": str(prompt_file)}},
+            "ordered_prompts": schedule,
+        },
+    }
+    identity_path = tmp_path / "identity.json"
+    identity_path.write_text(json.dumps(identity_payload) + "\n")
+    target_rows = tmp_path / "target.jsonl"
+    draft_rows = tmp_path / "draft.jsonl"
+
+    def write_rows(path: Path, role: str) -> None:
+        with path.open("w") as stream:
+            for index, prompt_row in enumerate(prompts):
+                prompt = prompt_row["prompt"]
+                core = {
+                    "model": "target",
+                    "prompt": prompt,
+                    "max_tokens": 64,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "seed": 42,
+                    "request_id": f"specdec-tie-pilot-HumanEval-{index}",
+                }
+                body = {
+                    **core,
+                    "logprobs": 20 if role == "target" else 0,
+                    "return_tokens_as_token_ids": True,
+                    "return_token_ids": True,
+                }
+                extracted = {
+                    "output_text": "x",
+                    "token_ids": [10],
+                    "prompt_token_ids": [1, 2],
+                    "finish_reason": "length",
+                    "top_logprobs": [{"token_id:10": -0.1}] if role == "target" else [],
+                }
+                row = {
+                    "schema_version": 1,
+                    "producer": "q30-tie-aware-online-row-v1",
+                    "role": role,
+                    "subset": "HumanEval",
+                    "index": index,
+                    "source_row": index % 164,
+                    "prompt_sha256": schedule[index]["prompt_sha256"],
+                    "request_core_sha256": hashlib.sha256(
+                        json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    "request_sha256": hashlib.sha256(
+                        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                    **extracted,
+                    "response_sha256": hashlib.sha256(
+                        json.dumps(extracted, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                }
+                stream.write(json.dumps(row) + "\n")
+
+    write_rows(target_rows, "target")
+    write_rows(draft_rows, "dflash2")
+    target_manifest = tmp_path / "target-manifest.json"
+    draft_manifest = tmp_path / "draft-manifest.json"
+    target_fingerprint = tmp_path / "target-fingerprint.json"
+    draft_fingerprint = tmp_path / "draft-fingerprint.json"
+    target_launcher = tmp_path / "target-launcher.yaml"
+    draft_launcher = tmp_path / "draft-launcher.yaml"
+    for path in (
+        target_manifest,
+        draft_manifest,
+        target_fingerprint,
+        draft_fingerprint,
+        target_launcher,
+        draft_launcher,
+    ):
+        path.write_text(path.name + "\n")
+    target_manifest_payload = {"slurm_job_id": "12345", "server_args": ["x"] * 7 + ["8000"]}
+    draft_manifest_payload = {"slurm_job_id": "12345", "server_args": ["x"] * 7 + ["8010"]}
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_artifact_identity",
+        lambda _path: identity_payload,
+    )
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_target_control_manifest",
+        lambda *_args: (
+            target_manifest_payload,
+            target_fingerprint,
+            {"inputs": {}},
+            target_launcher,
+        ),
+    )
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_dflash2_probe_manifest",
+        lambda *_args: (draft_manifest_payload, draft_launcher, draft_fingerprint),
+    )
+    current = {
+        "slurm_job_id": "12345",
+        "slurm_job_num_nodes": 1,
+        "slurm_job_nodelist": "lyris0001",
+        "gpu_count": 4,
+        "cell_visible_devices": {"left": "0,1", "right": "2,3"},
+    }
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._query_current_allocation", lambda: current
+    )
+    allocation = tmp_path / "allocation.json"
+    build_target_control_allocation_receipt(
+        allocation,
+        slurm_job_id="12345",
+        slurm_job_num_nodes=1,
+        slurm_job_nodelist="lyris0001",
+        gpu_count=4,
+    )
+    receipt = tmp_path / "receipt.json"
+    build_tie_aware_pilot_receipt(
+        target_rows,
+        draft_rows,
+        target_manifest,
+        draft_manifest,
+        identity_path,
+        allocation,
+        receipt,
+    )
+    assert validate_tie_aware_pilot_receipt(receipt)["status"] == "passed"
+
+    original_rows = target_rows.read_text()
+    target_rows.write_text(original_rows.replace('"output_text": "x"', '"output_text": "y"', 1))
+    with pytest.raises(ValueError, match="descriptor"):
+        validate_tie_aware_pilot_receipt(receipt)
+    target_rows.write_text(original_rows)
+
+    draft_manifest_payload["server_args"][-1] = "8000"
+    with pytest.raises(ValueError, match="ports"):
+        build_tie_aware_pilot_receipt(
+            target_rows,
+            draft_rows,
+            target_manifest,
+            draft_manifest,
+            identity_path,
+            allocation,
+            tmp_path / "same-port.json",
+        )
+    draft_manifest_payload["server_args"][-1] = "8010"
+    draft_manifest_payload["slurm_job_id"] = "99999"
+    with pytest.raises(ValueError, match="job"):
+        build_tie_aware_pilot_receipt(
+            target_rows,
+            draft_rows,
+            target_manifest,
+            draft_manifest,
+            identity_path,
+            allocation,
+            tmp_path / "wrong-job.json",
+        )
 
 
 def _sha256(path: Path) -> str:
@@ -1078,6 +1432,24 @@ def test_first_divergence_phase_is_bounded_and_never_runs_speed_cells() -> None:
     assert 'DIVERGENCE_PROBE="${DIVERGENCE_PROBE_MODE}"' in pair
     assert "capture-probe" in wrapper
     assert '"${DIVERGENCE_PROBE:-0}" == 1' in wrapper
+
+
+def test_tie_aware_pilot_is_humaneval_c1_only_and_exits_before_speed() -> None:
+    """The pilot is a bounded diagnostic gate that cannot enter performance cells."""
+    pair = _PAIR.read_text()
+    wrapper = _WRAPPER.read_text()
+
+    assert "tie-pilot:1:200:2" in pair
+    branch = pair.index('if [[ "${PAIR_PHASE}" == tie-pilot ]]')
+    capture = pair.index("run_pair_cells 1", branch)
+    analyze = pair.index("analyze-tie-pilot", capture)
+    verify = pair.index("verify-tie-pilot", analyze)
+    status = pair.index('receipt.get("status") != "passed"', verify)
+    stop = pair.index("exit 0", status)
+    speed = pair.index("run_pair_cells 0", stop)
+    assert branch < capture < analyze < verify < status < stop < speed
+    assert 'TIE_AWARE_PILOT="${TIE_AWARE_PILOT_MODE}"' in pair
+    assert '"${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-tie-pilot' in wrapper
 
 
 def test_pair_summary_reports_per_gpu_speed_latency_and_acceptance(tmp_path: Path) -> None:

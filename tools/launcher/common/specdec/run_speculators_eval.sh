@@ -483,7 +483,15 @@ if [[ ${READY} -ne 1 ]]; then
 fi
 
 if [[ "${CAPTURE_EQUIVALENCE:-0}" == 1 ]]; then
-    if [[ "${DIVERGENCE_PROBE:-0}" == 1 ]]; then
+    if [[ "${TIE_AWARE_PILOT:-0}" == 1 ]]; then
+        tie_role=dflash2
+        [[ "${SPEC_METHOD}" == baseline ]] && tie_role=target
+        "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
+            "${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-tie-pilot \
+            --dataset-manifest "${DATASET_MANIFEST_PATH}" --hf-home "${HF_HOME}" \
+            --endpoint "http://127.0.0.1:${PORT}/v1" --model "${HF_MODEL_CKPT}" \
+            --role "${tie_role}" --output "${RUN_DIR}/tie-aware-pilot.jsonl"
+    elif [[ "${DIVERGENCE_PROBE:-0}" == 1 ]]; then
         "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
             "${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-probe \
             --dataset-manifest "${DATASET_MANIFEST_PATH}" --hf-home "${HF_HOME}" \
@@ -503,7 +511,9 @@ if [[ "${EQUIVALENCE_ONLY:-0}" == 1 ]]; then
         exit 2
     }
     FINAL_STATUS="success"
-    if [[ "${DIVERGENCE_PROBE:-0}" == 1 ]]; then
+    if [[ "${TIE_AWARE_PILOT:-0}" == 1 ]]; then
+        echo "Speculators tie-aware pilot capture complete: ${RUN_DIR}"
+    elif [[ "${DIVERGENCE_PROBE:-0}" == 1 ]]; then
         echo "Speculators divergence probe complete: ${RUN_DIR}"
     else
         echo "Speculators output-equivalence capture complete: ${RUN_DIR}"
