@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import sys
@@ -205,7 +206,7 @@ def test_manifest_replay_binds_data_file_and_self_hash(tmp_path: Path) -> None:
     module = _load_module()
     output = tmp_path / "pilot"
 
-    completion = module.build_pilot_bundles(
+    completion = module._build_pilot_bundles_for_test(
         _tiny_rows(),
         config=_tiny_config(module),
         tokenizer=_MaskTokenizer(),
@@ -233,7 +234,7 @@ def test_publication_failure_for_insufficient_assistant_tokens_has_no_final_root
     output = tmp_path / "pilot"
 
     with pytest.raises(module.PilotError, match="assistant-token minimum"):
-        module.build_pilot_bundles(
+        module._build_pilot_bundles_for_test(
             _tiny_rows(),
             config=_tiny_config(module, minimum_assistant_tokens=13),
             tokenizer=_MaskTokenizer(),
@@ -251,7 +252,7 @@ def test_publication_failure_from_worker_has_no_final_root(tmp_path: Path) -> No
     output = tmp_path / "pilot"
 
     with pytest.raises(module.PilotError, match="token worker"):
-        module.build_pilot_bundles(
+        module._build_pilot_bundles_for_test(
             _tiny_rows(),
             config=_tiny_config(module),
             tokenizer=_FailingTokenizer(),
@@ -276,9 +277,68 @@ def test_no_replace_publication_preserves_existing_destination(tmp_path: Path) -
         "output_root": output,
         "producer_source_commit": "b" * 40,
     }
-    module.build_pilot_bundles(_tiny_rows(), **arguments)
+    module._build_pilot_bundles_for_test(_tiny_rows(), **arguments)
     before = (output / "COMPLETE.json").read_bytes()
 
     with pytest.raises(module.PilotError, match="already exists"):
-        module.build_pilot_bundles(_tiny_rows(), **arguments)
+        module._build_pilot_bundles_for_test(_tiny_rows(), **arguments)
     assert (output / "COMPLETE.json").read_bytes() == before
+
+
+def test_public_build_rejects_nonproduction_scientific_identity(tmp_path: Path) -> None:
+    """Letting test-sized quotas reach the public builder would publish a false pilot."""
+    module = _load_module()
+
+    with pytest.raises(module.PilotError, match="frozen production identity"):
+        module.build_pilot_bundles(
+            _tiny_rows(),
+            config=_tiny_config(module),
+            tokenizer=_MaskTokenizer(),
+            tokenizer_path="/tokenizer",
+            tokenizer_sha256="a" * 64,
+            output_root=tmp_path / "pilot",
+            producer_source_commit="b" * 40,
+        )
+
+
+def test_held_out_uuid_rejects_uppercase_hex() -> None:
+    """Case-insensitive held-out UUIDs must not silently miss canonical identities."""
+    module = _load_module()
+
+    with pytest.raises(module.PilotError, match="SHA-256"):
+        module.select_pilot_rows({"chat": []}, held_out_prompt_uuids={"A" * 64})
+
+
+def test_quota_rejects_boolean_row_count() -> None:
+    """Treating True as one would alter the scientific quota contract."""
+    module = _load_module()
+
+    with pytest.raises(module.PilotError, match="positive integer"):
+        module.PilotConfig(
+            historical_quotas=(module.PilotQuota("chat", "chat", True),),
+            balanced_quotas=(module.PilotQuota("chat", "chat", True),),
+        )
+
+
+def test_linux_noreplace_maps_racing_destination_to_pilot_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """An EEXIST race during the final install must never replace another publisher."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+
+    def race(_source, _destination):
+        raise OSError(errno.EEXIST, "exists")
+
+    monkeypatch.setattr(module, "_rename_noreplace", race)
+    with pytest.raises(module.PilotError, match="already exists"):
+        module._build_pilot_bundles_for_test(
+            _tiny_rows(),
+            config=_tiny_config(module),
+            tokenizer=_MaskTokenizer(),
+            tokenizer_path="/tokenizer",
+            tokenizer_sha256="a" * 64,
+            output_root=output,
+            producer_source_commit="b" * 40,
+        )
+    assert not output.exists()

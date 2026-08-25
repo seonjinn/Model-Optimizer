@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import uuid
 from collections.abc import Iterable, Mapping
@@ -189,12 +191,12 @@ def select_pilot_rows(
 
     kept = [row for row in candidates if row.prompt_uuid not in held_out]
     held_out_count = len(candidates) - len(kept)
-    canonical_candidates, duplicate_count = _deduplicate_candidates(kept)
+    duplicate_count = len(kept) - len({row.prompt_uuid for row in kept})
     return PilotSelection(
         historical_proportion=_select_arm(
-            HISTORICAL_PROPORTION, canonical_candidates, config.historical_quotas, config
+            HISTORICAL_PROPORTION, kept, config.historical_quotas, config
         ),
-        balanced=_select_arm(BALANCED, canonical_candidates, config.balanced_quotas, config),
+        balanced=_select_arm(BALANCED, kept, config.balanced_quotas, config),
         excluded_held_out=held_out_count,
         excluded_invalid=invalid,
         excluded_duplicate_candidates=duplicate_count,
@@ -204,8 +206,14 @@ def select_pilot_rows(
 def _validate_quotas(arm: str, quotas: tuple[PilotQuota, ...]) -> None:
     if not quotas:
         raise PilotError(f"{arm} quotas cannot be empty")
-    if any(not isinstance(quota, PilotQuota) or quota.rows < 1 for quota in quotas):
-        raise PilotError(f"{arm} quotas must be positive PilotQuota values")
+    if any(
+        not isinstance(quota, PilotQuota)
+        or isinstance(quota.rows, bool)
+        or not isinstance(quota.rows, int)
+        or quota.rows < 1
+        for quota in quotas
+    ):
+        raise PilotError(f"{arm} quota rows must be positive integers")
     if len({quota.split for quota in quotas}) != len(quotas):
         raise PilotError(f"{arm} cannot declare a split more than once")
 
@@ -219,7 +227,12 @@ def _validate_held_out(values: Iterable[str]) -> set[str]:
         result = set(values)
     except TypeError as error:
         raise PilotError("held-out UUIDs must be iterable strings") from error
-    if any(not isinstance(value, str) or len(value) != 64 for value in result):
+    if any(
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+        for value in result
+    ):
         raise PilotError("held-out UUIDs must be SHA-256 strings")
     return result
 
@@ -357,7 +370,41 @@ def build_pilot_bundles(
     scratch_root: Path | None = None,
     execution: Mapping[str, object] | None = None,
 ) -> PilotCompletion:
-    """Select, token-count, receipt-validate, and atomically publish both pilot arms."""
+    """Publish only the frozen 100K-row, 16M-token Qwen3-4B pilot identity."""
+    config = config or PilotConfig()
+    _validate_production_identity(config)
+    _verify_tokenizer_artifact(Path(tokenizer_path), tokenizer_sha256)
+    tokenizer = _load_verified_qwen_tokenizer(Path(tokenizer_path))
+    return _build_pilot_bundles_for_test(
+        split_rows,
+        config=config,
+        held_out_prompt_uuids=held_out_prompt_uuids,
+        tokenizer=tokenizer,
+        tokenizer_path=tokenizer_path,
+        tokenizer_sha256=tokenizer_sha256,
+        output_root=output_root,
+        producer_source_commit=producer_source_commit,
+        workers=workers,
+        scratch_root=scratch_root,
+        execution=execution,
+    )
+
+
+def _build_pilot_bundles_for_test(
+    split_rows: Mapping[str, Iterable[Mapping[str, object]]],
+    *,
+    config: PilotConfig | None = None,
+    held_out_prompt_uuids: Iterable[str] = (),
+    tokenizer: Any,
+    tokenizer_path: str | Path,
+    tokenizer_sha256: str,
+    output_root: Path,
+    producer_source_commit: str,
+    workers: int | None = None,
+    scratch_root: Path | None = None,
+    execution: Mapping[str, object] | None = None,
+) -> PilotCompletion:
+    """Test-only generic publication helper; production callers use ``build_pilot_bundles``."""
     config = config or PilotConfig()
     output_root = Path(output_root)
     _validate_build_inputs(
@@ -378,6 +425,9 @@ def build_pilot_bundles(
         arm: _count_selected_rows(tokenizer, selected.rows_for(arm), effective_workers)
         for arm in (HISTORICAL_PROPORTION, BALANCED)
     }
+    template_sha256 = hashlib.sha256(
+        str(getattr(tokenizer, "chat_template", "")).encode("utf-8")
+    ).hexdigest()
     for arm, counts in tokens_by_arm.items():
         if sum(counts) < config.minimum_assistant_tokens:
             raise PilotError(
@@ -399,6 +449,7 @@ def build_pilot_bundles(
             config=config,
             tokenizer_path=tokenizer_path,
             tokenizer_sha256=tokenizer_sha256,
+            tokenizer_template_sha256=template_sha256,
             producer_source_commit=producer_source_commit,
             effective_workers=effective_workers,
             execution=execution,
@@ -410,7 +461,14 @@ def build_pilot_bundles(
         _verify_bundle_root(local_partial)
         if output_root.exists():
             raise PilotError(f"publication destination already exists: {output_root}")
-        os.rename(local_partial, output_root)
+        try:
+            _rename_noreplace(local_partial, output_root)
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                raise PilotError(
+                    f"publication destination already exists: {output_root}"
+                ) from error
+            raise PilotError("atomic pilot publication failed") from error
         local_partial = None
         _fsync_directory(output_root.parent)
         _verify_bundle_root(output_root)
@@ -472,6 +530,67 @@ def _validate_build_inputs(
         raise PilotError("workers must be a positive integer")
 
 
+def _validate_production_identity(config: PilotConfig) -> None:
+    approved = PilotConfig()
+    if (
+        config.seed != SEED
+        or config.minimum_assistant_tokens < 16_000_000
+        or config.source_repository != approved.source_repository
+        or config.historical_quotas != approved.historical_quotas
+        or config.balanced_quotas != approved.balanced_quotas
+        or len(config.source_revision) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in config.source_revision)
+    ):
+        raise PilotError("public builder requires the frozen production identity")
+    if not sys.platform.startswith("linux"):
+        raise PilotError("public builder requires Linux atomic no-replace publication")
+
+
+def _verify_tokenizer_artifact(path: Path, expected_sha256: str) -> None:
+    if not path.exists() or path.is_symlink():
+        raise PilotError("tokenizer path must be an existing non-symlink artifact")
+    digest = hashlib.sha256()
+    if path.is_file():
+        digest.update(path.read_bytes())
+    elif path.is_dir():
+        for child in sorted(candidate for candidate in path.rglob("*") if candidate.is_file()):
+            digest.update(child.relative_to(path).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(child.read_bytes())
+    else:
+        raise PilotError("tokenizer path must be a file or directory")
+    if digest.hexdigest() != expected_sha256:
+        raise PilotError("tokenizer artifact does not match the pinned SHA-256")
+
+
+def _load_verified_qwen_tokenizer(path: Path) -> Any:
+    try:
+        from transformers import AutoTokenizer  # pyright: ignore[reportMissingImports]
+
+        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
+    except Exception as error:
+        raise PilotError("unable to load the pinned Qwen3-4B tokenizer") from error
+    if not isinstance(getattr(tokenizer, "chat_template", None), str):
+        raise PilotError("pinned Qwen3-4B tokenizer has no chat template")
+    return tokenizer
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Install a directory without replacement; Linux gets the kernel primitive."""
+    if sys.platform.startswith("linux"):
+        import ctypes
+
+        renameat2 = ctypes.CDLL(None, use_errno=True).syscall
+        result = renameat2(316, -100, os.fsencode(source), -100, os.fsencode(destination), 1)
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), destination)
+        return
+    if destination.exists():
+        raise OSError(errno.EEXIST, "destination exists", destination)
+    os.rename(source, destination)
+
+
 def _count_selected_rows(
     tokenizer: Any, rows: tuple[PilotRow, ...], workers: int
 ) -> tuple[int, ...]:
@@ -495,6 +614,7 @@ def _write_bundle_contents(
     config: PilotConfig,
     tokenizer_path: str | Path,
     tokenizer_sha256: str,
+    tokenizer_template_sha256: str,
     producer_source_commit: str,
     effective_workers: int,
     execution: Mapping[str, object] | None,
@@ -521,9 +641,9 @@ def _write_bundle_contents(
             destination.flush()
             os.fsync(destination.fileno())
         execution_payload = {
+            **(dict(execution) if execution is not None else {}),
             "requested_workers": config.workers,
             "effective_workers": effective_workers,
-            **(dict(execution) if execution is not None else {}),
         }
         _write_json(arm_root / "EXECUTION.json", execution_payload)
         manifest = {
@@ -544,7 +664,11 @@ def _write_bundle_contents(
                 "bytes": data_path.stat().st_size,
                 "sha256": _sha256_file(data_path),
             },
-            "tokenizer": {"path": str(tokenizer_path), "sha256": tokenizer_sha256},
+            "tokenizer": {
+                "path": str(tokenizer_path),
+                "sha256": tokenizer_sha256,
+                "chat_template_sha256": tokenizer_template_sha256,
+            },
             "assistant_tokens": sum(tokens_by_arm[arm]),
             "minimum_assistant_tokens": config.minimum_assistant_tokens,
             "exclusions": {
@@ -615,10 +739,43 @@ def _verify_bundle_root(root: Path) -> dict[str, PilotArmCompletion]:
         rows = _read_data_rows(data_path)
         if manifest.get("row_count") != len(rows):
             raise PilotError(f"{arm} row count does not reconcile")
+        quotas = manifest.get("quotas")
+        split_counts: dict[str, int] = {}
+        for row in rows:
+            split_counts[row.split] = split_counts.get(row.split, 0) + 1
+        if not isinstance(quotas, Mapping) or dict(sorted(quotas.items())) != dict(
+            sorted(split_counts.items())
+        ):
+            raise PilotError(f"{arm} exact split quotas do not reconcile")
+        if len({row.prompt_uuid for row in rows}) != len(rows):
+            raise PilotError(f"{arm} global prompt UUID uniqueness does not reconcile")
         if manifest.get("category_counts") != _category_counts(rows):
             raise PilotError(f"{arm} category counts do not reconcile")
         if manifest.get("prompt_uuid_sha256") != _prompt_digest(rows):
             raise PilotError(f"{arm} prompt UUID digest does not reconcile")
+        source = manifest.get("source")
+        if (
+            not isinstance(source, Mapping)
+            or source.get("repository") != "nvidia/Nemotron-Post-Training-Dataset-v2"
+            or not isinstance(source.get("revision"), str)
+            or len(source["revision"]) not in (40, 64)
+            or any(character not in "0123456789abcdef" for character in source["revision"])
+        ):
+            raise PilotError(f"{arm} pinned source identity does not reconcile")
+        tokenizer = manifest.get("tokenizer")
+        if (
+            not isinstance(tokenizer, Mapping)
+            or not isinstance(tokenizer.get("sha256"), str)
+            or not isinstance(tokenizer.get("chat_template_sha256"), str)
+            or any(
+                len(str(tokenizer[field])) != 64
+                or any(character not in "0123456789abcdef" for character in str(tokenizer[field]))
+                for field in ("sha256", "chat_template_sha256")
+            )
+        ):
+            raise PilotError(f"{arm} tokenizer/template identity does not reconcile")
+        if manifest.get("assistant_tokens", 0) < manifest.get("minimum_assistant_tokens", 1):
+            raise PilotError(f"{arm} assistant-token minimum does not reconcile")
         arms[arm] = PilotArmCompletion(
             arm=arm,
             row_count=len(rows),
