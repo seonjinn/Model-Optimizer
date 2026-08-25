@@ -451,6 +451,26 @@ if [[ "${SPEC_METHOD}" != "baseline" ]]; then
         "${DRAFT_MODEL}" "${NUM_SPEC_TOKENS}")"
     SERVER_ARGS+=(--speculative-config "${SPEC_CONFIG}")
 fi
+if [[ "${SPEC_METHOD}" == dflash2 && "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
+    SERVER_ARGS+=(--per-request-spec-decode-metrics detailed)
+    if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]]; then
+        SERVER_ARGS+=(--enforce-eager)
+    fi
+fi
+if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
+    [[ "${CAPTURE_EQUIVALENCE:-0}:${EQUIVALENCE_ONLY:-0}:${MAX_CONCURRENCY}:${MAX_REQUESTS}" \
+        == "1:1:1:200" ]] || {
+        echo "ERROR: internal-target diagnostic requires bounded C1 equivalence-only mode" >&2
+        exit 2
+    }
+    [[ "${SPEC_METHOD}" == baseline || "${SPEC_METHOD}" == dflash2 ]] || {
+        echo "ERROR: internal-target diagnostic supports only target and DFlash2" >&2
+        exit 2
+    }
+elif [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 ]]; then
+    echo "ERROR: DFlash2 enforce-eager is restricted to the internal-target diagnostic" >&2
+    exit 2
+fi
 if [[ -n "${VLLM_SERVER_RUNTIME_RECEIPT_SHA256:-}" ]]; then
     export VLLM_USE_V2_MODEL_RUNNER=1
 fi
@@ -483,7 +503,22 @@ if [[ ${READY} -ne 1 ]]; then
 fi
 
 if [[ "${CAPTURE_EQUIVALENCE:-0}" == 1 ]]; then
-    if [[ "${TIE_AWARE_PILOT:-0}" == 1 ]]; then
+    if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
+        internal_role=dflash2
+        internal_engine_mode=compiled
+        if [[ "${SPEC_METHOD}" == baseline ]]; then
+            internal_role=target
+        fi
+        if [[ "${DFLASH2_ENFORCE_EAGER:-0}" == 1 && "${SPEC_METHOD}" == dflash2 ]]; then
+            internal_engine_mode=eager
+        fi
+        "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
+            "${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-internal-target \
+            --dataset-manifest "${DATASET_MANIFEST_PATH}" --hf-home "${HF_HOME}" \
+            --endpoint "http://127.0.0.1:${PORT}/v1" --model "${HF_MODEL_CKPT}" \
+            --role "${internal_role}" --engine-mode "${internal_engine_mode}" \
+            --output "${RUN_DIR}/internal-target.jsonl"
+    elif [[ "${TIE_AWARE_PILOT:-0}" == 1 ]]; then
         tie_role=dflash2
         [[ "${SPEC_METHOD}" == baseline ]] && tie_role=target
         "${SPECULATORS_CLIENT_RUNTIME}/bin/python3" \
@@ -511,7 +546,9 @@ if [[ "${EQUIVALENCE_ONLY:-0}" == 1 ]]; then
         exit 2
     }
     FINAL_STATUS="success"
-    if [[ "${TIE_AWARE_PILOT:-0}" == 1 ]]; then
+    if [[ "${DFLASH2_INTERNAL_TARGET:-0}" == 1 ]]; then
+        echo "Speculators internal-target diagnostic capture complete: ${RUN_DIR}"
+    elif [[ "${TIE_AWARE_PILOT:-0}" == 1 ]]; then
         echo "Speculators tie-aware pilot capture complete: ${RUN_DIR}"
     elif [[ "${DIVERGENCE_PROBE:-0}" == 1 ]]; then
         echo "Speculators divergence probe complete: ${RUN_DIR}"

@@ -52,6 +52,18 @@ PROBE_ROWS = (
     ("tool_call", 0),
     ("translation", 0),
 )
+INTERNAL_TARGET_DIAGNOSTIC_ROWS = (
+    (0, "exact-control"),
+    (1, "source-1-first-invalid"),
+    (8, "source-8-first-tied"),
+    (27, "early-divergence-position-2"),
+    (41, "early-divergence-position-1"),
+    (82, "maximum-target-logprob-gap"),
+    (151, "second-largest-target-logprob-gap"),
+    (165, "source-1-repeat-tied"),
+    (172, "source-8-repeat-invalid"),
+)
+RCA_SOURCE_PILOT_RECEIPT_SHA256 = "4b7c6254c7d52cf8da159d1bad261255790899e36068d0c7c4ccb66ea2199cca"
 EVALUATION_STEP = 4166
 DFLASH2_BLOCK_SIZE = 8
 DFLASH2_SPECULATIVE_TOKENS = 7
@@ -493,8 +505,7 @@ def _load_ledger(path: Path, requests_per_subset: int) -> list[dict[str, Any]]:
             or not isinstance(row.get("output_tokens"), list)
             or not all(isinstance(token, str) for token in row["output_tokens"])
             or row.get("seed") != 42
-            or hashlib.sha256(row["output_text"].encode()).hexdigest()
-            != row["output_sha256"]
+            or hashlib.sha256(row["output_text"].encode()).hexdigest() != row["output_sha256"]
             or row.get("finish_reason") not in {"stop", "length"}
         ):
             raise ValueError("output ledger row schema mismatch")
@@ -577,8 +588,7 @@ def summarize_target_control(
         raise ValueError("target control prompt schedule mismatch")
     left_request_sha256 = [row["request_sha256"] for row in left]
     if left_request_sha256 != [row["request_sha256"] for row in right] or (
-        expected_request_sha256 is not None
-        and left_request_sha256 != expected_request_sha256
+        expected_request_sha256 is not None and left_request_sha256 != expected_request_sha256
     ):
         raise ValueError("target control request fingerprint mismatch")
 
@@ -597,8 +607,7 @@ def summarize_target_control(
             expected["output_text"] == actual["output_text"] for expected, actual in pairs
         )
         exact_tokens = sum(
-            expected["output_tokens"] == actual["output_tokens"]
-            for expected, actual in pairs
+            expected["output_tokens"] == actual["output_tokens"] for expected, actual in pairs
         )
         prefixes = [
             _common_prefix_length(expected["output_tokens"], actual["output_tokens"])
@@ -867,8 +876,7 @@ def _validate_control_launcher(path_value: object, image: Path, expected_sha: ob
     if not _is_sha256(expected_sha) or _sha256(path) != expected_sha:
         raise ValueError("target control launcher config mismatch")
     expected = (
-        "pipeline:\n  task_0:\n    slurm_config:\n"
-        f"      container: {image.resolve(strict=True)}\n"
+        f"pipeline:\n  task_0:\n    slurm_config:\n      container: {image.resolve(strict=True)}\n"
     )
     if path.read_text() != expected:
         raise ValueError("target control launcher config is not canonical")
@@ -880,9 +888,8 @@ def _validate_artifact_identity(path: Path) -> dict[str, Any]:
     if (
         identity.get("producer") != "q30-dflash2-s4166-speculators-inputs-v1"
         or identity.get("schema_version") != 1
-        or identity.get("receipt_sha256") != _sha_json(
-            {key: value for key, value in identity.items() if key != "receipt_sha256"}
-        )
+        or identity.get("receipt_sha256")
+        != _sha_json({key: value for key, value in identity.items() if key != "receipt_sha256"})
     ):
         raise ValueError("artifact identity receipt mismatch")
     target = identity.get("target")
@@ -967,7 +974,10 @@ def _validate_target_control_manifest(
         or evaluation != evaluation_expected
         or not isinstance(server_args, list)
         or not all(isinstance(value, str) for value in server_args)
-        or any(value == "--speculative-config" or value.startswith("--speculative-config=") for value in server_args)
+        or any(
+            value == "--speculative-config" or value.startswith("--speculative-config=")
+            for value in server_args
+        )
         or server_args[:6]
         != [
             "-m",
@@ -1087,9 +1097,7 @@ def _validate_target_control_manifest(
             "tensor_parallel_size": 2,
         },
     }
-    if (
-        inputs != expected_inputs
-    ):
+    if inputs != expected_inputs:
         raise ValueError("target control input fingerprint mismatch")
     return manifest, fingerprint_path, fingerprint, launcher_path
 
@@ -1143,7 +1151,9 @@ def build_target_control_receipt(
     ):
         if allocation.get(name) != current_allocation.get(name):
             raise ValueError(f"target control live allocation mismatch: {name}")
-    if any(manifest.get("slurm_job_id") != allocation["slurm_job_id"] for manifest in manifest_payloads):
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"] for manifest in manifest_payloads
+    ):
         raise ValueError("target control allocation job mismatch")
     ports = {manifest["server_args"][-1] for manifest in manifest_payloads}
     if ports != {"8000", "8010"}:
@@ -1156,9 +1166,7 @@ def build_target_control_receipt(
     )
     payload["artifact_identity"] = _file_descriptor(artifact_identity_path)
     payload["manifests"] = [_file_descriptor(path) for path in manifests]
-    payload["input_fingerprints"] = [
-        _file_descriptor(path) for path in fingerprint_paths
-    ]
+    payload["input_fingerprints"] = [_file_descriptor(path) for path in fingerprint_paths]
     payload["launcher_configs"] = [_file_descriptor(path) for path in launcher_paths]
     payload["allocation_receipt"] = _file_descriptor(allocation_receipt_path)
     payload["ledgers"] = [_file_descriptor(left_path), _file_descriptor(right_path)]
@@ -1224,7 +1232,9 @@ def validate_target_control_receipt(path: Path) -> dict[str, Any]:
         raise ValueError("target control input fingerprint mismatch between cells")
     if {manifest["server_args"][-1] for manifest in manifest_payloads} != {"8000", "8010"}:
         raise ValueError("target control server ports are not isolated")
-    if any(manifest.get("slurm_job_id") != allocation["slurm_job_id"] for manifest in manifest_payloads):
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"] for manifest in manifest_payloads
+    ):
         raise ValueError("target control allocation job mismatch")
     replayed = summarize_target_control(
         ledgers[0],
@@ -1432,7 +1442,9 @@ def _expected_request_hashes(identity: dict[str, Any]) -> list[str]:
         if len(prompts) != 200:
             raise ValueError("target control requires durable exact-200 prompt files")
         for index, (_, prompt) in enumerate(prompts):
-            hashes.append(hashlib.sha256(_completion_request_body(model, subset, index, prompt)).hexdigest())
+            hashes.append(
+                hashlib.sha256(_completion_request_body(model, subset, index, prompt)).hexdigest()
+            )
     return hashes
 
 
@@ -1471,6 +1483,90 @@ def _probe_choice(result: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("probe response token/logprob schema mismatch")
     return choice
+
+
+def _validate_spec_decode_metrics_payload(speculative: object) -> dict[str, Any]:
+    expected = {
+        "mean_acceptance_length",
+        "draft_acceptance_rate",
+        "acceptance_histogram",
+        "num_spec_steps",
+        "num_accepted_draft_tokens",
+        "num_draft_tokens",
+        "num_spec_tokens",
+        "per_step_accepted",
+        "per_step_drafted",
+    }
+    if not isinstance(speculative, dict) or set(speculative) != expected:
+        raise ValueError("DFlash2 detailed speculative metrics schema mismatch")
+    histogram = speculative["acceptance_histogram"]
+    accepted = speculative["per_step_accepted"]
+    drafted = speculative["per_step_drafted"]
+    integer_fields = (
+        "num_spec_steps",
+        "num_accepted_draft_tokens",
+        "num_draft_tokens",
+        "num_spec_tokens",
+    )
+    if (
+        any(
+            isinstance(speculative[name], bool)
+            or not isinstance(speculative[name], int)
+            or speculative[name] < 0
+            for name in integer_fields
+        )
+        or speculative["num_spec_tokens"] != DFLASH2_SPECULATIVE_TOKENS
+        or not isinstance(histogram, list)
+        or len(histogram) != DFLASH2_SPECULATIVE_TOKENS + 1
+        or not isinstance(accepted, list)
+        or not isinstance(drafted, list)
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in (*histogram, *accepted, *drafted)
+        )
+        or len(accepted) != len(drafted)
+        or len(accepted) != speculative["num_spec_steps"]
+    ):
+        raise ValueError("DFlash2 detailed speculative metrics values mismatch")
+    steps = speculative["num_spec_steps"]
+    accepted_total = speculative["num_accepted_draft_tokens"]
+    drafted_total = speculative["num_draft_tokens"]
+    mean = speculative["mean_acceptance_length"]
+    rate = speculative["draft_acceptance_rate"]
+    if (
+        steps <= 0
+        or sum(histogram) != steps
+        or sum(index * count for index, count in enumerate(histogram)) != accepted_total
+        or collections.Counter(accepted)
+        != collections.Counter({index: count for index, count in enumerate(histogram) if count})
+        or sum(accepted) != accepted_total
+        or sum(drafted) != drafted_total
+        or any(
+            accepted_count > drafted_count or drafted_count > DFLASH2_SPECULATIVE_TOKENS
+            for accepted_count, drafted_count in zip(accepted, drafted, strict=True)
+        )
+        or not isinstance(mean, (int, float))
+        or isinstance(mean, bool)
+        or not math.isfinite(mean)
+        or not math.isclose(float(mean), 1 + accepted_total / steps, rel_tol=0, abs_tol=1e-12)
+        or not isinstance(rate, (int, float))
+        or isinstance(rate, bool)
+        or not math.isfinite(rate)
+        or not math.isclose(
+            float(rate),
+            accepted_total / drafted_total if drafted_total else 0.0,
+            rel_tol=0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("DFlash2 detailed speculative metrics accounting mismatch")
+    return speculative
+
+
+def _validated_spec_decode_metrics(result: dict[str, Any]) -> dict[str, Any]:
+    metrics = result.get("metrics")
+    speculative = metrics.get("speculative_decoding") if isinstance(metrics, dict) else None
+    return _validate_spec_decode_metrics_payload(speculative)
 
 
 def capture_divergence_probe(
@@ -1535,7 +1631,9 @@ def capture_divergence_probe(
                 assert isinstance(replay_logprobs, dict)
                 top = replay_logprobs["top_logprobs"]
                 if len(replay_ids) != 1 or not isinstance(top, list) or len(top) != 1:
-                    raise ValueError("target prefix replay did not return one next-token distribution")
+                    raise ValueError(
+                        "target prefix replay did not return one next-token distribution"
+                    )
                 replays.append(
                     {
                         "position": position,
@@ -1587,13 +1685,11 @@ def _validate_probe_payload(path: Path, expected_method: str) -> dict[str, Any]:
             "records",
             "receipt_sha256",
         }
-        or
-        payload.get("schema_version") != 1
+        or payload.get("schema_version") != 1
         or payload.get("producer") != "q30-dflash2-first-token-probe-v1"
         or payload.get("method") != expected_method
         or payload.get("receipt_sha256") != _sha_json(unsigned)
-        or payload.get("sampling")
-        != {"temperature": 0, "top_p": 1, "seed": 42, "logprobs": 20}
+        or payload.get("sampling") != {"temperature": 0, "top_p": 1, "seed": 42, "logprobs": 20}
         or not isinstance(payload.get("records"), list)
         or len(payload["records"]) != len(PROBE_ROWS)
     ):
@@ -1647,7 +1743,9 @@ def _validate_probe_against_identity(
             or not isinstance(record["output_text"], str)
             or not isinstance(token_ids, list)
             or not token_ids
-            or not all(isinstance(value, int) and not isinstance(value, bool) for value in token_ids)
+            or not all(
+                isinstance(value, int) and not isinstance(value, bool) for value in token_ids
+            )
             or not isinstance(prompt_token_ids, list)
             or not prompt_token_ids
             or not all(
@@ -1730,10 +1828,9 @@ def analyze_divergence_probe(baseline_path: Path, dflash2_path: Path) -> dict[st
     """Find the first token divergence and replayed target rank for each exact prompt."""
     baseline = _validate_probe_payload(baseline_path, "baseline")
     draft = _validate_probe_payload(dflash2_path, "dflash2")
-    if (
-        baseline.get("model") != draft.get("model")
-        or baseline.get("dataset_prompt_sha256") != draft.get("dataset_prompt_sha256")
-    ):
+    if baseline.get("model") != draft.get("model") or baseline.get(
+        "dataset_prompt_sha256"
+    ) != draft.get("dataset_prompt_sha256"):
         raise ValueError("probe inputs are not matched")
     output: list[dict[str, Any]] = []
     for expected_key, target, proposed in zip(
@@ -1752,10 +1849,17 @@ def analyze_divergence_probe(baseline_path: Path, dflash2_path: Path) -> dict[st
         target_ids = target.get("token_ids")
         draft_ids = proposed.get("token_ids")
         replays = target.get("replays")
-        if not isinstance(target_ids, list) or not isinstance(draft_ids, list) or not isinstance(replays, list):
+        if (
+            not isinstance(target_ids, list)
+            or not isinstance(draft_ids, list)
+            or not isinstance(replays, list)
+        ):
             raise ValueError("probe token evidence mismatch")
         common = 0
-        while common < min(len(target_ids), len(draft_ids)) and target_ids[common] == draft_ids[common]:
+        while (
+            common < min(len(target_ids), len(draft_ids))
+            and target_ids[common] == draft_ids[common]
+        ):
             common += 1
         if common == len(target_ids) == len(draft_ids):
             output.append({"subset": key[0], "index": key[1], "status": "exact-match"})
@@ -1829,6 +1933,9 @@ def _validate_dflash2_probe_manifest(
     baseline_fingerprint: dict[str, Any],
     artifact_identity_path: Path,
     identity: dict[str, Any],
+    *,
+    detailed_metrics: bool = False,
+    enforce_eager: bool = False,
 ) -> tuple[dict[str, Any], Path, Path]:
     manifest = _load_json(path)
     target = identity["target"]
@@ -1853,6 +1960,28 @@ def _validate_dflash2_probe_manifest(
         "evaluation",
         "artifact_identity",
     )
+    expected_server_args = [
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        target["path"],
+        "--tensor-parallel-size",
+        "2",
+        "--port",
+        server_args[7] if isinstance(server_args, list) and len(server_args) > 7 else "",
+        "--speculative-config",
+        _canonical(
+            {
+                "method": "dflash",
+                "model": draft["export_path"],
+                "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
+            }
+        ),
+    ]
+    if detailed_metrics:
+        expected_server_args.extend(["--per-request-spec-decode-metrics", "detailed"])
+    if enforce_eager:
+        expected_server_args.append("--enforce-eager")
     if (
         set(manifest) != _CONTROL_MANIFEST_KEYS
         or manifest.get("status") != "success"
@@ -1864,25 +1993,8 @@ def _validate_dflash2_probe_manifest(
         or any(manifest.get(name) != baseline.get(name) for name in common)
         or not isinstance(evaluation, dict)
         or not isinstance(server_args, list)
-        or len(server_args) != 10
-        or server_args[:6]
-        != [
-            "-m",
-            "vllm.entrypoints.cli.main",
-            "serve",
-            target["path"],
-            "--tensor-parallel-size",
-            "2",
-        ]
-        or server_args[6] != "--port"
+        or server_args != expected_server_args
         or server_args[7] not in {"8000", "8010"}
-        or server_args[8] != "--speculative-config"
-        or json.loads(server_args[9])
-        != {
-            "method": "dflash",
-            "model": draft["export_path"],
-            "num_speculative_tokens": DFLASH2_SPECULATIVE_TOKENS,
-        }
         or not isinstance(config, dict)
         or set(config) != {"target", "draft", "launcher"}
         or config.get("target") != _sha256(Path(target["path"]) / "config.json")
@@ -1958,9 +2070,10 @@ def build_divergence_probe_receipt(
     ):
         if allocation.get(name) != current.get(name):
             raise ValueError(f"divergence probe live allocation mismatch: {name}")
-    if baseline_manifest["slurm_job_id"] != allocation["slurm_job_id"] or dflash_manifest[
-        "slurm_job_id"
-    ] != allocation["slurm_job_id"]:
+    if (
+        baseline_manifest["slurm_job_id"] != allocation["slurm_job_id"]
+        or dflash_manifest["slurm_job_id"] != allocation["slurm_job_id"]
+    ):
         raise ValueError("divergence probe job ID mismatch")
     payload = analyze_divergence_probe(baseline_probe_path, dflash2_probe_path)
     payload["claim_scope"] = "token-correctness diagnosis only; no speedup claim"
@@ -2010,12 +2123,8 @@ def validate_divergence_probe_receipt(path: Path) -> dict[str, Any]:
     assert isinstance(launchers_value, dict)
     assert isinstance(fingerprints_value, dict)
     probes = {name: _validate_file_descriptor(value) for name, value in probes_value.items()}
-    manifests = {
-        name: _validate_file_descriptor(value) for name, value in manifests_value.items()
-    }
-    launchers = {
-        name: _validate_file_descriptor(value) for name, value in launchers_value.items()
-    }
+    manifests = {name: _validate_file_descriptor(value) for name, value in manifests_value.items()}
+    launchers = {name: _validate_file_descriptor(value) for name, value in launchers_value.items()}
     fingerprints = {
         name: _validate_file_descriptor(value) for name, value in fingerprints_value.items()
     }
@@ -2090,8 +2199,7 @@ def classify_tie_aware_rows(target: dict[str, Any], dflash2: dict[str, Any]) -> 
         }
     common = 0
     while (
-        common < min(len(target_ids), len(dflash_ids))
-        and target_ids[common] == dflash_ids[common]
+        common < min(len(target_ids), len(dflash_ids)) and target_ids[common] == dflash_ids[common]
     ):
         common += 1
     base = {
@@ -2254,6 +2362,680 @@ def capture_tie_aware_pilot(
             os.unlink(temporary)
 
 
+def _valid_top_logprobs(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(
+            isinstance(key, str)
+            and re.fullmatch(r"token_id:[0-9]+", key) is not None
+            and isinstance(logprob, (int, float))
+            and not isinstance(logprob, bool)
+            and math.isfinite(logprob)
+            for key, logprob in value.items()
+        )
+    )
+
+
+def capture_internal_target_diagnostic(
+    dataset_manifest_path: Path,
+    hf_home: Path,
+    output_path: Path,
+    *,
+    endpoint: str,
+    model: str,
+    role: str,
+    engine_mode: str,
+) -> None:
+    """Capture the fixed RCA rows with online logits and detailed acceptance evidence."""
+    if role not in {"target", "dflash2"}:
+        raise ValueError("internal-target role must be target or dflash2")
+    if engine_mode not in {"compiled", "eager"} or (role == "target" and engine_mode != "compiled"):
+        raise ValueError("internal-target engine mode mismatch")
+    prompt_set = compute_prompt_set(dataset_manifest_path, hf_home)
+    files = prompt_set.get("files")
+    if not isinstance(files, dict) or not isinstance(files.get("HumanEval"), dict):
+        raise ValueError("internal-target HumanEval prompt evidence is missing")
+    prompts = _read_prompt_prefix(Path(str(files["HumanEval"]["path"])), 200)
+    if len(prompts) != 200:
+        raise ValueError("internal-target diagnostic requires exact-200 HumanEval schedule")
+    if output_path.exists():
+        raise FileExistsError(f"internal-target output exists: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{output_path.name}.", dir=output_path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            for index, reason in INTERNAL_TARGET_DIAGNOSTIC_ROWS:
+                source_row, prompt = prompts[index]
+                body = {
+                    "model": model,
+                    "prompt": prompt,
+                    "max_tokens": 64,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "seed": 42,
+                    "logprobs": 20,
+                    "return_tokens_as_token_ids": True,
+                    "return_token_ids": True,
+                    "request_id": f"specdec-internal-target-HumanEval-{index}",
+                }
+                result = _post_completion(endpoint, body)
+                choice = _probe_choice(result)
+                finish = choice.get("finish_reason")
+                logprobs = choice["logprobs"]
+                assert isinstance(logprobs, dict)
+                top = logprobs["top_logprobs"]
+                token_ids = choice["token_ids"]
+                assert isinstance(token_ids, list)
+                if (
+                    finish not in {"stop", "length"}
+                    or not isinstance(top, list)
+                    or len(top) != len(token_ids)
+                    or not all(_valid_top_logprobs(distribution) for distribution in top)
+                ):
+                    raise ValueError("internal-target completion evidence mismatch")
+                speculative = _validated_spec_decode_metrics(result) if role == "dflash2" else None
+                if (
+                    role == "target"
+                    and isinstance(result.get("metrics"), dict)
+                    and result["metrics"].get("speculative_decoding") is not None
+                ):
+                    raise ValueError(
+                        "target-only response unexpectedly contains speculative metrics"
+                    )
+                extracted = {
+                    "output_text": choice["text"],
+                    "token_ids": token_ids,
+                    "prompt_token_ids": choice["prompt_token_ids"],
+                    "finish_reason": finish,
+                    "top_logprobs": top,
+                    "speculative_decoding": speculative,
+                }
+                record = {
+                    "schema_version": 1,
+                    "producer": "q30-dflash2-internal-target-row-v1",
+                    "role": role,
+                    "engine_mode": engine_mode,
+                    "subset": "HumanEval",
+                    "index": index,
+                    "source_row": source_row,
+                    "selection_reason": reason,
+                    "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                    "request_sha256": _sha_json(body),
+                    **extracted,
+                    "response_sha256": _sha_json(extracted),
+                }
+                stream.write(_canonical(record) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _read_internal_target_rows(path: Path, expected_role: str) -> list[dict[str, Any]]:
+    expected_keys = {
+        "schema_version",
+        "producer",
+        "role",
+        "engine_mode",
+        "subset",
+        "index",
+        "source_row",
+        "selection_reason",
+        "prompt_sha256",
+        "request_sha256",
+        "output_text",
+        "token_ids",
+        "prompt_token_ids",
+        "finish_reason",
+        "top_logprobs",
+        "speculative_decoding",
+        "response_sha256",
+    }
+    rows: list[dict[str, Any]] = []
+    with path.open() as stream:
+        for line in stream:
+            value = json.loads(line)
+            if not isinstance(value, dict) or set(value) != expected_keys:
+                raise ValueError("internal-target row schema mismatch")
+            tokens = value.get("token_ids")
+            prompt_tokens = value.get("prompt_token_ids")
+            top = value.get("top_logprobs")
+            extracted = {
+                "output_text": value.get("output_text"),
+                "token_ids": tokens,
+                "prompt_token_ids": prompt_tokens,
+                "finish_reason": value.get("finish_reason"),
+                "top_logprobs": top,
+                "speculative_decoding": value.get("speculative_decoding"),
+            }
+            if (
+                value.get("schema_version") != 1
+                or value.get("producer") != "q30-dflash2-internal-target-row-v1"
+                or value.get("role") != expected_role
+                or value.get("engine_mode") not in {"compiled", "eager"}
+                or (expected_role == "target" and value.get("engine_mode") != "compiled")
+                or value.get("subset") != "HumanEval"
+                or isinstance(value.get("index"), bool)
+                or not isinstance(value.get("index"), int)
+                or isinstance(value.get("source_row"), bool)
+                or not isinstance(value.get("source_row"), int)
+                or value["source_row"] < 0
+                or not isinstance(value.get("selection_reason"), str)
+                or not _is_sha256(value.get("prompt_sha256"))
+                or not _is_sha256(value.get("request_sha256"))
+                or not _is_sha256(value.get("response_sha256"))
+                or value["response_sha256"] != _sha_json(extracted)
+                or not isinstance(value.get("output_text"), str)
+                or value.get("finish_reason") not in {"stop", "length"}
+                or not isinstance(tokens, list)
+                or not tokens
+                or not all(
+                    isinstance(token, int) and not isinstance(token, bool) and token >= 0
+                    for token in tokens
+                )
+                or not isinstance(prompt_tokens, list)
+                or not prompt_tokens
+                or not all(
+                    isinstance(token, int) and not isinstance(token, bool) and token >= 0
+                    for token in prompt_tokens
+                )
+                or not isinstance(top, list)
+                or len(top) != len(tokens)
+                or not all(_valid_top_logprobs(distribution) for distribution in top)
+            ):
+                raise ValueError("internal-target row evidence mismatch")
+            if expected_role == "target":
+                if value.get("speculative_decoding") is not None:
+                    raise ValueError("target row must not contain speculative metrics")
+                if any(
+                    f"token_id:{token}" not in distribution
+                    or float(distribution[f"token_id:{token}"])
+                    != max(map(float, distribution.values()))
+                    for token, distribution in zip(tokens, top, strict=True)
+                ):
+                    raise ValueError("target-only row did not emit its online argmax")
+            else:
+                _validate_spec_decode_metrics_payload(value.get("speculative_decoding"))
+            rows.append(value)
+    expected = list(INTERNAL_TARGET_DIAGNOSTIC_ROWS)
+    if [(row["index"], row["selection_reason"]) for row in rows] != expected:
+        raise ValueError("internal-target RCA selection mismatch")
+    if expected_role == "dflash2" and len({row["engine_mode"] for row in rows}) != 1:
+        raise ValueError("internal-target DFlash2 engine modes are mixed")
+    return rows
+
+
+def _emitted_token_verdict(row: dict[str, Any], position: int) -> dict[str, Any]:
+    tokens = row["token_ids"]
+    distributions = row["top_logprobs"]
+    if position >= len(tokens) or position >= len(distributions):
+        return {"class": "unresolved-termination", "position": position}
+    token = tokens[position]
+    distribution = distributions[position]
+    assert isinstance(distribution, dict)
+    maximum = max(map(float, distribution.values()))
+    logprob = distribution.get(f"token_id:{token}")
+    if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
+        return {
+            "class": "unresolved-internal-top20",
+            "position": position,
+            "dflash2_token_id": token,
+            "internal_target_max_logprob": maximum,
+        }
+    value = float(logprob)
+    rank = 1 + sum(float(item) > value for item in distribution.values())
+    return {
+        "class": (
+            "speculative-internal-argmax"
+            if value == maximum
+            else "internal-target-consistency-mismatch"
+        ),
+        "position": position,
+        "dflash2_token_id": token,
+        "dflash2_token_internal_rank": rank,
+        "internal_target_max_logprob": maximum,
+        "dflash2_token_internal_logprob": value,
+    }
+
+
+def _paired_target_verdict(
+    target_row: dict[str, Any], dflash2_token_id: int, position: int
+) -> dict[str, Any]:
+    distributions = target_row["top_logprobs"]
+    if position >= len(distributions):
+        return {"class": "unresolved-target-termination", "position": position}
+    distribution = distributions[position]
+    assert isinstance(distribution, dict)
+    maximum = max(map(float, distribution.values()))
+    logprob = distribution.get(f"token_id:{dflash2_token_id}")
+    if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
+        return {
+            "class": "unresolved-target-top20",
+            "position": position,
+            "dflash2_token_id": dflash2_token_id,
+            "paired_target_max_logprob": maximum,
+        }
+    value = float(logprob)
+    rank = 1 + sum(float(item) > value for item in distribution.values())
+    return {
+        "class": "target-rerun-argmax" if value == maximum else "paired-target-not-argmax",
+        "position": position,
+        "dflash2_token_id": dflash2_token_id,
+        "dflash2_token_paired_target_rank": rank,
+        "paired_target_max_logprob": maximum,
+        "dflash2_token_paired_target_logprob": value,
+    }
+
+
+def summarize_internal_target_diagnostic(target_path: Path, dflash2_path: Path) -> dict[str, Any]:
+    """Classify selected outputs against target-only and speculative-engine logits."""
+    target_rows = _read_internal_target_rows(target_path, "target")
+    dflash_rows = _read_internal_target_rows(dflash2_path, "dflash2")
+    classifications: list[dict[str, Any]] = []
+    accepted_total = 0
+    drafted_total = 0
+    spec_steps = 0
+    for target, draft in zip(target_rows, dflash_rows, strict=True):
+        identity_fields = (
+            "subset",
+            "index",
+            "source_row",
+            "selection_reason",
+            "prompt_sha256",
+            "request_sha256",
+            "prompt_token_ids",
+        )
+        if any(target[name] != draft[name] for name in identity_fields):
+            raise ValueError("internal-target paired row identity mismatch")
+        metrics = draft["speculative_decoding"]
+        assert isinstance(metrics, dict)
+        accepted_total += metrics["num_accepted_draft_tokens"]
+        drafted_total += metrics["num_draft_tokens"]
+        spec_steps += metrics["num_spec_steps"]
+        target_ids = target["token_ids"]
+        dflash_ids = draft["token_ids"]
+        common = 0
+        while (
+            common < min(len(target_ids), len(dflash_ids))
+            and target_ids[common] == dflash_ids[common]
+        ):
+            common += 1
+        base = {
+            "subset": "HumanEval",
+            "index": target["index"],
+            "source_row": target["source_row"],
+            "selection_reason": target["selection_reason"],
+            "engine_mode": draft["engine_mode"],
+        }
+        if common == len(target_ids) == len(dflash_ids):
+            if target["finish_reason"] != draft["finish_reason"]:
+                classifications.append(
+                    {**base, "class": "unresolved-termination", "common_prefix_tokens": common}
+                )
+                continue
+            mismatch = None
+            for position in range(len(dflash_ids)):
+                verdict = _emitted_token_verdict(draft, position)
+                if verdict["class"] != "speculative-internal-argmax":
+                    mismatch = verdict
+                    break
+            classifications.append({**base, **mismatch} if mismatch else {**base, "class": "exact"})
+            continue
+        if common >= len(target_ids) or common >= len(dflash_ids):
+            classifications.append(
+                {**base, "class": "unresolved-termination", "common_prefix_tokens": common}
+            )
+            continue
+        internal_verdict = _emitted_token_verdict(draft, common)
+        if internal_verdict["class"] != "speculative-internal-argmax":
+            verdict = internal_verdict
+        else:
+            paired_target_verdict = _paired_target_verdict(target, dflash_ids[common], common)
+            verdict = (
+                paired_target_verdict
+                if paired_target_verdict["class"] != "paired-target-not-argmax"
+                else internal_verdict
+            )
+        classifications.append(
+            {
+                **base,
+                **verdict,
+                "target_only_token_id": target_ids[common],
+            }
+        )
+    counts = dict(collections.Counter(str(row["class"]) for row in classifications))
+    engine_mode = dflash_rows[0]["engine_mode"]
+    if counts.get("internal-target-consistency-mismatch", 0):
+        next_action = "instrument-rejection-and-logprob-index-mapping"
+    elif any(label.startswith("unresolved-") for label in counts):
+        next_action = "capture-full-vocabulary-or-termination-evidence"
+    elif counts.get("speculative-internal-argmax", 0):
+        next_action = (
+            "rerun-internal-target-eager"
+            if engine_mode == "compiled"
+            else "instrument-speculative-kv-context-and-numerical-path"
+        )
+    elif counts.get("target-rerun-argmax", 0):
+        next_action = "treat-as-target-rerun-tie-not-engine-drift"
+    else:
+        next_action = "no-runtime-mismatch-reproduced"
+    return {
+        "schema_version": 1,
+        "producer": "q30-dflash2-internal-target-diagnostic-v1",
+        "claim_scope": "runtime correctness diagnosis only; no speedup or training-quality claim",
+        "selection": [
+            {"subset": "HumanEval", "index": index, "reason": reason}
+            for index, reason in INTERNAL_TARGET_DIAGNOSTIC_ROWS
+        ],
+        "engine_mode": engine_mode,
+        "counts": counts,
+        "classifications": classifications,
+        "acceptance": {
+            "num_spec_steps": spec_steps,
+            "num_accepted_draft_tokens": accepted_total,
+            "num_draft_tokens": drafted_total,
+            "draft_acceptance_rate": accepted_total / drafted_total if drafted_total else 0.0,
+        },
+        "next_action": next_action,
+    }
+
+
+def _validate_rca_source_receipt(
+    path: Path, current_identity: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    payload = _load_json(path)
+    unsigned = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    classifications = payload.get("classifications")
+    expected_classes = {
+        0: "exact",
+        1: "target-invalid",
+        8: "tied-target-valid",
+        27: "target-invalid",
+        41: "target-invalid",
+        82: "target-invalid",
+        151: "target-invalid",
+        165: "tied-target-valid",
+        172: "target-invalid",
+    }
+    if (
+        payload.get("receipt_sha256") != _sha_json(unsigned)
+        or payload.get("receipt_sha256") != RCA_SOURCE_PILOT_RECEIPT_SHA256
+        or payload.get("producer") != "q30-dflash2-tie-aware-pilot-summary-v1"
+        or payload.get("status") != "failed"
+        or payload.get("subset") != "HumanEval"
+        or payload.get("occurrences") != 200
+        or not isinstance(classifications, list)
+        or len(classifications) != 200
+        or [row.get("index") if isinstance(row, dict) else None for row in classifications]
+        != list(range(200))
+    ):
+        raise ValueError("internal-target RCA source receipt mismatch")
+    selected = {
+        row.get("index"): row
+        for row in classifications
+        if isinstance(row, dict) and row.get("index") in expected_classes
+    }
+    for index, expected_class in expected_classes.items():
+        row = selected.get(index)
+        if (
+            not isinstance(row, dict)
+            or row.get("subset") != "HumanEval"
+            or row.get("source_row") != index % 164
+            or row.get("class") != expected_class
+        ):
+            raise ValueError("internal-target RCA classification mismatch")
+    if current_identity is not None:
+        source_identity_path = _validate_file_descriptor(payload.get("artifact_identity"))
+        source_identity = _load_json(source_identity_path)
+        source_unsigned = {
+            key: value for key, value in source_identity.items() if key != "receipt_sha256"
+        }
+        source_dataset = source_identity.get("dataset")
+        current_dataset = current_identity.get("dataset")
+        if (
+            source_identity.get("producer") != "q30-dflash2-s4166-speculators-inputs-v1"
+            or source_identity.get("receipt_sha256") != _sha_json(source_unsigned)
+            or not isinstance(source_dataset, dict)
+            or not isinstance(current_dataset, dict)
+            or source_dataset.get("prompt_sha256") != current_dataset.get("prompt_sha256")
+            or not isinstance(source_dataset.get("ordered_prompts"), list)
+            or not isinstance(current_dataset.get("ordered_prompts"), list)
+        ):
+            raise ValueError("internal-target RCA prompt identity mismatch")
+        source_schedule = {
+            row.get("index"): row
+            for row in source_dataset["ordered_prompts"]
+            if isinstance(row, dict) and row.get("subset") == "HumanEval"
+        }
+        current_schedule = {
+            row.get("index"): row
+            for row in current_dataset["ordered_prompts"]
+            if isinstance(row, dict) and row.get("subset") == "HumanEval"
+        }
+        for index, _ in INTERNAL_TARGET_DIAGNOSTIC_ROWS:
+            expected = source_schedule.get(index)
+            current = current_schedule.get(index)
+            if (
+                not isinstance(expected, dict)
+                or not isinstance(current, dict)
+                or expected.get("source_row") != current.get("source_row")
+                or expected.get("prompt_sha256") != current.get("prompt_sha256")
+            ):
+                raise ValueError("internal-target RCA selected prompt mismatch")
+    return payload
+
+
+def _validate_internal_rows_against_identity(
+    path: Path, role: str, identity: dict[str, Any]
+) -> list[dict[str, Any]]:
+    rows = _read_internal_target_rows(path, role)
+    target = identity.get("target")
+    dataset = identity.get("dataset")
+    if not isinstance(target, dict) or not isinstance(dataset, dict):
+        raise ValueError("internal-target artifact identity mismatch")
+    schedule = dataset.get("ordered_prompts")
+    files = dataset.get("files")
+    if not isinstance(schedule, list) or not isinstance(files, dict):
+        raise ValueError("internal-target prompt identity mismatch")
+    entry = files.get("HumanEval")
+    if not isinstance(entry, dict):
+        raise ValueError("internal-target HumanEval identity missing")
+    prompts = _read_prompt_prefix(Path(str(entry.get("path", ""))), 200)
+    schedule_by_index = {
+        row.get("index"): row
+        for row in schedule
+        if isinstance(row, dict) and row.get("subset") == "HumanEval"
+    }
+    for row, (index, reason) in zip(rows, INTERNAL_TARGET_DIAGNOSTIC_ROWS, strict=True):
+        source_row, prompt = prompts[index]
+        body = {
+            "model": target.get("path"),
+            "prompt": prompt,
+            "max_tokens": 64,
+            "temperature": 0,
+            "top_p": 1,
+            "seed": 42,
+            "logprobs": 20,
+            "return_tokens_as_token_ids": True,
+            "return_token_ids": True,
+            "request_id": f"specdec-internal-target-HumanEval-{index}",
+        }
+        expected = schedule_by_index.get(index)
+        if (
+            not isinstance(expected, dict)
+            or row["index"] != index
+            or row["source_row"] != source_row
+            or row["selection_reason"] != reason
+            or row["prompt_sha256"] != hashlib.sha256(prompt.encode()).hexdigest()
+            or row["prompt_sha256"] != expected.get("prompt_sha256")
+            or source_row != expected.get("source_row")
+            or row["request_sha256"] != _sha_json(body)
+        ):
+            raise ValueError("internal-target row does not match artifact schedule")
+    return rows
+
+
+def build_internal_target_diagnostic_receipt(
+    target_rows_path: Path,
+    dflash2_rows_path: Path,
+    source_pilot_receipt_path: Path,
+    target_manifest_path: Path,
+    dflash2_manifest_path: Path,
+    artifact_identity_path: Path,
+    allocation_receipt_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Publish live-job evidence for the bounded internal-target diagnostic."""
+    identity = _validate_artifact_identity(artifact_identity_path)
+    source = _validate_rca_source_receipt(source_pilot_receipt_path, identity)
+    target_rows = _validate_internal_rows_against_identity(target_rows_path, "target", identity)
+    dflash_rows = _validate_internal_rows_against_identity(dflash2_rows_path, "dflash2", identity)
+    if any(
+        target["prompt_token_ids"] != dflash["prompt_token_ids"]
+        for target, dflash in zip(target_rows, dflash_rows, strict=True)
+    ):
+        raise ValueError("internal-target paired prompt token IDs mismatch")
+    target_evidence = _validate_target_control_manifest(
+        target_manifest_path, artifact_identity_path, identity
+    )
+    engine_mode = dflash_rows[0]["engine_mode"]
+    dflash_manifest, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
+        dflash2_manifest_path,
+        target_evidence[0],
+        target_evidence[2],
+        artifact_identity_path,
+        identity,
+        detailed_metrics=True,
+        enforce_eager=engine_mode == "eager",
+    )
+    allocation = validate_target_control_allocation_receipt(allocation_receipt_path)
+    current = _query_current_allocation()
+    for name in (
+        "slurm_job_id",
+        "slurm_job_num_nodes",
+        "slurm_job_nodelist",
+        "gpu_count",
+        "cell_visible_devices",
+    ):
+        if allocation.get(name) != current.get(name):
+            raise ValueError(f"internal-target live allocation mismatch: {name}")
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"]
+        for manifest in (target_evidence[0], dflash_manifest)
+    ):
+        raise ValueError("internal-target allocation job mismatch")
+    if {
+        _manifest_server_port(target_evidence[0]),
+        _manifest_server_port(dflash_manifest),
+    } != {"8000", "8010"}:
+        raise ValueError("internal-target server ports are not isolated")
+    payload = summarize_internal_target_diagnostic(target_rows_path, dflash2_rows_path)
+    payload["source_pilot_receipt_sha256"] = source["receipt_sha256"]
+    payload["allocation_evidence_scope"] = (
+        "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    )
+    payload["source_pilot_receipt"] = _file_descriptor(source_pilot_receipt_path)
+    payload["artifact_identity"] = _file_descriptor(artifact_identity_path)
+    payload["allocation_receipt"] = _file_descriptor(allocation_receipt_path)
+    payload["rows"] = {
+        "target": _file_descriptor(target_rows_path),
+        "dflash2": _file_descriptor(dflash2_rows_path),
+    }
+    payload["manifests"] = {
+        "target": _file_descriptor(target_manifest_path),
+        "dflash2": _file_descriptor(dflash2_manifest_path),
+    }
+    payload["input_fingerprints"] = {
+        "target": _file_descriptor(target_evidence[1]),
+        "dflash2": _file_descriptor(dflash_fingerprint),
+    }
+    payload["launcher_configs"] = {
+        "target": _file_descriptor(target_evidence[3]),
+        "dflash2": _file_descriptor(dflash_launcher),
+    }
+    payload["receipt_sha256"] = _sha_json(payload)
+    _atomic_json(output_path, payload, no_replace=True)
+    return payload
+
+
+def validate_internal_target_diagnostic_receipt(path: Path) -> dict[str, Any]:
+    """Replay all durable internal-target evidence without scheduler-origin claims."""
+    payload = _load_json(path)
+    claim = payload.pop("receipt_sha256", None)
+    if claim != _sha_json(payload):
+        raise ValueError("internal-target receipt self-hash mismatch")
+    source_path = _validate_file_descriptor(payload.get("source_pilot_receipt"))
+    artifact_path = _validate_file_descriptor(payload.get("artifact_identity"))
+    allocation_path = _validate_file_descriptor(payload.get("allocation_receipt"))
+    evidence: dict[str, dict[str, Path]] = {}
+    for group in ("rows", "manifests", "input_fingerprints", "launcher_configs"):
+        value = payload.get(group)
+        if not isinstance(value, dict) or set(value) != {"target", "dflash2"}:
+            raise ValueError(f"internal-target {group} schema mismatch")
+        evidence[group] = {name: _validate_file_descriptor(item) for name, item in value.items()}
+    identity = _validate_artifact_identity(artifact_path)
+    source = _validate_rca_source_receipt(source_path, identity)
+    target_rows = _validate_internal_rows_against_identity(
+        evidence["rows"]["target"], "target", identity
+    )
+    dflash_rows = _validate_internal_rows_against_identity(
+        evidence["rows"]["dflash2"], "dflash2", identity
+    )
+    if any(
+        target["prompt_token_ids"] != dflash["prompt_token_ids"]
+        for target, dflash in zip(target_rows, dflash_rows, strict=True)
+    ):
+        raise ValueError("internal-target paired prompt token IDs mismatch")
+    target_evidence = _validate_target_control_manifest(
+        evidence["manifests"]["target"], artifact_path, identity
+    )
+    engine_mode = dflash_rows[0]["engine_mode"]
+    dflash_manifest, dflash_launcher, dflash_fingerprint = _validate_dflash2_probe_manifest(
+        evidence["manifests"]["dflash2"],
+        target_evidence[0],
+        target_evidence[2],
+        artifact_path,
+        identity,
+        detailed_metrics=True,
+        enforce_eager=engine_mode == "eager",
+    )
+    allocation = validate_target_control_allocation_receipt(allocation_path)
+    if any(
+        manifest.get("slurm_job_id") != allocation["slurm_job_id"]
+        for manifest in (target_evidence[0], dflash_manifest)
+    ):
+        raise ValueError("internal-target allocation replay mismatch")
+    if {
+        _manifest_server_port(target_evidence[0]),
+        _manifest_server_port(dflash_manifest),
+    } != {"8000", "8010"}:
+        raise ValueError("internal-target server ports are not isolated")
+    if evidence["input_fingerprints"] != {
+        "target": target_evidence[1],
+        "dflash2": dflash_fingerprint,
+    } or evidence["launcher_configs"] != {
+        "target": target_evidence[3],
+        "dflash2": dflash_launcher,
+    }:
+        raise ValueError("internal-target provenance descriptor mismatch")
+    replayed = summarize_internal_target_diagnostic(
+        evidence["rows"]["target"], evidence["rows"]["dflash2"]
+    )
+    for name, value in replayed.items():
+        if payload.get(name) != value:
+            raise ValueError(f"internal-target replay mismatch: {name}")
+    if (
+        payload.get("source_pilot_receipt_sha256") != source["receipt_sha256"]
+        or payload.get("allocation_evidence_scope")
+        != "live SLURM/GPU origin checked at creation; offline verification is tamper replay"
+    ):
+        raise ValueError("internal-target claim scope mismatch")
+    return {**payload, "receipt_sha256": claim}
+
+
 def _read_tie_aware_pilot_rows(path: Path, expected_role: str) -> list[dict[str, Any]]:
     expected_keys = {
         "schema_version",
@@ -2339,9 +3121,7 @@ def summarize_tie_aware_pilot(target_path: Path, dflash2_path: Path) -> dict[str
     for row in classifications:
         label = str(row["class"])
         counts[label] = counts.get(label, 0) + 1
-    unresolved = sum(
-        count for label, count in counts.items() if label.startswith("unresolved-")
-    )
+    unresolved = sum(count for label, count in counts.items() if label.startswith("unresolved-"))
     return {
         "schema_version": 1,
         "producer": "q30-dflash2-tie-aware-pilot-summary-v1",
@@ -2354,9 +3134,7 @@ def summarize_tie_aware_pilot(target_path: Path, dflash2_path: Path) -> dict[str
         "unique_source_rows": len({row["source_row"] for row in target_rows}),
         "counts": counts,
         "status": (
-            "passed"
-            if counts.get("target-invalid", 0) == 0 and unresolved == 0
-            else "failed"
+            "passed" if counts.get("target-invalid", 0) == 0 and unresolved == 0 else "failed"
         ),
         "classifications": classifications,
     }
@@ -2379,9 +3157,7 @@ def _validate_tie_aware_rows_against_identity(
         raise ValueError("tie-aware HumanEval file is missing")
     prompts = _read_prompt_prefix(Path(str(entry.get("path", ""))), 200)
     expected_schedule = [
-        item
-        for item in schedule
-        if isinstance(item, dict) and item.get("subset") == "HumanEval"
+        item for item in schedule if isinstance(item, dict) and item.get("subset") == "HumanEval"
     ]
     if len(prompts) != 200 or len(expected_schedule) != 200:
         raise ValueError("tie-aware pilot needs the authenticated exact-200 schedule")
@@ -2443,9 +3219,7 @@ def build_tie_aware_pilot_receipt(
     """Publish the job-authenticated 200-row tie-aware pilot receipt."""
     identity = _validate_artifact_identity(artifact_identity_path)
     target_rows = _validate_tie_aware_rows_against_identity(target_rows_path, "target", identity)
-    dflash_rows = _validate_tie_aware_rows_against_identity(
-        dflash2_rows_path, "dflash2", identity
-    )
+    dflash_rows = _validate_tie_aware_rows_against_identity(dflash2_rows_path, "dflash2", identity)
     if any(
         target["prompt_token_ids"] != dflash["prompt_token_ids"]
         for target, dflash in zip(target_rows, dflash_rows, strict=True)
@@ -2564,9 +3338,7 @@ def validate_tie_aware_pilot_receipt(path: Path) -> dict[str, Any]:
         "dflash2": dflash_launcher,
     }:
         raise ValueError("tie-aware pilot provenance descriptor mismatch")
-    replayed = summarize_tie_aware_pilot(
-        evidence["rows"]["target"], evidence["rows"]["dflash2"]
-    )
+    replayed = summarize_tie_aware_pilot(evidence["rows"]["target"], evidence["rows"]["dflash2"])
     for name, value in replayed.items():
         if payload.get(name) != value:
             raise ValueError(f"tie-aware pilot replay mismatch: {name}")
@@ -2691,6 +3463,15 @@ def main() -> None:
     tie_capture.add_argument("--model", required=True)
     tie_capture.add_argument("--role", required=True, choices=("target", "dflash2"))
 
+    internal_capture = commands.add_parser("capture-internal-target")
+    internal_capture.add_argument("--dataset-manifest", required=True)
+    internal_capture.add_argument("--hf-home", required=True)
+    internal_capture.add_argument("--output", required=True)
+    internal_capture.add_argument("--endpoint", required=True)
+    internal_capture.add_argument("--model", required=True)
+    internal_capture.add_argument("--role", required=True, choices=("target", "dflash2"))
+    internal_capture.add_argument("--engine-mode", required=True, choices=("compiled", "eager"))
+
     compare = commands.add_parser("compare-outputs")
     compare.add_argument("--baseline", required=True)
     compare.add_argument("--dflash2", required=True)
@@ -2767,6 +3548,19 @@ def main() -> None:
     tie_verify = commands.add_parser("verify-tie-pilot")
     tie_verify.add_argument("--receipt", required=True)
 
+    internal_analysis = commands.add_parser("analyze-internal-target")
+    internal_analysis.add_argument("--target-rows", required=True)
+    internal_analysis.add_argument("--dflash2-rows", required=True)
+    internal_analysis.add_argument("--source-pilot-receipt", required=True)
+    internal_analysis.add_argument("--target-manifest", required=True)
+    internal_analysis.add_argument("--dflash2-manifest", required=True)
+    internal_analysis.add_argument("--artifact-identity", required=True)
+    internal_analysis.add_argument("--allocation-receipt", required=True)
+    internal_analysis.add_argument("--output", required=True)
+
+    internal_verify = commands.add_parser("verify-internal-target")
+    internal_verify.add_argument("--receipt", required=True)
+
     args = parser.parse_args()
     if args.command == "prompt-set":
         payload = compute_prompt_set(Path(args.dataset_manifest), Path(args.hf_home))
@@ -2804,6 +3598,16 @@ def main() -> None:
             endpoint=args.endpoint,
             model=args.model,
             role=args.role,
+        )
+    elif args.command == "capture-internal-target":
+        capture_internal_target_diagnostic(
+            Path(args.dataset_manifest),
+            Path(args.hf_home),
+            Path(args.output),
+            endpoint=args.endpoint,
+            model=args.model,
+            role=args.role,
+            engine_mode=args.engine_mode,
         )
     elif args.command == "compare-outputs":
         artifact_identity_sha256 = _sha256(Path(args.artifact_identity))
@@ -2855,6 +3659,19 @@ def main() -> None:
         )
     elif args.command == "verify-tie-pilot":
         validate_tie_aware_pilot_receipt(Path(args.receipt))
+    elif args.command == "analyze-internal-target":
+        build_internal_target_diagnostic_receipt(
+            Path(args.target_rows),
+            Path(args.dflash2_rows),
+            Path(args.source_pilot_receipt),
+            Path(args.target_manifest),
+            Path(args.dflash2_manifest),
+            Path(args.artifact_identity),
+            Path(args.allocation_receipt),
+            Path(args.output),
+        )
+    elif args.command == "verify-internal-target":
+        validate_internal_target_diagnostic_receipt(Path(args.receipt))
     elif args.command == "summarize":
         correctness = _load_json(Path(args.correctness_receipt))
         claim = correctness.pop("receipt_sha256", None)

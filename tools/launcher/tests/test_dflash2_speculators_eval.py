@@ -18,22 +18,27 @@ import pytest
 from common.specdec.dflash2_runtime_contract import artifact_tree_sha256, write_artifact_receipt
 from common.specdec.dflash2_speculators_eval import (
     DATASET_REVISION,
+    INTERNAL_TARGET_DIAGNOSTIC_ROWS,
     PROBE_ROWS,
     STANDARD_SUBSETS,
     analyze_divergence_probe,
     build_artifact_identity,
+    build_internal_target_diagnostic_receipt,
     build_target_control_allocation_receipt,
     build_target_control_receipt,
     build_tie_aware_pilot_receipt,
     capture_divergence_probe,
+    capture_internal_target_diagnostic,
     capture_outputs,
     capture_tie_aware_pilot,
     classify_tie_aware_rows,
     compute_prompt_set,
     materialize_prompt_set,
+    summarize_internal_target_diagnostic,
     summarize_pair,
     summarize_target_control,
     summarize_tie_aware_pilot,
+    validate_internal_target_diagnostic_receipt,
     validate_milestone_export,
     validate_output_equivalence,
     validate_target_control_allocation_receipt,
@@ -179,9 +184,7 @@ def test_divergence_probe_identifies_first_invalid_dflash2_token(tmp_path: Path)
     baseline.write_text(json.dumps(tied) + "\n")
     changed_draft = json.loads(draft.read_text())
     changed_draft["records"][1]["token_ids"] = [10, 11, 99]
-    unsigned = {
-        key: value for key, value in changed_draft.items() if key != "receipt_sha256"
-    }
+    unsigned = {key: value for key, value in changed_draft.items() if key != "receipt_sha256"}
     changed_draft["receipt_sha256"] = hashlib.sha256(
         json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -222,9 +225,7 @@ def test_capture_divergence_probe_uses_pinned_vllm_token_schema(
             ]
         }
 
-    monkeypatch.setattr(
-        "common.specdec.dflash2_speculators_eval._post_completion", fake_completion
-    )
+    monkeypatch.setattr("common.specdec.dflash2_speculators_eval._post_completion", fake_completion)
     output = tmp_path / "probe.json"
     payload = capture_divergence_probe(
         manifest,
@@ -284,9 +285,10 @@ def test_tie_aware_classifier_is_fail_closed_for_top20_and_termination() -> None
     )
     malformed = row([10, 11], "length", [])
     malformed["top_logprobs"] = [{"token_id:10": -0.1}, {"token_id:11": float("nan")}]
-    assert classify_tie_aware_rows(target=malformed, dflash2=row([10, 11], "length", []))[
-        "class"
-    ] == "unresolved-target-evidence"
+    assert (
+        classify_tie_aware_rows(target=malformed, dflash2=row([10, 11], "length", []))["class"]
+        == "unresolved-target-evidence"
+    )
     later_malformed = row(
         [10, 11, 12],
         "length",
@@ -297,9 +299,7 @@ def test_tie_aware_classifier_is_fail_closed_for_top20_and_termination() -> None
         ],
     )
     earlier_tie = row([10, 99, 55], "length", [])
-    assert classify_tie_aware_rows(later_malformed, earlier_tie)["class"] == (
-        "tied-target-valid"
-    )
+    assert classify_tie_aware_rows(later_malformed, earlier_tie)["class"] == ("tied-target-valid")
 
 
 def test_tie_aware_pilot_streams_exact_humaneval_schedule_and_online_target_logits(
@@ -314,7 +314,7 @@ def test_tie_aware_pilot_streams_exact_humaneval_schedule_and_online_target_logi
 
     def fake_completion(_endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
         calls.append(body)
-        return {
+        payload = {
             "choices": [
                 {
                     "text": "x",
@@ -325,10 +325,9 @@ def test_tie_aware_pilot_streams_exact_humaneval_schedule_and_online_target_logi
                 }
             ]
         }
+        return payload
 
-    monkeypatch.setattr(
-        "common.specdec.dflash2_speculators_eval._post_completion", fake_completion
-    )
+    monkeypatch.setattr("common.specdec.dflash2_speculators_eval._post_completion", fake_completion)
     target_path = tmp_path / "target.jsonl"
     capture_tie_aware_pilot(
         matched_manifest,
@@ -355,6 +354,401 @@ def test_tie_aware_pilot_streams_exact_humaneval_schedule_and_online_target_logi
             model="target",
             role="target",
         )
+
+
+def test_internal_target_diagnostic_captures_exact_rca_rows_and_detailed_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded probe captures only RCA-selected rows and exact detailed metrics."""
+    manifest, hf_home = _write_prompt_snapshot(tmp_path / "prompts", rows=164)
+    matched_hf = tmp_path / "matched-hf"
+    matched_manifest = tmp_path / "matched-manifest.json"
+    materialize_prompt_set(manifest, hf_home, matched_hf, matched_manifest)
+    calls: list[dict[str, Any]] = []
+    malformed = False
+
+    def fake_completion(_endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+        calls.append(body)
+        token = 10 if body["request_id"].endswith("-0") else 99
+        payload = {
+            "choices": [
+                {
+                    "text": "x",
+                    "finish_reason": "length",
+                    "token_ids": [token],
+                    "prompt_token_ids": [1, 2],
+                    "logprobs": {
+                        "top_logprobs": [{f"token_id:{token}": -0.1, "token_id:10": -0.2}]
+                    },
+                }
+            ],
+            "metrics": {
+                "speculative_decoding": {
+                    "mean_acceptance_length": 2.0,
+                    "draft_acceptance_rate": 1 / 7,
+                    "acceptance_histogram": [0, 1, 0, 0, 0, 0, 0, 0],
+                    "num_spec_steps": 1,
+                    "num_accepted_draft_tokens": 1,
+                    "num_draft_tokens": 7,
+                    "num_spec_tokens": 7,
+                    "per_step_accepted": [1],
+                    "per_step_drafted": [7],
+                }
+            },
+        }
+        if malformed:
+            payload["metrics"]["speculative_decoding"]["per_step_drafted"] = []
+        return payload
+
+    monkeypatch.setattr("common.specdec.dflash2_speculators_eval._post_completion", fake_completion)
+    output = tmp_path / "internal.jsonl"
+    capture_internal_target_diagnostic(
+        matched_manifest,
+        matched_hf,
+        output,
+        endpoint="http://dflash2/v1",
+        model="target",
+        role="dflash2",
+        engine_mode="compiled",
+    )
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+
+    assert [row["index"] for row in rows] == [index for index, _ in INTERNAL_TARGET_DIAGNOSTIC_ROWS]
+    assert all(call["logprobs"] == 20 for call in calls)
+    assert all(row["speculative_decoding"]["per_step_drafted"] == [7] for row in rows)
+    assert all(row["engine_mode"] == "compiled" for row in rows)
+
+    malformed = True
+    with pytest.raises(ValueError, match="detailed speculative metrics"):
+        capture_internal_target_diagnostic(
+            matched_manifest,
+            matched_hf,
+            tmp_path / "malformed.jsonl",
+            endpoint="http://dflash2/v1",
+            model="target",
+            role="dflash2",
+            engine_mode="compiled",
+        )
+
+
+def test_internal_target_summary_distinguishes_runtime_rejection_from_engine_drift(
+    tmp_path: Path,
+) -> None:
+    """The summary routes below-own-argmax separately from baseline disagreement."""
+    target_path = tmp_path / "target.jsonl"
+    dflash_path = tmp_path / "dflash.jsonl"
+
+    def record(
+        index: int, role: str, tokens: list[int], top: list[dict[str, float]]
+    ) -> dict[str, Any]:
+        extracted = {
+            "output_text": "x",
+            "token_ids": tokens,
+            "prompt_token_ids": [1, 2],
+            "finish_reason": "length",
+            "top_logprobs": top,
+            "speculative_decoding": (
+                None
+                if role == "target"
+                else {
+                    "mean_acceptance_length": 2.0,
+                    "draft_acceptance_rate": 1 / 7,
+                    "acceptance_histogram": [0, 1, 0, 0, 0, 0, 0, 0],
+                    "num_spec_steps": 1,
+                    "num_accepted_draft_tokens": 1,
+                    "num_draft_tokens": 7,
+                    "num_spec_tokens": 7,
+                    "per_step_accepted": [1],
+                    "per_step_drafted": [7],
+                }
+            ),
+        }
+        selection = dict(INTERNAL_TARGET_DIAGNOSTIC_ROWS)[index]
+        return {
+            "schema_version": 1,
+            "producer": "q30-dflash2-internal-target-row-v1",
+            "role": role,
+            "engine_mode": "compiled",
+            "subset": "HumanEval",
+            "index": index,
+            "source_row": index if index < 164 else index - 164,
+            "selection_reason": selection,
+            "prompt_sha256": f"{index:064x}",
+            "request_sha256": "a" * 64,
+            **extracted,
+            "response_sha256": hashlib.sha256(
+                json.dumps(extracted, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        }
+
+    target_rows = []
+    dflash_rows = []
+    for position, (index, _) in enumerate(INTERNAL_TARGET_DIAGNOSTIC_ROWS):
+        target_second = (
+            {"token_id:11": -0.1, "token_id:99": -0.1}
+            if position in {1, 2}
+            else {"token_id:11": -0.1, "token_id:99": -0.3}
+        )
+        target_rows.append(
+            record(index, "target", [10, 11], [{"token_id:10": -0.1}, target_second])
+        )
+        if position == 0:
+            dflash_rows.append(
+                record(index, "dflash2", [10, 11], [{"token_id:10": -0.1}, {"token_id:11": -0.1}])
+            )
+        elif position == 1:
+            dflash_rows.append(
+                record(
+                    index,
+                    "dflash2",
+                    [10, 99],
+                    [{"token_id:10": -0.1}, {"token_id:11": -0.1, "token_id:99": -0.3}],
+                )
+            )
+        else:
+            dflash_rows.append(
+                record(
+                    index,
+                    "dflash2",
+                    [10, 99],
+                    [{"token_id:10": -0.1}, {"token_id:11": -0.3, "token_id:99": -0.1}],
+                )
+            )
+    target_path.write_text("".join(json.dumps(row) + "\n" for row in target_rows))
+    dflash_path.write_text("".join(json.dumps(row) + "\n" for row in dflash_rows))
+
+    summary = summarize_internal_target_diagnostic(target_path, dflash_path)
+
+    assert summary["counts"] == {
+        "exact": 1,
+        "internal-target-consistency-mismatch": 1,
+        "speculative-internal-argmax": len(INTERNAL_TARGET_DIAGNOSTIC_ROWS) - 3,
+        "target-rerun-argmax": 1,
+    }
+    assert summary["classifications"][1]["class"] == "internal-target-consistency-mismatch"
+    assert summary["classifications"][2]["class"] == "target-rerun-argmax"
+    assert summary["next_action"] == "instrument-rejection-and-logprob-index-mapping"
+
+    dflash_rows[1] = record(
+        INTERNAL_TARGET_DIAGNOSTIC_ROWS[1][0],
+        "dflash2",
+        [10, 99],
+        [{"token_id:10": -0.1}, {"token_id:99": -0.1}],
+    )
+    dflash_path.write_text("".join(json.dumps(row) + "\n" for row in dflash_rows))
+
+    mixed_summary = summarize_internal_target_diagnostic(target_path, dflash_path)
+
+    assert mixed_summary["counts"]["target-rerun-argmax"] == 2
+    assert mixed_summary["counts"]["speculative-internal-argmax"] > 0
+    assert mixed_summary["next_action"] == "rerun-internal-target-eager"
+
+
+def test_internal_target_receipt_binds_rca_source_and_rejects_row_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The diagnostic receipt closes selected-row, source-pilot, and job evidence."""
+    target_rows_path = tmp_path / "target.jsonl"
+    dflash_rows_path = tmp_path / "dflash2.jsonl"
+
+    def write_rows(path: Path, role: str) -> list[dict[str, Any]]:
+        rows = []
+        for index, reason in INTERNAL_TARGET_DIAGNOSTIC_ROWS:
+            metrics = (
+                None
+                if role == "target"
+                else {
+                    "mean_acceptance_length": 2.0,
+                    "draft_acceptance_rate": 1 / 7,
+                    "acceptance_histogram": [0, 1, 0, 0, 0, 0, 0, 0],
+                    "num_spec_steps": 1,
+                    "num_accepted_draft_tokens": 1,
+                    "num_draft_tokens": 7,
+                    "num_spec_tokens": 7,
+                    "per_step_accepted": [1],
+                    "per_step_drafted": [7],
+                }
+            )
+            extracted = {
+                "output_text": "x",
+                "token_ids": [10],
+                "prompt_token_ids": [1, 2],
+                "finish_reason": "length",
+                "top_logprobs": [{"token_id:10": -0.1}],
+                "speculative_decoding": metrics,
+            }
+            rows.append(
+                {
+                    "schema_version": 1,
+                    "producer": "q30-dflash2-internal-target-row-v1",
+                    "role": role,
+                    "engine_mode": "compiled",
+                    "subset": "HumanEval",
+                    "index": index,
+                    "source_row": index % 164,
+                    "selection_reason": reason,
+                    "prompt_sha256": f"{index:064x}",
+                    "request_sha256": "a" * 64,
+                    **extracted,
+                    "response_sha256": hashlib.sha256(
+                        json.dumps(extracted, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest(),
+                }
+            )
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        return rows
+
+    target_rows = write_rows(target_rows_path, "target")
+    dflash_rows = write_rows(dflash_rows_path, "dflash2")
+    source_classes = [
+        {
+            "subset": "HumanEval",
+            "index": index,
+            "source_row": index % 164,
+            "class": "exact",
+        }
+        for index in range(200)
+    ]
+    expected = {
+        1: "target-invalid",
+        8: "tied-target-valid",
+        27: "target-invalid",
+        41: "target-invalid",
+        82: "target-invalid",
+        151: "target-invalid",
+        165: "tied-target-valid",
+        172: "target-invalid",
+    }
+    for index, label in expected.items():
+        source_classes[index]["class"] = label
+    source_payload = {
+        "schema_version": 1,
+        "producer": "q30-dflash2-tie-aware-pilot-summary-v1",
+        "status": "failed",
+        "subset": "HumanEval",
+        "occurrences": 200,
+        "classifications": source_classes,
+    }
+    source_payload["receipt_sha256"] = hashlib.sha256(
+        json.dumps(source_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    source_path = tmp_path / "source-pilot.json"
+    source_path.write_text(json.dumps(source_payload) + "\n")
+    identity_path = tmp_path / "identity.json"
+    identity_path.write_text("{}\n")
+    target_manifest = tmp_path / "target-manifest.json"
+    dflash_manifest = tmp_path / "dflash-manifest.json"
+    target_manifest.write_text("{}\n")
+    dflash_manifest.write_text("{}\n")
+    target_fingerprint = tmp_path / "target-fingerprint.json"
+    dflash_fingerprint = tmp_path / "dflash-fingerprint.json"
+    target_launcher = tmp_path / "target-launcher.yaml"
+    dflash_launcher = tmp_path / "dflash-launcher.yaml"
+    for path in (target_fingerprint, dflash_fingerprint, target_launcher, dflash_launcher):
+        path.write_text(path.name + "\n")
+    target_manifest_payload = {
+        "slurm_job_id": "12345",
+        "server_args": ["serve", "target", "--port", "8000"],
+    }
+    dflash_manifest_payload = {
+        "slurm_job_id": "12345",
+        "server_args": ["serve", "target", "--port", "8010"],
+    }
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_artifact_identity", lambda _path: {}
+    )
+    with pytest.raises(ValueError, match="RCA source receipt"):
+        build_internal_target_diagnostic_receipt(
+            target_rows_path,
+            dflash_rows_path,
+            source_path,
+            target_manifest,
+            dflash_manifest,
+            identity_path,
+            tmp_path / "unused-allocation.json",
+            tmp_path / "forged-source.json",
+        )
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_rca_source_receipt",
+        lambda *_args: source_payload,
+    )
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_internal_rows_against_identity",
+        lambda path, role, _identity: target_rows if role == "target" else dflash_rows,
+    )
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_target_control_manifest",
+        lambda *_args: (
+            target_manifest_payload,
+            target_fingerprint,
+            {"inputs": {}},
+            target_launcher,
+        ),
+    )
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._validate_dflash2_probe_manifest",
+        lambda *_args, **_kwargs: (
+            dflash_manifest_payload,
+            dflash_launcher,
+            dflash_fingerprint,
+        ),
+    )
+    current = {
+        "slurm_job_id": "12345",
+        "slurm_job_num_nodes": 1,
+        "slurm_job_nodelist": "lyris0001",
+        "gpu_count": 4,
+        "cell_visible_devices": {"left": "0,1", "right": "2,3"},
+    }
+    monkeypatch.setattr(
+        "common.specdec.dflash2_speculators_eval._query_current_allocation", lambda: current
+    )
+    allocation = tmp_path / "allocation.json"
+    build_target_control_allocation_receipt(
+        allocation,
+        slurm_job_id="12345",
+        slurm_job_num_nodes=1,
+        slurm_job_nodelist="lyris0001",
+        gpu_count=4,
+    )
+    receipt = tmp_path / "receipt.json"
+    build_internal_target_diagnostic_receipt(
+        target_rows_path,
+        dflash_rows_path,
+        source_path,
+        target_manifest,
+        dflash_manifest,
+        identity_path,
+        allocation,
+        receipt,
+    )
+    assert validate_internal_target_diagnostic_receipt(receipt)["engine_mode"] == "compiled"
+
+    dflash_rows_path.write_text(
+        dflash_rows_path.read_text().replace('"output_text": "x"', '"output_text": "y"', 1)
+    )
+    with pytest.raises(ValueError, match="descriptor"):
+        validate_internal_target_diagnostic_receipt(receipt)
+
+
+def test_internal_target_phase_is_bounded_and_routes_enforce_eager_without_speed() -> None:
+    """Compiled and eager diagnostics use detailed metrics and stop before speed cells."""
+    pair = _PAIR.read_text()
+    wrapper = _WRAPPER.read_text()
+
+    for phase in ("internal-target", "internal-target-eager"):
+        assert f"{phase}:1:200:2" in pair
+    branch = pair.index('if [[ "${PAIR_PHASE}" == internal-target')
+    capture = pair.index("run_pair_cells 1", branch)
+    analyze = pair.index("analyze-internal-target", capture)
+    verify = pair.index("verify-internal-target", analyze)
+    stop = pair.index("exit 0", verify)
+    speed = pair.index("run_pair_cells 0", stop)
+    assert branch < capture < analyze < verify < stop < speed
+    assert 'DFLASH2_INTERNAL_TARGET="${DFLASH2_INTERNAL_TARGET_MODE}"' in pair
+    assert 'DFLASH2_ENFORCE_EAGER="${DFLASH2_ENFORCE_EAGER_MODE}"' in pair
+    assert "--per-request-spec-decode-metrics detailed" in wrapper
+    assert "SERVER_ARGS+=(--enforce-eager)" in wrapper
 
 
 def test_tie_aware_pilot_summary_fails_closed_on_unresolved_rows(tmp_path: Path) -> None:
@@ -1002,7 +1396,13 @@ def test_target_control_quantifies_cross_and_repeat_divergence(tmp_path: Path) -
         for index in range(100, 200):
             source = rows[subset_offset + index - 100]
             repeated = rows[subset_offset + index]
-            for key in ("source_row", "prompt_sha256", "output_sha256", "output_text", "output_tokens"):
+            for key in (
+                "source_row",
+                "prompt_sha256",
+                "output_sha256",
+                "output_text",
+                "output_tokens",
+            ):
                 repeated[key] = source[key]
     rows[100]["output_text"] = "different"
     rows[100]["output_tokens"] = ["different"]
@@ -1187,8 +1587,7 @@ def test_target_control_receipt_replays_authenticated_job_evidence(
         run.mkdir()
         launcher_config = run / "resolved-launcher.yaml"
         launcher_config.write_text(
-            "pipeline:\n  task_0:\n    slurm_config:\n"
-            f"      container: {image.resolve()}\n"
+            f"pipeline:\n  task_0:\n    slurm_config:\n      container: {image.resolve()}\n"
         )
         config_sha256 = {
             "launcher": _sha256(launcher_config),
