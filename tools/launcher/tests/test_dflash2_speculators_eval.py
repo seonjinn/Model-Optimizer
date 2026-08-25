@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from common.specdec import dflash2_speculators_eval as evaluator
 from common.specdec.dflash2_runtime_contract import artifact_tree_sha256, write_artifact_receipt
 from common.specdec.dflash2_speculators_eval import (
     DATASET_REVISION,
@@ -793,6 +794,48 @@ def test_internal_target_no_prefix_manifest_args_are_exact_and_fail_closed() -> 
             enforce_eager=False,
             disable_prefix_caching=True,
         )
+
+
+def test_internal_target_cli_accepts_no_prefix_mode_and_wrapper_propagates_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production CLI accepts the new mode and cannot hide capture failure."""
+    observed: dict[str, Any] = {}
+
+    def capture(*_args: Any, **kwargs: Any) -> None:
+        observed.update(kwargs)
+
+    monkeypatch.setattr(evaluator, "capture_internal_target_diagnostic", capture)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "dflash2_speculators_eval.py",
+            "capture-internal-target",
+            "--dataset-manifest",
+            str(tmp_path / "dataset.json"),
+            "--hf-home",
+            str(tmp_path / "hf"),
+            "--output",
+            str(tmp_path / "rows.jsonl"),
+            "--endpoint",
+            "http://127.0.0.1:8010/v1",
+            "--model",
+            "/target",
+            "--role",
+            "dflash2",
+            "--engine-mode",
+            "eager-no-prefix",
+        ],
+    )
+
+    evaluator.main()
+
+    assert observed["engine_mode"] == "eager-no-prefix"
+    wrapper = _WRAPPER.read_text()
+    command = wrapper.index('"${SCRIPT_DIR}/dflash2_speculators_eval.py" capture-internal-target')
+    output = wrapper.index('--output "${RUN_DIR}/internal-target.jsonl"', command)
+    assert "|| exit $?" in wrapper[output : output + 80]
 
 
 def test_tie_aware_pilot_summary_fails_closed_on_unresolved_rows(tmp_path: Path) -> None:

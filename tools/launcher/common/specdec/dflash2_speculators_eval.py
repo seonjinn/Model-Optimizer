@@ -3519,7 +3519,9 @@ def main() -> None:
     internal_capture.add_argument("--endpoint", required=True)
     internal_capture.add_argument("--model", required=True)
     internal_capture.add_argument("--role", required=True, choices=("target", "dflash2"))
-    internal_capture.add_argument("--engine-mode", required=True, choices=("compiled", "eager"))
+    internal_capture.add_argument(
+        "--engine-mode", required=True, choices=("compiled", "eager", "eager-no-prefix")
+    )
 
     compare = commands.add_parser("compare-outputs")
     compare.add_argument("--baseline", required=True)

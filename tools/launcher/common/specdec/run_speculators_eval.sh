@@ -528,7 +528,7 @@ if [[ "${CAPTURE_EQUIVALENCE:-0}" == 1 ]]; then
             --dataset-manifest "${DATASET_MANIFEST_PATH}" --hf-home "${HF_HOME}" \
             --endpoint "http://127.0.0.1:${PORT}/v1" --model "${HF_MODEL_CKPT}" \
             --role "${internal_role}" --engine-mode "${internal_engine_mode}" \
-            --output "${RUN_DIR}/internal-target.jsonl"
+            --output "${RUN_DIR}/internal-target.jsonl" || exit $?
     elif [[ "${TIE_AWARE_PILOT:-0}" == 1 ]]; then
         tie_role=dflash2
         [[ "${SPEC_METHOD}" == baseline ]] && tie_role=target
