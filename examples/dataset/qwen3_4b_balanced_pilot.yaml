@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version: qwen3-4b-balanced-pilot-v1
+source:
+  repository: nvidia/Nemotron-Post-Training-Dataset-v2
+  revision: null  # Caller must provide one immutable commit.
+seed: 20260822
+rows_per_arm: 100000
+minimum_assistant_tokens_per_arm: 16000000
+arms:
+  historical-proportion:
+    chat: 48286
+    math: 18420
+    code: 13462
+    stem: 19832
+  balanced:
+    math: 25000
+    code: 20000
+    stem: 25000
+    chat: 20000
+    multilingual_de: 2000
+    multilingual_es: 2000
+    multilingual_fr: 2000
+    multilingual_it: 2000
+    multilingual_ja: 2000
