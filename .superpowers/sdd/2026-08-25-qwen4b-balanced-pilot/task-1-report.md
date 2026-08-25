@@ -177,3 +177,45 @@ Fresh local verification on 2026-08-25:
 - Compileall and `git diff --check`: passed.
 
 This round remains local and unpushed pending an independent rereview.
+
+## Claude hostile-review corrective round
+
+Claude Code Opus found no critical issue in the frozen third-review diff but
+identified four actionable verifier/test warnings. Technical reproduction
+confirmed the two production concerns before implementation:
+
+- RED path-swap and same-inode-rewrite tests both showed that the verifier could
+  hash `data.jsonl` through one open and then accept rows read through another
+  open while the published path changed. Replay now opens the arm directory and
+  data leaf componentwise with no-follow descriptors, hashes and parses the same
+  file descriptor, recomputes token evidence, and compares the file inode plus
+  file/parent metadata before and after. Both deterministic attacks now fail
+  with `data file changed during verification`.
+- RED caller-scratch coverage showed the verifier had no way to route its
+  authenticated tokenizer copy into a private allocation. Public completion
+  replay now accepts a caller-owned mode-0700 scratch root. If omitted, it owns
+  and cleans an unpredictable mode-0700 wrapper created by `mkdtemp`; the
+  tokenizer snapshot is nested inside rather than staged directly in a public
+  temp directory. Tests reject mode-0755 caller scratch and prove both caller
+  and fallback scratch trees are empty after replay.
+- Renamed the input-reversal test so it makes no false worker-fanout claim. Real
+  1-versus-96 token-worker byte identity remains covered by the existing bundle
+  test.
+- Replaced the unused-function monkeypatch streaming test with a cursor proxy
+  whose weakly tracked rows fail if the production writer materializes more
+  than two selected rows. The real writer stays within the bound and emits all
+  expected records.
+- Clarified matching failure as global quota infeasibility after prompt dedup;
+  the non-Linux rename path remains test-only because the public production
+  identity already requires Linux.
+
+Fresh local evidence on 2026-08-25:
+
+- New focused gates: `6 passed, 36 deselected in 5.06s`.
+- Full isolated Task 1 file: `41 passed, 1 skipped in 209.90s`; the sole skip is
+  Linux-only `renameat2`. The 190.84-second outlier was the unchanged local HF
+  tokenizer fixture; all new tests completed in less than one second each.
+- Ruff check/format and Pyright (`0 errors, 0 warnings, 0 informations`) pass.
+
+This round is local and unpushed; an independent non-Claude rereview is still
+required after the signed follow-up commit.

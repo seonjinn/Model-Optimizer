@@ -169,6 +169,8 @@ class _DataEvidence:
     prompt_uuid_sha256: str
     assistant_tokens: int
     token_evidence_sha256: str
+    data_bytes: int
+    data_sha256: str
 
 
 @dataclass(frozen=True)
@@ -553,8 +555,8 @@ def _select_arm_from_spool(
         filled = len(members[quota.split])
         if filled != quota.rows:
             raise PilotError(
-                f"{arm}/{quota.category}/{quota.split} has {filled} unique eligible rows, "
-                f"below exact quota {quota.rows}"
+                f"{arm}/{quota.category}/{quota.split} received {filled} rows after global "
+                f"prompt dedup; exact quota {quota.rows} is globally infeasible"
             )
     selected_identities: list[tuple[str, str, str]] = []
     for prompt_uuid, split in assignment.items():
@@ -822,11 +824,13 @@ def _build_pilot_bundles_for_test(
             shutil.rmtree(local_partial)
 
 
-def verify_pilot_completion(output_root: Path) -> PilotCompletion:
+def verify_pilot_completion(
+    output_root: Path, *, scratch_root: Path | None = None
+) -> PilotCompletion:
     """Replay every file descriptor and receipt in an installed pilot root."""
     try:
         output_root = Path(output_root)
-        arms = _verify_bundle_root(output_root, production=True)
+        arms = _verify_bundle_root(output_root, production=True, scratch_root=scratch_root)
         complete = _read_json(output_root / "COMPLETE.json")
         return PilotCompletion(
             output_root=output_root,
@@ -1353,10 +1357,19 @@ _MANIFEST_FIELDS = {
 
 
 def _verify_bundle_root(
-    root: Path, *, production: bool = True, tokenizer: Any | None = None
+    root: Path,
+    *,
+    production: bool = True,
+    tokenizer: Any | None = None,
+    scratch_root: Path | None = None,
 ) -> dict[str, PilotArmCompletion]:
     try:
-        return _verify_bundle_root_impl(Path(root), production=production, tokenizer=tokenizer)
+        return _verify_bundle_root_impl(
+            Path(root),
+            production=production,
+            tokenizer=tokenizer,
+            scratch_root=scratch_root,
+        )
     except PilotError:
         raise
     except Exception as error:
@@ -1365,7 +1378,11 @@ def _verify_bundle_root(
 
 
 def _verify_bundle_root_impl(
-    root: Path, *, production: bool, tokenizer: Any | None
+    root: Path,
+    *,
+    production: bool,
+    tokenizer: Any | None,
+    scratch_root: Path | None,
 ) -> dict[str, PilotArmCompletion]:
     complete = _read_json(root / "COMPLETE.json")
     if (
@@ -1398,22 +1415,27 @@ def _verify_bundle_root_impl(
             raise PilotError(f"{arm} manifest self-hash does not reconcile")
         if descriptor["manifest_sha256"] != manifest["manifest_sha256"]:
             raise PilotError(f"{arm} manifest descriptor does not reconcile")
-        data_path = manifest_path.parent / "data.jsonl"
-        data = manifest["data_file"]
-        if data["bytes"] != data_path.stat().st_size or data["sha256"] != _sha256_file(data_path):
-            raise PilotError(f"{arm} data file descriptor does not reconcile")
         _verify_execution_receipt(manifest_path.parent / "EXECUTION.json")
         manifests[arm] = manifest
     _validate_cross_arm_pins(manifests)
     staged: Path | None = None
+    owned_scratch: Path | None = None
     verified_tokenizer = tokenizer
     try:
         tokenizer_pin = manifests[HISTORICAL_PROPORTION]["tokenizer"]
         if verified_tokenizer is None:
+            if scratch_root is None:
+                owned_scratch = Path(
+                    tempfile.mkdtemp(prefix=".qwen4b-verify-", dir=tempfile.gettempdir())
+                )
+                os.chmod(owned_scratch, 0o700)
+                verifier_scratch = owned_scratch
+            else:
+                verifier_scratch = _validate_private_scratch_root(Path(scratch_root))
             staged, digest = _stage_verified_tokenizer_snapshot(
                 Path(tokenizer_pin["path"]),
                 tokenizer_pin["sha256"],
-                Path(tempfile.gettempdir()),
+                verifier_scratch,
             )
             verified_tokenizer = _load_verified_qwen_tokenizer(staged)
             preflight = _qwen3_tokenizer_preflight_evidence(verified_tokenizer, digest)
@@ -1445,6 +1467,8 @@ def _verify_bundle_root_impl(
     finally:
         if staged is not None and staged.exists():
             shutil.rmtree(staged)
+        if owned_scratch is not None and owned_scratch.exists():
+            shutil.rmtree(owned_scratch)
     return arms
 
 
@@ -1572,6 +1596,33 @@ def _verify_execution_receipt(path: Path) -> None:
         raise PilotError("execution receipt schema or self-hash does not reconcile")
 
 
+def _validate_private_scratch_root(path: Path) -> Path:
+    try:
+        observed = path.lstat()
+    except OSError as error:
+        raise PilotError("verifier scratch root is unavailable") from error
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or stat.S_ISLNK(observed.st_mode)
+        or observed.st_mode & 0o077
+        or (hasattr(os, "geteuid") and observed.st_uid != os.geteuid())
+    ):
+        raise PilotError("verifier scratch root must be a caller-owned private directory")
+    return path
+
+
+def _stable_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def _read_data_evidence(
     path: Path, *, training_sequence_length: int, tokenizer: Any
 ) -> _DataEvidence:
@@ -1581,52 +1632,91 @@ def _read_data_evidence(
     prompt_uuids: set[str] = set()
     token_pairs: list[tuple[str, int]] = []
     assistant_tokens = 0
-    with path.open(encoding="utf-8") as source:
-        for line in source:
-            try:
-                payload = json.loads(line)
-                if type(payload) is not dict or set(payload) != {
-                    "prompt_uuid",
-                    "split",
-                    "category",
-                    "messages",
-                    "assistant_tokens",
-                }:
-                    raise PilotError("data JSONL row schema is invalid")
-                split = payload["split"]
-                if type(split) is not str:
-                    raise PilotError("data JSONL split is invalid")
-                row = _normalize_row(split, payload)
-                declared_count = payload["assistant_tokens"]
+    data_digest = hashlib.sha256()
+    data_bytes = 0
+    parent_fd: int | None = None
+    data_fd: int | None = None
+    try:
+        parent_fd = _open_nofollow_directory(path.parent)
+        parent_initial = os.fstat(parent_fd)
+        data_fd = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        data_initial = os.fstat(data_fd)
+        if not stat.S_ISREG(data_initial.st_mode):
+            raise PilotError("data file is not a regular file")
+        with os.fdopen(data_fd, "rb", closefd=False) as source:
+            for raw_line in source:
+                data_digest.update(raw_line)
+                data_bytes += len(raw_line)
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise PilotError("data file JSONL row is malformed") from error
+                try:
+                    payload = json.loads(line)
+                    if type(payload) is not dict or set(payload) != {
+                        "prompt_uuid",
+                        "split",
+                        "category",
+                        "messages",
+                        "assistant_tokens",
+                    }:
+                        raise PilotError("data JSONL row schema is invalid")
+                    split = payload["split"]
+                    if type(split) is not str:
+                        raise PilotError("data JSONL split is invalid")
+                    row = _normalize_row(split, payload)
+                    declared_count = payload["assistant_tokens"]
+                    if (
+                        type(declared_count) is not int
+                        or declared_count < 1
+                        or declared_count > training_sequence_length
+                    ):
+                        raise PilotError("data JSONL assistant-token evidence is invalid")
+                except (KeyError, TypeError, json.JSONDecodeError, PilotError) as error:
+                    raise PilotError("data file JSONL row is malformed") from error
                 if (
-                    type(declared_count) is not int
-                    or declared_count < 1
-                    or declared_count > training_sequence_length
+                    row.category != payload["category"]
+                    or row.prompt_uuid != payload["prompt_uuid"]
+                    or row.prompt_uuid in prompt_uuids
                 ):
-                    raise PilotError("data JSONL assistant-token evidence is invalid")
-            except (KeyError, TypeError, json.JSONDecodeError, PilotError) as error:
-                raise PilotError("data JSONL row is malformed") from error
-            if (
-                row.category != payload["category"]
-                or row.prompt_uuid != payload["prompt_uuid"]
-                or row.prompt_uuid in prompt_uuids
-            ):
-                raise PilotError("data JSONL identity or global UUID uniqueness does not reconcile")
-            count = count_assistant_tokens(
-                tokenizer,
-                row.messages,
-                training_sequence_length=training_sequence_length,
-            )
-            if declared_count != count:
-                raise PilotError(
-                    "data JSONL assistant-token evidence does not match authenticated tokenizer"
+                    raise PilotError(
+                        "data JSONL identity or global UUID uniqueness does not reconcile"
+                    )
+                count = count_assistant_tokens(
+                    tokenizer,
+                    row.messages,
+                    training_sequence_length=training_sequence_length,
                 )
-            prompt_uuids.add(row.prompt_uuid)
-            token_pairs.append((row.prompt_uuid, count))
-            row_count += 1
-            assistant_tokens += count
-            split_counts[row.split] = split_counts.get(row.split, 0) + 1
-            category_counts[row.category] = category_counts.get(row.category, 0) + 1
+                if declared_count != count:
+                    raise PilotError(
+                        "data JSONL assistant-token evidence does not match authenticated tokenizer"
+                    )
+                prompt_uuids.add(row.prompt_uuid)
+                token_pairs.append((row.prompt_uuid, count))
+                row_count += 1
+                assistant_tokens += count
+                split_counts[row.split] = split_counts.get(row.split, 0) + 1
+                category_counts[row.category] = category_counts.get(row.category, 0) + 1
+        data_final = os.fstat(data_fd)
+        parent_final = os.fstat(parent_fd)
+        named_final = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _stable_stat_identity(data_initial) != _stable_stat_identity(data_final)
+            or _stable_stat_identity(data_initial) != _stable_stat_identity(named_final)
+            or _stable_stat_identity(parent_initial) != _stable_stat_identity(parent_final)
+        ):
+            raise PilotError("data file changed during verification")
+    except OSError as error:
+        raise PilotError("data file changed during verification") from error
+    finally:
+        if data_fd is not None:
+            os.close(data_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
     prompt_digest = hashlib.sha256("\n".join(sorted(prompt_uuids)).encode("utf-8")).hexdigest()
     token_digest = hashlib.sha256()
     for prompt_uuid, count in sorted(token_pairs):
@@ -1639,12 +1729,17 @@ def _read_data_evidence(
         prompt_uuid_sha256=prompt_digest,
         assistant_tokens=assistant_tokens,
         token_evidence_sha256=token_digest.hexdigest(),
+        data_bytes=data_bytes,
+        data_sha256=data_digest.hexdigest(),
     )
 
 
 def _reconcile_manifest_evidence(
     manifest: dict[str, Any], evidence: _DataEvidence, *, arm: str, production: bool
 ) -> None:
+    data_file = manifest["data_file"]
+    if data_file["bytes"] != evidence.data_bytes or data_file["sha256"] != evidence.data_sha256:
+        raise PilotError(f"{arm} data file descriptor does not reconcile")
     if manifest["row_count"] != evidence.row_count:
         raise PilotError(f"{arm} row count does not reconcile")
     if manifest["quotas"] != evidence.split_counts:

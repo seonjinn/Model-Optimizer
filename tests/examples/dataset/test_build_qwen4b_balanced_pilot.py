@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import threading
+import weakref
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -137,20 +138,18 @@ def test_quota_selection_uses_exact_multilingual_language_quotas() -> None:
     }
 
 
-def test_parallel_selection_is_stable_when_input_is_reversed() -> None:
-    """Dropping rank ordering or depending on worker order must change these IDs."""
+def test_selection_is_stable_when_input_is_reversed() -> None:
+    """Dropping canonical rank ordering must change these selected prompt IDs."""
     module = _load_module()
     rows = _all_split_rows(extra_per_split=5)
     reversed_rows = {split: list(reversed(values)) for split, values in rows.items()}
 
-    one_worker = module.select_pilot_rows(rows, config=_scaled_config(module, workers=1))
-    many_workers = module.select_pilot_rows(
-        reversed_rows, config=_scaled_config(module, workers=96)
-    )
+    forward = module.select_pilot_rows(rows, config=_scaled_config(module))
+    reverse = module.select_pilot_rows(reversed_rows, config=_scaled_config(module))
 
     for arm in ("historical-proportion", "balanced"):
-        assert [row.prompt_uuid for row in one_worker.rows_for(arm)] == [
-            row.prompt_uuid for row in many_workers.rows_for(arm)
+        assert [row.prompt_uuid for row in forward.rows_for(arm)] == [
+            row.prompt_uuid for row in reverse.rows_for(arm)
         ]
 
 
@@ -529,34 +528,85 @@ def test_tokenization_keeps_inflight_work_bounded(monkeypatch, tmp_path: Path) -
     connection.close()
 
 
-def test_bundle_builder_streams_selected_bodies_without_materialized_selection(
-    monkeypatch, tmp_path: Path
-) -> None:
-    """The builder must stream its verified output even if tuple selection is unavailable."""
+def test_bundle_writer_keeps_selected_rows_streaming_bounded(tmp_path: Path) -> None:
+    """Materializing the selected SQLite cursor must retain too many tracked rows."""
     module = _load_module()
+    connection = sqlite3.connect(tmp_path / "selected.sqlite")
+    module._prepare_selection_database(connection)
+    rows = []
+    for arm in ("historical-proportion", "balanced"):
+        rows.extend(
+            (
+                arm,
+                index,
+                hashlib.sha256(f"{arm}-{index}".encode()).hexdigest(),
+                "chat",
+                "chat",
+                json.dumps(_row("chat", index)["messages"]),
+                6,
+            )
+            for index in range(20)
+        )
+    connection.executemany("INSERT INTO selected VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+    connection.commit()
 
-    def forbid_materialized_selection(*_args, **_kwargs):
-        raise AssertionError("materialized selected messages")
+    class _TrackedRow:
+        def __init__(self, values: tuple[object, ...]) -> None:
+            self.values = values
 
-    monkeypatch.setattr(module, "select_pilot_rows", forbid_materialized_selection)
-    output = tmp_path / "pilot"
-    module._build_pilot_bundles_for_test(
-        _tiny_rows(),
-        config=_tiny_config(module),
-        tokenizer=_MaskTokenizer(),
+        def __iter__(self):
+            return iter(self.values)
+
+    live_rows: weakref.WeakSet[_TrackedRow] = weakref.WeakSet()
+    peak_live = 0
+
+    class _BoundedCursor:
+        def __init__(self, cursor) -> None:
+            self.cursor = cursor
+
+        def __iter__(self):
+            nonlocal peak_live
+            for values in self.cursor:
+                tracked = _TrackedRow(values)
+                live_rows.add(tracked)
+                peak_live = max(peak_live, len(live_rows))
+                if len(live_rows) > 2:
+                    raise AssertionError("selected rows were materialized")
+                yield tracked
+
+    class _ConnectionProxy:
+        def execute(self, statement: str, parameters=()):
+            cursor = connection.execute(statement, parameters)
+            if "FROM selected WHERE arm = ? ORDER BY ordinal" in statement:
+                return _BoundedCursor(cursor)
+            return cursor
+
+    quota = module.PilotQuota("chat", "chat", 20)
+    config = module.PilotConfig(
+        source_revision="c" * 40,
+        historical_quotas=(quota,),
+        balanced_quotas=(quota,),
+        minimum_assistant_tokens=1,
+    )
+    output = tmp_path / "partial"
+    output.mkdir(mode=0o700)
+    module._write_spooled_bundle_contents(
+        output,
+        connection=_ConnectionProxy(),
+        selection_stats=module._SelectionStats(0, 0, 0),
+        tokens_by_arm={"historical-proportion": 120, "balanced": 120},
+        config=config,
         tokenizer_path="/tokenizer",
         tokenizer_sha256="a" * 64,
-        output_root=output,
-        producer_source_commit="b" * 40,
-        workers=2,
+        tokenizer_template_sha256="b" * 64,
+        producer_source_commit="c" * 40,
+        effective_workers=1,
+        execution=None,
     )
 
-    assert (
-        module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())[
-            "balanced"
-        ].row_count
-        == 2
-    )
+    connection.close()
+    assert peak_live <= 2
+    assert len((output / "balanced/data.jsonl").read_text().splitlines()) == 20
 
 
 def test_cross_split_duplicate_assignment_preserves_feasible_quotas() -> None:
@@ -760,6 +810,8 @@ def test_verifier_recomputes_assistant_tokens_after_full_attacker_rehash(
     tokenizer_source = tmp_path / "tokenizer"
     tokenizer_source.mkdir()
     (tokenizer_source / "tokenizer.json").write_text('{"model":"Qwen3-4B"}\n')
+    fallback_scratch = tmp_path / "public-temp"
+    fallback_scratch.mkdir(mode=0o755)
     module._build_pilot_bundles_for_test(
         _tiny_rows(),
         config=_tiny_config(module),
@@ -802,11 +854,92 @@ def test_verifier_recomputes_assistant_tokens_after_full_attacker_rehash(
         return _Qwen3MaskTokenizer()
 
     monkeypatch.setattr(module, "_load_verified_qwen_tokenizer", load_snapshot)
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(fallback_scratch))
 
     with pytest.raises(module.PilotError, match="assistant-token"):
         module._verify_bundle_root(output, production=False)
     assert len(loaded_snapshots) == 1
     assert not loaded_snapshots[0].exists()
+    assert list(fallback_scratch.iterdir()) == []
+
+
+@pytest.mark.parametrize("mutation", ["swap", "same-inode-rewrite"])
+def test_verifier_rejects_data_change_while_stable_descriptor_is_open(
+    monkeypatch, tmp_path: Path, mutation: str
+) -> None:
+    """A path swap or same-inode rewrite during replay must invalidate the bundle."""
+    module = _load_module()
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path="/tokenizer",
+        tokenizer_sha256="a" * 64,
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+    data_path = output / "historical-proportion" / "data.jsonl"
+    original_count = module.count_assistant_tokens
+    mutated = False
+
+    def mutate_during_replay(tokenizer, messages, **kwargs):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            original = data_path.read_bytes()
+            if mutation == "swap":
+                displaced = data_path.with_suffix(".original")
+                data_path.rename(displaced)
+                data_path.write_bytes(original)
+            else:
+                data_path.write_bytes(original)
+        return original_count(tokenizer, messages, **kwargs)
+
+    monkeypatch.setattr(module, "count_assistant_tokens", mutate_during_replay)
+
+    with pytest.raises(module.PilotError, match="changed during verification"):
+        module._verify_bundle_root(output, production=False, tokenizer=_MaskTokenizer())
+
+
+def test_verifier_stages_tokenizer_only_under_caller_private_scratch(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Verifier tokenizer bytes must never be staged directly in a public temp directory."""
+    module = _load_module()
+    tokenizer_source = tmp_path / "tokenizer"
+    tokenizer_source.mkdir()
+    (tokenizer_source / "tokenizer.json").write_text('{"model":"Qwen3-4B"}\n')
+    output = tmp_path / "pilot"
+    module._build_pilot_bundles_for_test(
+        _tiny_rows(),
+        config=_tiny_config(module),
+        tokenizer=_MaskTokenizer(),
+        tokenizer_path=tokenizer_source,
+        tokenizer_sha256=_tree_digest(tokenizer_source),
+        output_root=output,
+        producer_source_commit="b" * 40,
+    )
+    scratch = tmp_path / "private-scratch"
+    scratch.mkdir(mode=0o755)
+    loaded_snapshots: list[Path] = []
+
+    def load_snapshot(path: Path):
+        loaded_snapshots.append(path)
+        path.relative_to(scratch)
+        return _Qwen3MaskTokenizer()
+
+    monkeypatch.setattr(module, "_load_verified_qwen_tokenizer", load_snapshot)
+
+    with pytest.raises(module.PilotError, match="caller-owned private directory"):
+        module._verify_bundle_root(output, production=False, scratch_root=scratch)
+    os.chmod(scratch, 0o700)
+    verified = module._verify_bundle_root(output, production=False, scratch_root=scratch)
+
+    assert verified["balanced"].row_count == 2
+    assert len(loaded_snapshots) == 1
+    assert not loaded_snapshots[0].exists()
+    assert list(scratch.iterdir()) == []
 
 
 def test_execution_parallelism_does_not_change_scientific_bundle_bytes(tmp_path: Path) -> None:
