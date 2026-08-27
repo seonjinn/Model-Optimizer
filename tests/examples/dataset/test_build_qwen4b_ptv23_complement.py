@@ -1,0 +1,1150 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Authenticated PTV2/PTV3 700K continuation corpus contracts."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib.util
+import inspect
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+CONFIG_PATH = ROOT / "examples/dataset/qwen3_4b_ptv23_complement_700k_v1.json"
+MODULE_PATH = ROOT / "examples/dataset/build_qwen4b_ptv23_complement.py"
+SOURCE_REQUIREMENTS_PATH = ROOT / "examples/dataset/qwen3_4b_ptv23_complement_sources_v1.json"
+
+
+def _load_module():
+    assert MODULE_PATH.is_file(), "the continuation builder module must exist"
+    spec = importlib.util.spec_from_file_location("build_qwen4b_ptv23_complement", MODULE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    sys.path.insert(0, str(MODULE_PATH.parent))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
+class _Tokenizer:
+    def apply_chat_template(self, messages, **_kwargs):
+        content = str(messages[-1]["content"])
+        length = 9 if content == "long" else 4
+        return {
+            "input_ids": list(range(length)),
+            "assistant_masks": [0] * (length - 2) + [1, 1],
+        }
+
+
+def _row(category: str, label: str, index: int) -> dict[str, object]:
+    return {
+        "category": category,
+        "source_id": "fixture/source",
+        "source_file_sha256": "a" * 64,
+        "source_row_index": index,
+        "messages": [
+            {"role": "user", "content": f"prompt-{label}"},
+            {"role": "assistant", "content": label},
+        ],
+        "tools": [],
+    }
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _write_inventory(path: Path, source_file: Path) -> tuple[Path, str]:
+    row_schema = {
+        "format": "jsonl",
+        "messages_field": "messages",
+        "tools_field": "tools",
+    }
+    raw = source_file.read_bytes()
+    payload = {
+        "schema_version": "ptv2-ptv3-complement-source-inventory-v1",
+        "scientific_identity": "ptv2-ptv3-complement-700k-v1",
+        "sources": [
+            {
+                "category": "stem",
+                "source_id": "nvidia/Fixture",
+                "revision": "a" * 40,
+                "split": "train",
+                "license_expression": "CC-BY-4.0",
+                "approved_use": True,
+                "replay_lane": "none",
+                "row_schema": row_schema,
+                "row_schema_sha256": hashlib.sha256(_canonical(row_schema)).hexdigest(),
+                "files": [
+                    {
+                        "logical_path": "data/train.jsonl",
+                        "path": str(source_file),
+                        "bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "row_count": 1,
+                    }
+                ],
+            }
+        ],
+    }
+    path.write_bytes(_canonical(payload) + b"\n")
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_historical_receipt(path: Path) -> tuple[Path, str]:
+    occurrences = ["1" * 64, "2" * 64, "1" * 64]
+    unique = sorted(set(occurrences))
+    body = {
+        "schema_version": "ptv2-historical-occurrence-receipt-v1",
+        "source_revision": "5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
+        "occurrence_count": len(occurrences),
+        "ordered_prompt_uuids": occurrences,
+        "ordered_prompt_uuids_sha256": hashlib.sha256(_canonical(occurrences)).hexdigest(),
+        "unique_prompt_uuids": unique,
+        "unique_prompt_uuids_sha256": hashlib.sha256(_canonical(unique)).hexdigest(),
+        "duplicate_uuid_multiplicity": {"1" * 64: 2},
+    }
+    payload = body | {"receipt_sha256": hashlib.sha256(_canonical(body)).hexdigest()}
+    path.write_bytes(_canonical(payload) + b"\n")
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_heldout_receipt(path: Path, values: list[str]) -> tuple[Path, str]:
+    prompt_uuids = sorted(set(values))
+    body = {
+        "schema_version": "specdec-held-out-uuid-receipt-v1",
+        "prompt_uuids": prompt_uuids,
+        "prompt_uuids_sha256": hashlib.sha256(_canonical(prompt_uuids)).hexdigest(),
+    }
+    payload = body | {"receipt_sha256": hashlib.sha256(_canonical(body)).hexdigest()}
+    path.write_bytes(_canonical(payload) + b"\n")
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_tokenizer_trust(path: Path, snapshot: Path) -> tuple[Path, str]:
+    entries = [
+        [item.relative_to(snapshot).as_posix(), hashlib.sha256(item.read_bytes()).hexdigest()]
+        for item in sorted(snapshot.rglob("*"))
+        if item.is_file()
+    ]
+    body = {
+        "schema_version": "qwen3-4b-tokenizer-trust-v1",
+        "repository": "Qwen/Qwen3-4B",
+        "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+        "snapshot_path": str(snapshot),
+        "snapshot_tree_sha256": hashlib.sha256(_canonical(entries)).hexdigest(),
+        "chat_template_sha256": "6" * 64,
+        "training_chat_template_sha256": "7" * 64,
+        "im_start_token_id": 151644,
+        "im_end_token_id": 151645,
+    }
+    payload = body | {"receipt_sha256": hashlib.sha256(_canonical(body)).hexdigest()}
+    path.write_bytes(_canonical(payload) + b"\n")
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _toy_verifier_roots(
+    module,
+    monkeypatch,
+    tmp_path: Path,
+    rows_by_category: dict[str, list[dict[str, object]]],
+    historical,
+    held_out,
+) -> dict[str, object]:
+    monkeypatch.setattr(module, "_require_external_approval_roots", lambda: None)
+    monkeypatch.setattr(module, "_authenticate_provenance_roots", lambda *_args: None)
+    monkeypatch.setattr(
+        module, "load_complement_config", lambda _path: {"quotas": module.APPROVED_QUOTAS}
+    )
+    monkeypatch.setattr(module, "reconcile_source_requirements", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "_category_rows", lambda _inventory: rows_by_category)
+    inventory = module.SourceInventory(
+        module.SCIENTIFIC_IDENTITY,
+        "6" * 64,
+        (),
+    )
+    return {
+        "config_path": CONFIG_PATH,
+        "inventory": inventory,
+        "historical": historical,
+        "held_out": held_out,
+        "tokenizer_trust_file_sha256": "7" * 64,
+        "scratch_root": tmp_path / "verify-scratch",
+    }
+
+
+def test_policy_pins_the_approved_scientific_identity_and_exact_quotas() -> None:
+    assert CONFIG_PATH.is_file(), "the approved continuation policy must be versioned"
+    payload = json.loads(CONFIG_PATH.read_bytes())
+
+    assert payload["scientific_identity"] == "ptv2-ptv3-complement-700k-v1"
+    assert payload["tokenizer"] == {
+        "repository": "Qwen/Qwen3-4B",
+        "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+        "training_sequence_length": 4096,
+        "trust_schema": "qwen3-4b-tokenizer-trust-v1",
+    }
+    assert payload["source_requirements"] == {
+        "path": "qwen3_4b_ptv23_complement_sources_v1.json",
+        "sha256": "e61ec87c2aba19c67c4a4549dba11f33abe8a3126f76232df0d72da43e8c81e1",
+    }
+    assert payload["quotas"] == {
+        "ptv2_stem": 300_000,
+        "ptv2_multilingual_ja": 50_000,
+        "ptv2_multilingual_es": 50_000,
+        "ptv2_multilingual_fr": 50_000,
+        "ptv2_multilingual_it": 50_000,
+        "ptv3_swe_v3": 100_000,
+        "ptv3_interactive_agentic_swe": 19_000,
+        "ptv3_general_tool_trajectories": 81_000,
+    }
+    assert sum(payload["quotas"].values()) == 700_000
+
+
+def test_config_loader_rejects_any_noncanonical_policy_change(tmp_path: Path) -> None:
+    module = _load_module()
+    payload = json.loads(CONFIG_PATH.read_bytes())
+    payload["quotas"]["ptv3_general_tool_trajectories"] -= 1
+    changed = tmp_path / "changed.json"
+    changed.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(module.ComplementError, match="approved continuation policy"):
+        module.load_complement_config(changed)
+
+
+def test_selection_uses_source_order_and_refills_only_from_the_same_category() -> None:
+    module = _load_module()
+    heldout_row = _row("stem", "heldout", 0)
+    heldout_uuid = module.prompt_uuid_from_row(heldout_row)
+    good_one = _row("stem", "one", 1)
+    invalid = _row("stem", "invalid", 2)
+    invalid["messages"] = [{"role": "user", "content": "missing assistant"}]
+    good_two = _row("stem", "two", 4)
+    duplicate = _row("tools", "one", 0)
+    duplicate["messages"] = good_one["messages"]
+
+    selection = module.select_continuation_rows(
+        {
+            "stem": [heldout_row, good_one, invalid, _row("stem", "long", 3), good_two],
+            "tools": [duplicate, _row("tools", "three", 1)],
+        },
+        quotas={"stem": 2, "tools": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids={heldout_uuid},
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+    )
+
+    assert [row.messages[-1]["content"] for row in selection.rows] == ["one", "two", "three"]
+    assert [row.source_row_index for row in selection.rows] == [1, 4, 1]
+    assert selection.exclusions == {
+        "duplicate": 1,
+        "held_out": 1,
+        "invalid": 1,
+        "overlength": 1,
+    }
+
+
+def test_replay_validation_rejects_unresolved_calls_and_preserves_native_trace() -> None:
+    module = _load_module()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "run a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    call = {
+        "id": "call-7",
+        "type": "function",
+        "function": {"name": "shell", "arguments": "{}"},
+    }
+    unresolved = _row("agentic", "ignored", 0)
+    unresolved["tools"] = tools
+    unresolved["messages"] = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "I should inspect first.",
+            "tool_calls": [call],
+        },
+    ]
+    valid = _row("agentic", "ignored", 1)
+    valid["tools"] = tools
+    valid["messages"] = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "I should inspect first.",
+            "tool_calls": [call],
+        },
+        {"role": "tool", "tool_call_id": "call-7", "name": "shell", "content": "ok"},
+        {"role": "assistant", "content": "done", "reasoning_content": "The result is clear."},
+    ]
+
+    selection = module.select_continuation_rows(
+        {"agentic": [unresolved, valid]},
+        quotas={"agentic": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset({"agentic"}),
+    )
+
+    assert selection.rows[0].messages == valid["messages"]
+    assert selection.rows[0].tools == tools
+    assert selection.exclusions == {"unresolved_tool_call": 1}
+
+
+def test_source_inventory_authenticates_repo_revision_file_schema_and_order(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    source_file = tmp_path / "train.jsonl"
+    source_file.write_bytes(_canonical(_row("stem", "one", 0)) + b"\n")
+    inventory_path, inventory_file_sha256 = _write_inventory(
+        tmp_path / "inventory.json", source_file
+    )
+
+    inventory = module.load_source_inventory(inventory_path, expected_sha256=inventory_file_sha256)
+
+    assert inventory.scientific_identity == "ptv2-ptv3-complement-700k-v1"
+    assert inventory.sources[0].source_id == "nvidia/Fixture"
+    assert inventory.sources[0].revision == "a" * 40
+    assert (
+        inventory.sources[0].files[0].sha256 == hashlib.sha256(source_file.read_bytes()).hexdigest()
+    )
+
+
+def test_source_inventory_rejects_forged_physical_row_count(tmp_path: Path) -> None:
+    module = _load_module()
+    source_file = tmp_path / "train.jsonl"
+    source_file.write_bytes(_canonical(_row("stem", "one", 0)) + b"\n")
+    inventory_path, _ = _write_inventory(tmp_path / "inventory.json", source_file)
+    payload = json.loads(inventory_path.read_bytes())
+    payload["sources"][0]["files"][0]["row_count"] = 2
+    inventory_path.write_bytes(_canonical(payload) + b"\n")
+
+    with pytest.raises(module.ComplementError, match="physical row count"):
+        module.load_source_inventory(
+            inventory_path,
+            expected_sha256=hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+        )
+
+
+def test_historical_exclusion_requires_caller_pin_and_binds_order_and_multiplicity(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    receipt_path, receipt_file_sha256 = _write_historical_receipt(tmp_path / "historical.json")
+
+    receipt = module.load_historical_exclusion(
+        receipt_path,
+        expected_sha256=receipt_file_sha256,
+        expected_occurrence_count=3,
+    )
+
+    assert receipt.prompt_uuids == frozenset({"1" * 64, "2" * 64})
+    assert (
+        receipt.ordered_prompt_uuids_sha256
+        == hashlib.sha256(_canonical(["1" * 64, "2" * 64, "1" * 64])).hexdigest()
+    )
+    assert receipt.duplicate_uuid_multiplicity == {"1" * 64: 2}
+
+
+def test_held_out_receipts_are_individually_authenticated_then_unioned(tmp_path: Path) -> None:
+    module = _load_module()
+    first = _write_heldout_receipt(tmp_path / "first.json", ["3" * 64, "4" * 64])
+    second = _write_heldout_receipt(tmp_path / "second.json", ["4" * 64, "5" * 64])
+
+    union = module.load_held_out_union([first, second], required_names=frozenset())
+
+    assert union.prompt_uuids == frozenset({"3" * 64, "4" * 64, "5" * 64})
+    assert union.receipt_file_sha256s == (first[1], second[1])
+    assert (
+        union.prompt_uuids_sha256
+        == hashlib.sha256(_canonical(sorted(union.prompt_uuids))).hexdigest()
+    )
+
+
+def test_production_held_out_union_requires_exact_named_receipt_set() -> None:
+    module = _load_module()
+
+    with pytest.raises(module.ComplementError, match="required held-out receipt set"):
+        module.load_held_out_union([])
+
+
+def test_source_reconciliation_fails_until_external_approval_allowlist_is_pinned(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    source_file = tmp_path / "train.jsonl"
+    source_file.write_bytes(_canonical(_row("stem", "one", 0)) + b"\n")
+    inventory_path, inventory_sha256 = _write_inventory(tmp_path / "inventory.json", source_file)
+    inventory = module.load_source_inventory(inventory_path, expected_sha256=inventory_sha256)
+
+    with pytest.raises(module.ComplementError, match="external approval root"):
+        module.reconcile_source_requirements(
+            SOURCE_REQUIREMENTS_PATH,
+            inventory=inventory,
+            capacity_receipt_path=tmp_path / "capacity.json",
+        )
+
+
+def test_publication_hashes_large_evidence_without_materialized_lists() -> None:
+    source = MODULE_PATH.read_text()
+
+    assert "ordered_prompt_uuids = [" not in source
+    assert "source_occurrences = [" not in source
+    assert "token_evidence = [" not in source
+
+
+def test_bundle_binds_canonical_bytes_order_quotas_occurrences_exclusions_and_trust(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    selection = module.select_continuation_rows(
+        {"stem": [_row("stem", "one", 0), _row("stem", "two", 1)]},
+        quotas={"stem": 2},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+    )
+    historical_path, historical_file_sha256 = _write_historical_receipt(
+        tmp_path / "historical.json"
+    )
+    historical = module.load_historical_exclusion(
+        historical_path,
+        expected_sha256=historical_file_sha256,
+        expected_occurrence_count=3,
+    )
+    held_out = module.load_held_out_union([], required_names=frozenset())
+    completion = module.publish_selection_bundle(
+        selection,
+        output_root=tmp_path / "lustre/bundle",
+        scratch_root=tmp_path / "raid",
+        quotas={"stem": 2},
+        config_file_sha256=hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+        source_inventory_file_sha256="6" * 64,
+        historical=historical,
+        held_out=held_out,
+        tokenizer_trust_file_sha256="7" * 64,
+        runtime_sha256="8" * 64,
+        source_commit="9" * 40,
+        enforce_production_paths=False,
+    )
+    manifest_raw = (completion.output_root / "MANIFEST.json").read_bytes()
+    manifest = json.loads(manifest_raw)
+
+    assert manifest_raw == _canonical(manifest) + b"\n"
+    assert manifest["row_count"] == 2
+    assert manifest["quotas"] == {"stem": 2}
+    assert (
+        manifest["ordered_prompt_uuids_sha256"]
+        == hashlib.sha256(_canonical([row.prompt_uuid for row in selection.rows])).hexdigest()
+    )
+    assert manifest["duplicate_uuid_multiplicity"] == {}
+    assert manifest["historical"]["ordered_prompt_uuids_sha256"] == (
+        historical.ordered_prompt_uuids_sha256
+    )
+    assert (
+        manifest["source_occurrences_sha256"]
+        == hashlib.sha256(
+            _canonical(
+                [
+                    [row.source_id, row.source_file_sha256, row.source_row_index]
+                    for row in selection.rows
+                ]
+            )
+        ).hexdigest()
+    )
+    assert manifest["trust"]["runtime_sha256"] == "8" * 64
+    assert manifest["trust"]["source_commit"] == "9" * 40
+
+
+def test_verifier_replays_selected_rows_and_rejects_data_tampering(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "APPROVED_QUOTAS", {"stem": 1})
+    monkeypatch.setattr(module, "REQUIRED_HELD_OUT_RECEIPT_NAMES", frozenset())
+    selection = module.select_continuation_rows(
+        {"stem": [_row("stem", "one", 0)]},
+        quotas={"stem": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+        capacity_receipt_path=tmp_path / "capacity.json",
+    )
+    historical_path, historical_file_sha256 = _write_historical_receipt(
+        tmp_path / "historical.json"
+    )
+    historical = module.load_historical_exclusion(
+        historical_path,
+        expected_sha256=historical_file_sha256,
+        expected_occurrence_count=3,
+    )
+    held_out = module.load_held_out_union([], required_names=frozenset())
+    completion = module.publish_selection_bundle(
+        selection,
+        output_root=tmp_path / "lustre/bundle",
+        scratch_root=tmp_path / "raid",
+        quotas={"stem": 1},
+        config_file_sha256=hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+        source_inventory_file_sha256="6" * 64,
+        historical=historical,
+        held_out=held_out,
+        tokenizer_trust_file_sha256="7" * 64,
+        runtime_sha256="8" * 64,
+        source_commit="9" * 40,
+        enforce_production_paths=False,
+    )
+
+    verifier_roots = _toy_verifier_roots(
+        module,
+        monkeypatch,
+        tmp_path,
+        {"stem": [_row("stem", "one", 0)]},
+        historical,
+        held_out,
+    )
+    module.verify_selection_bundle(
+        completion.output_root,
+        expected_manifest_file_sha256=completion.manifest_file_sha256,
+        tokenizer=_Tokenizer(),
+        **verifier_roots,
+        expected_runtime_sha256="8" * 64,
+        expected_source_commit="9" * 40,
+    )
+    with (completion.output_root / "DATA.jsonl").open("ab") as stream:
+        stream.write(b"{}\n")
+
+    with pytest.raises(module.ComplementError, match="data identity"):
+        module.verify_selection_bundle(
+            completion.output_root,
+            expected_manifest_file_sha256=completion.manifest_file_sha256,
+            tokenizer=_Tokenizer(),
+            **verifier_roots,
+            expected_runtime_sha256="8" * 64,
+            expected_source_commit="9" * 40,
+        )
+
+
+def test_cli_exposes_authenticated_build_and_verify_modes() -> None:
+    result = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "{build,verify}" in result.stdout
+    assert "--historical-receipt-sha256" in result.stdout
+    assert "--source-inventory-sha256" in result.stdout
+    assert "--tokenizer-trust-sha256" in result.stdout
+    assert "--runtime-sha256" in result.stdout
+
+
+def test_executable_defines_config_loader_before_main_guard() -> None:
+    """The direct build path must not call a function defined after its guard."""
+    tree = ast.parse(MODULE_PATH.read_text())
+    loader_position = next(
+        index
+        for index, node in enumerate(tree.body)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "load_complement_config"
+    )
+    guard_position = next(
+        index
+        for index, node in enumerate(tree.body)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "__name__"
+    )
+
+    assert loader_position < guard_position
+
+
+def test_verifier_rejects_manifest_defined_toy_quota(tmp_path: Path) -> None:
+    """The approved identity may never be reduced to attacker-selected toy quotas."""
+    module = _load_module()
+    selection = module.select_continuation_rows(
+        {"stem": [_row("stem", "one", 0)]},
+        quotas={"stem": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+    )
+    historical_path, historical_file_sha256 = _write_historical_receipt(
+        tmp_path / "historical.json"
+    )
+    completion = module.publish_selection_bundle(
+        selection,
+        output_root=tmp_path / "bundle",
+        scratch_root=tmp_path / "scratch",
+        quotas={"stem": 1},
+        config_file_sha256="5" * 64,
+        source_inventory_file_sha256="6" * 64,
+        historical=module.load_historical_exclusion(
+            historical_path,
+            expected_sha256=historical_file_sha256,
+            expected_occurrence_count=3,
+        ),
+        held_out=module.load_held_out_union([], required_names=frozenset()),
+        tokenizer_trust_file_sha256="7" * 64,
+        runtime_sha256="8" * 64,
+        source_commit="9" * 40,
+        enforce_production_paths=False,
+    )
+
+    with pytest.raises(module.ComplementError, match="approved quotas"):
+        module.verify_selection_bundle(
+            completion.output_root,
+            expected_manifest_file_sha256=completion.manifest_file_sha256,
+            tokenizer=_Tokenizer(),
+            config_path=CONFIG_PATH,
+            inventory=module.SourceInventory(module.SCIENTIFIC_IDENTITY, "6" * 64, ()),
+            historical=module.load_historical_exclusion(
+                historical_path,
+                expected_sha256=historical_file_sha256,
+                expected_occurrence_count=3,
+            ),
+            held_out=module.load_held_out_union([], required_names=frozenset()),
+            tokenizer_trust_file_sha256="7" * 64,
+            scratch_root=tmp_path / "verify-scratch",
+            expected_runtime_sha256="8" * 64,
+            expected_source_commit="9" * 40,
+        )
+
+
+def test_verifier_revalidates_agentic_trajectory_integrity(tmp_path: Path, monkeypatch) -> None:
+    """Replay verification must reject an unresolved tool call in an installed bundle."""
+    module = _load_module()
+    category = "ptv3_interactive_agentic_swe"
+    monkeypatch.setattr(module, "APPROVED_QUOTAS", {category: 1})
+    monkeypatch.setattr(module, "REQUIRED_HELD_OUT_RECEIPT_NAMES", frozenset())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "description": "run a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    unresolved = _row(category, "ignored", 0)
+    unresolved["tools"] = tools
+    unresolved["messages"] = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "inspect first",
+            "tool_calls": [
+                {
+                    "id": "call-7",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+    selection = module.select_continuation_rows(
+        {category: [unresolved]},
+        quotas={category: 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+        capacity_receipt_path=tmp_path / "capacity.json",
+    )
+    historical_path, historical_sha256 = _write_historical_receipt(tmp_path / "historical.json")
+    historical = module.load_historical_exclusion(
+        historical_path,
+        expected_sha256=historical_sha256,
+        expected_occurrence_count=3,
+    )
+    held_out = module.load_held_out_union([], required_names=frozenset())
+    completion = module.publish_selection_bundle(
+        selection,
+        output_root=tmp_path / "bundle",
+        scratch_root=tmp_path / "scratch",
+        quotas={category: 1},
+        config_file_sha256=hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+        source_inventory_file_sha256="6" * 64,
+        historical=historical,
+        held_out=held_out,
+        tokenizer_trust_file_sha256="7" * 64,
+        runtime_sha256="8" * 64,
+        source_commit="9" * 40,
+        enforce_production_paths=False,
+    )
+
+    verifier_roots = _toy_verifier_roots(
+        module, monkeypatch, tmp_path, {category: [unresolved]}, historical, held_out
+    )
+    with pytest.raises(module.ComplementError, match=r"trajectory|insufficient eligible capacity"):
+        module.verify_selection_bundle(
+            completion.output_root,
+            expected_manifest_file_sha256=completion.manifest_file_sha256,
+            tokenizer=_Tokenizer(),
+            **verifier_roots,
+            expected_runtime_sha256="8" * 64,
+            expected_source_commit="9" * 40,
+        )
+
+
+def test_source_requirements_must_be_reconciled_before_build() -> None:
+    """The executable boundary must expose strict source-requirement reconciliation."""
+    module = _load_module()
+
+    assert hasattr(module, "reconcile_source_requirements")
+
+
+def test_source_reconciliation_rejects_inventory_missing_known_pins(
+    tmp_path: Path, monkeypatch
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "APPROVED_PTV3_SWE_SOURCE_PINS", (("x", "1" * 40, "2" * 64),))
+    monkeypatch.setattr(module, "APPROVED_ROW_SCHEMA_SHA256S", frozenset({"2" * 64}))
+    source_file = tmp_path / "train.jsonl"
+    source_file.write_bytes(_canonical(_row("stem", "one", 0)) + b"\n")
+    inventory_path, inventory_sha256 = _write_inventory(tmp_path / "inventory.json", source_file)
+    inventory = module.load_source_inventory(inventory_path, expected_sha256=inventory_sha256)
+    monkeypatch.setattr(module, "APPROVED_SOURCE_INVENTORY_FILE_SHA256", inventory_sha256)
+    monkeypatch.setattr(module, "APPROVED_HISTORICAL_RECEIPT_FILE_SHA256", "3" * 64)
+    monkeypatch.setattr(
+        module,
+        "APPROVED_HELD_OUT_RECEIPT_FILE_SHA256S",
+        dict.fromkeys(module.REQUIRED_HELD_OUT_RECEIPT_NAMES, "4" * 64),
+    )
+
+    with pytest.raises(module.ComplementError, match="known source pin"):
+        module.reconcile_source_requirements(
+            SOURCE_REQUIREMENTS_PATH,
+            inventory=inventory,
+            capacity_receipt_path=tmp_path / "missing-capacity.json",
+        )
+
+
+def test_source_iteration_rejects_mutation_after_inventory_authentication(tmp_path: Path) -> None:
+    """Rows may not be emitted under a stale authenticated source-file digest."""
+    module = _load_module()
+    source_file = tmp_path / "train.jsonl"
+    source_file.write_bytes(_canonical(_row("stem", "one", 0)) + b"\n")
+    inventory_path, inventory_sha256 = _write_inventory(tmp_path / "inventory.json", source_file)
+    inventory = module.load_source_inventory(inventory_path, expected_sha256=inventory_sha256)
+    source_file.write_bytes(_canonical(_row("stem", "two", 0)) + b"\n")
+
+    with pytest.raises(module.ComplementError, match=r"changed|identity"):
+        list(module._iter_source_file(inventory.sources[0], inventory.sources[0].files[0]))
+
+
+def test_verifier_streams_data_instead_of_materializing_whole_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """DATA.jsonl verification must not use the whole-file byte loader."""
+    module = _load_module()
+    monkeypatch.setattr(module, "APPROVED_QUOTAS", {"stem": 1})
+    monkeypatch.setattr(module, "REQUIRED_HELD_OUT_RECEIPT_NAMES", frozenset())
+    selection = module.select_continuation_rows(
+        {"stem": [_row("stem", "one", 0)]},
+        quotas={"stem": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+        capacity_receipt_path=tmp_path / "capacity.json",
+    )
+    historical_path, historical_sha256 = _write_historical_receipt(tmp_path / "historical.json")
+    historical = module.load_historical_exclusion(
+        historical_path,
+        expected_sha256=historical_sha256,
+        expected_occurrence_count=3,
+    )
+    held_out = module.load_held_out_union([], required_names=frozenset())
+    completion = module.publish_selection_bundle(
+        selection,
+        output_root=tmp_path / "bundle",
+        scratch_root=tmp_path / "scratch",
+        quotas={"stem": 1},
+        config_file_sha256=hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+        source_inventory_file_sha256="6" * 64,
+        historical=historical,
+        held_out=held_out,
+        tokenizer_trust_file_sha256="7" * 64,
+        runtime_sha256="8" * 64,
+        source_commit="9" * 40,
+        enforce_production_paths=False,
+    )
+    original = module._stable_regular_bytes
+
+    def reject_data_materialization(path: Path) -> bytes:
+        if path.name == "DATA.jsonl":
+            raise AssertionError("DATA.jsonl was materialized")
+        return original(path)
+
+    monkeypatch.setattr(module, "_stable_regular_bytes", reject_data_materialization)
+
+    verifier_roots = _toy_verifier_roots(
+        module,
+        monkeypatch,
+        tmp_path,
+        {"stem": [_row("stem", "one", 0)]},
+        historical,
+        held_out,
+    )
+    module.verify_selection_bundle(
+        completion.output_root,
+        expected_manifest_file_sha256=completion.manifest_file_sha256,
+        tokenizer=_Tokenizer(),
+        **verifier_roots,
+        expected_runtime_sha256="8" * 64,
+        expected_source_commit="9" * 40,
+    )
+
+
+def test_selection_does_not_advance_source_after_quota_is_full() -> None:
+    """Capacity evidence must count exactly the rows needed to fill a quota."""
+    module = _load_module()
+
+    class CountingRows:
+        def __init__(self) -> None:
+            self.advances = 0
+
+        def __iter__(self):
+            for row in (_row("stem", "one", 0), _row("stem", "two", 1)):
+                self.advances += 1
+                yield row
+
+    rows = CountingRows()
+    selection = module.select_continuation_rows(
+        {"stem": rows},
+        quotas={"stem": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+    )
+
+    assert len(selection.rows) == 1
+    assert rows.advances == 1
+
+
+def test_checked_source_requirements_pin_known_agentic_files_and_name_real_blockers() -> None:
+    assert SOURCE_REQUIREMENTS_PATH.is_file()
+    payload = json.loads(SOURCE_REQUIREMENTS_PATH.read_bytes())
+
+    assert payload["scientific_identity"] == "ptv2-ptv3-complement-700k-v1"
+    assert payload["known_pinned_sources"] == [
+        {
+            "category": "ptv3_interactive_agentic_swe",
+            "repository": "nvidia/Nemotron-SFT-SWE-v2",
+            "revision": "bd151f3f2d89c4804dda0083d912bd9f6a0a9fb7",
+            "split": "openhands_swe",
+            "path": "data/swe.jsonl",
+            "bytes": 11350621642,
+            "sha256": "e887bd7ff4bd11a187d45af2e46db4847bd982771a6493dbe07d83d915c35bde",
+        },
+        {
+            "category": "ptv3_interactive_agentic_swe",
+            "repository": "nvidia/Nemotron-SWE-v1",
+            "revision": "0fe17a965b297a9c943a59050a14c42d5f0083ce",
+            "split": "r2e_gym",
+            "path": "data/r2e_gym.jsonl",
+            "bytes": 11141242062,
+            "sha256": "1e0fb6d9a8d955fb0f2160e44a4946e5f2c4eb3931e80dadb724ff823cdbc14c",
+        },
+        {
+            "category": "ptv3_general_tool_trajectories",
+            "repository": "nvidia/Nemotron-Agentic-v1",
+            "revision": "650d590978ca35c8f1ecea2faf136e5fac421b62",
+            "split": "interactive_agent",
+            "path": "data/interactive_agent.jsonl",
+            "bytes": 448570455,
+            "sha256": "dcfeda22372fa707c979cab29ddfe896b89a933f15ed4acbb4f16e7e3787d9dd",
+        },
+        {
+            "category": "ptv3_general_tool_trajectories",
+            "repository": "nvidia/Nemotron-Agentic-v1",
+            "revision": "650d590978ca35c8f1ecea2faf136e5fac421b62",
+            "split": "tool_calling",
+            "path": "data/tool_calling.jsonl",
+            "bytes": 5338348607,
+            "sha256": "f537a901d38a999627b8fe59e77a1007af0d79d71a892ad9a4a3d80456e5601b",
+        },
+    ]
+    assert payload["blocking_external_pins"] == [
+        "ptv2_candidate_file_inventory_and_sha256",
+        "ptv3_swe_v3_authoritative_revision_file_inventory_and_sha256",
+        "source_row_schema_sha256_for_every_file",
+        "post_exclusion_post_tokenization_capacity_receipt_for_every_category",
+    ]
+
+
+def test_tokenizer_trust_reuses_the_caller_pinned_official_qwen_snapshot(tmp_path: Path) -> None:
+    module = _load_module()
+    snapshot = tmp_path / "tokenizer"
+    snapshot.mkdir()
+    (snapshot / "tokenizer.json").write_bytes(b"fixture")
+    trust_path, trust_file_sha256 = _write_tokenizer_trust(
+        tmp_path / "tokenizer-trust.json", snapshot
+    )
+
+    trust = module.load_tokenizer_trust(trust_path, expected_sha256=trust_file_sha256)
+
+    assert trust.repository == "Qwen/Qwen3-4B"
+    assert trust.revision == "1cfa9a7208912126459214e8b04321603b3df60c"
+    assert trust.snapshot_path == snapshot
+    assert trust.im_start_token_id == 151644
+    assert trust.im_end_token_id == 151645
+
+
+def test_production_selection_spools_selected_conversations_to_raid_backed_sqlite(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    spool_path = tmp_path / "raid/selection.sqlite"
+
+    selection = module.select_continuation_rows(
+        {"stem": [_row("stem", "one", 0), _row("stem", "two", 1)]},
+        quotas={"stem": 2},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+        spool_path=spool_path,
+    )
+
+    assert spool_path.is_file()
+    assert not isinstance(selection.rows, tuple)
+    assert [row.messages[-1]["content"] for row in selection.rows] == ["one", "two"]
+
+
+def test_capacity_failure_persists_exact_same_category_blocker_without_redistribution(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    receipt_path = tmp_path / "capacity.json"
+
+    with pytest.raises(module.ComplementError, match="insufficient eligible capacity for stem"):
+        module.select_continuation_rows(
+            {"stem": [_row("stem", "one", 0)], "tools": [_row("tools", "two", 0)]},
+            quotas={"stem": 2, "tools": 1},
+            prior_prompt_uuids=set(),
+            held_out_prompt_uuids=set(),
+            tokenizer=_Tokenizer(),
+            training_sequence_length=8,
+            replay_categories=frozenset(),
+            capacity_receipt_path=receipt_path,
+        )
+
+    payload = json.loads(receipt_path.read_bytes())
+    assert receipt_path.read_bytes() == _canonical(payload) + b"\n"
+    assert payload["status"] == "insufficient-capacity"
+    assert payload["blocking_category"] == "stem"
+    assert payload["required"] == 2
+    assert payload["selected"] == 1
+    assert payload["redistribution"] == "forbidden"
+
+
+def test_verifier_requires_live_external_provenance_and_exclusion_roots() -> None:
+    """Self-claimed manifest hashes cannot authenticate source or exclusion semantics."""
+    module = _load_module()
+    parameters = inspect.signature(module.verify_selection_bundle).parameters
+
+    assert {
+        "config_path",
+        "inventory",
+        "historical",
+        "held_out",
+        "tokenizer_trust_file_sha256",
+        "scratch_root",
+    } <= set(parameters)
+
+
+def test_verifier_enforces_nonzero_assistant_supervision() -> None:
+    """Replay must enforce the same nonzero assistant mask gate as selection."""
+    source = MODULE_PATH.read_text()
+    verifier = source[source.index("def verify_selection_bundle") : source.index("def _parse_args")]
+
+    assert "assistant_tokens < 1" in verifier
+
+
+def test_authenticated_builder_readers_use_one_nofollow_descriptor() -> None:
+    """Trusted input bytes cannot be reopened through a swapped path."""
+    source = MODULE_PATH.read_text()
+    stable_bytes = source[
+        source.index("def _stable_regular_bytes") : source.index("def _stable_regular_evidence")
+    ]
+    stable_evidence = source[
+        source.index("def _stable_regular_evidence") : source.index("def _physical_row_count")
+    ]
+
+    for helper in (stable_bytes, stable_evidence):
+        assert "os.open" in helper
+        assert "O_NOFOLLOW" in helper
+        assert ".read_bytes()" not in helper
+        assert "path.open(" not in helper
+
+
+def test_build_fails_on_unresolved_approval_roots_before_selection() -> None:
+    """A known policy blocker must fail before a 700K tokenize/select pass."""
+    source = MODULE_PATH.read_text()
+    build_branch = source[
+        source.index('if args.command == "build"') : source.index(
+            "return 0", source.index('if args.command == "build"')
+        )
+    ]
+
+    assert build_branch.index("_require_external_approval_roots") < build_branch.index(
+        "select_continuation_rows"
+    )
+
+
+def test_publication_rehashes_copied_partial_before_atomic_rename() -> None:
+    """The bytes installed on shared storage must be authenticated after copying."""
+    source = MODULE_PATH.read_text()
+    publication = source[
+        source.index("def publish_selection_bundle") : source.index("def verify_selection_bundle")
+    ]
+
+    assert "publication partial changed while copying" in publication
+
+
+def test_publication_reauthenticates_the_installed_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pathname replacement at rename time cannot become the completion identity."""
+    module = _load_module()
+    selection = module.select_continuation_rows(
+        {"stem": [_row("stem", "one", 0)]},
+        quotas={"stem": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+    )
+    historical_path, historical_file_sha256 = _write_historical_receipt(
+        tmp_path / "historical.json"
+    )
+    historical = module.load_historical_exclusion(
+        historical_path,
+        expected_sha256=historical_file_sha256,
+        expected_occurrence_count=3,
+    )
+    held_out = module.load_held_out_union([], required_names=frozenset())
+
+    def install_foreign_bundle(_source: Path, destination: Path) -> None:
+        destination.mkdir()
+        (destination / "DATA.jsonl").write_bytes(b"foreign\n")
+        (destination / "MANIFEST.json").write_bytes(b"{}\n")
+
+    monkeypatch.setattr(module, "_rename_noreplace", install_foreign_bundle)
+    with pytest.raises(module.ComplementError, match="destination changed after install"):
+        module.publish_selection_bundle(
+            selection,
+            output_root=tmp_path / "bundle",
+            scratch_root=tmp_path / "scratch",
+            quotas={"stem": 1},
+            config_file_sha256=hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+            source_inventory_file_sha256="6" * 64,
+            historical=historical,
+            held_out=held_out,
+            tokenizer_trust_file_sha256="7" * 64,
+            runtime_sha256="8" * 64,
+            source_commit="9" * 40,
+            enforce_production_paths=False,
+        )
+
+
+def test_tokenizer_is_loaded_only_from_a_fresh_verified_snapshot_stage() -> None:
+    source = MODULE_PATH.read_text()
+    loader = source[
+        source.index("def _load_qwen_tokenizer") : source.index("def _authenticated_source_stream")
+    ]
+
+    assert "_stage_tokenizer_snapshot" in loader
+    assert "staged_snapshot" in loader
+
+
+def test_builder_stable_readers_require_regular_descriptors() -> None:
+    source = MODULE_PATH.read_text()
+    stable = source[
+        source.index("def _stable_regular_bytes") : source.index("def _physical_row_count")
+    ]
+
+    assert "stat.S_ISREG" in stable
+
+
+def test_replay_scratch_is_cleaned_on_every_exit() -> None:
+    source = MODULE_PATH.read_text()
+    verifier = source[source.index("def verify_selection_bundle") : source.index("def _parse_args")]
+
+    assert "with tempfile.TemporaryDirectory" in verifier
+
+
+def test_heldout_help_documents_named_receipt_syntax() -> None:
+    help_text = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "build", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    assert "NAME=PATH:SHA256" in help_text
+
+
+def test_physical_row_count_uses_a_nofollow_regular_descriptor(tmp_path: Path) -> None:
+    """Capacity counting cannot reopen a trusted path as a FIFO or symlink."""
+    module = _load_module()
+    nonregular = tmp_path / "directory"
+    nonregular.mkdir()
+    source = MODULE_PATH.read_text()
+    counter = source[
+        source.index("def _physical_row_count") : source.index("def load_source_inventory")
+    ]
+
+    assert "os.open" in counter
+    assert "stat.S_ISREG" in counter
+    assert "path.open" not in counter
+    with pytest.raises(module.ComplementError, match="regular file"):
+        module._physical_row_count(nonregular, "jsonl")
+
+
+def test_replay_workspace_uses_context_managed_cleanup() -> None:
+    """Replay scratch is removed immediately on success and every exception."""
+    source = MODULE_PATH.read_text()
+    verifier = source[source.index("def verify_selection_bundle") : source.index("def _parse_args")]
+
+    assert "with tempfile.TemporaryDirectory" in verifier

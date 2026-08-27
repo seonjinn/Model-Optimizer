@@ -1,0 +1,25 @@
+{
+  "schema_version": "ptv2-ptv3-complement-config-v1",
+  "scientific_identity": "ptv2-ptv3-complement-700k-v1",
+  "training_sequence_length": 4096,
+  "tokenizer": {
+    "repository": "Qwen/Qwen3-4B",
+    "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+    "training_sequence_length": 4096,
+    "trust_schema": "qwen3-4b-tokenizer-trust-v1"
+  },
+  "source_requirements": {
+    "path": "qwen3_4b_ptv23_complement_sources_v1.json",
+    "sha256": "e61ec87c2aba19c67c4a4549dba11f33abe8a3126f76232df0d72da43e8c81e1"
+  },
+  "quotas": {
+    "ptv2_stem": 300000,
+    "ptv2_multilingual_ja": 50000,
+    "ptv2_multilingual_es": 50000,
+    "ptv2_multilingual_fr": 50000,
+    "ptv2_multilingual_it": 50000,
+    "ptv3_swe_v3": 100000,
+    "ptv3_interactive_agentic_swe": 19000,
+    "ptv3_general_tool_trajectories": 81000
+  }
+}
