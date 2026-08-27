@@ -1,0 +1,1064 @@
+{
+  "schema_version": 1,
+  "name": "qwen3-30ba3b-thinking-ptv2-full201-stage-inventory-v1",
+  "repository": "nvidia/Nemotron-Post-Training-Dataset-v2",
+  "revision": "5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
+  "configuration": "default",
+  "license": "CC-BY-4.0",
+  "file_count": 201,
+  "total_bytes": 44423886661,
+  "source_sha256_status": "gated-redacted-require-bootstrap",
+  "bootstrap_entrypoint": "examples/dataset/bootstrap_ptv2_source_manifest.py",
+  "sources": [
+    {
+      "split": "chat",
+      "files": [
+        {
+          "path": "data/chat-00000-of-00012.parquet",
+          "bytes": 141322814,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00001-of-00012.parquet",
+          "bytes": 200351874,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00002-of-00012.parquet",
+          "bytes": 258973528,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00003-of-00012.parquet",
+          "bytes": 252647149,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00004-of-00012.parquet",
+          "bytes": 231499612,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00005-of-00012.parquet",
+          "bytes": 220754012,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00006-of-00012.parquet",
+          "bytes": 207132363,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00007-of-00012.parquet",
+          "bytes": 272316628,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00008-of-00012.parquet",
+          "bytes": 251929210,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00009-of-00012.parquet",
+          "bytes": 258213393,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00010-of-00012.parquet",
+          "bytes": 260569515,
+          "sha256": null
+        },
+        {
+          "path": "data/chat-00011-of-00012.parquet",
+          "bytes": 259768788,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "math",
+      "files": [
+        {
+          "path": "data/math-00000-of-00002.parquet",
+          "bytes": 110330404,
+          "sha256": null
+        },
+        {
+          "path": "data/math-00001-of-00002.parquet",
+          "bytes": 110235963,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "code",
+      "files": [
+        {
+          "path": "data/code-00000-of-00002.parquet",
+          "bytes": 222127279,
+          "sha256": null
+        },
+        {
+          "path": "data/code-00001-of-00002.parquet",
+          "bytes": 221813371,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "stem",
+      "files": [
+        {
+          "path": "data/stem-00000-of-00002.parquet",
+          "bytes": 218258427,
+          "sha256": null
+        },
+        {
+          "path": "data/stem-00001-of-00002.parquet",
+          "bytes": 169800930,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "multilingual_de",
+      "files": [
+        {
+          "path": "data/multilingual_de-00000-of-00038.parquet",
+          "bytes": 222678090,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00001-of-00038.parquet",
+          "bytes": 225033175,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00002-of-00038.parquet",
+          "bytes": 222663656,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00003-of-00038.parquet",
+          "bytes": 222587322,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00004-of-00038.parquet",
+          "bytes": 224164798,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00005-of-00038.parquet",
+          "bytes": 223486328,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00006-of-00038.parquet",
+          "bytes": 224958156,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00007-of-00038.parquet",
+          "bytes": 224063129,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00008-of-00038.parquet",
+          "bytes": 223147207,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00009-of-00038.parquet",
+          "bytes": 221656024,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00010-of-00038.parquet",
+          "bytes": 223278774,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00011-of-00038.parquet",
+          "bytes": 221734701,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00012-of-00038.parquet",
+          "bytes": 222017288,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00013-of-00038.parquet",
+          "bytes": 224226092,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00014-of-00038.parquet",
+          "bytes": 223023027,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00015-of-00038.parquet",
+          "bytes": 222939856,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00016-of-00038.parquet",
+          "bytes": 224882178,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00017-of-00038.parquet",
+          "bytes": 224142538,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00018-of-00038.parquet",
+          "bytes": 225146089,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00019-of-00038.parquet",
+          "bytes": 223740747,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00020-of-00038.parquet",
+          "bytes": 222077196,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00021-of-00038.parquet",
+          "bytes": 225272720,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00022-of-00038.parquet",
+          "bytes": 223743615,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00023-of-00038.parquet",
+          "bytes": 221842563,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00024-of-00038.parquet",
+          "bytes": 224743717,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00025-of-00038.parquet",
+          "bytes": 221028430,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00026-of-00038.parquet",
+          "bytes": 223786271,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00027-of-00038.parquet",
+          "bytes": 221711257,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00028-of-00038.parquet",
+          "bytes": 225681777,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00029-of-00038.parquet",
+          "bytes": 223140881,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00030-of-00038.parquet",
+          "bytes": 224156905,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00031-of-00038.parquet",
+          "bytes": 222220264,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00032-of-00038.parquet",
+          "bytes": 222555170,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00033-of-00038.parquet",
+          "bytes": 222502544,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00034-of-00038.parquet",
+          "bytes": 221593432,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00035-of-00038.parquet",
+          "bytes": 224486757,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00036-of-00038.parquet",
+          "bytes": 225777659,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_de-00037-of-00038.parquet",
+          "bytes": 222606033,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "multilingual_ja",
+      "files": [
+        {
+          "path": "data/multilingual_ja-00000-of-00037.parquet",
+          "bytes": 219896560,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00001-of-00037.parquet",
+          "bytes": 219723829,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00002-of-00037.parquet",
+          "bytes": 216688965,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00003-of-00037.parquet",
+          "bytes": 218512984,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00004-of-00037.parquet",
+          "bytes": 219765901,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00005-of-00037.parquet",
+          "bytes": 219631100,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00006-of-00037.parquet",
+          "bytes": 218498432,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00007-of-00037.parquet",
+          "bytes": 217501157,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00008-of-00037.parquet",
+          "bytes": 219971929,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00009-of-00037.parquet",
+          "bytes": 218944555,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00010-of-00037.parquet",
+          "bytes": 220301943,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00011-of-00037.parquet",
+          "bytes": 218884882,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00012-of-00037.parquet",
+          "bytes": 220638512,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00013-of-00037.parquet",
+          "bytes": 217650718,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00014-of-00037.parquet",
+          "bytes": 218044152,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00015-of-00037.parquet",
+          "bytes": 219332382,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00016-of-00037.parquet",
+          "bytes": 219825329,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00017-of-00037.parquet",
+          "bytes": 218220955,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00018-of-00037.parquet",
+          "bytes": 220405910,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00019-of-00037.parquet",
+          "bytes": 219358498,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00020-of-00037.parquet",
+          "bytes": 218096881,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00021-of-00037.parquet",
+          "bytes": 219731862,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00022-of-00037.parquet",
+          "bytes": 217536401,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00023-of-00037.parquet",
+          "bytes": 220662184,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00024-of-00037.parquet",
+          "bytes": 217881472,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00025-of-00037.parquet",
+          "bytes": 221057360,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00026-of-00037.parquet",
+          "bytes": 219949358,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00027-of-00037.parquet",
+          "bytes": 220001396,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00028-of-00037.parquet",
+          "bytes": 220104879,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00029-of-00037.parquet",
+          "bytes": 219380283,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00030-of-00037.parquet",
+          "bytes": 218413755,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00031-of-00037.parquet",
+          "bytes": 218814375,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00032-of-00037.parquet",
+          "bytes": 219686360,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00033-of-00037.parquet",
+          "bytes": 220562884,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00034-of-00037.parquet",
+          "bytes": 217588203,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00035-of-00037.parquet",
+          "bytes": 217676543,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_ja-00036-of-00037.parquet",
+          "bytes": 218702724,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "multilingual_es",
+      "files": [
+        {
+          "path": "data/multilingual_es-00000-of-00033.parquet",
+          "bytes": 223229107,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00001-of-00033.parquet",
+          "bytes": 224897743,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00002-of-00033.parquet",
+          "bytes": 222519857,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00003-of-00033.parquet",
+          "bytes": 222669703,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00004-of-00033.parquet",
+          "bytes": 222729527,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00005-of-00033.parquet",
+          "bytes": 223258990,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00006-of-00033.parquet",
+          "bytes": 222623759,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00007-of-00033.parquet",
+          "bytes": 221332985,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00008-of-00033.parquet",
+          "bytes": 222551315,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00009-of-00033.parquet",
+          "bytes": 222388485,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00010-of-00033.parquet",
+          "bytes": 223258152,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00011-of-00033.parquet",
+          "bytes": 223374298,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00012-of-00033.parquet",
+          "bytes": 222035520,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00013-of-00033.parquet",
+          "bytes": 222657714,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00014-of-00033.parquet",
+          "bytes": 222525812,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00015-of-00033.parquet",
+          "bytes": 222184026,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00016-of-00033.parquet",
+          "bytes": 223786556,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00017-of-00033.parquet",
+          "bytes": 222663512,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00018-of-00033.parquet",
+          "bytes": 223096605,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00019-of-00033.parquet",
+          "bytes": 222867347,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00020-of-00033.parquet",
+          "bytes": 222741684,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00021-of-00033.parquet",
+          "bytes": 222203356,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00022-of-00033.parquet",
+          "bytes": 221634255,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00023-of-00033.parquet",
+          "bytes": 221208203,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00024-of-00033.parquet",
+          "bytes": 220995667,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00025-of-00033.parquet",
+          "bytes": 223098307,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00026-of-00033.parquet",
+          "bytes": 222249480,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00027-of-00033.parquet",
+          "bytes": 222515875,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00028-of-00033.parquet",
+          "bytes": 221228834,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00029-of-00033.parquet",
+          "bytes": 222421978,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00030-of-00033.parquet",
+          "bytes": 223429404,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00031-of-00033.parquet",
+          "bytes": 223747292,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_es-00032-of-00033.parquet",
+          "bytes": 223228439,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "multilingual_fr",
+      "files": [
+        {
+          "path": "data/multilingual_fr-00000-of-00037.parquet",
+          "bytes": 220646383,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00001-of-00037.parquet",
+          "bytes": 222223715,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00002-of-00037.parquet",
+          "bytes": 221759816,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00003-of-00037.parquet",
+          "bytes": 221303532,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00004-of-00037.parquet",
+          "bytes": 222592318,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00005-of-00037.parquet",
+          "bytes": 219438696,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00006-of-00037.parquet",
+          "bytes": 221301314,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00007-of-00037.parquet",
+          "bytes": 221491780,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00008-of-00037.parquet",
+          "bytes": 221946571,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00009-of-00037.parquet",
+          "bytes": 221887280,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00010-of-00037.parquet",
+          "bytes": 222708928,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00011-of-00037.parquet",
+          "bytes": 222795323,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00012-of-00037.parquet",
+          "bytes": 222284846,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00013-of-00037.parquet",
+          "bytes": 221272452,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00014-of-00037.parquet",
+          "bytes": 221886260,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00015-of-00037.parquet",
+          "bytes": 221836176,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00016-of-00037.parquet",
+          "bytes": 219905956,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00017-of-00037.parquet",
+          "bytes": 221888052,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00018-of-00037.parquet",
+          "bytes": 219826518,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00019-of-00037.parquet",
+          "bytes": 220719865,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00020-of-00037.parquet",
+          "bytes": 221915358,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00021-of-00037.parquet",
+          "bytes": 221012313,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00022-of-00037.parquet",
+          "bytes": 220668196,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00023-of-00037.parquet",
+          "bytes": 223548539,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00024-of-00037.parquet",
+          "bytes": 223421392,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00025-of-00037.parquet",
+          "bytes": 221248825,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00026-of-00037.parquet",
+          "bytes": 221484007,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00027-of-00037.parquet",
+          "bytes": 220924374,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00028-of-00037.parquet",
+          "bytes": 221971330,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00029-of-00037.parquet",
+          "bytes": 221236799,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00030-of-00037.parquet",
+          "bytes": 220501892,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00031-of-00037.parquet",
+          "bytes": 222624940,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00032-of-00037.parquet",
+          "bytes": 221775934,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00033-of-00037.parquet",
+          "bytes": 223440416,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00034-of-00037.parquet",
+          "bytes": 221526952,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00035-of-00037.parquet",
+          "bytes": 222645256,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_fr-00036-of-00037.parquet",
+          "bytes": 221110790,
+          "sha256": null
+        }
+      ]
+    },
+    {
+      "split": "multilingual_it",
+      "files": [
+        {
+          "path": "data/multilingual_it-00000-of-00038.parquet",
+          "bytes": 220872312,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00001-of-00038.parquet",
+          "bytes": 221416906,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00002-of-00038.parquet",
+          "bytes": 220553498,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00003-of-00038.parquet",
+          "bytes": 222410634,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00004-of-00038.parquet",
+          "bytes": 220475681,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00005-of-00038.parquet",
+          "bytes": 220848935,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00006-of-00038.parquet",
+          "bytes": 221157407,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00007-of-00038.parquet",
+          "bytes": 222180730,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00008-of-00038.parquet",
+          "bytes": 222429572,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00009-of-00038.parquet",
+          "bytes": 220473537,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00010-of-00038.parquet",
+          "bytes": 222701995,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00011-of-00038.parquet",
+          "bytes": 222611702,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00012-of-00038.parquet",
+          "bytes": 221653136,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00013-of-00038.parquet",
+          "bytes": 222236757,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00014-of-00038.parquet",
+          "bytes": 222171805,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00015-of-00038.parquet",
+          "bytes": 220616710,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00016-of-00038.parquet",
+          "bytes": 220209587,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00017-of-00038.parquet",
+          "bytes": 220927407,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00018-of-00038.parquet",
+          "bytes": 221447135,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00019-of-00038.parquet",
+          "bytes": 220351121,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00020-of-00038.parquet",
+          "bytes": 221076085,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00021-of-00038.parquet",
+          "bytes": 221716171,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00022-of-00038.parquet",
+          "bytes": 220938960,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00023-of-00038.parquet",
+          "bytes": 222142417,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00024-of-00038.parquet",
+          "bytes": 221922481,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00025-of-00038.parquet",
+          "bytes": 221876763,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00026-of-00038.parquet",
+          "bytes": 221714778,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00027-of-00038.parquet",
+          "bytes": 221329860,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00028-of-00038.parquet",
+          "bytes": 223211168,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00029-of-00038.parquet",
+          "bytes": 220833196,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00030-of-00038.parquet",
+          "bytes": 222363103,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00031-of-00038.parquet",
+          "bytes": 220585858,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00032-of-00038.parquet",
+          "bytes": 220334971,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00033-of-00038.parquet",
+          "bytes": 220585651,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00034-of-00038.parquet",
+          "bytes": 221998713,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00035-of-00038.parquet",
+          "bytes": 220053359,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00036-of-00038.parquet",
+          "bytes": 220381879,
+          "sha256": null
+        },
+        {
+          "path": "data/multilingual_it-00037-of-00038.parquet",
+          "bytes": 220760561,
+          "sha256": null
+        }
+      ]
+    }
+  ]
+}
