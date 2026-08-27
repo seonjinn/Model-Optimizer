@@ -255,6 +255,192 @@ def test_q30t_parent_rejects_missing_weights_or_modelopt_state(
         removed.write_bytes(contents)
 
 
+def _replace_monolithic_weight_with_index(identity: ParentIdentity, raw: bytes) -> None:
+    checkpoint = identity.checkpoint_path
+    (checkpoint / "model.safetensors").unlink()
+    (checkpoint / "model.safetensors.index.json").write_bytes(raw)
+
+
+def _refresh_checkpoint_manifest(identity: ParentIdentity) -> None:
+    checkpoint = identity.checkpoint_path
+    manifest_path = checkpoint.parent / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    hashes = _regular_hashes(checkpoint)
+    manifest["resume_checkpoint_sha256"] = hashes
+    manifest["resume_checkpoint_storage"] = dict.fromkeys(hashes, "copy")
+    manifest_path.write_bytes(_canonical(manifest) + b"\n")
+
+
+def _build_parent_for_weight_failure(
+    identity: ParentIdentity,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _refresh_checkpoint_manifest(identity)
+    identities = dict(receipt_module.Q30T_PARENT_IDENTITIES)
+    identities["DFlash"] = identity
+    monkeypatch.setattr(receipt_module, "Q30T_PARENT_IDENTITIES", identities)
+    build_q30t_parent_receipt(
+        checkpoint=identity.checkpoint_path,
+        method="DFlash",
+        target_revision="a" * 40,
+        target_tree_sha256="b" * 64,
+        historical_receipt_file_sha256="c" * 64,
+        historical_ordered_prompt_uuids_sha256="d" * 64,
+        source_commit="e" * 40,
+        runtime_sha256="f" * 64,
+    )
+
+
+def test_q30t_parent_rejects_index_without_referenced_weight_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An index JSON is metadata, not usable weights by itself."""
+    identity = _fixture_identity(tmp_path)
+    _write_parent_tree(identity)
+    index = {"metadata": {}, "weight_map": {}}
+    _replace_monolithic_weight_with_index(identity, _canonical(index) + b"\n")
+
+    with pytest.raises(ValueError, match="weights and ModelOpt state"):
+        _build_parent_for_weight_failure(identity, monkeypatch)
+
+
+def test_q30t_parent_rejects_index_with_missing_or_empty_weight_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every shard referenced by the HF weight map must exist and be nonempty."""
+    identity = _fixture_identity(tmp_path)
+    _write_parent_tree(identity)
+    index = {"metadata": {}, "weight_map": {"model.layer.weight": "model-00001.safetensors"}}
+    _replace_monolithic_weight_with_index(identity, _canonical(index) + b"\n")
+
+    with pytest.raises(ValueError, match="weights and ModelOpt state"):
+        _build_parent_for_weight_failure(identity, monkeypatch)
+
+    (identity.checkpoint_path / "model-00001.safetensors").write_bytes(b"")
+    with pytest.raises(ValueError, match="weights and ModelOpt state"):
+        _build_parent_for_weight_failure(identity, monkeypatch)
+
+
+@pytest.mark.parametrize("reference", ["../foreign.safetensors", "/foreign.safetensors", ""])
+def test_q30t_parent_rejects_invalid_index_weight_shard_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference: str,
+) -> None:
+    """HF index shard references cannot escape or ambiguously name the checkpoint."""
+    identity = _fixture_identity(tmp_path)
+    _write_parent_tree(identity)
+    index = {"metadata": {}, "weight_map": {"model.layer.weight": reference}}
+    _replace_monolithic_weight_with_index(identity, _canonical(index) + b"\n")
+
+    with pytest.raises(ValueError, match="weights and ModelOpt state"):
+        _build_parent_for_weight_failure(identity, monkeypatch)
+
+
+def test_q30t_parent_rejects_duplicate_or_invalid_index_weight_map_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Duplicate parameter keys and non-string shard references are not exact HF indexes."""
+    identity = _fixture_identity(tmp_path)
+    _write_parent_tree(identity)
+    duplicate_key = (
+        b'{"metadata":{},"weight_map":{"model.layer.weight":"model-00001.safetensors",'
+        b'"model.layer.weight":"model-00002.safetensors"}}\n'
+    )
+    _replace_monolithic_weight_with_index(identity, duplicate_key)
+
+    with pytest.raises(ValueError, match="weights and ModelOpt state"):
+        _build_parent_for_weight_failure(identity, monkeypatch)
+
+    invalid_reference = {"metadata": {}, "weight_map": {"model.layer.weight": 7}}
+    (identity.checkpoint_path / "model.safetensors.index.json").write_bytes(
+        _canonical(invalid_reference) + b"\n"
+    )
+    with pytest.raises(ValueError, match="weights and ModelOpt state"):
+        _build_parent_for_weight_failure(identity, monkeypatch)
+
+
+def test_q30t_parent_accepts_complete_hf_weight_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A canonical HF index is usable when all referenced shards are bound and nonempty."""
+    identity = _fixture_identity(tmp_path)
+    _write_parent_tree(identity)
+    checkpoint = identity.checkpoint_path
+    (checkpoint / "model-00001-of-00002.safetensors").write_bytes(b"first shard")
+    (checkpoint / "model-00002-of-00002.safetensors").write_bytes(b"second shard")
+    index = {
+        "metadata": {"total_size": 22},
+        "weight_map": {
+            "model.layer.0.weight": "model-00001-of-00002.safetensors",
+            "model.layer.1.weight": "model-00002-of-00002.safetensors",
+        },
+    }
+    _replace_monolithic_weight_with_index(identity, _canonical(index) + b"\n")
+    _refresh_checkpoint_manifest(identity)
+    identities = dict(receipt_module.Q30T_PARENT_IDENTITIES)
+    identities["DFlash"] = identity
+    monkeypatch.setattr(receipt_module, "Q30T_PARENT_IDENTITIES", identities)
+
+    raw = build_q30t_parent_receipt(
+        checkpoint=checkpoint,
+        method="DFlash",
+        target_revision="a" * 40,
+        target_tree_sha256="b" * 64,
+        historical_receipt_file_sha256="c" * 64,
+        historical_ordered_prompt_uuids_sha256="d" * 64,
+        source_commit="e" * 40,
+        runtime_sha256="f" * 64,
+    )
+
+    assert json.loads(raw)["checkpoint_tree_sha256"]
+
+
+def test_q30t_parent_closes_descriptor_when_fdopen_raises_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-OSError fdopen failure cannot leak the already-open descriptor."""
+    candidate = tmp_path / "candidate.bin"
+    candidate.write_bytes(b"payload")
+    directory_fd = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    expected = os.stat(candidate.name, dir_fd=directory_fd, follow_symlinks=False)
+    real_open = os.open
+    real_close = os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def tracked_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    def fail_fdopen(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("synthetic fdopen failure")
+
+    monkeypatch.setattr(receipt_module.os, "open", tracked_open)
+    monkeypatch.setattr(receipt_module.os, "close", tracked_close)
+    monkeypatch.setattr(receipt_module.os, "fdopen", fail_fdopen)
+    try:
+        with pytest.raises(ValueError, match="synthetic fdopen failure"):
+            receipt_module._read_regular_at(
+                directory_fd,
+                candidate.name,
+                str(candidate),
+                expected,
+                retain=False,
+                require_single_link=False,
+            )
+        assert opened[-1] in closed
+    finally:
+        if opened and opened[-1] not in closed:
+            real_close(opened[-1])
+        real_close(directory_fd)
+
+
 def test_q30t_parent_requires_completed_exact_job_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -267,6 +453,33 @@ def test_q30t_parent_requires_completed_exact_job_evidence(
     (identity.checkpoint_path.parents[2] / "control/training-complete-s25391.json").unlink()
 
     with pytest.raises(ValueError, match="completion evidence"):
+        build_q30t_parent_receipt(
+            checkpoint=identity.checkpoint_path,
+            method="DFlash",
+            target_revision="a" * 40,
+            target_tree_sha256="b" * 64,
+            historical_receipt_file_sha256="c" * 64,
+            historical_ordered_prompt_uuids_sha256="d" * 64,
+            source_commit="e" * 40,
+            runtime_sha256="f" * 64,
+        )
+
+
+def test_q30t_parent_rejects_extra_completion_evidence_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A self-authored completion extension cannot enter the parent trust root."""
+    identity = _fixture_identity(tmp_path)
+    _write_parent_tree(identity)
+    identities = dict(receipt_module.Q30T_PARENT_IDENTITIES)
+    identities["DFlash"] = identity
+    monkeypatch.setattr(receipt_module, "Q30T_PARENT_IDENTITIES", identities)
+    completion_path = identity.checkpoint_path.parents[2] / "control/training-complete-s25391.json"
+    completion = json.loads(completion_path.read_bytes())
+    completion["caller_claim"] = "completed"
+    completion_path.write_bytes(_canonical(completion) + b"\n")
+
+    with pytest.raises(ValueError, match="completion evidence does not reconcile"):
         build_q30t_parent_receipt(
             checkpoint=identity.checkpoint_path,
             method="DFlash",

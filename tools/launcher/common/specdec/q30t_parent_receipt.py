@@ -11,7 +11,7 @@ import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -37,14 +37,8 @@ Q30T_GLOBAL_STEP = 25_391
 Q30T_HISTORICAL_OCCURRENCES = 1_300_000
 _READ_BLOCK_BYTES = 8 * 1024 * 1024
 _MAX_JSON_BYTES = 64 * 1024 * 1024
-_WEIGHT_NAMES = frozenset(
-    {
-        "model.safetensors",
-        "model.safetensors.index.json",
-        "pytorch_model.bin",
-        "pytorch_model.bin.index.json",
-    }
-)
+_MONOLITHIC_WEIGHT_NAMES = frozenset({"model.safetensors", "pytorch_model.bin"})
+_WEIGHT_INDEX_NAMES = frozenset({"model.safetensors.index.json", "pytorch_model.bin.index.json"})
 
 
 @dataclass(frozen=True)
@@ -145,10 +139,12 @@ def _read_regular_at(
         raise ValueError(f"Q30 parent input is unreadable: {display_path}") from error
     try:
         stream = os.fdopen(descriptor, "rb")
-    except OSError as error:
+    except BaseException as error:
         with suppress(OSError):
             os.close(descriptor)
-        raise ValueError(f"Q30 parent input cannot be read: {display_path}") from error
+        if isinstance(error, OSError):
+            raise ValueError(f"Q30 parent input cannot be read: {display_path}") from error
+        raise
     with stream:
         before = os.fstat(stream.fileno())
         if (
@@ -230,7 +226,7 @@ def _walk_checkpoint(root: Path) -> tuple[list[dict[str, object]], dict[str, byt
                     name,
                     path,
                     expected,
-                    retain=path == "trainer_state.json",
+                    retain=path == "trainer_state.json" or path in _WEIGHT_INDEX_NAMES,
                     require_single_link=False,
                 )
                 files.append({"path": path, "type": "regular", "size": size, "sha256": digest})
@@ -276,20 +272,82 @@ def _json_object(raw: bytes, label: str) -> dict[str, Any]:
     return payload
 
 
+def _json_object_without_duplicate_keys(raw: bytes, label: str) -> dict[str, Any]:
+    duplicate_key = False
+
+    def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal duplicate_key
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                duplicate_key = True
+            result[key] = value
+        return result
+
+    try:
+        payload: Any = json.loads(raw, object_pairs_hook=object_from_pairs)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Q30 parent {label} JSON is invalid") from error
+    if duplicate_key or not isinstance(payload, dict):
+        raise ValueError(f"Q30 parent {label} JSON is not an exact object")
+    return payload
+
+
+def _has_usable_weights(files: list[dict[str, object]], retained: dict[str, bytes]) -> bool:
+    by_path = {entry["path"]: entry for entry in files}
+    for name in _MONOLITHIC_WEIGHT_NAMES:
+        monolithic = by_path.get(name)
+        if type(monolithic) is dict:
+            monolithic_size = monolithic.get("size")
+            if type(monolithic_size) is int and monolithic_size > 0:
+                return True
+    indexes = [name for name in _WEIGHT_INDEX_NAMES if name in by_path]
+    if len(indexes) != 1:
+        return False
+    index_name = indexes[0]
+    index_entry = by_path[index_name]
+    index_size = index_entry.get("size")
+    if type(index_size) is not int or index_size < 1:
+        return False
+    try:
+        index = _json_object_without_duplicate_keys(retained[index_name], "weight index")
+    except (KeyError, ValueError):
+        return False
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        return False
+    suffix = ".safetensors" if index_name == "model.safetensors.index.json" else ".bin"
+    for parameter_name, reference in weight_map.items():
+        if type(parameter_name) is not str or not parameter_name or type(reference) is not str:
+            return False
+        path = PurePosixPath(reference)
+        if (
+            not reference
+            or "\\" in reference
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in reference.split("/"))
+            or path.as_posix() != reference
+            or not reference.endswith(suffix)
+        ):
+            return False
+        shard = by_path.get(reference)
+        if type(shard) is not dict or shard.get("type") != "regular":
+            return False
+        shard_size = shard.get("size")
+        if type(shard_size) is not int or shard_size < 1:
+            return False
+    return True
+
+
 def _checkpoint_evidence(
     checkpoint: Path,
 ) -> tuple[list[dict[str, object]], str, str, dict[str, bytes]]:
     files, retained = _walk_checkpoint(checkpoint)
     by_path = {entry["path"]: entry for entry in files}
-    weight_entries = [
-        entry
-        for entry in files
-        if entry["path"] in _WEIGHT_NAMES and isinstance(entry["size"], int) and entry["size"] > 0
-    ]
     modelopt = by_path.get("modelopt_state.pth")
     modelopt_size = modelopt.get("size") if modelopt is not None else None
     if (
-        not weight_entries
+        not _has_usable_weights(files, retained)
         or modelopt is None
         or type(modelopt_size) is not int
         or modelopt_size < 1
