@@ -113,6 +113,57 @@ def test_q30t_receipt_binds_snapshot_template_and_special_tokens(tmp_path: Path)
     assert verify_q30t_tokenizer_receipt(receipt) == parsed
 
 
+def test_q30t_receipt_builder_rejects_relative_snapshot_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A builder receipt must never emit a path its verifier cannot authenticate."""
+    snapshot = _make_q30_snapshot(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="absolute"):
+        build_q30t_tokenizer_receipt(
+            snapshot=snapshot.relative_to(tmp_path),
+            repository=Q30_REPOSITORY,
+            revision=FIXTURE_Q30_REVISION,
+        )
+
+
+def test_q30t_snapshot_reader_closes_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ownership-transfer failure must not leak the opened snapshot descriptor."""
+    snapshot = _make_q30_snapshot(tmp_path)
+    directory_fd = os.open(snapshot, os.O_RDONLY)
+    expected = os.stat("tokenizer.json", dir_fd=directory_fd, follow_symlinks=False)
+    real_open = os.open
+    captured: list[int] = []
+
+    def capture_open(*args: object, **kwargs: object) -> int:
+        descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        captured.append(descriptor)
+        return descriptor
+
+    def fail_fdopen(*_args: object, **_kwargs: object) -> None:
+        raise ValueError("injected wrapper failure")
+
+    monkeypatch.setattr(receipt_module.os, "open", capture_open)
+    monkeypatch.setattr(receipt_module.os, "fdopen", fail_fdopen)
+    try:
+        with pytest.raises(ValueError, match="injected wrapper failure"):
+            receipt_module._read_regular_at(
+                directory_fd,
+                "tokenizer.json",
+                str(snapshot / "tokenizer.json"),
+                expected,
+                True,
+            )
+        assert captured
+        with pytest.raises(OSError):
+            os.fstat(captured[-1])
+    finally:
+        os.close(directory_fd)
+
+
 @pytest.mark.parametrize("field", ["snapshot_tree_sha256", "training_chat_template_sha256"])
 def test_q30t_receipt_rejects_tampering(tmp_path: Path, field: str) -> None:
     """Rehashed derived receipt fields still fail snapshot reconciliation."""

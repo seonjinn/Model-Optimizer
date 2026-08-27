@@ -57,10 +57,14 @@ def _read_regular_at(
         raise ValueError(f"Q30 tokenizer snapshot input is unreadable: {display_path}") from error
     try:
         stream = os.fdopen(descriptor, "rb")
-    except OSError as error:
+    except BaseException as error:
         with suppress(OSError):
             os.close(descriptor)
-        raise ValueError(f"Q30 tokenizer snapshot input cannot be read: {display_path}") from error
+        if isinstance(error, OSError):
+            raise ValueError(
+                f"Q30 tokenizer snapshot input cannot be read: {display_path}"
+            ) from error
+        raise
     with stream:
         before = os.fstat(stream.fileno())
         if (
@@ -251,6 +255,8 @@ def _derived_snapshot_evidence(snapshot: Path) -> dict[str, object]:
 
 def build_q30t_tokenizer_receipt(snapshot: Path, repository: str, revision: str) -> bytes:
     """Build canonical receipt bytes from one exact Q30 Thinking tokenizer snapshot."""
+    if not snapshot.is_absolute():
+        raise ValueError("Q30 tokenizer snapshot path must be absolute")
     if repository != Q30T_TOKENIZER_REPOSITORY or not _is_lower_hex(revision, 40):
         raise ValueError("Q30 tokenizer target identity is invalid")
     body: dict[str, object] = {
