@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import pwd
 import re
 import signal
 import stat
@@ -16,7 +18,10 @@ from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import TYPE_CHECKING, Literal, NoReturn
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 SCHEMA_VERSION: Literal["ptv23-node-keeper-v1"] = "ptv23-node-keeper-v1"
 __all__ = [
@@ -36,6 +41,7 @@ __all__ = [
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 _NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _BLOCK_SIZE = 8 * 1024 * 1024
+_CLEANUP_RACE_HOOK: Callable[[], None] | None = None
 
 
 class KeeperError(RuntimeError):
@@ -225,11 +231,35 @@ def _absolute(path: Path, what: str) -> None:
         raise KeeperError(f"{what} must be an absolute path")
 
 
+def _nofollow_flag() -> int:
+    flag = getattr(os, "O_NOFOLLOW", 0)
+    if not isinstance(flag, int) or flag == 0:
+        raise KeeperError("platform lacks a usable O_NOFOLLOW flag")
+    return flag
+
+
+def _canonical_absolute_path(path: Path, what: str) -> None:
+    _absolute(path, what)
+    rendered = str(path)
+    if rendered != os.path.normpath(rendered) or any(
+        component in {".", ".."} for component in path.parts
+    ):
+        raise KeeperError(f"{what} must use canonical path components")
+
+
+def _expected_scratch_root(job_id: str) -> Path:
+    return (
+        Path("/raid/scratch") / pwd.getpwuid(os.geteuid()).pw_name / f"ptv23-node-keeper-{job_id}"
+    )
+
+
 def _validate_plan(plan: KeeperPlan) -> None:
     if plan.schema_version != SCHEMA_VERSION:
         raise KeeperError("unsupported keeper plan schema")
     if not plan.job_id or not plan.node_name:
         raise KeeperError("keeper identity must be non-empty")
+    if not _NAME_RE.fullmatch(plan.job_id) or not _NAME_RE.fullmatch(plan.node_name):
+        raise KeeperError("keeper identity is unsafe")
     if not plan.sources:
         raise KeeperError("keeper plan must stage at least one source")
     for path, what in (
@@ -237,7 +267,9 @@ def _validate_plan(plan: KeeperPlan) -> None:
         (plan.anchor_root, "anchor root"),
         (plan.fifo_path, "controller FIFO"),
     ):
-        _absolute(path, what)
+        _canonical_absolute_path(path, what)
+    if plan.scratch_root != _expected_scratch_root(plan.job_id):
+        raise KeeperError("scratch root must be the current user's node-local job namespace")
     if not plan.directory_roots:
         raise KeeperError("keeper plan must name allowed directory roots")
     if tuple(sorted(plan.directory_roots, key=str)) != plan.directory_roots:
@@ -245,7 +277,7 @@ def _validate_plan(plan: KeeperPlan) -> None:
     if len(set(plan.directory_roots)) != len(plan.directory_roots):
         raise KeeperError("directory roots must be unique")
     for root in plan.directory_roots:
-        _absolute(root, "directory root")
+        _canonical_absolute_path(root, "directory root")
     try:
         relative_anchor = plan.anchor_root.relative_to(plan.scratch_root)
     except ValueError as error:
@@ -259,7 +291,7 @@ def _validate_plan(plan: KeeperPlan) -> None:
     for source in plan.sources:
         if not _NAME_RE.fullmatch(source.name) or source.name in {".", ".."}:
             raise KeeperError("keeper source name is unsafe")
-        _absolute(source.source_path, "keeper source")
+        _canonical_absolute_path(source.source_path, "keeper source")
         if not _is_hash(source.expected_sha256):
             raise KeeperError("keeper source SHA-256 is invalid")
         if not any(_is_under(source.source_path, root) for root in plan.directory_roots):
@@ -276,8 +308,8 @@ def _is_under(path: Path, root: Path) -> bool:
 
 def open_tree_root(path: Path) -> int:
     """Open an absolute directory path one no-follow component at a time."""
-    _absolute(path, "directory root")
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    _canonical_absolute_path(path, "directory root")
+    flags = os.O_RDONLY | os.O_DIRECTORY | _nofollow_flag()
     descriptor = os.open("/", flags)
     try:
         for component in path.parts[1:]:
@@ -294,11 +326,12 @@ def open_tree_root(path: Path) -> int:
 
 
 def _open_regular(path: Path) -> int:
+    _canonical_absolute_path(path, "keeper source")
     parent = open_tree_root(path.parent)
     try:
         descriptor = os.open(
             path.name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | _nofollow_flag(),
             dir_fd=parent,
         )
     finally:
@@ -334,6 +367,7 @@ def stage_regular_to_tmpfile(
     source_path: Path, expected_sha256: str, scratch_root: Path
 ) -> tuple[int, int, str]:
     """Copy and independently re-authenticate one no-follow file into ``O_TMPFILE``."""
+    _nofollow_flag()
     if not _is_hash(expected_sha256):
         raise KeeperError("expected source SHA-256 is invalid")
     tmpfile_flag = getattr(os, "O_TMPFILE", None)
@@ -387,7 +421,7 @@ def _create_private_anchor_root(plan: KeeperPlan) -> int:
             raise KeeperError("private anchor root must be fresh") from error
         anchor_root = os.open(
             name,
-            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | os.O_DIRECTORY | _nofollow_flag(),
             dir_fd=scratch,
         )
     finally:
@@ -416,22 +450,55 @@ def _create_anchor(directory: int, *, name: str, keeper_pid: int, descriptor: in
 
 
 def _cleanup_owned_anchors(directory: int, anchors: tuple[_OwnedAnchor, ...]) -> None:
-    for anchor in anchors:
-        try:
-            metadata = os.stat(anchor.name, dir_fd=directory, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if not stat.S_ISLNK(metadata.st_mode):
-            continue
-        try:
-            target = os.readlink(anchor.name, dir_fd=directory)
-        except OSError:
-            continue
-        if (metadata.st_dev, metadata.st_ino) == (
-            anchor.device,
-            anchor.inode,
-        ) and target == anchor.target:
-            os.unlink(anchor.name, dir_fd=directory)
+    """Abandon private anchors without unlinking mutable names.
+
+    Descriptor closure makes every owned anchor unusable. Removing a pathname
+    after checking its inode has an unavoidable replacement race, so node-local
+    scratch cleanup reclaims this private job directory after the allocation.
+    """
+    if _CLEANUP_RACE_HOOK is not None:
+        _CLEANUP_RACE_HOOK()
+    del directory, anchors
+
+
+def _acquire_keeper_lock(plan: KeeperPlan) -> int:
+    """Acquire the exclusive node-local keeper lifetime lock for this identity."""
+    scratch = open_tree_root(plan.scratch_root)
+    lock_name = f".keeper-{plan.node_name}.lock"
+    try:
+        descriptor = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | _nofollow_flag(),
+            0o600,
+            dir_fd=scratch,
+        )
+    finally:
+        os.close(scratch)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise KeeperError("keeper lifetime lock is not a regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise KeeperError("keeper already exists for this job and node") from error
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_controller_fifo(path: Path) -> int:
+    """Open and retain an exact no-follow controller FIFO descriptor."""
+    _canonical_absolute_path(path, "controller FIFO")
+    parent = open_tree_root(path.parent)
+    try:
+        descriptor = os.open(path.name, os.O_RDONLY | _nofollow_flag(), dir_fd=parent)
+    finally:
+        os.close(parent)
+    if not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise KeeperError("controller path must be a FIFO")
+    return descriptor
 
 
 def _process_start_ticks(pid: int) -> int:
@@ -689,12 +756,13 @@ def validate_keeper_receipt(path: Path) -> KeeperReceipt:
 
 def serve(plan: KeeperPlan, receipt_path: Path) -> None:
     """Publish descriptor anchors, then hold them until FIFO EOF or ``stop``."""
-    _absolute(receipt_path, "receipt path")
+    _canonical_absolute_path(receipt_path, "receipt path")
     keeper_pid = os.getpid()
     keeper_start_ticks = _process_start_ticks(keeper_pid)
     descriptors: list[int] = []
     anchors: list[_OwnedAnchor] = []
     anchor_directory: int | None = None
+    lock_descriptor: int | None = None
     published = False
     received_stop = False
     failed_by_signal = False
@@ -707,6 +775,7 @@ def serve(plan: KeeperPlan, receipt_path: Path) -> None:
         signum: signal.signal(signum, stop_handler) for signum in (signal.SIGTERM, signal.SIGINT)
     }
     try:
+        lock_descriptor = _acquire_keeper_lock(plan)
         anchor_directory = _create_private_anchor_root(plan)
         items: list[KeeperItem] = []
         for source in plan.sources:
@@ -742,9 +811,9 @@ def serve(plan: KeeperPlan, receipt_path: Path) -> None:
             items=tuple(items),
         )
         _write_fresh_receipt(receipt_path, receipt)
-        receipt_metadata = os.stat(receipt_path, follow_symlinks=False)
+        receipt_metadata = os.lstat(receipt_path)
         published = True
-        fifo = os.open(plan.fifo_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fifo = _open_controller_fifo(plan.fifo_path)
         try:
             while block := os.read(fifo, 4096):
                 if b"stop" in block.splitlines():
@@ -762,22 +831,25 @@ def serve(plan: KeeperPlan, receipt_path: Path) -> None:
             os.close(anchor_directory)
         for descriptor in descriptors:
             os.close(descriptor)
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+    if failed_by_signal:
+        failure_receipt = _make_receipt(
+            plan,
+            keeper_pid=keeper_pid,
+            keeper_start_ticks=keeper_start_ticks,
+            items=(),
+        )
+        if published:
+            if receipt_metadata is None:
+                raise KeeperError("keeper failure receipt has no owned readiness receipt")
+            _replace_owned_receipt(receipt_path, receipt_metadata, failure_receipt)
+        else:
+            _write_fresh_receipt(receipt_path, failure_receipt)
+        return
     if not published:
         raise KeeperError("keeper failed before publishing a receipt")
-    if failed_by_signal:
-        if receipt_metadata is None:
-            raise KeeperError("keeper failure receipt has no owned readiness receipt")
-        _replace_owned_receipt(
-            receipt_path,
-            receipt_metadata,
-            _make_receipt(
-                plan,
-                keeper_pid=keeper_pid,
-                keeper_start_ticks=keeper_start_ticks,
-                items=(),
-            ),
-        )
-    if received_stop or failed_by_signal:
+    if received_stop:
         return
 
 
