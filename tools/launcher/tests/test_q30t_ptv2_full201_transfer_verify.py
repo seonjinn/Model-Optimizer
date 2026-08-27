@@ -255,7 +255,40 @@ def test_publication_rechecks_source_leases_immediately_before_atomic_install(
         source_root=source_root, output=output, workers=2
     )
 
-    assert checks == 3
+    assert checks == 4
+
+
+def test_publication_reports_a_late_lease_break_after_final_receipt_rebinding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A post-install lease break fails with explicit semantics for the retained artifact."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    real_require = module._ReadLeaseGuard.require_no_break
+    checks = 0
+
+    def break_at_final_check(guard: object) -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 4:
+            raise module.TransferVerificationError(
+                "conflicting writer requested a read lease break"
+            )
+        real_require(guard)
+
+    monkeypatch.setattr(module._ReadLeaseGuard, "require_no_break", break_at_final_check)
+
+    with pytest.raises(
+        module.TransferVerificationError,
+        match=r"late source lease break.*remains installed|remains installed.*late source lease break",
+    ):
+        module.verify_and_publish_q30t_ptv2_full201_transfer(
+            source_root=source_root, output=output, workers=2
+        )
+
+    assert checks == 4
+    assert output.is_file()
+    assert json.loads(output.read_bytes())["observed_complete_at_verification"] is True
 
 
 def test_publication_preserves_a_foreign_replacement_of_its_temporary_name(
@@ -906,6 +939,9 @@ def _pushed_checkout(tmp_path: Path) -> tuple[Path, str]:
         "calls.write_text(\n"
         "    'EXECUTED=AUTHENTICATED\\n'\n"
         "    + f\"PYTHONPATH={os.environ.get('PYTHONPATH', '<unset>')}\\n\"\n"
+        "    + f\"PATH={os.environ.get('PATH', '<unset>')}\\n\"\n"
+        "    + f\"LD_PRELOAD={os.environ.get('LD_PRELOAD', '<unset>')}\\n\"\n"
+        "    + f\"SSH_ASKPASS={os.environ.get('SSH_ASKPASS', '<unset>')}\\n\"\n"
         "    + f'IDENT_RAW={int(ident == chr(36) + \"Id\" + chr(36))}\\n'\n"
         "    + (\n"
         "        f\"FORBIDDEN_FD_CLOSED={int(_is_closed(int(os.environ['FORBIDDEN_FD'])))}\\n\"\n"
@@ -987,13 +1023,39 @@ def _runner_environment(
     git.write_text(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
+        'if [[ -n "${GIT_ENV_EVIDENCE:-}" ]]; then\n'
+        "  printf 'PATH=%s LD_PRELOAD=%s SSH_ASKPASS=%s\\n' \"${PATH-<unset>}\" "
+        '"${LD_PRELOAD-<unset>}" "${SSH_ASKPASS-<unset>}" >> "$GIT_ENV_EVIDENCE"\n'
+        "fi\n"
         'printf "%s\\n" "$*" >> "$GIT_CALLS"\n'
         'args=("$@")\n'
         "is_fetch=0\n"
         "is_ls_tree=0\n"
+        "is_bare_init=0\n"
         'for arg in "${args[@]}"; do [[ "$arg" == fetch ]] && is_fetch=1; done\n'
         'for arg in "${args[@]}"; do [[ "$arg" == ls-tree ]] && is_ls_tree=1; done\n'
+        'for arg in "${args[@]}"; do [[ "$arg" == init ]] && is_bare_init=1; done\n'
+        'if [[ $is_bare_init == 1 && ( "${INJECT_BARE_REPOSITORY_REPLACEMENT:-0}" == 1 '
+        '|| "${INJECT_SCRATCH_REPLACEMENT:-0}" == 1 ) ]]; then\n'
+        '  "$REAL_GIT" "${args[@]}"\n'
+        '  repository_path="${args[${#args[@]}-1]}"\n'
+        '  if [[ "$repository_path" == . ]]; then repository_path="$(pwd -P)"; '
+        'elif [[ "$repository_path" != /* ]]; then repository_path="$(pwd -P)/$repository_path"; fi\n'
+        '  printf "%s\\n" "$repository_path" > "$BARE_REPOSITORY_PATH"\n'
+        '  if [[ "${INJECT_BARE_REPOSITORY_REPLACEMENT:-0}" == 1 ]]; then\n'
+        '    mv -- "$repository_path" "$repository_path.owned"\n'
+        '    "$REAL_GIT" init --bare --template=/dev/null "$repository_path" >/dev/null\n'
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
         "if [[ $is_fetch == 1 ]]; then\n"
+        '  if [[ "${PROBE_SSH_COMMAND:-0}" == 1 ]]; then\n'
+        '    "$REAL_PYTHON" - "$GIT_SSH_COMMAND" <<\'PY\'\n'
+        "import shlex, subprocess, sys\n"
+        "subprocess.run([*shlex.split(sys.argv[1]), 'fixture-host', 'git-upload-pack fixture'], "
+        "check=True)\n"
+        "PY\n"
+        "  fi\n"
         '  for index in "${!args[@]}"; do\n'
         '    if [[ "${args[$index]}" == gitlab '
         '|| ( "${args[$index]}" == "$APPROVED_TEST_GIT_URL" '
@@ -1001,21 +1063,29 @@ def _runner_environment(
         '      args[$index]="$TEST_GIT_FETCH_URL"\n'
         "    fi\n"
         "  done\n"
+        '  if [[ "${INJECT_BARE_REPOSITORY_REPLACEMENT:-0}" == 1 ]]; then\n'
+        '    repository_path="$(<"$BARE_REPOSITORY_PATH")"\n'
+        '    git_directory=""\n'
+        '    for argument in "${args[@]}"; do\n'
+        '      [[ "$argument" == --git-dir=* ]] && git_directory="${argument#--git-dir=}"\n'
+        "    done\n"
+        '    "$REAL_PYTHON" - "$repository_path.owned" "$git_directory" '
+        "\"$BARE_REPOSITORY_INODE_EVIDENCE\" <<'PY'\n"
+        "import os, pathlib, sys\n"
+        "original, selected, evidence = sys.argv[1:]\n"
+        "pathlib.Path(evidence).write_text(f'{os.stat(original).st_ino} {os.stat(selected).st_ino}\\n')\n"
+        "PY\n"
+        "  fi\n"
         '  if [[ "${INJECT_SCRATCH_REPLACEMENT:-0}" == 1 ]]; then\n'
         '    "$REAL_GIT" "${args[@]}"\n'
-        '    for argument in "${args[@]}"; do\n'
-        '      if [[ "$argument" == --git-dir=* ]]; then\n'
-        '        repository_path="${argument#--git-dir=}"\n'
-        '        scratch_path="${repository_path%/repository.git}"\n'
-        '        mv -- "$scratch_path" "$scratch_path.owned"\n'
-        '        mkdir -m 0700 -- "$scratch_path"\n'
-        '        marker="$scratch_path/foreign-preserve"\n'
-        '        printf "foreign\\n" > "$marker"\n'
-        '        printf "%s\\n" "$marker" > "$SCRATCH_REPLACEMENT_POINTER"\n'
-        "        exit 0\n"
-        "      fi\n"
-        "    done\n"
-        "    exit 89\n"
+        '    repository_path="$(<"$BARE_REPOSITORY_PATH")"\n'
+        '    scratch_path="${repository_path%/repository.git}"\n'
+        '    mv -- "$scratch_path" "$scratch_path.owned"\n'
+        '    mkdir -m 0700 -- "$scratch_path"\n'
+        '    marker="$scratch_path/foreign-preserve"\n'
+        '    printf "foreign\\n" > "$marker"\n'
+        '    printf "%s\\n" "$marker" > "$SCRATCH_REPLACEMENT_POINTER"\n'
+        "    exit 0\n"
         "  fi\n"
         "fi\n"
         "if [[ $is_ls_tree == 1 ]]; then\n"
@@ -1031,7 +1101,12 @@ def _runner_environment(
     )
     git.chmod(0o755)
     ssh = bin_root / "ssh"
-    ssh.write_text("#!/bin/sh\nexit 97\n")
+    ssh.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        'printf "%s\\n" "$*" >> "$SSH_CALLS"\n'
+        'if [[ " $* " != *" -F /dev/null "* ]]; then touch "$SSH_REDIRECT_MARKER"; fi\n'
+    )
     ssh.chmod(0o755)
     real_git = shutil.which("git")
     if real_git is None:
@@ -1047,8 +1122,13 @@ def _runner_environment(
     environment.update(
         {
             "PATH": f"{bin_root}{os.pathsep}{environment['PATH']}",
+            "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
+            "Q30T_TEST_PYTHON": str(python),
+            "Q30T_TEST_GIT": str(git),
+            "Q30T_TEST_SSH": str(ssh),
             "PYTHON_CALLS": str(calls),
             "GIT_CALLS": str(tmp_path / "git-calls"),
+            "GIT_ENV_EVIDENCE": str(tmp_path / "runner-git-environments"),
             "REAL_GIT": real_git,
             "REAL_PYTHON": real_python,
             "TEST_GIT_FETCH_URL": _git(["config", "--get", "test.fetchUrl"], cwd=repository),
@@ -1059,6 +1139,10 @@ def _runner_environment(
             ),
             "ESCAPED_WRITE_MARKER": str(tmp_path / "escaped-write-observed"),
             "MANIFEST_SWAP_MARKER": str(tmp_path / "manifest-path-swapped"),
+            "SSH_CALLS": str(tmp_path / "runner-ssh-calls"),
+            "SSH_REDIRECT_MARKER": str(tmp_path / "runner-ssh-redirected"),
+            "BARE_REPOSITORY_PATH": str(tmp_path / "runner-bare-repository-path"),
+            "BARE_REPOSITORY_INODE_EVIDENCE": str(tmp_path / "runner-bare-repository-inodes"),
             "PYTHONPATH": "/poisoned/inherited/path",
             "SLURM_JOB_ID": "4242",
             "SLURM_NNODES": "1",
@@ -1083,6 +1167,34 @@ def _runner_command(environment: Mapping[str, str]) -> list[str]:
     return [BASH, str(RUNNER), environment["SOURCE_SHA"], environment["OUTPUT_PATH"]]
 
 
+def test_runner_uses_sterile_git_and_final_exec_environments(tmp_path: Path) -> None:
+    """Inherited command, loader, and SSH injection cannot cross either child boundary."""
+    repository, source_commit = _pushed_checkout(tmp_path)
+    environment, calls = _runner_environment(tmp_path, repository, source_commit)
+    environment.update(
+        {
+            "LD_PRELOAD": "/nonexistent/q30t-injected-loader.so",
+            "SSH_ASKPASS": str(tmp_path / "injected-askpass"),
+        }
+    )
+
+    result = subprocess.run(
+        _runner_command(environment), env=environment, check=False, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text().splitlines()[1:5] == [
+        "PYTHONPATH=<unset>",
+        "PATH=<unset>",
+        "LD_PRELOAD=<unset>",
+        "SSH_ASKPASS=<unset>",
+    ]
+    git_environments = Path(environment["GIT_ENV_EVIDENCE"]).read_text().splitlines()
+    assert git_environments
+    assert all(str(tmp_path / "bin") not in line for line in git_environments)
+    assert all("LD_PRELOAD=<unset> SSH_ASKPASS=<unset>" in line for line in git_environments)
+
+
 def _submitter_environment(tmp_path: Path, repository: Path) -> tuple[dict[str, str], Path, Path]:
     bin_root = tmp_path / "submit-bin"
     bin_root.mkdir()
@@ -1093,29 +1205,72 @@ def _submitter_environment(tmp_path: Path, repository: Path) -> tuple[dict[str, 
     git.write_text(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
+        'if [[ -n "${SUBMIT_GIT_ENV_EVIDENCE:-}" ]]; then\n'
+        "  printf 'PATH=%s LD_PRELOAD=%s SSH_ASKPASS=%s\\n' \"${PATH-<unset>}\" "
+        '"${LD_PRELOAD-<unset>}" "${SSH_ASKPASS-<unset>}" >> "$SUBMIT_GIT_ENV_EVIDENCE"\n'
+        "fi\n"
         'args=("$@")\n'
+        'if [[ "${INJECT_SOURCE_CHECKOUT_REPLACEMENT:-0}" == 1 '
+        '&& ! -e "$SOURCE_REPLACEMENT_MARKER" ]]; then\n'
+        '  /bin/mv -- "$SOURCE_CHECKOUT_PATH" "$SOURCE_CHECKOUT_PATH.owned"\n'
+        '  /bin/mkdir -- "$SOURCE_CHECKOUT_PATH"\n'
+        '  printf "replaced\\n" > "$SOURCE_REPLACEMENT_MARKER"\n'
+        "fi\n"
         'for index in "${!args[@]}"; do\n'
         '  if [[ "${args[$index]}" == "$APPROVED_TEST_GIT_URL" ]]; then\n'
         '    args[$index]="$TEST_GIT_FETCH_URL"\n'
         "  fi\n"
         "done\n"
         "is_fetch=0\n"
+        "is_bare_init=0\n"
         'for argument in "${args[@]}"; do [[ "$argument" == fetch ]] && is_fetch=1; done\n'
+        'for argument in "${args[@]}"; do [[ "$argument" == init ]] && is_bare_init=1; done\n'
+        'if [[ $is_fetch == 1 && "${PROBE_SSH_COMMAND:-0}" == 1 ]]; then\n'
+        '  "$REAL_PYTHON" - "$GIT_SSH_COMMAND" <<\'PY\'\n'
+        "import shlex, subprocess, sys\n"
+        "subprocess.run([*shlex.split(sys.argv[1]), 'fixture-host', 'git-upload-pack fixture'], "
+        "check=True)\n"
+        "PY\n"
+        "fi\n"
+        'if [[ "${INJECT_CLEAN_STATUS:-0}" == 1 ]]; then\n'
+        '  for argument in "${args[@]}"; do [[ "$argument" == status ]] && exit 0; done\n'
+        "fi\n"
+        'if [[ $is_bare_init == 1 && ( "${INJECT_BARE_REPOSITORY_REPLACEMENT:-0}" == 1 '
+        '|| "${INJECT_SCRATCH_REPLACEMENT:-0}" == 1 ) ]]; then\n'
+        '  "$REAL_GIT" "${args[@]}"\n'
+        '  repository_path="${args[${#args[@]}-1]}"\n'
+        '  if [[ "$repository_path" == . ]]; then repository_path="$(pwd -P)"; '
+        'elif [[ "$repository_path" != /* ]]; then repository_path="$(pwd -P)/$repository_path"; fi\n'
+        '  printf "%s\\n" "$repository_path" > "$BARE_REPOSITORY_PATH"\n'
+        '  if [[ "${INJECT_BARE_REPOSITORY_REPLACEMENT:-0}" == 1 ]]; then\n'
+        '    mv -- "$repository_path" "$repository_path.owned"\n'
+        '    "$REAL_GIT" init --bare --template=/dev/null "$repository_path" >/dev/null\n'
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
+        'if [[ $is_fetch == 1 && "${INJECT_BARE_REPOSITORY_REPLACEMENT:-0}" == 1 ]]; then\n'
+        '  repository_path="$(<"$BARE_REPOSITORY_PATH")"\n'
+        '  git_directory=""\n'
+        '  for argument in "${args[@]}"; do\n'
+        '    [[ "$argument" == --git-dir=* ]] && git_directory="${argument#--git-dir=}"\n'
+        "  done\n"
+        '  "$REAL_PYTHON" - "$repository_path.owned" "$git_directory" '
+        "\"$BARE_REPOSITORY_INODE_EVIDENCE\" <<'PY'\n"
+        "import os, pathlib, sys\n"
+        "original, selected, evidence = sys.argv[1:]\n"
+        "pathlib.Path(evidence).write_text(f'{os.stat(original).st_ino} {os.stat(selected).st_ino}\\n')\n"
+        "PY\n"
+        "fi\n"
         'if [[ $is_fetch == 1 && "${INJECT_SCRATCH_REPLACEMENT:-0}" == 1 ]]; then\n'
         '  "$REAL_GIT" "${args[@]}"\n'
-        '  for argument in "${args[@]}"; do\n'
-        '    if [[ "$argument" == --git-dir=* ]]; then\n'
-        '      repository_path="${argument#--git-dir=}"\n'
-        '      scratch_path="${repository_path%/repository.git}"\n'
-        '      mv -- "$scratch_path" "$scratch_path.owned"\n'
-        '      mkdir -m 0700 -- "$scratch_path"\n'
-        '      marker="$scratch_path/foreign-preserve"\n'
-        '      printf "foreign\\n" > "$marker"\n'
-        '      printf "%s\\n" "$marker" > "$SCRATCH_REPLACEMENT_POINTER"\n'
-        "      exit 0\n"
-        "    fi\n"
-        "  done\n"
-        "  exit 89\n"
+        '  repository_path="$(<"$BARE_REPOSITORY_PATH")"\n'
+        '  scratch_path="${repository_path%/repository.git}"\n'
+        '  mv -- "$scratch_path" "$scratch_path.owned"\n'
+        '  mkdir -m 0700 -- "$scratch_path"\n'
+        '  marker="$scratch_path/foreign-preserve"\n'
+        '  printf "foreign\\n" > "$marker"\n'
+        '  printf "%s\\n" "$marker" > "$SCRATCH_REPLACEMENT_POINTER"\n'
+        "  exit 0\n"
         "fi\n"
         'exec "$REAL_GIT" "${args[@]}"\n'
     )
@@ -1124,6 +1279,11 @@ def _submitter_environment(tmp_path: Path, repository: Path) -> tuple[dict[str, 
     sbatch.write_text(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
+        'if [[ -n "${SBATCH_ENV_EVIDENCE:-}" ]]; then\n'
+        "  printf 'PATH=%s LD_PRELOAD=%s SSH_ASKPASS=%s FORBIDDEN=%s\\n' "
+        '"${PATH-<unset>}" "${LD_PRELOAD-<unset>}" "${SSH_ASKPASS-<unset>}" '
+        '"${FORBIDDEN_SUBMISSION_VALUE-<unset>}" >> "$SBATCH_ENV_EVIDENCE"\n'
+        "fi\n"
         'printf "%s\\0" "$@" >> "$SBATCH_CALLS"\n'
         'printf "\\0" >> "$SBATCH_CALLS"\n'
         'for argument in "$@"; do\n'
@@ -1150,23 +1310,138 @@ def _submitter_environment(tmp_path: Path, repository: Path) -> tuple[dict[str, 
         'if [[ " $* " == *" --parsable "* ]]; then printf "778899\\n"; fi\n'
     )
     sbatch.chmod(0o755)
+    ssh = bin_root / "ssh"
+    ssh.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        'printf "%s\\n" "$*" >> "$SSH_CALLS"\n'
+        'if [[ " $* " != *" -F /dev/null "* ]]; then touch "$SSH_REDIRECT_MARKER"; fi\n'
+    )
+    ssh.chmod(0o755)
     real_git = shutil.which("git")
     if real_git is None:
         raise RuntimeError("git is required for submitter tests")
     environment = os.environ | {
         "PATH": f"{bin_root}{os.pathsep}{os.environ['PATH']}",
+        "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
+        "Q30T_TEST_PYTHON": str(Path(sys.executable).resolve()),
+        "Q30T_TEST_GIT": str(git),
+        "Q30T_TEST_SBATCH": str(sbatch),
+        "Q30T_TEST_SSH": str(ssh),
         "REAL_GIT": real_git,
         "TEST_GIT_FETCH_URL": _git(["config", "--get", "test.fetchUrl"], cwd=repository),
         "APPROVED_TEST_GIT_URL": APPROVED_GITLAB_FETCH_URL,
         "SBATCH_CALLS": str(sbatch_calls),
+        "SBATCH_ENV_EVIDENCE": str(tmp_path / "sbatch-environment"),
+        "SUBMIT_GIT_ENV_EVIDENCE": str(tmp_path / "submit-git-environments"),
         "SPOOLED_RUNNER": str(spooled_runner),
         "SBATCH_RUNNER_EVIDENCE": str(runner_evidence),
         "REAL_PYTHON": sys.executable,
+        "TMPDIR": str(tmp_path),
+        "BARE_REPOSITORY_PATH": str(tmp_path / "submitter-bare-repository-path"),
+        "BARE_REPOSITORY_INODE_EVIDENCE": str(tmp_path / "submitter-bare-repository-inodes"),
         "FORBIDDEN_SUBMISSION_VALUE": "must-not-leak",
+        "SOURCE_CHECKOUT_PATH": str(repository),
+        "SOURCE_REPLACEMENT_MARKER": str(tmp_path / "source-checkout-replaced"),
+        "SSH_CALLS": str(tmp_path / "submitter-ssh-calls"),
+        "SSH_REDIRECT_MARKER": str(tmp_path / "submitter-ssh-redirected"),
     }
     if sys.platform != "linux":
         environment["Q30T_TEST_ALLOW_UNSEALED_PLATFORM"] = sys.platform
     return environment, sbatch_calls, spooled_runner
+
+
+def test_submitter_uses_sterile_git_and_scheduler_environments(tmp_path: Path) -> None:
+    """Inherited command, loader, SSH, and arbitrary values cannot redirect submit children."""
+    repository, _ = _pushed_checkout(tmp_path)
+    environment, _, _ = _submitter_environment(tmp_path, repository)
+    environment.update(
+        {
+            "LD_PRELOAD": "/nonexistent/q30t-submit-loader.so",
+            "SSH_ASKPASS": str(tmp_path / "injected-submit-askpass"),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            BASH,
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(repository),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+            "q30t-ptv23-complement-700k-v1/ptv2-full201-transfer/VERIFY.json",
+            "--slurm-output",
+            str(tmp_path / "slurm-%j.out"),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    git_environments = Path(environment["SUBMIT_GIT_ENV_EVIDENCE"]).read_text().splitlines()
+    assert git_environments
+    assert all(str(tmp_path / "submit-bin") not in line for line in git_environments)
+    assert all("LD_PRELOAD=<unset> SSH_ASKPASS=<unset>" in line for line in git_environments)
+    scheduler_environment = Path(environment["SBATCH_ENV_EVIDENCE"]).read_text().splitlines()
+    assert scheduler_environment
+    assert all(str(tmp_path / "submit-bin") not in line for line in scheduler_environment)
+    assert set(scheduler_environment) == {
+        next(line for line in scheduler_environment if "FORBIDDEN=<unset>" in line)
+    }
+    assert all("LD_PRELOAD=<unset> SSH_ASKPASS=<unset>" in line for line in scheduler_environment)
+
+
+@pytest.mark.parametrize("boundary", ["runner", "submitter"])
+def test_canonical_fetch_disables_mutable_user_ssh_configuration(
+    boundary: str,
+    tmp_path: Path,
+) -> None:
+    """Both canonical fetches invoke reviewed SSH with the user configuration disabled."""
+    repository, source_commit = _pushed_checkout(tmp_path)
+    if boundary == "runner":
+        environment, _ = _runner_environment(tmp_path, repository, source_commit)
+        command = _runner_command(environment)
+    else:
+        environment, _, _ = _submitter_environment(tmp_path, repository)
+        command = [
+            BASH,
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(repository),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+            "q30t-ptv23-complement-700k-v1/ptv2-full201-transfer/VERIFY.json",
+            "--slurm-output",
+            str(tmp_path / "slurm-%j.out"),
+        ]
+    environment["PROBE_SSH_COMMAND"] = "1"
+
+    result = subprocess.run(
+        command,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    ssh_calls = Path(environment["SSH_CALLS"]).read_text().splitlines()
+    assert ssh_calls
+    assert all("-F /dev/null" in call for call in ssh_calls)
+    assert not Path(environment["SSH_REDIRECT_MARKER"]).exists()
+
+
+def test_launchers_do_not_require_the_python_311_safe_path_flag() -> None:
+    """Ptyche's approved interpreter runs isolated without a redundant version-gated -P."""
+    for launcher in (RUNNER, SUBMITTER):
+        source = launcher.read_text()
+        assert " -P /dev/fd/3" not in source
+        assert '\n            "-P",' not in source
 
 
 def test_trusted_submitter_spools_the_exact_fetched_runner_with_no_exported_environment(
@@ -1177,8 +1452,6 @@ def test_trusted_submitter_spools_the_exact_fetched_runner_with_no_exported_envi
     repository, source_commit = _pushed_checkout(tmp_path)
     environment, sbatch_calls, spooled_runner = _submitter_environment(tmp_path, repository)
     runner_path = "tools/launcher/common/specdec/run_q30t_ptv2_full201_transfer_verify.sbatch"
-    _git(["update-index", "--skip-worktree", runner_path], cwd=repository)
-    (repository / runner_path).write_text("#!/bin/bash\nprintf 'FOREIGN RUNNER\\n'\n")
     assert _git(["status", "--porcelain"], cwd=repository) == ""
     approved_output = environment.get(
         "OUTPUT_PATH",
@@ -1219,6 +1492,172 @@ def test_trusted_submitter_spools_the_exact_fetched_runner_with_no_exported_envi
     assert b"--export=NONE" in arguments
     assert source_commit.encode() in arguments
     assert b"must-not-leak" not in calls[0]
+
+
+@pytest.mark.parametrize("index_flag", ["--skip-worktree", "--assume-unchanged"])
+def test_submitter_rejects_hidden_index_flags(index_flag: str, tmp_path: Path) -> None:
+    """A clean status cannot conceal skip-worktree or assume-unchanged tracked bytes."""
+    repository, _ = _pushed_checkout(tmp_path)
+    environment, sbatch_calls, _ = _submitter_environment(tmp_path, repository)
+    _git(["update-index", index_flag, "tracked"], cwd=repository)
+    (repository / "tracked").write_text("hidden mutable bytes\n")
+    assert _git(["status", "--porcelain"], cwd=repository) == ""
+
+    result = subprocess.run(
+        [
+            BASH,
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(repository),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+            "q30t-ptv23-complement-700k-v1/ptv2-full201-transfer/VERIFY.json",
+            "--slurm-output",
+            str(tmp_path / "slurm-%j.out"),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "hidden index flag" in result.stderr
+    assert not sbatch_calls.exists()
+
+
+def test_submitter_compares_tracked_bytes_independently_of_status(tmp_path: Path) -> None:
+    """A forged clean status cannot bypass direct HEAD-to-worktree byte comparison."""
+    repository, _ = _pushed_checkout(tmp_path)
+    environment, sbatch_calls, _ = _submitter_environment(tmp_path, repository)
+    (repository / "tracked").write_text("status-hidden mutable bytes\n")
+    environment["INJECT_CLEAN_STATUS"] = "1"
+
+    result = subprocess.run(
+        [
+            BASH,
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(repository),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+            "q30t-ptv23-complement-700k-v1/ptv2-full201-transfer/VERIFY.json",
+            "--slurm-output",
+            str(tmp_path / "slurm-%j.out"),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "tracked bytes differ from HEAD" in result.stderr
+    assert not sbatch_calls.exists()
+
+
+def test_submitter_binds_all_checkout_observations_to_one_directory_descriptor(
+    tmp_path: Path,
+) -> None:
+    """Replacing SOURCE_PATH after its descriptor opens cannot mix checkout observations."""
+    repository, _ = _pushed_checkout(tmp_path)
+    environment, sbatch_calls, _ = _submitter_environment(tmp_path, repository)
+    environment["INJECT_SOURCE_CHECKOUT_REPLACEMENT"] = "1"
+
+    result = subprocess.run(
+        [
+            BASH,
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(repository),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+            "q30t-ptv23-complement-700k-v1/ptv2-full201-transfer/VERIFY.json",
+            "--slurm-output",
+            str(tmp_path / "slurm-%j.out"),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert Path(environment["SOURCE_REPLACEMENT_MARKER"]).is_file()
+    assert sbatch_calls.exists()
+
+
+def test_submitter_authenticates_a_real_shaped_gitlink(tmp_path: Path) -> None:
+    """A clean tracked 160000 commit entry is authenticated instead of rejected as unsafe."""
+    repository, _ = _pushed_checkout(tmp_path)
+    gitlink_path = Path("tools/launcher/modules/Megatron-LM")
+    gitlink = repository / gitlink_path
+    gitlink.mkdir(parents=True)
+    _git(["init", "-b", "fixture-gitlink"], cwd=gitlink)
+    (gitlink / "tracked-submodule-file").write_text("gitlink payload\n")
+    _git(["add", "tracked-submodule-file"], cwd=gitlink)
+    _git(
+        [
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "gitlink fixture",
+        ],
+        cwd=gitlink,
+    )
+    gitlink_commit = _git(["rev-parse", "HEAD"], cwd=gitlink)
+    _git(
+        ["update-index", "--add", "--cacheinfo", f"160000,{gitlink_commit},{gitlink_path}"],
+        cwd=repository,
+    )
+    _git(
+        [
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "track gitlink",
+        ],
+        cwd=repository,
+    )
+    source_commit = _git(["rev-parse", "HEAD"], cwd=repository)
+    fixture_remote = _git(["config", "--get", "test.fetchUrl"], cwd=repository)
+    _git(["push", fixture_remote, CANONICAL_BRANCH], cwd=repository)
+    environment, sbatch_calls, _ = _submitter_environment(tmp_path, repository)
+
+    result = subprocess.run(
+        [
+            BASH,
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(repository),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+            "q30t-ptv23-complement-700k-v1/ptv2-full201-transfer/VERIFY.json",
+            "--slurm-output",
+            str(tmp_path / "slurm-%j.out"),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert source_commit.encode() in sbatch_calls.read_bytes()
 
 
 def test_trusted_submitter_test_only_precedes_the_real_submission(tmp_path: Path) -> None:
@@ -1319,10 +1758,45 @@ def test_submitter_exit_preserves_a_foreign_scratch_namespace_replacement(
         text=True,
     )
 
-    assert result.returncode != 0
+    assert result.returncode == 0, result.stderr
     marker = Path(pointer.read_text().strip())
     assert marker.read_text() == "foreign\n"
-    assert not sbatch_calls.exists()
+    assert sbatch_calls.exists()
+
+
+def test_submitter_keeps_the_sterile_bare_repository_descriptor_bound(
+    tmp_path: Path,
+) -> None:
+    """A valid bare repository installed at the old pathname cannot replace the fetched repo."""
+    repository, _ = _pushed_checkout(tmp_path)
+    environment, sbatch_calls, _ = _submitter_environment(tmp_path, repository)
+    environment["INJECT_BARE_REPOSITORY_REPLACEMENT"] = "1"
+
+    result = subprocess.run(
+        [
+            BASH,
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(repository),
+            "--output",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+            "q30t-ptv23-complement-700k-v1/ptv2-full201-transfer/VERIFY.json",
+            "--slurm-output",
+            str(tmp_path / "slurm-%j.out"),
+        ],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    original_inode, selected_inode = (
+        Path(environment["BARE_REPOSITORY_INODE_EVIDENCE"]).read_text().split()
+    )
+    assert selected_inode == original_inode
+    assert sbatch_calls.exists()
 
 
 def test_runner_uses_one_cpu_node_and_the_exact_production_source(
@@ -1345,6 +1819,9 @@ def test_runner_uses_one_cpu_node_and_the_exact_production_source(
     assert call_lines == [
         "EXECUTED=AUTHENTICATED",
         "PYTHONPATH=<unset>",
+        "PATH=<unset>",
+        "LD_PRELOAD=<unset>",
+        "SSH_ASKPASS=<unset>",
         "IDENT_RAW=1",
         "--source-root",
         approved_root,
@@ -1359,8 +1836,10 @@ def test_runner_uses_one_cpu_node_and_the_exact_production_source(
     sys.platform == "linux",
     reason="Linux production fallback is fixed at /raid/scratch and requires a target-node probe",
 )
+@pytest.mark.parametrize("preexisting_user_root", [False, True])
 def test_runner_uses_a_job_bound_node_local_fallback_without_slurm_tmpdir(
     tmp_path: Path,
+    preexisting_user_root: bool,
 ) -> None:
     """Ptyche jobs without SLURM_TMPDIR use an exclusive job-bound node-local directory."""
     repository, source_commit = _pushed_checkout(tmp_path)
@@ -1371,7 +1850,9 @@ def test_runner_uses_a_job_bound_node_local_fallback_without_slurm_tmpdir(
         ["id", "-un"], check=True, capture_output=True, text=True
     ).stdout.strip()
     user_root = node_local_root / user_name
-    user_root.mkdir(parents=True, mode=0o700)
+    node_local_root.mkdir(mode=0o755)
+    if preexisting_user_root:
+        user_root.mkdir(mode=0o700)
     environment.update(
         {
             "Q30T_TEST_ALLOW_NODE_LOCAL_SCRATCH_ROOT": "1",
@@ -1391,7 +1872,50 @@ def test_runner_uses_a_job_bound_node_local_fallback_without_slurm_tmpdir(
     assert scratch.is_dir() and not scratch.is_symlink()
     assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
     git_calls = Path(environment["GIT_CALLS"]).read_text()
-    assert f"--git-dir={scratch}/repository.git" in git_calls
+    assert (scratch / "repository.git").is_dir()
+    assert "--git-dir=. fetch" in git_calls
+    assert f"--git-dir={scratch}/repository.git" not in git_calls
+
+
+@pytest.mark.skipif(
+    sys.platform == "linux",
+    reason="Linux production fallback is fixed at /raid/scratch and requires a target-node probe",
+)
+@pytest.mark.parametrize("unsafe_root", ["wrong-mode", "symlink"])
+def test_runner_rejects_an_unsafe_node_local_user_root(
+    tmp_path: Path,
+    unsafe_root: str,
+) -> None:
+    """The fallback never adopts a permissive user directory or follows a scratch symlink."""
+    repository, source_commit = _pushed_checkout(tmp_path)
+    environment, calls = _runner_environment(tmp_path, repository, source_commit)
+    environment.pop("SLURM_TMPDIR")
+    user_name = subprocess.run(
+        ["id", "-un"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    actual_root = tmp_path / "actual-raid-scratch"
+    actual_root.mkdir(mode=0o755)
+    node_local_root = actual_root
+    if unsafe_root == "wrong-mode":
+        user_root = actual_root / user_name
+        user_root.mkdir(mode=0o700)
+        user_root.chmod(0o755)
+    else:
+        node_local_root = tmp_path / "raid-scratch-link"
+        node_local_root.symlink_to(actual_root, target_is_directory=True)
+    environment.update(
+        {
+            "Q30T_TEST_ALLOW_NODE_LOCAL_SCRATCH_ROOT": "1",
+            "Q30T_TEST_NODE_LOCAL_SCRATCH_ROOT": str(node_local_root),
+        }
+    )
+
+    result = subprocess.run(
+        _runner_command(environment), env=environment, check=False, capture_output=True, text=True
+    )
+
+    assert result.returncode != 0
+    assert not calls.exists()
 
 
 def test_runner_exit_preserves_a_foreign_scratch_namespace_replacement(
@@ -1412,10 +1936,28 @@ def test_runner_exit_preserves_a_foreign_scratch_namespace_replacement(
         _runner_command(environment), env=environment, check=False, capture_output=True, text=True
     )
 
-    assert result.returncode != 0
+    assert result.returncode == 0, result.stderr
     marker = Path(pointer.read_text().strip())
     assert marker.read_text() == "foreign\n"
-    assert not calls.exists()
+    assert calls.exists()
+
+
+def test_runner_keeps_the_sterile_bare_repository_descriptor_bound(tmp_path: Path) -> None:
+    """A valid bare repository installed at the old pathname cannot replace the fetched repo."""
+    repository, source_commit = _pushed_checkout(tmp_path)
+    environment, calls = _runner_environment(tmp_path, repository, source_commit)
+    environment["INJECT_BARE_REPOSITORY_REPLACEMENT"] = "1"
+
+    result = subprocess.run(
+        _runner_command(environment), env=environment, check=False, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stderr
+    original_inode, selected_inode = (
+        Path(environment["BARE_REPOSITORY_INODE_EVIDENCE"]).read_text().split()
+    )
+    assert selected_inode == original_inode
+    assert calls.exists()
 
 
 def test_runner_fetches_and_executes_only_the_standalone_verifier_blob(
@@ -1465,7 +2007,13 @@ def test_runner_executes_fetched_bytes_when_skip_worktree_hides_a_modification(
     assert result.returncode == 0, result.stderr
     call_lines = calls.read_text().splitlines()
     assert call_lines[0] == "EXECUTED=AUTHENTICATED"
-    assert call_lines[1:3] == ["PYTHONPATH=<unset>", "IDENT_RAW=1"]
+    assert call_lines[1:6] == [
+        "PYTHONPATH=<unset>",
+        "PATH=<unset>",
+        "LD_PRELOAD=<unset>",
+        "SSH_ASKPASS=<unset>",
+        "IDENT_RAW=1",
+    ]
 
 
 def test_runner_seals_the_authenticated_verifier_before_execution(tmp_path: Path) -> None:
@@ -1480,7 +2028,7 @@ def test_runner_seals_the_authenticated_verifier_before_execution(tmp_path: Path
     assert result.returncode == 0, result.stderr
     assert calls.read_text().splitlines()[0] == "EXECUTED=AUTHENTICATED"
     expected_audit = (
-        "sealed-verifier-write-check: inplace=EPERM reopened=EPERM"
+        "sealed-verifier-write-check: inplace=EPERM reopened-write=EPERM"
         if sys.platform == "linux"
         else f"sealed-verifier-write-check: test-fallback={sys.platform}"
     )

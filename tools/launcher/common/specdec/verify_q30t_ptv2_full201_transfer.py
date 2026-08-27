@@ -370,6 +370,7 @@ def _require_published_receipt_binding(
     parent_expected: os.stat_result,
     receipt_expected: os.stat_result,
     payload: bytes,
+    lease_guard: _ReadLeaseGuard,
 ) -> None:
     descriptor, current = _open_absolute_directory(output.parent)
     try:
@@ -391,6 +392,12 @@ def _require_published_receipt_binding(
             or reread != payload
         ):
             raise TransferVerificationError("published receipt changed after installation")
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            raise TransferVerificationError(
+                "published receipt parent final fsync failed"
+            ) from error
         rebound_parent_fd, rebound_parent = _open_absolute_directory(output.parent)
         try:
             if (
@@ -401,6 +408,19 @@ def _require_published_receipt_binding(
                 or stat.S_IMODE(rebound_parent.st_mode) & 0o077
             ):
                 raise TransferVerificationError("approved verification receipt parent changed")
+            _require_unchanged_at(
+                rebound_parent_fd,
+                output.name,
+                receipt_expected,
+                output,
+            )
+            try:
+                lease_guard.require_no_break()
+            except TransferVerificationError as error:
+                raise TransferVerificationError(
+                    "late source lease break invalidated verification; "
+                    "the no-clobber receipt remains installed but is not authenticated"
+                ) from error
         finally:
             os.close(rebound_parent_fd)
     finally:
@@ -887,6 +907,7 @@ def _publish_no_clobber(output: Path, payload: bytes, lease_guard: _ReadLeaseGua
         parent_expected=parent_expected,
         receipt_expected=published,
         payload=payload,
+        lease_guard=lease_guard,
     )
 
 
