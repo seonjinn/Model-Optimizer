@@ -77,13 +77,41 @@ git_environment=(
     GIT_NO_REPLACE_OBJECTS=1
 )
 
-sterile_parent="${SLURM_TMPDIR:-}"
-[[ -d "$sterile_parent" && ! -L "$sterile_parent" ]] || {
-    echo "scheduler-owned SLURM_TMPDIR is unavailable" >&2
-    exit 2
-}
+if [[ -n "${SLURM_TMPDIR:-}" ]]; then
+    sterile_parent="$SLURM_TMPDIR"
+    [[ -d "$sterile_parent" && ! -L "$sterile_parent" ]] || {
+        echo "scheduler-owned SLURM_TMPDIR is unsafe" >&2
+        exit 2
+    }
+else
+    job_user="$(id -un 2>/dev/null)" || {
+        echo "job user identity is unavailable" >&2
+        exit 2
+    }
+    [[ "$job_user" =~ ^[A-Za-z0-9._-]+$ ]] || {
+        echo "job user identity is invalid" >&2
+        exit 2
+    }
+    node_local_root="/raid/scratch"
+    if [[ -n "${Q30T_TEST_ALLOW_NODE_LOCAL_SCRATCH_ROOT:-}" \
+        || -n "${Q30T_TEST_NODE_LOCAL_SCRATCH_ROOT:-}" ]]; then
+        [[ "$OSTYPE" != linux* \
+            && "${Q30T_TEST_ALLOW_NODE_LOCAL_SCRATCH_ROOT:-}" == 1 \
+            && "${Q30T_TEST_NODE_LOCAL_SCRATCH_ROOT:-}" == /* ]] || {
+            echo "node-local scratch test override is forbidden" >&2
+            exit 2
+        }
+        node_local_root="$Q30T_TEST_NODE_LOCAL_SCRATCH_ROOT"
+    fi
+    sterile_parent="${node_local_root%/}/$job_user"
+    [[ -d "$sterile_parent" && ! -L "$sterile_parent" && -O "$sterile_parent" ]] || {
+        echo "job-owned node-local scratch is unavailable" >&2
+        exit 2
+    }
+fi
 umask 077
-private_scratch="$(mktemp -d "${sterile_parent%/}/q30t-transfer-verifier.XXXXXX")" || {
+private_scratch="$(mktemp -d \
+    "${sterile_parent%/}/q30t-transfer-verifier.${SLURM_JOB_ID}.XXXXXX")" || {
     echo "private verifier scratch creation failed" >&2
     exit 2
 }

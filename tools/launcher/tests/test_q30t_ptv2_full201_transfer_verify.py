@@ -1255,6 +1255,7 @@ def test_trusted_submitter_test_only_precedes_the_real_submission(tmp_path: Path
     assert b"--parsable" in submitted and b"--test-only" not in submitted
     for arguments in (test_only, submitted):
         assert b"--export=NONE" in arguments
+        assert b"--job-name=q30t-ptv2-full201-transfer-verify" in arguments
         assert source_commit.encode() in arguments
     evidence = [
         json.loads(line)
@@ -1352,6 +1353,45 @@ def test_runner_uses_one_cpu_node_and_the_exact_production_source(
         "--workers",
         "16",
     ]
+
+
+@pytest.mark.skipif(
+    sys.platform == "linux",
+    reason="Linux production fallback is fixed at /raid/scratch and requires a target-node probe",
+)
+def test_runner_uses_a_job_bound_node_local_fallback_without_slurm_tmpdir(
+    tmp_path: Path,
+) -> None:
+    """Ptyche jobs without SLURM_TMPDIR use an exclusive job-bound node-local directory."""
+    repository, source_commit = _pushed_checkout(tmp_path)
+    environment, calls = _runner_environment(tmp_path, repository, source_commit)
+    environment.pop("SLURM_TMPDIR")
+    node_local_root = tmp_path / "raid-scratch"
+    user_name = subprocess.run(
+        ["id", "-un"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    user_root = node_local_root / user_name
+    user_root.mkdir(parents=True, mode=0o700)
+    environment.update(
+        {
+            "Q30T_TEST_ALLOW_NODE_LOCAL_SCRATCH_ROOT": "1",
+            "Q30T_TEST_NODE_LOCAL_SCRATCH_ROOT": str(node_local_root),
+        }
+    )
+
+    result = subprocess.run(
+        _runner_command(environment), env=environment, check=False, capture_output=True, text=True
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.exists()
+    scratch_directories = list(user_root.glob("q30t-transfer-verifier.4242.*"))
+    assert len(scratch_directories) == 1
+    scratch = scratch_directories[0]
+    assert scratch.is_dir() and not scratch.is_symlink()
+    assert stat.S_IMODE(scratch.stat().st_mode) == 0o700
+    git_calls = Path(environment["GIT_CALLS"]).read_text()
+    assert f"--git-dir={scratch}/repository.git" in git_calls
 
 
 def test_runner_exit_preserves_a_foreign_scratch_namespace_replacement(

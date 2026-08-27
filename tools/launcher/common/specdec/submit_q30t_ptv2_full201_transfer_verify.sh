@@ -227,6 +227,7 @@ command = [
     sys.argv[3],
     "--nodes=1",
     "--cpus-per-task=32",
+    "--job-name=q30t-ptv2-full201-transfer-verify",
     f"--output={sys.argv[4]}",
     "--export=NONE",
     runner_path,
