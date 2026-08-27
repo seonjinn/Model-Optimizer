@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -24,49 +25,85 @@ Q30T_TOKENIZER_REPOSITORY = "Qwen/Qwen3-30B-A3B-Thinking-2507"
 Q30T_TOKENIZER_TRUST_SCHEMA = "qwen3-30ba3b-thinking-tokenizer-trust-v1"
 _IM_START = "<|im_start|>"
 _IM_END = "<|im_end|>"
+_MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
+_READ_BLOCK_BYTES = 1024 * 1024
 
 
 def _canonical_json(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _is_lower_hex(value: object, length: int) -> bool:
-    return isinstance(value, str) and len(value) == length and all(
-        character in "0123456789abcdef" for character in value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
     )
 
 
-def _identity(status: os.stat_result) -> tuple[int, int, int, int]:
-    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns
+def _is_lower_hex(value: object, length: int) -> bool:
+    return (
+        type(value) is str
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
-def _read_regular_at(directory_fd: int, name: str, display_path: str) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
+
+
+def _read_regular_at(
+    directory_fd: int, name: str, display_path: str, expected: os.stat_result, retain: bool
+) -> tuple[str, bytes | None]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(name, flags, dir_fd=directory_fd)
     except OSError as error:
         raise ValueError(f"Q30 tokenizer snapshot input is unreadable: {display_path}") from error
-    with os.fdopen(descriptor, "rb") as stream:
+    try:
+        stream = os.fdopen(descriptor, "rb")
+    except OSError as error:
+        with suppress(OSError):
+            os.close(descriptor)
+        raise ValueError(f"Q30 tokenizer snapshot input cannot be read: {display_path}") from error
+    with stream:
         before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode):
+        if (
+            _identity(expected) != _identity(before)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+        ):
             raise ValueError(f"Q30 tokenizer snapshot input is not regular: {display_path}")
-        raw = stream.read()
+        digest = sha256()
+        retained = bytearray() if retain else None
+        while block := stream.read(_READ_BLOCK_BYTES):
+            digest.update(block)
+            if retained is not None:
+                retained.extend(block)
+                if len(retained) > _MAX_TOKENIZER_JSON_BYTES:
+                    raise ValueError(f"Q30 tokenizer JSON is too large: {display_path}")
         after = os.fstat(stream.fileno())
-    if _identity(before) != _identity(after) or len(raw) != before.st_size:
+    if _identity(before) != _identity(after):
         raise ValueError(f"Q30 tokenizer snapshot input changed while reading: {display_path}")
-    return raw
+    return digest.hexdigest(), bytes(retained) if retained is not None else None
 
 
-def _walk_snapshot(snapshot: Path) -> tuple[list[list[str]], dict[str, bytes]]:
+def _walk_snapshot(snapshot: Path) -> tuple[str, dict[str, bytes]]:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
+        root_before = os.stat(snapshot, follow_symlinks=False)
+        if not stat.S_ISDIR(root_before.st_mode):
+            raise ValueError("Q30 tokenizer snapshot is not a directory")
         root_fd = os.open(snapshot, flags)
     except OSError as error:
         raise ValueError(f"Q30 tokenizer snapshot is unreadable: {snapshot}") from error
-    entries: list[list[str]] = []
+    root_opened = os.fstat(root_fd)
+    if _identity(root_before) != _identity(root_opened):
+        os.close(root_fd)
+        raise ValueError("Q30 tokenizer snapshot changed while opening")
+    tree = sha256()
+    tree.update(b"[")
+    first_entry = True
+    file_count = 0
     files: dict[str, bytes] = {}
 
     def walk(directory_fd: int, relative: str) -> None:
+        nonlocal file_count, first_entry
         before = os.fstat(directory_fd)
         if not stat.S_ISDIR(before.st_mode):
             raise ValueError("Q30 tokenizer snapshot directory is invalid")
@@ -81,17 +118,36 @@ def _walk_snapshot(snapshot: Path) -> tuple[list[list[str]], dict[str, bytes]]:
             if stat.S_ISLNK(status.st_mode):
                 raise ValueError(f"Q30 tokenizer snapshot cannot contain symlinks: {path}")
             if stat.S_ISREG(status.st_mode):
-                raw = _read_regular_at(directory_fd, name, path)
-                entries.append([path, sha256(raw).hexdigest()])
-                files[path] = raw
+                if status.st_nlink != 1:
+                    raise ValueError(f"Q30 tokenizer snapshot cannot contain hardlinks: {path}")
+                digest, raw = _read_regular_at(
+                    directory_fd,
+                    name,
+                    path,
+                    status,
+                    path in {"tokenizer_config.json", "tokenizer.json"},
+                )
+                if not first_entry:
+                    tree.update(b",")
+                tree.update(_canonical_json([path, digest]))
+                first_entry = False
+                file_count += 1
+                if raw is not None:
+                    files[path] = raw
                 continue
             if not stat.S_ISDIR(status.st_mode):
                 raise ValueError(f"Q30 tokenizer snapshot has unsupported entry: {path}")
             try:
                 child_fd = os.open(name, flags, dir_fd=directory_fd)
             except OSError as error:
-                raise ValueError(f"Q30 tokenizer snapshot directory is unreadable: {path}") from error
+                raise ValueError(
+                    f"Q30 tokenizer snapshot directory is unreadable: {path}"
+                ) from error
             try:
+                if _identity(status) != _identity(os.fstat(child_fd)):
+                    raise ValueError(
+                        f"Q30 tokenizer snapshot directory changed while opening: {path}"
+                    )
                 walk(child_fd, path)
             finally:
                 os.close(child_fd)
@@ -103,15 +159,16 @@ def _walk_snapshot(snapshot: Path) -> tuple[list[list[str]], dict[str, bytes]]:
         walk(root_fd, "")
     finally:
         os.close(root_fd)
-    if not entries:
+    if file_count == 0:
         raise ValueError("Q30 tokenizer snapshot is empty")
-    return entries, files
+    tree.update(b"]")
+    return tree.hexdigest(), files
 
 
 def snapshot_tree_sha256(snapshot: Path) -> str:
     """Return the descriptor-stable SHA-256 tree identity for one tokenizer snapshot."""
-    entries, _ = _walk_snapshot(snapshot)
-    return sha256(_canonical_json(entries)).hexdigest()
+    tree_sha256, _ = _walk_snapshot(snapshot)
+    return tree_sha256
 
 
 def _json_object(raw: bytes, name: str) -> dict[str, Any]:
@@ -172,7 +229,7 @@ def _special_token_ids(tokenizer_json: dict[str, Any]) -> tuple[int, int]:
 
 
 def _derived_snapshot_evidence(snapshot: Path) -> dict[str, object]:
-    entries, files = _walk_snapshot(snapshot)
+    snapshot_tree_sha256, files = _walk_snapshot(snapshot)
     try:
         config = _json_object(files["tokenizer_config.json"], "config")
         tokenizer_json = _json_object(files["tokenizer.json"], "vocabulary")
@@ -184,7 +241,7 @@ def _derived_snapshot_evidence(snapshot: Path) -> dict[str, object]:
     training_template = _training_chat_template(official_template)
     im_start_token_id, im_end_token_id = _special_token_ids(tokenizer_json)
     return {
-        "snapshot_tree_sha256": sha256(_canonical_json(entries)).hexdigest(),
+        "snapshot_tree_sha256": snapshot_tree_sha256,
         "chat_template_sha256": sha256(official_template.encode("utf-8")).hexdigest(),
         "training_chat_template_sha256": sha256(training_template.encode("utf-8")).hexdigest(),
         "im_start_token_id": im_start_token_id,
@@ -209,6 +266,8 @@ def build_q30t_tokenizer_receipt(snapshot: Path, repository: str, revision: str)
 
 def verify_q30t_tokenizer_receipt(receipt: bytes) -> dict[str, object]:
     """Recompute and validate every Q30 tokenizer receipt identity from disk."""
+    if type(receipt) is not bytes:
+        raise ValueError("Q30 tokenizer receipt identity is invalid")
     try:
         payload: Any = json.loads(receipt)
     except json.JSONDecodeError as error:
@@ -229,10 +288,26 @@ def verify_q30t_tokenizer_receipt(receipt: bytes) -> dict[str, object]:
         not isinstance(payload, dict)
         or receipt != _canonical_json(payload) + b"\n"
         or set(payload) != expected_keys
+        or any(
+            type(payload[name]) is not str
+            for name in ("schema_version", "repository", "revision", "snapshot_path")
+        )
+        or any(
+            not _is_lower_hex(payload[name], 64)
+            for name in (
+                "snapshot_tree_sha256",
+                "chat_template_sha256",
+                "training_chat_template_sha256",
+                "receipt_sha256",
+            )
+        )
+        or any(
+            type(payload[name]) is not int or payload[name] < 0
+            for name in ("im_start_token_id", "im_end_token_id")
+        )
         or payload["schema_version"] != Q30T_TOKENIZER_TRUST_SCHEMA
         or payload["repository"] != Q30T_TOKENIZER_REPOSITORY
         or not _is_lower_hex(payload["revision"], 40)
-        or not isinstance(payload["snapshot_path"], str)
         or not Path(payload["snapshot_path"]).is_absolute()
     ):
         raise ValueError("Q30 tokenizer receipt identity is invalid")

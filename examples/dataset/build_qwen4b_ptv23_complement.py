@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import shutil
@@ -22,6 +21,18 @@ from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, BinaryIO, overload
+
+try:
+    from common.specdec.q30t_tokenizer_receipt import (  # pyright: ignore[reportMissingImports]
+        verify_q30t_tokenizer_receipt,
+    )
+except ModuleNotFoundError:
+    try:
+        from tools.launcher.common.specdec.q30t_tokenizer_receipt import (
+            verify_q30t_tokenizer_receipt,
+        )
+    except ModuleNotFoundError:
+        verify_q30t_tokenizer_receipt = None
 
 from ptv23_complement_target_policy import (
     ComplementError,
@@ -79,6 +90,7 @@ APPROVED_ROW_SCHEMA_SHA256S: frozenset[str] = frozenset()
 APPROVED_SOURCE_INVENTORY_FILE_SHA256 = ""
 APPROVED_HISTORICAL_RECEIPT_FILE_SHA256 = ""
 APPROVED_HELD_OUT_RECEIPT_FILE_SHA256S: dict[str, str] = {}
+APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S: frozenset[str] = frozenset()
 
 
 def _require_external_approval_roots() -> None:
@@ -638,20 +650,10 @@ def _snapshot_tree_sha256(root: Path) -> str:
 
 
 def _verify_q30t_tokenizer_receipt(raw: bytes) -> None:
-    module_path = (
-        Path(__file__).resolve().parents[2]
-        / "tools/launcher/common/specdec/q30t_tokenizer_receipt.py"
-    )
-    spec = importlib.util.spec_from_file_location("q30t_tokenizer_receipt", module_path)
-    if spec is None or spec.loader is None:
+    if verify_q30t_tokenizer_receipt is None:
         raise ComplementError("Q30 tokenizer receipt verifier is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    verifier = getattr(module, "verify_q30t_tokenizer_receipt", None)
-    if not callable(verifier):
-        raise ComplementError("Q30 tokenizer receipt verifier is invalid")
     try:
-        verifier(raw)
+        verify_q30t_tokenizer_receipt(raw)
     except ValueError as error:
         raise ComplementError("Q30 tokenizer receipt evidence does not reconcile") from error
 
@@ -665,6 +667,7 @@ def load_tokenizer_trust(
     """Authenticate the target-bound tokenizer/template trust receipt."""
     if not _is_lower_hex(expected_sha256, 64):
         raise ComplementError("tokenizer trust caller SHA-256 is invalid")
+    is_q30t = policy.tokenizer_trust_schema == "qwen3-30ba3b-thinking-tokenizer-trust-v1"
     raw = _stable_regular_bytes(path)
     if sha256(raw).hexdigest() != expected_sha256:
         raise ComplementError("tokenizer trust caller SHA-256 mismatch")
@@ -693,6 +696,8 @@ def load_tokenizer_trust(
         or payload["revision"] != policy.tokenizer_revision
     ):
         raise ComplementError("target tokenizer identity is invalid")
+    if is_q30t and expected_sha256 not in APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S:
+        raise ComplementError("reviewed Q30 tokenizer receipt is unavailable")
     digest_fields = (
         payload["snapshot_tree_sha256"],
         payload["chat_template_sha256"],
@@ -700,7 +705,6 @@ def load_tokenizer_trust(
     )
     snapshot = Path(payload["snapshot_path"])
     body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
-    is_q30t = policy.tokenizer_trust_schema == "qwen3-30ba3b-thinking-tokenizer-trust-v1"
     if (
         any(not _is_lower_hex(value, 64) for value in digest_fields)
         or payload["receipt_sha256"] != sha256(_canonical_json(body)).hexdigest()
@@ -1017,9 +1021,7 @@ def reconcile_source_requirements(
         if identity not in inventory_files:
             raise ComplementError("known source pin is missing from authenticated inventory")
     blockers = requirements["blocking_external_pins"]
-    expected_blockers = APPROVED_SOURCE_REQUIREMENT_BLOCKERS.get(
-        policy.source_requirements_sha256
-    )
+    expected_blockers = APPROVED_SOURCE_REQUIREMENT_BLOCKERS.get(policy.source_requirements_sha256)
     if expected_blockers is None or blockers != list(expected_blockers):
         raise ComplementError("source requirement blocker vocabulary is invalid")
     grouped: dict[str, list[InventorySource]] = {}
@@ -2252,10 +2254,7 @@ def load_complement_config(
     if sha256(raw).hexdigest() != policy.quota_config_sha256 or payload != expected:
         raise ComplementError("approved continuation policy does not match")
     requirements = path.parent / policy.source_requirements_path
-    if (
-        sha256(_stable_regular_bytes(requirements)).hexdigest()
-        != policy.source_requirements_sha256
-    ):
+    if sha256(_stable_regular_bytes(requirements)).hexdigest() != policy.source_requirements_sha256:
         raise ComplementError("approved source requirements identity does not match")
     return expected
 
