@@ -50,7 +50,7 @@ import json
 import sys
 from pathlib import Path
 
-from common.specdec.cluster_profile import load_cluster_profile
+from common.specdec.cluster_profile import load_cluster_profile, scheduler_gpu_args
 from common.specdec.qwen4b_study_manifest import validate_readiness_receipt
 from common.specdec.stage_hf_subset import load_subset_plan
 
@@ -78,9 +78,11 @@ print(plan["container"]["path"])
 print(plan["container"]["sha256"])
 print(readiness_path)
 print(Path(sys.argv[1]).resolve())
+gpu_args = scheduler_gpu_args(profile)
+print(gpu_args[0] if gpu_args else "")
 PY
 )
-(( ${#identity[@]} == 9 )) || { echo "invalid staging identity" >&2; exit 2; }
+(( ${#identity[@]} == 10 )) || { echo "invalid staging identity" >&2; exit 2; }
 
 ACCOUNT="${identity[0]}"
 PARTITION="${identity[1]}"
@@ -91,6 +93,7 @@ IMAGE="${identity[5]}"
 IMAGE_SHA256="${identity[6]}"
 READINESS="${identity[7]}"
 PROFILE="${identity[8]}"
+GPU_ARG="${identity[9]}"
 REPO_ROOT="$(git -C "$LAUNCHER_ROOT" rev-parse --show-toplevel)"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 [[ -z "$(git -C "$REPO_ROOT" status --porcelain)" ]] || { echo "source checkout is dirty" >&2; exit 2; }
@@ -102,10 +105,11 @@ mkdir -p "$LOG_DIR"
 export_values="ALL,REPO_ROOT=$REPO_ROOT,SOURCE_COMMIT=$SOURCE_COMMIT,PROFILE=$PROFILE,PROFILE_SHA256=$PROFILE_SHA256,PLAN_PATH=$PLAN,PLAN_SHA256=$PLAN_SHA256,IMAGE=$IMAGE,IMAGE_SHA256=$IMAGE_SHA256,OUTPUT_ROOT=$OUTPUT_ROOT,READINESS_RECEIPT=$READINESS,READINESS_RECEIPT_SHA256=$READINESS_SHA256"
 args=(
     --account="$ACCOUNT" --partition="$PARTITION" --job-name=qwen4b-ptv3-stage
-    --nodes=1 --ntasks=1 --gpus-per-node=4 --cpus-per-task=16 --mem=128G --time="$WALLTIME"
+    --nodes=1 --ntasks=1 --cpus-per-task=16 --mem=128G --time="$WALLTIME"
     --output="$LOG_DIR/%x-%j.out" --error="$LOG_DIR/%x-%j.err"
     --export="$export_values"
 )
+[[ -z "$GPU_ARG" ]] || args+=("$GPU_ARG")
 [[ -z "$DEPENDENCY" ]] || args+=(--dependency="afterok:$DEPENDENCY")
 sbatch --test-only "${args[@]}" "$RUNNER" >/dev/null
 [[ "$DRY_RUN" -eq 0 ]] || { echo "test-only passed"; exit 0; }

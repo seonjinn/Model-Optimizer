@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -157,12 +159,125 @@ def test_qwen4b_ptv3_plan_is_selective_and_fully_content_pinned() -> None:
     assert all(record["revision"] != "main" for record in plan["files"])
 
 
-def test_subset_submitter_requests_the_profile_gpu_node_contract() -> None:
-    """OCI batch submissions name the four GPUs required by its partition."""
-    submitter = (
-        REPOSITORY_ROOT / "tools/launcher/common/specdec/submit_hf_subset_stage.sh"
-    ).read_text()
+@pytest.mark.parametrize(
+    ("explicit_gpu_flag", "expected_gpu_arg"),
+    [(False, None), (True, "--gpus-per-node=4")],
+)
+def test_subset_submitter_honors_the_profile_gpu_flag_contract(
+    tmp_path: Path,
+    explicit_gpu_flag: bool,
+    expected_gpu_arg: str | None,
+) -> None:
+    """The real dry-run omits unsupported GPU flags on exclusive partitions."""
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "\n".join(
+            [
+                "name: fixture",
+                f"modelopt_commit: {'a' * 40}",
+                "ssh_host: fixture",
+                "account: fixture-account",
+                "partition: fixture-partition",
+                "fallback_partition: null",
+                "durable_root: /lustre/fixture",
+                "scratch_candidates:",
+                "  - /raid/scratch",
+                "training_nodes: 16",
+                "training_segment: 16",
+                "evaluation_nodes: 1",
+                "evaluation_segment: 1",
+                "gpus_per_node: 4",
+                f"explicit_gpu_flag: {str(explicit_gpu_flag).lower()}",
+                "walltime: '01:00:00'",
+            ]
+        )
+        + "\n"
+    )
+    readiness = tmp_path / "readiness.json"
+    readiness.write_text(
+        json.dumps(
+            {
+                "profile": "fixture",
+                "account": "fixture-account",
+                "partition": "fixture-partition",
+                "scratch_root": "/raid/scratch",
+                "pyxis_available": True,
+                "architecture": "aarch64",
+                "gpu_count": 4,
+            }
+        )
+        + "\n"
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"messages":[]}\n')
+    plan = _plan(tmp_path, source)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "sbatch.calls"
+    _write_executable(
+        fake_bin / "git",
+        """#!/bin/sh
+case "$*" in
+  *"rev-parse --show-toplevel"*) printf '%s\\n' "$FAKE_REPO_ROOT" ;;
+  *"rev-parse HEAD"*) printf '%040d\\n' 0 ;;
+  *"status --porcelain"*) : ;;
+  *) exit 2 ;;
+esac
+""",
+    )
+    _write_executable(fake_bin / "mkdir", "#!/bin/sh\nexit 0\n")
+    _write_executable(
+        fake_bin / "sbatch",
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$SBATCH_CALLS"\n',
+    )
+    submitter = REPOSITORY_ROOT / "tools/launcher/common/specdec/submit_hf_subset_stage.sh"
+    bash3_mapfile_compat = """
+mapfile() {
+  identity=()
+  while IFS= read -r line; do identity+=("$line"); done
+}
+export -f mapfile
+exec "$@"
+"""
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            bash3_mapfile_compat,
+            "subset-submit-test",
+            str(submitter),
+            "--profile",
+            str(profile),
+            "--readiness",
+            str(readiness),
+            "--plan",
+            str(plan),
+            "--output-root",
+            "/lustre/fixture/output",
+            "--dry-run",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "DRAFTER_LAUNCHER_ROOT": str(REPOSITORY_ROOT / "tools/launcher"),
+            "FAKE_REPO_ROOT": str(REPOSITORY_ROOT),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "SBATCH_CALLS": str(calls),
+        },
+    )
 
-    assert "--gpus-per-node=4" in submitter
-    assert '--time="$WALLTIME"' in submitter
-    assert "sbatch --test-only" in submitter
+    assert result.returncode == 0, result.stderr
+    sbatch_args = calls.read_text()
+    if expected_gpu_arg is None:
+        assert "--gpus-per-node" not in sbatch_args
+    else:
+        assert expected_gpu_arg in sbatch_args
+    assert "--time=01:00:00" in sbatch_args
+    assert "--test-only" in sbatch_args
+
+
+def _write_executable(path: Path, contents: str) -> None:
+    path.write_text(contents)
+    path.chmod(0o755)
