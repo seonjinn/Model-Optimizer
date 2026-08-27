@@ -164,7 +164,7 @@ def _toy_verifier_roots(
     monkeypatch.setattr(module, "_require_external_approval_roots", lambda: None)
     monkeypatch.setattr(module, "_authenticate_provenance_roots", lambda *_args: None)
     monkeypatch.setattr(
-        module, "load_complement_config", lambda _path: {"quotas": module.APPROVED_QUOTAS}
+        module, "load_complement_config", lambda _path, **_kwargs: {"quotas": module.APPROVED_QUOTAS}
     )
     monkeypatch.setattr(module, "reconcile_source_requirements", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(module, "_category_rows", lambda _inventory: rows_by_category)

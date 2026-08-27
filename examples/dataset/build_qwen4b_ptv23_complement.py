@@ -22,22 +22,30 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, BinaryIO, overload
 
+from ptv23_complement_target_policy import (
+    ComplementError,
+    TargetTokenizerPolicy,
+    load_target_policy,
+)
 from trajectory_schema import TrajectoryValidationError, validate_trajectory
 
 SCHEMA_VERSION = "ptv2-ptv3-complement-config-v1"
-SCIENTIFIC_IDENTITY = "ptv2-ptv3-complement-700k-v1"
-TRAINING_SEQUENCE_LENGTH = 4_096
+Q4_TARGET_POLICY_PATH = Path(__file__).with_name("qwen3_4b_ptv23_target_v1.json")
+Q4_TARGET_POLICY_SHA256 = "028830a9bde3f9353809894fc2650ee734c55a7b6860d6ec3ac32f55ff37b4df"
+Q4_TARGET_POLICY = load_target_policy(Q4_TARGET_POLICY_PATH, Q4_TARGET_POLICY_SHA256)
+SCIENTIFIC_IDENTITY = Q4_TARGET_POLICY.scientific_identity
+TRAINING_SEQUENCE_LENGTH = Q4_TARGET_POLICY.training_sequence_length
 PTV2_REVISION = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
-QWEN3_4B_REVISION = "1cfa9a7208912126459214e8b04321603b3df60c"
+QWEN3_4B_REVISION = Q4_TARGET_POLICY.tokenizer_revision
 TOKENIZER_POLICY = {
-    "repository": "Qwen/Qwen3-4B",
+    "repository": Q4_TARGET_POLICY.tokenizer_repository,
     "revision": QWEN3_4B_REVISION,
     "training_sequence_length": TRAINING_SEQUENCE_LENGTH,
-    "trust_schema": "qwen3-4b-tokenizer-trust-v1",
+    "trust_schema": Q4_TARGET_POLICY.tokenizer_trust_schema,
 }
 SOURCE_REQUIREMENTS_POLICY = {
-    "path": "qwen3_4b_ptv23_complement_sources_v1.json",
-    "sha256": "e61ec87c2aba19c67c4a4549dba11f33abe8a3126f76232df0d72da43e8c81e1",
+    "path": Q4_TARGET_POLICY.source_requirements_path,
+    "sha256": Q4_TARGET_POLICY.source_requirements_sha256,
 }
 APPROVED_QUOTAS = {
     "ptv2_stem": 300_000,
@@ -55,10 +63,6 @@ APPROVED_ROW_SCHEMA_SHA256S: frozenset[str] = frozenset()
 APPROVED_SOURCE_INVENTORY_FILE_SHA256 = ""
 APPROVED_HISTORICAL_RECEIPT_FILE_SHA256 = ""
 APPROVED_HELD_OUT_RECEIPT_FILE_SHA256S: dict[str, str] = {}
-
-
-class ComplementError(ValueError):
-    """The continuation identity or one of its authenticated inputs is invalid."""
 
 
 def _require_external_approval_roots() -> None:
@@ -337,7 +341,12 @@ def _physical_row_count(path: Path, source_format: str) -> int:
     return row_count
 
 
-def load_source_inventory(path: Path, *, expected_sha256: str) -> SourceInventory:
+def load_source_inventory(
+    path: Path,
+    *,
+    expected_sha256: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
+) -> SourceInventory:
     """Authenticate exact source repositories, revisions, files, schema, and order."""
     if not _is_lower_hex(expected_sha256, 64):
         raise ComplementError("source inventory caller SHA-256 is invalid")
@@ -352,7 +361,7 @@ def load_source_inventory(path: Path, *, expected_sha256: str) -> SourceInventor
         raise ComplementError("source inventory must use canonical JSON bytes")
     if set(payload) != {"schema_version", "scientific_identity", "sources"} or (
         payload["schema_version"] != "ptv2-ptv3-complement-source-inventory-v1"
-        or payload["scientific_identity"] != SCIENTIFIC_IDENTITY
+        or payload["scientific_identity"] != policy.scientific_identity
         or not isinstance(payload["sources"], list)
         or not payload["sources"]
     ):
@@ -456,7 +465,7 @@ def load_source_inventory(path: Path, *, expected_sha256: str) -> SourceInventor
                 files=tuple(parsed_files),
             )
         )
-    return SourceInventory(SCIENTIFIC_IDENTITY, expected_sha256, tuple(parsed_sources))
+    return SourceInventory(policy.scientific_identity, expected_sha256, tuple(parsed_sources))
 
 
 def load_historical_exclusion(
@@ -612,8 +621,13 @@ def _snapshot_tree_sha256(root: Path) -> str:
     return sha256(_canonical_json(entries)).hexdigest()
 
 
-def load_tokenizer_trust(path: Path, *, expected_sha256: str) -> TokenizerTrust:
-    """Authenticate the reused official Qwen3-4B tokenizer/template trust receipt."""
+def load_tokenizer_trust(
+    path: Path,
+    *,
+    expected_sha256: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
+) -> TokenizerTrust:
+    """Authenticate the target-bound tokenizer/template trust receipt."""
     if not _is_lower_hex(expected_sha256, 64):
         raise ComplementError("tokenizer trust caller SHA-256 is invalid")
     raw = _stable_regular_bytes(path)
@@ -639,13 +653,13 @@ def load_tokenizer_trust(path: Path, *, expected_sha256: str) -> TokenizerTrust:
         not isinstance(payload, dict)
         or raw != _canonical_json(payload) + b"\n"
         or set(payload) != expected_keys
-        or payload["schema_version"] != "qwen3-4b-tokenizer-trust-v1"
-        or payload["repository"] != "Qwen/Qwen3-4B"
-        or payload["revision"] != QWEN3_4B_REVISION
+        or payload["schema_version"] != policy.tokenizer_trust_schema
+        or payload["repository"] != policy.tokenizer_repository
+        or payload["revision"] != policy.tokenizer_revision
         or payload["im_start_token_id"] != 151_644
         or payload["im_end_token_id"] != 151_645
     ):
-        raise ComplementError("tokenizer trust identity is invalid")
+        raise ComplementError("target tokenizer identity is invalid")
     digest_fields = (
         payload["snapshot_tree_sha256"],
         payload["chat_template_sha256"],
@@ -903,10 +917,11 @@ def reconcile_source_requirements(
     *,
     inventory: SourceInventory,
     capacity_receipt_path: Path,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> None:
     """Resolve every checked source requirement against authenticated live evidence."""
     raw = _stable_regular_bytes(path)
-    if sha256(raw).hexdigest() != SOURCE_REQUIREMENTS_POLICY["sha256"]:
+    if sha256(raw).hexdigest() != policy.source_requirements_sha256:
         raise ComplementError("approved source requirements identity does not match")
     try:
         requirements: Any = json.loads(raw)
@@ -922,7 +937,7 @@ def reconcile_source_requirements(
             "blocking_external_pins",
         }
         or requirements["schema_version"] != "ptv2-ptv3-complement-source-requirements-v1"
-        or requirements["scientific_identity"] != SCIENTIFIC_IDENTITY
+        or requirements["scientific_identity"] != policy.scientific_identity
         or not isinstance(requirements["known_pinned_sources"], list)
         or not isinstance(requirements["blocking_external_pins"], list)
     ):
@@ -1094,6 +1109,7 @@ def select_continuation_rows(
     replay_categories: frozenset[str],
     spool_path: Path | None = None,
     capacity_receipt_path: Path | None = None,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> ContinuationSelection:
     """Select exact per-category quotas without redistribution, replacement, or cycling."""
     if tuple(rows_by_category) != tuple(quotas):
@@ -1248,7 +1264,7 @@ def select_continuation_rows(
             category_exclusions = reasons - reasons_before
             capacity_payload = {
                 "schema_version": "ptv2-ptv3-complement-capacity-v1",
-                "scientific_identity": SCIENTIFIC_IDENTITY,
+                "scientific_identity": policy.scientific_identity,
                 "status": "insufficient-capacity",
                 "blocking_category": category,
                 "required": quota,
@@ -1287,7 +1303,7 @@ def select_continuation_rows(
     if capacity_receipt_path is not None:
         capacity_payload = {
             "schema_version": "ptv2-ptv3-complement-capacity-v1",
-            "scientific_identity": SCIENTIFIC_IDENTITY,
+            "scientific_identity": policy.scientific_identity,
             "status": "sufficient",
             "redistribution": "forbidden",
             "categories": capacities,
@@ -1379,6 +1395,7 @@ def publish_selection_bundle(
     runtime_sha256: str,
     source_commit: str,
     enforce_production_paths: bool = True,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> ComplementCompletion:
     """Write canonical bytes on scratch and atomically install or safely adopt on Lustre."""
     hashes = (
@@ -1454,7 +1471,7 @@ def publish_selection_bundle(
     selected_token_evidence_sha256.update(b"]")
     manifest_body: dict[str, object] = {
         "schema_version": "ptv2-ptv3-complement-bundle-v1",
-        "scientific_identity": SCIENTIFIC_IDENTITY,
+        "scientific_identity": policy.scientific_identity,
         "row_count": len(selection.rows),
         "quotas": dict(quotas),
         "category_counts": dict(counts),
@@ -1492,6 +1509,7 @@ def publish_selection_bundle(
             "config_file_sha256": config_file_sha256,
             "source_inventory_file_sha256": source_inventory_file_sha256,
             "tokenizer_trust_file_sha256": tokenizer_trust_file_sha256,
+            "target_policy_file_sha256": policy.file_sha256,
             "runtime_sha256": runtime_sha256,
             "source_commit": source_commit,
         },
@@ -1568,6 +1586,7 @@ def verify_selection_bundle(
     scratch_root: Path,
     expected_runtime_sha256: str,
     expected_source_commit: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> dict[str, Any]:
     """Replay one bundle and clean its scratch synchronously on every exit."""
     scratch_root.mkdir(parents=True, exist_ok=True)
@@ -1584,6 +1603,7 @@ def verify_selection_bundle(
             replay_root=Path(replay_name),
             expected_runtime_sha256=expected_runtime_sha256,
             expected_source_commit=expected_source_commit,
+            policy=policy,
         )
 
 
@@ -1600,6 +1620,7 @@ def _verify_selection_bundle_with_replay_root(
     replay_root: Path,
     expected_runtime_sha256: str,
     expected_source_commit: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> dict[str, Any]:
     """Replay one caller-pinned installed bundle through schema, UUID, and token gates."""
     if (
@@ -1642,7 +1663,7 @@ def _verify_selection_bundle_with_replay_root(
         or manifest_raw != _canonical_json(manifest) + b"\n"
         or set(manifest) != expected_manifest_keys
         or manifest.get("schema_version") != "ptv2-ptv3-complement-bundle-v1"
-        or manifest.get("scientific_identity") != SCIENTIFIC_IDENTITY
+        or manifest.get("scientific_identity") != policy.scientific_identity
         or manifest.get("quotas") != APPROVED_QUOTAS
         or manifest.get("category_counts") != APPROVED_QUOTAS
         or manifest.get("row_count") != sum(APPROVED_QUOTAS.values())
@@ -1652,7 +1673,7 @@ def _verify_selection_bundle_with_replay_root(
     manifest_body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     if manifest.get("manifest_sha256") != sha256(_canonical_json(manifest_body)).hexdigest():
         raise ComplementError("manifest identity does not reconcile")
-    config = load_complement_config(config_path)
+    config = load_complement_config(config_path, policy=policy)
     if config["quotas"] != APPROVED_QUOTAS:
         raise ComplementError("verification config quotas are invalid")
     _authenticate_provenance_roots(inventory, historical, held_out)
@@ -1664,12 +1685,14 @@ def _verify_selection_bundle_with_replay_root(
             "config_file_sha256",
             "source_inventory_file_sha256",
             "tokenizer_trust_file_sha256",
+            "target_policy_file_sha256",
             "runtime_sha256",
             "source_commit",
         }
         or trust.get("config_file_sha256") != sha256(_stable_regular_bytes(config_path)).hexdigest()
         or trust.get("source_inventory_file_sha256") != inventory.file_sha256
         or trust.get("tokenizer_trust_file_sha256") != tokenizer_trust_file_sha256
+        or trust.get("target_policy_file_sha256") != policy.file_sha256
         or trust.get("runtime_sha256") != expected_runtime_sha256
         or trust.get("source_commit") != expected_source_commit
     ):
@@ -1730,9 +1753,10 @@ def _verify_selection_bundle_with_replay_root(
     ):
         raise ComplementError("capacity receipt identity does not reconcile")
     reconcile_source_requirements(
-        config_path.parent / SOURCE_REQUIREMENTS_POLICY["path"],
+        config_path.parent / policy.source_requirements_path,
         inventory=inventory,
         capacity_receipt_path=capacity_path,
+        policy=policy,
     )
     replay_capacity_path = replay_root / "CAPACITY.json"
     replay = select_continuation_rows(
@@ -1741,12 +1765,13 @@ def _verify_selection_bundle_with_replay_root(
         prior_prompt_uuids=set(historical.prompt_uuids),
         held_out_prompt_uuids=set(held_out.prompt_uuids),
         tokenizer=tokenizer,
-        training_sequence_length=TRAINING_SEQUENCE_LENGTH,
+        training_sequence_length=policy.training_sequence_length,
         replay_categories=frozenset(
             {"ptv3_interactive_agentic_swe", "ptv3_general_tool_trajectories"}
         ),
         spool_path=replay_root / "selection.sqlite",
         capacity_receipt_path=replay_capacity_path,
+        policy=policy,
     )
     if (
         replay.exclusions != manifest.get("exclusions")
@@ -1836,7 +1861,7 @@ def _verify_selection_bundle_with_replay_root(
                         source_id=record["source_id"],
                         lane=lane,
                         tokenizer=tokenizer,
-                        training_seq_len=TRAINING_SEQUENCE_LENGTH,
+                        training_seq_len=policy.training_sequence_length,
                     )
                 except TrajectoryValidationError as error:
                     raise ComplementError(f"data trajectory is invalid at row {index}") from error
@@ -1848,7 +1873,7 @@ def _verify_selection_bundle_with_replay_root(
             if (
                 full_tokens != record["full_tokens"]
                 or assistant_tokens != record["assistant_tokens"]
-                or full_tokens > TRAINING_SEQUENCE_LENGTH
+                or full_tokens > policy.training_sequence_length
                 or assistant_tokens < 1
             ):
                 raise ComplementError("selected tokenizer evidence does not reconcile")
@@ -1921,6 +1946,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     build = subparsers.add_parser("build")
+    build.add_argument("--target-policy", type=Path, required=True)
+    build.add_argument("--target-policy-sha256", required=True)
     build.add_argument("--config", type=Path, required=True)
     build.add_argument("--source-inventory", type=Path, required=True)
     build.add_argument("--source-inventory-sha256", required=True)
@@ -1940,6 +1967,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     build.add_argument("--output-root", type=Path, required=True)
     build.add_argument("--completion-receipt", type=Path, required=True)
     verify = subparsers.add_parser("verify")
+    verify.add_argument("--target-policy", type=Path, required=True)
+    verify.add_argument("--target-policy-sha256", required=True)
     verify.add_argument("--config", type=Path, required=True)
     verify.add_argument("--source-inventory", type=Path, required=True)
     verify.add_argument("--source-inventory-sha256", required=True)
@@ -1960,11 +1989,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _completion_payload(
-    completion: ComplementCompletion, *, runtime_sha256: str, source_commit: str
+    completion: ComplementCompletion,
+    *,
+    runtime_sha256: str,
+    source_commit: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> dict[str, object]:
     body: dict[str, object] = {
         "schema_version": "ptv2-ptv3-complement-completion-v1",
-        "scientific_identity": SCIENTIFIC_IDENTITY,
+        "scientific_identity": policy.scientific_identity,
         "output_root": str(completion.output_root),
         "row_count": completion.row_count,
         "manifest_file_sha256": completion.manifest_file_sha256,
@@ -1981,9 +2014,10 @@ def _write_completion_receipt(
     *,
     runtime_sha256: str,
     source_commit: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> str:
     payload = _completion_payload(
-        completion, runtime_sha256=runtime_sha256, source_commit=source_commit
+        completion, runtime_sha256=runtime_sha256, source_commit=source_commit, policy=policy
     )
     raw = _canonical_json(payload) + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1999,6 +2033,7 @@ def _load_completion_receipt(
     output_root: Path,
     runtime_sha256: str,
     source_commit: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> dict[str, Any]:
     raw = _stable_regular_bytes(path)
     if sha256(raw).hexdigest() != expected_sha256:
@@ -2013,7 +2048,7 @@ def _load_completion_receipt(
     if (
         raw != _canonical_json(payload) + b"\n"
         or payload.get("schema_version") != "ptv2-ptv3-complement-completion-v1"
-        or payload.get("scientific_identity") != SCIENTIFIC_IDENTITY
+        or payload.get("scientific_identity") != policy.scientific_identity
         or payload.get("output_root") != str(output_root)
         or payload.get("runtime_sha256") != runtime_sha256
         or payload.get("source_commit") != source_commit
@@ -2042,15 +2077,16 @@ def _held_out_args(values: Iterable[str]) -> list[tuple[str, Path, str]]:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    policy = load_target_policy(args.target_policy, args.target_policy_sha256)
     tokenizer_trust = load_tokenizer_trust(
-        args.tokenizer_trust, expected_sha256=args.tokenizer_trust_sha256
+        args.tokenizer_trust, expected_sha256=args.tokenizer_trust_sha256, policy=policy
     )
     tokenizer = _load_qwen_tokenizer(tokenizer_trust, args.scratch_root)
     if args.command == "build":
         _require_external_approval_roots()
-        config = load_complement_config(args.config)
+        config = load_complement_config(args.config, policy=policy)
         inventory = load_source_inventory(
-            args.source_inventory, expected_sha256=args.source_inventory_sha256
+            args.source_inventory, expected_sha256=args.source_inventory_sha256, policy=policy
         )
         historical = load_historical_exclusion(
             args.historical_receipt,
@@ -2068,7 +2104,7 @@ def main(argv: list[str] | None = None) -> int:
             prior_prompt_uuids=set(historical.prompt_uuids),
             held_out_prompt_uuids=set(held_out.prompt_uuids),
             tokenizer=tokenizer,
-            training_sequence_length=TRAINING_SEQUENCE_LENGTH,
+            training_sequence_length=policy.training_sequence_length,
             replay_categories=frozenset(
                 {
                     "ptv3_interactive_agentic_swe",
@@ -2077,11 +2113,13 @@ def main(argv: list[str] | None = None) -> int:
             ),
             spool_path=selection_scratch / "selection.sqlite",
             capacity_receipt_path=selection_scratch / "CAPACITY.json",
+            policy=policy,
         )
         reconcile_source_requirements(
-            args.config.parent / SOURCE_REQUIREMENTS_POLICY["path"],
+            args.config.parent / policy.source_requirements_path,
             inventory=inventory,
             capacity_receipt_path=selection_scratch / "CAPACITY.json",
+            policy=policy,
         )
         completion = publish_selection_bundle(
             selection,
@@ -2095,12 +2133,14 @@ def main(argv: list[str] | None = None) -> int:
             tokenizer_trust_file_sha256=tokenizer_trust.file_sha256,
             runtime_sha256=args.runtime_sha256,
             source_commit=args.source_commit,
+            policy=policy,
         )
         completion_receipt_sha256 = _write_completion_receipt(
             args.completion_receipt,
             completion,
             runtime_sha256=args.runtime_sha256,
             source_commit=args.source_commit,
+            policy=policy,
         )
         print(
             json.dumps(
@@ -2117,7 +2157,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     _require_external_approval_roots()
     inventory = load_source_inventory(
-        args.source_inventory, expected_sha256=args.source_inventory_sha256
+        args.source_inventory, expected_sha256=args.source_inventory_sha256, policy=policy
     )
     historical = load_historical_exclusion(
         args.historical_receipt, expected_sha256=args.historical_receipt_sha256
@@ -2129,6 +2169,7 @@ def main(argv: list[str] | None = None) -> int:
         output_root=args.output_root,
         runtime_sha256=args.runtime_sha256,
         source_commit=args.source_commit,
+        policy=policy,
     )
     verify_selection_bundle(
         args.output_root,
@@ -2142,31 +2183,43 @@ def main(argv: list[str] | None = None) -> int:
         scratch_root=args.scratch_root,
         expected_runtime_sha256=args.runtime_sha256,
         expected_source_commit=args.source_commit,
+        policy=policy,
     )
     print(json.dumps(completion_receipt, sort_keys=True))
     return 0
 
 
-def load_complement_config(path: Path) -> dict[str, Any]:
-    """Load only the one approved, immutable continuation policy."""
+def load_complement_config(
+    path: Path, *, policy: TargetTokenizerPolicy = Q4_TARGET_POLICY
+) -> dict[str, Any]:
+    """Load the immutable quota and source policy bound to one target policy."""
     try:
-        payload: Any = json.loads(_stable_regular_bytes(path))
+        raw = _stable_regular_bytes(path)
+        payload: Any = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise ComplementError("approved continuation policy is unreadable") from error
     expected = {
         "schema_version": SCHEMA_VERSION,
-        "scientific_identity": SCIENTIFIC_IDENTITY,
-        "training_sequence_length": TRAINING_SEQUENCE_LENGTH,
-        "tokenizer": TOKENIZER_POLICY,
-        "source_requirements": SOURCE_REQUIREMENTS_POLICY,
+        "scientific_identity": policy.scientific_identity,
+        "training_sequence_length": policy.training_sequence_length,
+        "tokenizer": {
+            "repository": policy.tokenizer_repository,
+            "revision": policy.tokenizer_revision,
+            "training_sequence_length": policy.training_sequence_length,
+            "trust_schema": policy.tokenizer_trust_schema,
+        },
+        "source_requirements": {
+            "path": policy.source_requirements_path,
+            "sha256": policy.source_requirements_sha256,
+        },
         "quotas": APPROVED_QUOTAS,
     }
-    if payload != expected:
+    if sha256(raw).hexdigest() != policy.quota_config_sha256 or payload != expected:
         raise ComplementError("approved continuation policy does not match")
-    requirements = path.parent / SOURCE_REQUIREMENTS_POLICY["path"]
+    requirements = path.parent / policy.source_requirements_path
     if (
         sha256(_stable_regular_bytes(requirements)).hexdigest()
-        != SOURCE_REQUIREMENTS_POLICY["sha256"]
+        != policy.source_requirements_sha256
     ):
         raise ComplementError("approved source requirements identity does not match")
     return expected
