@@ -18,7 +18,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NoReturn
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -131,7 +131,9 @@ class KeeperPlan:
                 for item in sources
             )
             return cls(
-                schema_version=_text(raw, "schema_version"),
+                schema_version=cast(
+                    "Literal['ptv23-node-keeper-v1']", _text(raw, "schema_version")
+                ),
                 job_id=_text(raw, "job_id"),
                 node_name=_text(raw, "node_name"),
                 scratch_root=Path(_text(raw, "scratch_root")),
@@ -154,6 +156,7 @@ class KeeperItem:
     staged_size: int
     staged_sha256: str
     anchor_path: Path
+    descriptor: int
 
     @property
     def source_sha256(self) -> str:
@@ -184,6 +187,7 @@ class KeeperReceipt:
             "items": [
                 {
                     "anchor_path": str(item.anchor_path),
+                    "descriptor": item.descriptor,
                     "expected_sha256": item.expected_sha256,
                     "name": item.name,
                     "source_path": str(item.source_path),
@@ -456,27 +460,25 @@ def _cleanup_owned_anchors(directory: int, anchors: tuple[_OwnedAnchor, ...]) ->
     after checking its inode has an unavoidable replacement race, so node-local
     scratch cleanup reclaims this private job directory after the allocation.
     """
-    if _CLEANUP_RACE_HOOK is not None:
-        _CLEANUP_RACE_HOOK()
-    del directory, anchors
+    for anchor in anchors:
+        if _CLEANUP_RACE_HOOK is not None:
+            _CLEANUP_RACE_HOOK()
+        try:
+            metadata = os.stat(anchor.name, dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            and (metadata.st_dev, metadata.st_ino) == (anchor.device, anchor.inode)
+            and os.readlink(anchor.name, dir_fd=directory) == anchor.target
+        ):
+            os.unlink(anchor.name, dir_fd=directory)
 
 
 def _acquire_keeper_lock(plan: KeeperPlan) -> int:
     """Acquire the exclusive node-local keeper lifetime lock for this identity."""
-    scratch = open_tree_root(plan.scratch_root)
-    lock_name = f".keeper-{plan.node_name}.lock"
+    descriptor = open_tree_root(plan.scratch_root)
     try:
-        descriptor = os.open(
-            lock_name,
-            os.O_RDWR | os.O_CREAT | _nofollow_flag(),
-            0o600,
-            dir_fd=scratch,
-        )
-    finally:
-        os.close(scratch)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise KeeperError("keeper lifetime lock is not a regular file")
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return descriptor
     except BlockingIOError as error:
@@ -518,6 +520,7 @@ def _make_receipt(
         "items": [
             {
                 "anchor_path": str(item.anchor_path),
+                "descriptor": item.descriptor,
                 "expected_sha256": item.expected_sha256,
                 "name": item.name,
                 "source_path": str(item.source_path),
@@ -559,13 +562,7 @@ def _write_fresh_receipt(path: Path, receipt: KeeperReceipt) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        try:
-            existing = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None:
-            raise KeeperError("keeper receipt path must be fresh")
-        os.rename(temporary_name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.link(temporary_name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
         os.fsync(parent)
     except BaseException:
         with suppress(FileNotFoundError):
@@ -576,35 +573,9 @@ def _write_fresh_receipt(path: Path, receipt: KeeperReceipt) -> None:
 
 
 def _replace_owned_receipt(path: Path, owned: os.stat_result, receipt: KeeperReceipt) -> None:
-    """Replace only the readiness receipt inode this keeper originally created."""
-    parent = open_tree_root(path.parent)
-    temporary_name = f".{path.name}.{os.getpid()}.failed.tmp"
-    try:
-        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino):
-            raise KeeperError("refusing to replace a foreign keeper receipt")
-        descriptor = os.open(
-            temporary_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=parent,
-        )
-        try:
-            _write_all(descriptor, _canonical(receipt.to_dict()) + b"\n")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino):
-            raise KeeperError("refusing to replace a foreign keeper receipt")
-        os.rename(temporary_name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
-        os.fsync(parent)
-    except BaseException:
-        with suppress(FileNotFoundError):
-            os.unlink(temporary_name, dir_fd=parent)
-        raise
-    finally:
-        os.close(parent)
+    """Publish immutable failure evidence without replacing a readiness path."""
+    del owned
+    _write_fresh_receipt(path.with_name(f"{path.name}.failed"), receipt)
 
 
 def _stable_read(path: Path) -> bytes:
@@ -669,11 +640,12 @@ def load_receipt(path: Path) -> KeeperReceipt:
                 staged_size=item["staged_size"],
                 staged_sha256=_text(item, "staged_sha256"),
                 anchor_path=Path(_text(item, "anchor_path")),
+                descriptor=item["descriptor"],
             )
             for item in items_raw
         )
         receipt = KeeperReceipt(
-            schema_version=_text(raw, "schema_version"),
+            schema_version=cast("Literal['ptv23-node-keeper-v1']", _text(raw, "schema_version")),
             job_id=_text(raw, "job_id"),
             node_name=_text(raw, "node_name"),
             keeper_pid=raw["keeper_pid"],
@@ -698,6 +670,8 @@ def load_receipt(path: Path) -> KeeperReceipt:
             or not _is_hash(item.staged_sha256)
             or not isinstance(item.staged_size, int)
             or item.staged_size < 0
+            or not isinstance(item.descriptor, int)
+            or item.descriptor < 0
             for item in receipt.items
         )
     ):
@@ -727,18 +701,11 @@ def validate_keeper_receipt(path: Path) -> KeeperReceipt:
     if not receipt.items:
         raise KeeperError("keeper reported a failed receipt")
     for item in receipt.items:
-        expected_target = f"/proc/{receipt.keeper_pid}/fd/"
+        descriptor_path = Path(f"/proc/{receipt.keeper_pid}/fd/{item.descriptor}")
         try:
-            anchor_metadata = os.lstat(item.anchor_path)
-            target = os.readlink(item.anchor_path)
+            descriptor = os.open(descriptor_path, os.O_RDONLY)
         except OSError as error:
-            raise KeeperError("keeper anchor is unavailable") from error
-        if not stat.S_ISLNK(anchor_metadata.st_mode) or not target.startswith(expected_target):
-            raise KeeperError("keeper anchor is not bound to its live descriptor")
-        try:
-            descriptor = os.open(item.anchor_path, os.O_RDONLY)
-        except OSError as error:
-            raise KeeperError("keeper anchor cannot be reopened") from error
+            raise KeeperError("keeper live descriptor cannot be reopened") from error
         try:
             metadata = os.fstat(descriptor)
             staged_size, staged_sha256 = _descriptor_digest(descriptor)
@@ -768,7 +735,9 @@ def serve(plan: KeeperPlan, receipt_path: Path) -> None:
     failed_by_signal = False
     receipt_metadata: os.stat_result | None = None
 
-    def stop_handler(_signum: int, _frame: object) -> NoReturn:
+    def stop_handler(_signum: int, _frame: object) -> None:
+        if failed_by_signal:
+            return
         raise _StopKeeper()
 
     previous_handlers = {
@@ -802,6 +771,7 @@ def serve(plan: KeeperPlan, receipt_path: Path) -> None:
                     staged_size=staged_size,
                     staged_sha256=staged_sha256,
                     anchor_path=plan.anchor_root / source.name,
+                    descriptor=descriptor,
                 )
             )
         receipt = _make_receipt(
@@ -824,8 +794,9 @@ def serve(plan: KeeperPlan, receipt_path: Path) -> None:
     except _StopKeeper:
         failed_by_signal = True
     finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+        if not failed_by_signal:
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
         if anchor_directory is not None:
             _cleanup_owned_anchors(anchor_directory, tuple(anchors))
             os.close(anchor_directory)
@@ -845,7 +816,11 @@ def serve(plan: KeeperPlan, receipt_path: Path) -> None:
                 raise KeeperError("keeper failure receipt has no owned readiness receipt")
             _replace_owned_receipt(receipt_path, receipt_metadata, failure_receipt)
         else:
-            _write_fresh_receipt(receipt_path, failure_receipt)
+            _write_fresh_receipt(
+                receipt_path.with_name(f"{receipt_path.name}.failed"), failure_receipt
+            )
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
         return
     if not published:
         raise KeeperError("keeper failed before publishing a receipt")

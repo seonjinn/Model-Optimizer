@@ -223,11 +223,13 @@ def test_canonical_plan_and_receipt_reject_noncanonical_wire_bytes(tmp_path: Pat
         staged_size=5,
         staged_sha256=_sha256(b"image"),
         anchor_path=tmp_path / "anchors" / "image",
+        descriptor=0,
     )
     body = {
         "items": [
             {
                 "anchor_path": str(item.anchor_path),
+                "descriptor": item.descriptor,
                 "expected_sha256": item.expected_sha256,
                 "name": item.name,
                 "source_path": str(item.source_path),
@@ -435,7 +437,7 @@ def test_signal_during_staging_publishes_a_canonical_failed_receipt(
     monkeypatch.setattr(keeper_module, "stage_regular_to_tmpfile", interrupt_staging)
     receipt_path = tmp_path / "failed.json"
     keeper_module.serve(plan, receipt_path)
-    assert keeper_module.load_receipt(receipt_path).items == ()
+    assert keeper_module.load_receipt(receipt_path.with_name("failed.json.failed")).items == ()
 
 
 def test_cleanup_race_hook_cannot_delete_a_foreign_replacement(
