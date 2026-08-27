@@ -47,6 +47,21 @@ SOURCE_REQUIREMENTS_POLICY = {
     "path": Q4_TARGET_POLICY.source_requirements_path,
     "sha256": Q4_TARGET_POLICY.source_requirements_sha256,
 }
+APPROVED_SOURCE_REQUIREMENT_BLOCKERS: dict[str, tuple[str, ...]] = {
+    Q4_TARGET_POLICY.source_requirements_sha256: (
+        "ptv2_candidate_file_inventory_and_sha256",
+        "ptv3_swe_v3_authoritative_revision_file_inventory_and_sha256",
+        "source_row_schema_sha256_for_every_file",
+        "post_exclusion_post_tokenization_capacity_receipt_for_every_category",
+    ),
+    "8cb600a2a839148814b0d26a6a80a7f061db5456291cd5d708be4520521d8e6b": (
+        "qwen3_30ba3b_thinking_tokenizer_revision_snapshot_template_and_special_tokens",
+        "ptv2_candidate_file_inventory_and_sha256",
+        "ptv3_swe_v3_authoritative_revision_file_inventory_and_sha256",
+        "source_row_schema_sha256_for_every_file",
+        "post_exclusion_post_tokenization_capacity_receipt_for_every_category",
+    ),
+}
 APPROVED_QUOTAS = {
     "ptv2_stem": 300_000,
     "ptv2_multilingual_ja": 50_000,
@@ -979,13 +994,10 @@ def reconcile_source_requirements(
         if identity not in inventory_files:
             raise ComplementError("known source pin is missing from authenticated inventory")
     blockers = requirements["blocking_external_pins"]
-    expected_blockers = [
-        "ptv2_candidate_file_inventory_and_sha256",
-        "ptv3_swe_v3_authoritative_revision_file_inventory_and_sha256",
-        "source_row_schema_sha256_for_every_file",
-        "post_exclusion_post_tokenization_capacity_receipt_for_every_category",
-    ]
-    if blockers != expected_blockers:
+    expected_blockers = APPROVED_SOURCE_REQUIREMENT_BLOCKERS.get(
+        policy.source_requirements_sha256
+    )
+    if expected_blockers is None or blockers != list(expected_blockers):
         raise ComplementError("source requirement blocker vocabulary is invalid")
     grouped: dict[str, list[InventorySource]] = {}
     for source in inventory.sources:
@@ -1026,7 +1038,7 @@ def reconcile_source_requirements(
         not isinstance(capacity, dict)
         or capacity_raw != _canonical_json(capacity) + b"\n"
         or capacity.get("schema_version") != "ptv2-ptv3-complement-capacity-v1"
-        or capacity.get("scientific_identity") != SCIENTIFIC_IDENTITY
+        or capacity.get("scientific_identity") != policy.scientific_identity
         or capacity.get("status") != "sufficient"
         or capacity.get("redistribution") != "forbidden"
         or not isinstance(capacity.get("categories"), list)
