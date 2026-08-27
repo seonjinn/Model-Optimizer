@@ -5,7 +5,11 @@ This record freezes the source-staging inputs for the simplified 700K continuati
 ## PTV3 stage-ready inventory
 
 - Stage plan: `qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json`
-- Plan SHA256: `2b70e67b36bc631cb19fde2a58d91052febb3af98de6295cbaa854899bb09444`
+- Plan SHA256: `752090878ed2c5fce47683b2939f9d857be5549311b158476fce33bb79f52eac`
+- Stage container: `/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/nemo2606/nemo_rl_nightly_nemo2606_20260812_2574659.sqsh`
+- Stage container SHA256: `ab3380e548e5c62aa0bbaeaba3d1b47896151868f74e5859ac4eb311f1a069ab`
+- Container provenance source commit: `6ede0dc763c77fb6c26349b0a617a8abe2985e95`
+- Ptyche dependency probe: job `2665866`, `COMPLETED 0:0`, `pyarrow 24.0.0`
 - `nvidia/Nemotron-SFT-SWE-v3` revision: `3f73de64c1fe928a8f538fe45ccc10c228cc4c6a`
 - SWE-v3 inventory: all 96 `data/train-xxxxx-of-00096.parquet` files in source order
 - SWE-v3 aggregate source bytes: `11,677,930,655`
@@ -15,6 +19,8 @@ This record freezes the source-staging inputs for the simplified 700K continuati
 - Every PTV3 file has an exact official LFS SHA256 and byte size. The plan is accepted directly by `tools/launcher/common/specdec/stage_hf_subset.py`.
 
 The SWE-v3 inventory was obtained mechanically from the official Hugging Face tree API at the pinned revision. Regenerating at the same revision must reproduce the exact file paths, LFS SHA256 values, sizes, aggregate, and plan digest.
+
+The first staging attempt, Ptyche job `2665853`, used the vLLM 0.27.1 runtime image and failed before publication because that image does not contain `pyarrow`. The replacement image above was selected only after the exact 128 GiB probe job `2665866` imported `pyarrow 24.0.0` successfully. A preliminary 16 GiB probe (`2665863`) was rejected as inconclusive because enroot extraction of the 29.8 GB image was OOM-killed before Python started.
 
 ## PTV2 full-201 bootstrap inventory
 

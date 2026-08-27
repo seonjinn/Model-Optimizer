@@ -26,11 +26,10 @@ PTV2_INVENTORY_PATH = (
 PTV2_REVISION = "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
 SWE_V3_REVISION = "3f73de64c1fe928a8f538fe45ccc10c228cc4c6a"
 PTYCHE_CONTAINER = (
-    "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/"
-    "assets/q235-training-prereqs-vllm0271-v1/image/"
-    "vllm_openai_v0271_aarch64_20260813_2688476.sqsh"
+    "/lustre/fsw/coreai_dlalgo_llm/users/sna/containers/nemo2606/"
+    "nemo_rl_nightly_nemo2606_20260812_2574659.sqsh"
 )
-PTYCHE_CONTAINER_SHA256 = "e7be53f2754097c88f7c801da92f6d94794ec4d78d9df937fcd315a6994297f0"
+PTYCHE_CONTAINER_SHA256 = "ab3380e548e5c62aa0bbaeaba3d1b47896151868f74e5859ac4eb311f1a069ab"
 PTV2_COUNTS = {
     "chat": 12,
     "math": 2,
