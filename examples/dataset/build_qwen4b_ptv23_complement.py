@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -636,6 +637,25 @@ def _snapshot_tree_sha256(root: Path) -> str:
     return sha256(_canonical_json(entries)).hexdigest()
 
 
+def _verify_q30t_tokenizer_receipt(raw: bytes) -> None:
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "tools/launcher/common/specdec/q30t_tokenizer_receipt.py"
+    )
+    spec = importlib.util.spec_from_file_location("q30t_tokenizer_receipt", module_path)
+    if spec is None or spec.loader is None:
+        raise ComplementError("Q30 tokenizer receipt verifier is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    verifier = getattr(module, "verify_q30t_tokenizer_receipt", None)
+    if not callable(verifier):
+        raise ComplementError("Q30 tokenizer receipt verifier is invalid")
+    try:
+        verifier(raw)
+    except ValueError as error:
+        raise ComplementError("Q30 tokenizer receipt evidence does not reconcile") from error
+
+
 def load_tokenizer_trust(
     path: Path,
     *,
@@ -671,8 +691,6 @@ def load_tokenizer_trust(
         or payload["schema_version"] != policy.tokenizer_trust_schema
         or payload["repository"] != policy.tokenizer_repository
         or payload["revision"] != policy.tokenizer_revision
-        or payload["im_start_token_id"] != 151_644
-        or payload["im_end_token_id"] != 151_645
     ):
         raise ComplementError("target tokenizer identity is invalid")
     digest_fields = (
@@ -682,12 +700,17 @@ def load_tokenizer_trust(
     )
     snapshot = Path(payload["snapshot_path"])
     body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    is_q30t = policy.tokenizer_trust_schema == "qwen3-30ba3b-thinking-tokenizer-trust-v1"
     if (
         any(not _is_lower_hex(value, 64) for value in digest_fields)
         or payload["receipt_sha256"] != sha256(_canonical_json(body)).hexdigest()
         or _snapshot_tree_sha256(snapshot) != payload["snapshot_tree_sha256"]
+        or (not is_q30t and payload["im_start_token_id"] != 151_644)
+        or (not is_q30t and payload["im_end_token_id"] != 151_645)
     ):
         raise ComplementError("tokenizer trust evidence does not reconcile")
+    if is_q30t:
+        _verify_q30t_tokenizer_receipt(raw)
     return TokenizerTrust(
         file_sha256=expected_sha256,
         receipt_sha256=payload["receipt_sha256"],
