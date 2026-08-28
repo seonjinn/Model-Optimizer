@@ -1487,6 +1487,42 @@ def test_q30t_approved_loader_rebinds_name_after_read(
         receipt_module.load_q30t_tokenizer_receipt(receipt, expected_sha256=receipt_sha256)
 
 
+def test_q30t_approved_loader_bounds_growth_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent growth gets one sentinel byte and never an unbounded read."""
+    receipt = tmp_path / "TOKENIZER.json"
+    receipt.write_bytes(b"x")
+    max_bytes = 1024 * 1024
+    real_read = os.read
+    requested: list[int] = []
+    delivered = 0
+    grew = False
+
+    def grow_then_read(descriptor: int, size: int) -> bytes:
+        nonlocal delivered, grew
+        if not grew:
+            with receipt.open("ab") as stream:
+                stream.write(b"x" * (max_bytes + 1))
+            grew = True
+        remaining = max(0, max_bytes - delivered)
+        allowed = min(1024 * 1024, remaining + 1)
+        if size > allowed:
+            raise AssertionError("receipt reader exceeded remaining-budget sentinel")
+        requested.append(size)
+        block = real_read(descriptor, size)
+        delivered += len(block)
+        return block
+
+    monkeypatch.setattr(receipt_module.os, "read", grow_then_read)
+
+    with pytest.raises(ValueError, match="Q30 tokenizer receipt is too large"):
+        receipt_module._read_stable_receipt(receipt, require_single_link=True)
+
+    assert requested == [max_bytes, 1]
+    assert delivered == max_bytes + 1
+
+
 def test_q30t_builder_recomputes_tokenizer_receipt_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

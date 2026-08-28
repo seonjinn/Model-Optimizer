@@ -356,7 +356,12 @@ def _read_stable_receipt(path: Path, *, require_single_link: bool) -> tuple[str,
                 raise ValueError("Q30 tokenizer receipt must be a single-link regular file")
             digest = sha256()
             raw = bytearray()
-            while block := os.read(descriptor, 1024 * 1024):
+            while block := os.read(
+                descriptor,
+                min(_READ_BLOCK_BYTES, _MAX_Q30T_TOKENIZER_RECEIPT_BYTES - len(raw) + 1),
+            ):
+                if len(raw) + len(block) > _MAX_Q30T_TOKENIZER_RECEIPT_BYTES:
+                    raise ValueError("Q30 tokenizer receipt is too large")
                 digest.update(block)
                 raw.extend(block)
             after = os.fstat(descriptor)
