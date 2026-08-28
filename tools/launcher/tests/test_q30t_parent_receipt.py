@@ -141,7 +141,16 @@ def test_approved_parent_identities_are_exact_ptyche_completions() -> None:
         "q30t-nemo-dspark-b8-16n-922609729/milestones/step-025391/"
         "resume-checkpoint-025391"
     )
-    assert frozenset() == receipt_module.APPROVED_Q30T_PARENT_RECEIPT_FILE_SHA256S
+
+
+def test_q30t_parent_approval_roots_are_the_independently_reviewed_pair() -> None:
+    """Only the independently reviewed DFlash and DSpark roots are approved."""
+    assert receipt_module.APPROVED_Q30T_PARENT_RECEIPT_FILE_SHA256S == frozenset(  # noqa: SIM300
+        {
+            "393a2b7c5cbe2037914cbfa531d1d6fdce2bcac2f4204aa001db89d345c3a500",
+            "d5416b8fd9644802b42f04511791418bf00dd023f8c5df96593010be95ff2571",
+        }
+    )
 
 
 def test_q30t_parent_receipt_binds_manifest_files_weights_and_modelopt_state(

@@ -132,8 +132,12 @@ Q30T_PARENT_IDENTITIES: Mapping[str, ParentIdentity] = MappingProxyType(
     }
 )
 
-# Populate only after both remote receipts have been independently regenerated and reviewed.
-APPROVED_Q30T_PARENT_RECEIPT_FILE_SHA256S: frozenset[str] = frozenset()
+APPROVED_Q30T_PARENT_RECEIPT_FILE_SHA256S: frozenset[str] = frozenset(
+    {
+        "393a2b7c5cbe2037914cbfa531d1d6fdce2bcac2f4204aa001db89d345c3a500",
+        "d5416b8fd9644802b42f04511791418bf00dd023f8c5df96593010be95ff2571",
+    }
+)
 
 
 def _canonical_json(value: object) -> bytes:

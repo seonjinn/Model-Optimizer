@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import json
 import os
 import subprocess
@@ -218,6 +220,27 @@ def _authorize_contract(
     )
     if authorize_dataset:
         monkeypatch.setattr(continuation, "_authenticate_dataset_bundle", lambda contract: None)
+
+
+def test_q30_controller_uses_native_q30_parent_loader() -> None:
+    """Q30 parent authentication stays native instead of adapting the Q4 contract."""
+    tree = ast.parse(inspect.getsource(continuation))
+    imports = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+    q30_parent_imports = {
+        alias.name
+        for node in imports
+        if node.module == "common.specdec.q30t_parent_receipt"
+        for alias in node.names
+    }
+    q4_parent_imports = {
+        alias.name
+        for node in imports
+        if node.module is not None and node.module.endswith("qwen4b_ptv23_continuation")
+        for alias in node.names
+    }
+
+    assert "load_q30t_parent_receipt" in q30_parent_imports
+    assert {"AuthenticatedParentCheckpoint", "ContinuationContract"}.isdisjoint(q4_parent_imports)
 
 
 def test_q30_schedule_is_exactly_the_approved_700k_schedule() -> None:
