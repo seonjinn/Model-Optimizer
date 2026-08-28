@@ -37,14 +37,43 @@ def test_identifier_digest_preserves_duplicate_occurrences_and_order() -> None:
 
 def test_prompt_uuid_strips_storage_fields_but_preserves_order_and_tools() -> None:
     module = _load("specdec_identity")
-    messages = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    messages = [
+        {"role": "system", "content": "policy"},
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a"},
+    ]
     tools = [{"type": "function", "function": {"name": "shell"}}]
-    stored = [dict(messages[0], row_index=9), messages[1]]
+    stored = [dict(messages[0], row_index=9), messages[1], messages[2]]
     assert module.prompt_uuid(stored, tools) == module.prompt_uuid(messages, tools)
-    assert module.prompt_uuid(list(reversed(messages)), tools) != module.prompt_uuid(
+    reordered = [messages[1], messages[0], messages[2]]
+    assert module.prompt_uuid(reordered, tools) != module.prompt_uuid(
         messages, tools
     )
     assert module.prompt_uuid(messages, []) != module.prompt_uuid(messages, tools)
+
+
+def test_prompt_uuid_ignores_only_non_prompt_roles_and_storage_fields() -> None:
+    module = _load("specdec_identity")
+    prompt = [
+        {"role": "system", "content": "policy", "row_index": 7},
+        {"role": "developer", "content": "contract"},
+        {"role": "user", "content": "fix it", "cache_path": "/tmp/x"},
+    ]
+    completed = [
+        *prompt,
+        {"role": "assistant", "content": "answer A"},
+        {"role": "tool", "content": "tool result"},
+    ]
+    tools = [{"type": "function", "function": {"name": "shell", "parameters": {}}}]
+    assert module.prompt_uuid(completed, tools) == module.prompt_uuid(prompt, tools)
+    assert module.prompt_uuid(prompt, tools) != module.prompt_uuid(prompt, [])
+    assert module.prompt_uuid(prompt, tools) != module.prompt_uuid(list(reversed(prompt)), tools)
+
+
+def test_prompt_messages_rejects_a_conversation_without_prompt_roles() -> None:
+    module = _load("specdec_identity")
+    with pytest.raises(ValueError, match="prompt-bearing"):
+        module.prompt_messages([{"role": "assistant", "content": "only completion"}])
 
 
 def test_exclusion_rejects_prior_heldout_duplicate_and_collision() -> None:

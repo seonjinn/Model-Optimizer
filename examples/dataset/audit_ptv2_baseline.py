@@ -101,15 +101,6 @@ def _decode(value: object) -> object:
     return value
 
 
-def _prompt_messages(messages: object) -> list[dict[str, object]]:
-    if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
-        raise AuditError("messages must be a list of mappings")
-    prompt = [item for item in messages if item.get("role") in {"system", "developer", "user"}]
-    if not prompt:
-        raise AuditError("conversation has no prompt-bearing messages")
-    return prompt
-
-
 def _validate_source_manifest(
     path: Path | None,
     expected: BaselineExpectation,
@@ -208,9 +199,8 @@ def audit_baseline(
         for batch in parquet.iter_batches(columns=columns, batch_size=8192):
             rows = batch.to_pylist()[:remaining_rows]
             for row in rows:
-                messages = _prompt_messages(_decode(row[message_column]))
                 tools = _decode(row.get("tools")) if row.get("tools") is not None else None
-                uuid = prompt_uuid(messages, tools)
+                uuid = prompt_uuid(_decode(row[message_column]), tools)
                 occurrence_prompt_ids.append(uuid)
                 uuid_counts[uuid] += 1
             remaining_rows -= len(rows)

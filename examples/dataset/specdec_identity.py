@@ -10,11 +10,13 @@ from dataclasses import dataclass, field
 from specdec_corpus_contracts import CanonicalPrompt, canonical_json, sha256_bytes
 
 __all__ = [
+    "PROMPT_ROLES",
     "ContaminationError",
     "DuplicatePromptError",
     "ExclusionIndex",
     "UUIDCollisionError",
     "canonicalize_prompt",
+    "prompt_messages",
     "prompt_uuid",
     "validate_and_admit",
 ]
@@ -30,6 +32,8 @@ STORAGE_ONLY_FIELDS = frozenset(
         "generated_assistant_message",
     }
 )
+
+PROMPT_ROLES = frozenset({"system", "developer", "user"})
 
 
 class ContaminationError(ValueError):
@@ -54,11 +58,22 @@ def _normalize(value: object) -> object:
     return value
 
 
+def prompt_messages(messages: object) -> list[dict[str, object]]:
+    if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
+        raise ValueError("messages must be a list of mappings")
+    retained = [dict(item) for item in messages if item.get("role") in PROMPT_ROLES]
+    if not retained:
+        raise ValueError("conversation has no prompt-bearing messages")
+    return retained
+
+
 def canonicalize_prompt(
     messages: list[dict[str, object]], tools: list[dict[str, object]] | None
 ) -> bytes:
     """Preserve semantic conversation structure while removing storage metadata."""
-    return canonical_json({"messages": _normalize(messages), "tools": _normalize(tools or [])})
+    return canonical_json(
+        {"messages": _normalize(prompt_messages(messages)), "tools": _normalize(tools or [])}
+    )
 
 
 def prompt_uuid(messages: list[dict[str, object]], tools: list[dict[str, object]] | None) -> str:

@@ -125,7 +125,15 @@ def test_replay_canonicalization_preserves_source_native_semantics_and_shared_uu
     shared = json.loads(identity.canonicalize_prompt(row["messages"], row["tools"]))
 
     assert row == original
-    assert validation.canonical["messages"] == shared["messages"]
+    assert shared["messages"] == [
+        {"role": "system", "content": "You edit repositories."},
+        {
+            "role": "developer",
+            "name": "repo-policy",
+            "content": "Preserve this role.",
+        },
+        {"role": "user", "content": "Fix the test."},
+    ]
     assert validation.canonical["tools"] == shared["tools"]
     assert validation.canonical["messages"][1]["role"] == "developer"
     assert validation.canonical["messages"][3]["name"] == "assistant-native-name"

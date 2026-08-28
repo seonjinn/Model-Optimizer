@@ -11,7 +11,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
-from specdec_identity import canonicalize_prompt
+from specdec_corpus_contracts import canonical_json
+from specdec_identity import _normalize
 
 __all__ = [
     "TrajectoryValidation",
@@ -135,7 +136,9 @@ def _storage_normalized_trajectory(
         tools = []
     if not isinstance(tools, list):
         _reject("invalid_tool_declarations", f"{source_id}: tools must be a list")
-    canonical_bytes = canonicalize_prompt(deepcopy(messages), deepcopy(tools))
+    canonical_bytes = canonical_json(
+        {"messages": _normalize(deepcopy(messages)), "tools": _normalize(deepcopy(tools))}
+    )
     payload = json.loads(canonical_bytes)
     return payload["messages"], payload["tools"], canonical_bytes
 
