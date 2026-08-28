@@ -38,6 +38,28 @@ _APPROVED_ARCHIVE = (
 )
 _APPROVED_ARCHIVE_SHA256 = "4a20aee61f290c48bed22a84b4a0ae0cbdc54e3e3910854d253188c8854f5dc9"
 _RUNNER = Path(__file__).parents[1] / "common/specdec/run_q30t_runtime_archive_receipt.sbatch"
+_NON_LINUX_FAKE_TOOLS = pytest.mark.skipif(
+    sys.platform == "linux",
+    reason="Linux production rejects the non-Linux fake-tool boundary",
+)
+_LINUX_PRODUCTION_TOOL_PATHS = (
+    Path("/bin/bash"),
+    Path("/usr/bin/env"),
+    Path("/usr/bin/python3"),
+    Path("/usr/bin/python3.12"),
+    Path("/usr/bin/tar"),
+    Path("/usr/bin/zstd"),
+    Path("/usr/bin/dirname"),
+    Path("/bin/mkdir"),
+    Path("/usr/bin/uname"),
+)
+_REAL_OR_FAKE_RUNNER_TOOLS = pytest.mark.skipif(
+    sys.platform == "linux"
+    and not all(
+        path.is_file() and os.access(path, os.X_OK) for path in _LINUX_PRODUCTION_TOOL_PATHS
+    ),
+    reason="Linux host lacks the fixed production runner toolset",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -103,19 +125,24 @@ def _runner_harness(tmp_path: Path) -> RunnerHarness:
         + '\n: > "$capture"\nfor argument in "$@"; do printf \'%s\\n\' "$argument" >> "$capture"; done',
     )
     environment = {
-        "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
-        "Q30T_TEST_BASH": str(tools["bash"]),
-        "Q30T_TEST_ENV": str(tools["env"]),
-        "Q30T_TEST_PYTHON": str(tools["python3.12"]),
-        "Q30T_TEST_TAR": str(tools["tar"]),
-        "Q30T_TEST_ZSTD": str(tools["zstd"]),
-        "Q30T_TEST_DIRNAME": str(tools["dirname"]),
-        "Q30T_TEST_MKDIR": str(tools["mkdir"]),
         "SLURM_EXPORT_ENV": "NONE",
         "SLURM_JOB_ID": "12345",
         "SLURM_NNODES": "1",
         "USER": "runner-test",
     }
+    if sys.platform != "linux":
+        environment.update(
+            {
+                "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
+                "Q30T_TEST_BASH": str(tools["bash"]),
+                "Q30T_TEST_ENV": str(tools["env"]),
+                "Q30T_TEST_PYTHON": str(tools["python3.12"]),
+                "Q30T_TEST_TAR": str(tools["tar"]),
+                "Q30T_TEST_ZSTD": str(tools["zstd"]),
+                "Q30T_TEST_DIRNAME": str(tools["dirname"]),
+                "Q30T_TEST_MKDIR": str(tools["mkdir"]),
+            }
+        )
     arguments = (
         _APPROVED_ARCHIVE,
         _APPROVED_ARCHIVE_SHA256,
@@ -738,6 +765,7 @@ def test_sbatch_is_one_node_cpu_only_and_uses_exact_runtime_root() -> None:
     assert '--extraction-root "$scratch_root/runtime"' in script
 
 
+@_NON_LINUX_FAKE_TOOLS
 def test_sbatch_executes_with_authenticated_test_tools_and_sterile_env(tmp_path: Path) -> None:
     """The runner reaches Python only through explicit validated tools and env -i."""
     harness = _runner_harness(tmp_path)
@@ -769,6 +797,7 @@ def test_sbatch_behaviorally_rejects_wrong_arity(tmp_path: Path) -> None:
     ("argument_index", "replacement"),
     [(0, "/lustre/foreign.tar.zst"), (1, "0" * 64)],
 )
+@_REAL_OR_FAKE_RUNNER_TOOLS
 def test_sbatch_behaviorally_rejects_wrong_fixed_archive_identity(
     tmp_path: Path, argument_index: int, replacement: str
 ) -> None:
@@ -795,6 +824,7 @@ def test_sbatch_behaviorally_rejects_wrong_fixed_archive_identity(
         ("SLURM_TRES_PER_NODE", "gpu:1"),
     ],
 )
+@_REAL_OR_FAKE_RUNNER_TOOLS
 def test_sbatch_behaviorally_rejects_gpu_environment(tmp_path: Path, name: str, value: str) -> None:
     """GPU variables and GPU TRES fail the CPU-only allocation boundary."""
     harness = _runner_harness(tmp_path)
@@ -805,6 +835,7 @@ def test_sbatch_behaviorally_rejects_gpu_environment(tmp_path: Path, name: str, 
     assert "requires a CPU-only allocation" in result.stderr
 
 
+@_NON_LINUX_FAKE_TOOLS
 def test_sbatch_behaviorally_rejects_output_parent_mismatch(tmp_path: Path) -> None:
     """The seventh argument must be the exact output pathname parent."""
     harness = _runner_harness(tmp_path)
@@ -838,10 +869,51 @@ def test_sbatch_behaviorally_rejects_exported_spoofed_ostype(tmp_path: Path) -> 
     assert not harness.capture_path.exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux-specific production boundary")
+@pytest.mark.parametrize(
+    "override_name",
+    [
+        "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES",
+        "Q30T_TEST_BASH",
+        "Q30T_TEST_ENV",
+        "Q30T_TEST_PYTHON",
+        "Q30T_TEST_TAR",
+        "Q30T_TEST_ZSTD",
+        "Q30T_TEST_DIRNAME",
+        "Q30T_TEST_MKDIR",
+    ],
+)
+def test_sbatch_linux_rejects_every_fake_tool_override_before_execution(
+    tmp_path: Path, override_name: str
+) -> None:
+    """Authenticated Linux identity makes each test override fail before its marker."""
+    harness = _runner_harness(tmp_path)
+    override_values = {
+        "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
+        "Q30T_TEST_BASH": str(harness.tools["bash"]),
+        "Q30T_TEST_ENV": str(harness.tools["env"]),
+        "Q30T_TEST_PYTHON": str(harness.tools["python3.12"]),
+        "Q30T_TEST_TAR": str(harness.tools["tar"]),
+        "Q30T_TEST_ZSTD": str(harness.tools["zstd"]),
+        "Q30T_TEST_DIRNAME": str(harness.tools["dirname"]),
+        "Q30T_TEST_MKDIR": str(harness.tools["mkdir"]),
+    }
+
+    result = _run_runner(
+        harness,
+        environment_updates={override_name: override_values[override_name]},
+    )
+
+    assert result.returncode == 2
+    assert "test executable configuration is invalid" in result.stderr
+    assert not harness.capture_path.exists()
+
+
 @pytest.mark.parametrize(
     "tool_name",
     ["bash", "env", "python3.12", "tar", "zstd", "dirname", "mkdir"],
 )
+@_NON_LINUX_FAKE_TOOLS
 def test_sbatch_behaviorally_rejects_symlink_tool_substitution(
     tmp_path: Path, tool_name: str
 ) -> None:
@@ -858,6 +930,7 @@ def test_sbatch_behaviorally_rejects_symlink_tool_substitution(
     assert not harness.capture_path.exists()
 
 
+@_NON_LINUX_FAKE_TOOLS
 def test_sbatch_behaviorally_rejects_relative_tool_substitution(tmp_path: Path) -> None:
     """A relative executable override is rejected before invocation."""
     harness = _runner_harness(tmp_path)
