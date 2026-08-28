@@ -208,8 +208,8 @@ def _authorize_contract(
     )
     monkeypatch.setattr(
         continuation,
-        "verify_q30t_tokenizer_receipt",
-        lambda raw: {
+        "load_q30t_tokenizer_receipt",
+        lambda path, *, expected_sha256: {
             "repository": contract.target_model,
             "revision": contract.target_revision,
             "snapshot_path": str(contract.target_checkpoint_path),
@@ -385,27 +385,36 @@ def test_q30_contract_authenticates_parent_tokenizer_and_input_bytes(
     """Every launch-time file identity and both external receipts are consumed."""
     contract = _contract(tmp_path)
     _authorize_contract(monkeypatch, contract)
-    calls: list[tuple[Path, str]] = []
+    parent_calls: list[tuple[Path, str]] = []
+    tokenizer_calls: list[tuple[Path, str]] = []
 
     def load_parent(path: Path, expected_sha256: str) -> Q30TParentReceipt:
-        calls.append((path, expected_sha256))
+        parent_calls.append((path, expected_sha256))
         return _parent(contract)
 
     monkeypatch.setattr(continuation, "load_q30t_parent_receipt", load_parent)
-    monkeypatch.setattr(
-        continuation,
-        "verify_q30t_tokenizer_receipt",
-        lambda raw: {
+
+    def load_tokenizer(path: Path, *, expected_sha256: str) -> dict[str, object]:
+        tokenizer_calls.append((path, expected_sha256))
+        return {
             "repository": contract.target_model,
             "revision": contract.target_revision,
             "snapshot_path": str(contract.target_checkpoint_path),
             "snapshot_tree_sha256": contract.target_tree_sha256,
-        },
+        }
+
+    monkeypatch.setattr(
+        continuation,
+        "load_q30t_tokenizer_receipt",
+        load_tokenizer,
     )
     monkeypatch.setattr(continuation, "_authenticate_dataset_bundle", lambda contract: None)
 
     build_q30_training_command(contract, stage="canary")
-    assert calls == [(contract.parent_receipt_path, contract.parent_receipt_file_sha256)]
+    assert parent_calls == [(contract.parent_receipt_path, contract.parent_receipt_file_sha256)]
+    assert tokenizer_calls == [
+        (contract.tokenizer_receipt_path, contract.tokenizer_receipt_file_sha256)
+    ]
 
     contract.dataset_path.write_bytes(b"tampered\n")
     with pytest.raises(ValueError, match="dataset SHA-256"):
@@ -670,8 +679,8 @@ def test_q30_contract_rejects_cross_bound_parent_or_tokenizer_substitution(
     )
     monkeypatch.setattr(
         continuation,
-        "verify_q30t_tokenizer_receipt",
-        lambda raw: {
+        "load_q30t_tokenizer_receipt",
+        lambda path, *, expected_sha256: {
             "repository": contract.target_model,
             "revision": contract.target_revision,
             "snapshot_path": str(contract.target_checkpoint_path),

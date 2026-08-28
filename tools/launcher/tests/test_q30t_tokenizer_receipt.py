@@ -1395,6 +1395,98 @@ def test_q30t_receipt_rejects_missing_canonical_newline(tmp_path: Path) -> None:
         verify_q30t_tokenizer_receipt(receipt.rstrip(b"\n"))
 
 
+def test_q30t_approved_loader_hashes_membership_and_replays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The approved loader binds caller bytes and replays snapshot evidence."""
+    snapshot = _make_q30_snapshot(tmp_path)
+    raw = build_q30t_tokenizer_receipt(snapshot, Q30_REPOSITORY, FIXTURE_Q30_REVISION)
+    receipt = tmp_path / "TOKENIZER.json"
+    receipt.write_bytes(raw)
+    receipt_sha256 = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(
+        receipt_module,
+        "APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S",
+        frozenset({receipt_sha256}),
+    )
+
+    loaded = receipt_module.load_q30t_tokenizer_receipt(receipt, expected_sha256=receipt_sha256)
+
+    assert loaded["revision"] == FIXTURE_Q30_REVISION
+    with pytest.raises(ValueError, match="caller SHA-256 mismatch"):
+        receipt_module.load_q30t_tokenizer_receipt(receipt, expected_sha256="0" * 64)
+
+
+def test_q30t_approved_loader_rejects_unreviewed_valid_receipt(tmp_path: Path) -> None:
+    """A valid receipt cannot self-authorize through its caller-provided hash."""
+    raw = build_q30t_tokenizer_receipt(
+        _make_q30_snapshot(tmp_path), Q30_REPOSITORY, FIXTURE_Q30_REVISION
+    )
+    receipt = tmp_path / "TOKENIZER.json"
+    receipt.write_bytes(raw)
+
+    with pytest.raises(ValueError, match="not independently reviewed"):
+        receipt_module.load_q30t_tokenizer_receipt(
+            receipt, expected_sha256=hashlib.sha256(raw).hexdigest()
+        )
+
+
+def test_q30t_approved_loader_rejects_hardlinked_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extra hardlink invalidates the approved receipt's path identity."""
+    raw = build_q30t_tokenizer_receipt(
+        _make_q30_snapshot(tmp_path), Q30_REPOSITORY, FIXTURE_Q30_REVISION
+    )
+    receipt = tmp_path / "TOKENIZER.json"
+    receipt.write_bytes(raw)
+    hardlink = tmp_path / "TOKENIZER-hardlink.json"
+    os.link(receipt, hardlink)
+    receipt_sha256 = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(
+        receipt_module,
+        "APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S",
+        frozenset({receipt_sha256}),
+    )
+
+    with pytest.raises(ValueError, match="single-link regular file"):
+        receipt_module.load_q30t_tokenizer_receipt(hardlink, expected_sha256=receipt_sha256)
+
+
+def test_q30t_approved_loader_rebinds_name_after_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pathname replacement after descriptor reading cannot be accepted."""
+    raw = build_q30t_tokenizer_receipt(
+        _make_q30_snapshot(tmp_path), Q30_REPOSITORY, FIXTURE_Q30_REVISION
+    )
+    receipt = tmp_path / "TOKENIZER.json"
+    receipt.write_bytes(raw)
+    replacement = tmp_path / "TOKENIZER-replacement.json"
+    replacement.write_bytes(raw)
+    receipt_sha256 = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(
+        receipt_module,
+        "APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S",
+        frozenset({receipt_sha256}),
+    )
+    real_read = os.read
+    rebound = False
+
+    def replace_after_read(descriptor: int, size: int) -> bytes:
+        nonlocal rebound
+        block = real_read(descriptor, size)
+        if not block and not rebound:
+            os.replace(replacement, receipt)
+            rebound = True
+        return block
+
+    monkeypatch.setattr(receipt_module.os, "read", replace_after_read)
+
+    with pytest.raises(ValueError, match="Q30 tokenizer receipt changed while reading"):
+        receipt_module.load_q30t_tokenizer_receipt(receipt, expected_sha256=receipt_sha256)
+
+
 def test_q30t_builder_recomputes_tokenizer_receipt_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

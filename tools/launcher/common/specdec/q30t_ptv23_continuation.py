@@ -22,7 +22,7 @@ from common.specdec.q30t_parent_receipt import (
     load_q30t_parent_receipt,
     require_matching_historical_lineage,
 )
-from common.specdec.q30t_tokenizer_receipt import verify_q30t_tokenizer_receipt
+from common.specdec.q30t_tokenizer_receipt import load_q30t_tokenizer_receipt
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -899,14 +899,10 @@ def _authenticate_contract(contract: Q30TContinuationContract) -> tuple[str, str
         raise ValueError("training entrypoint and method config must use canonical source paths")
     _require_file_sha256(contract.dataset_path, contract.dataset_sha256, label="dataset")
     _authenticate_dataset_bundle(contract)
-    tokenizer_receipt = _require_file_sha256(
+    tokenizer = load_q30t_tokenizer_receipt(
         contract.tokenizer_receipt_path,
-        contract.tokenizer_receipt_file_sha256,
-        label="tokenizer receipt",
-        retain=True,
+        expected_sha256=contract.tokenizer_receipt_file_sha256,
     )
-    assert tokenizer_receipt is not None
-    tokenizer = verify_q30t_tokenizer_receipt(tokenizer_receipt)
     expected_tokenizer = (
         contract.target_model,
         contract.target_revision,

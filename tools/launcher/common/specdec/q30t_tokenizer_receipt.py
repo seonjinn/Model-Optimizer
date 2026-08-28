@@ -25,18 +25,24 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
+    "APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S",
     "Q30T_TOKENIZER_REPOSITORY",
     "Q30T_TOKENIZER_TRUST_SCHEMA",
     "build_q30t_tokenizer_receipt",
+    "load_q30t_tokenizer_receipt",
     "main",
     "snapshot_tree_sha256",
     "verify_q30t_tokenizer_receipt",
 ]
 
+APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S: frozenset[str] = frozenset(
+    {"5ba642c455e60b67eca295dce92dd7da47292fdba66c5f9d269669c14cafc509"}
+)
 Q30T_TOKENIZER_REPOSITORY = "Qwen/Qwen3-30B-A3B-Thinking-2507"
 Q30T_TOKENIZER_TRUST_SCHEMA = "qwen3-30ba3b-thinking-tokenizer-trust-v1"
 _IM_START = "<|im_start|>"
 _IM_END = "<|im_end|>"
+_MAX_Q30T_TOKENIZER_RECEIPT_BYTES = 1024 * 1024
 _MAX_TOKENIZER_JSON_BYTES = 16 * 1024 * 1024
 _READ_BLOCK_BYTES = 1024 * 1024
 
@@ -332,6 +338,65 @@ def verify_q30t_tokenizer_receipt(receipt: bytes) -> dict[str, object]:
     if any(payload[name] != value for name, value in observed.items()):
         raise ValueError("Q30 tokenizer receipt evidence does not reconcile")
     return payload
+
+
+def _read_stable_receipt(path: Path, *, require_single_link: bool) -> tuple[str, bytes]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
+    try:
+        expected = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or (require_single_link and before.st_nlink != 1)
+                or before.st_size > _MAX_Q30T_TOKENIZER_RECEIPT_BYTES
+            ):
+                raise ValueError("Q30 tokenizer receipt must be a single-link regular file")
+            digest = sha256()
+            raw = bytearray()
+            while block := os.read(descriptor, 1024 * 1024):
+                digest.update(block)
+                raw.extend(block)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    finally:
+        os.close(parent_fd)
+
+    def identity(value: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    if (
+        identity(expected) != identity(before)
+        or identity(before) != identity(after)
+        or identity(after) != identity(named)
+        or len(raw) != before.st_size
+    ):
+        raise ValueError("Q30 tokenizer receipt changed while reading")
+    return digest.hexdigest(), bytes(raw)
+
+
+def load_q30t_tokenizer_receipt(path: Path, *, expected_sha256: str) -> dict[str, object]:
+    """Load one independently reviewed receipt and replay its snapshot evidence."""
+    if not _is_lower_hex(expected_sha256, 64):
+        raise ValueError("Q30 tokenizer receipt caller SHA-256 is invalid")
+    file_sha256, raw = _read_stable_receipt(path, require_single_link=True)
+    if file_sha256 != expected_sha256:
+        raise ValueError("Q30 tokenizer receipt caller SHA-256 mismatch")
+    if expected_sha256 not in APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S:
+        raise ValueError("Q30 tokenizer receipt is not independently reviewed")
+    return verify_q30t_tokenizer_receipt(raw)
 
 
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
