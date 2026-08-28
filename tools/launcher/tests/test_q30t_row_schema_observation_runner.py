@@ -11,6 +11,7 @@ import inspect
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -41,10 +42,37 @@ def _scratch_allocator_test_source(scratch_root: Path) -> str:
     source = runner.split(marker, 1)[1].split("\nPY\n", 1)[0]
     source = source.replace(
         'scratch_root_path = "/raid/scratch"',
-        f"scratch_root_path = {str(scratch_root.resolve())!r}",
+        f"scratch_root_path = {str(scratch_root.absolute())!r}",
     )
     source = source.replace("required_root_uids = {0}", "required_root_uids = {0, os.getuid()}")
+    source = source.replace("metadata.st_gid != 0", "metadata.st_gid != os.getgid()")
+    source = source.replace("or mode != 0o1777:", "or mode not in {0o700, 0o1777}:")
     return source
+
+
+def _run_root_component_policy(
+    *,
+    mode: int,
+    owner: int,
+    group: int,
+    effective_groups: set[int],
+    shared_root: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    allocator = _runner_embedded_python("Q30T_SCRATCH_ALLOCATOR")
+    primitives = allocator.rsplit("\nmain()", 1)[0]
+    exercise = (
+        primitives
+        + f"\neffective_group_ids = {effective_groups!r}\n"
+        + f"metadata = os.stat_result(({stat.S_IFDIR | mode}, 1, 1, 2, {owner}, {group}, 0, 0, 0, 0))\n"
+        + f"require_root_component(metadata, 'scratch root ancestor', shared_root={shared_root!r})\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-I", "-S", "-"],
+        input=exercise,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def _run_current_materialization_segment(
@@ -219,6 +247,83 @@ def test_scratch_allocator_falls_back_when_slurm_tmpdir_is_absent(tmp_path: Path
     assert (path.stat().st_dev, path.stat().st_ino) == (int(device), int(inode))
 
 
+def test_root_group_writable_raid_ancestor_is_safe_for_a_non_root_group_user() -> None:
+    """Ptyche's root:root mode-0775 /raid is an approved fixed ancestor."""
+    result = _run_root_component_policy(
+        mode=0o775,
+        owner=0,
+        group=0,
+        effective_groups={20, 100},
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("owner", "group", "mode", "effective_groups"),
+    [
+        (1000, 0, 0o775, {20, 100}),
+        (0, 20, 0o775, {20, 100}),
+        (0, 0, 0o775, {0, 20}),
+        (0, 0, 0o777, {20, 100}),
+    ],
+)
+def test_writable_scratch_ancestors_reject_untrusted_owner_group_or_permissions(
+    owner: int, group: int, mode: int, effective_groups: set[int]
+) -> None:
+    """Only root:root group-write outside the caller's groups is safe."""
+    result = _run_root_component_policy(
+        mode=mode,
+        owner=owner,
+        group=group,
+        effective_groups=effective_groups,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe" in result.stderr or "root-owned" in result.stderr
+
+
+def test_final_shared_scratch_root_accepts_exact_root_sticky_mode_1777() -> None:
+    """The final shared boundary retains Ptyche's root:root sticky-1777 contract."""
+    result = _run_root_component_policy(
+        mode=0o1777,
+        owner=0,
+        group=0,
+        effective_groups={20, 100},
+        shared_root=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_final_shared_scratch_root_rejects_non_exact_sticky_mode() -> None:
+    """Sticky semantics do not broaden the fixed final mode beyond 1777."""
+    result = _run_root_component_policy(
+        mode=0o1770,
+        owner=0,
+        group=0,
+        effective_groups={20, 100},
+        shared_root=True,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe write permissions" in result.stderr
+
+
+def test_final_shared_scratch_root_rejects_non_root_group() -> None:
+    """The fixed final boundary must remain root:root, not only root-owned."""
+    result = _run_root_component_policy(
+        mode=0o1777,
+        owner=0,
+        group=20,
+        effective_groups={100},
+        shared_root=True,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe write permissions" in result.stderr
+
+
 def test_materialization_never_truncates_through_a_descendant_symlink(tmp_path: Path) -> None:
     """An attacker-created examples symlink cannot redirect blob writes to foreign data."""
     scratch_root = tmp_path / "scratch"
@@ -365,6 +470,7 @@ def test_scratch_allocator_preserves_safe_slurm_tmpdir_path(tmp_path: Path) -> N
     scratch_root = tmp_path / "raid" / "scratch"
     slurm_tmpdir = scratch_root / "slurm-job-75209087"
     slurm_tmpdir.mkdir(parents=True, mode=0o700)
+    scratch_root.chmod(0o700)
     foreign = slurm_tmpdir / "foreign.keep"
     foreign.write_bytes(b"preserve-exactly")
     foreign_identity = (foreign.stat().st_dev, foreign.stat().st_ino)
@@ -467,6 +573,7 @@ def test_scratch_allocator_rejects_unsafe_existing_user_dir_without_deletion(
     scratch_root = tmp_path / "raid" / "scratch"
     user_dir = scratch_root / "test_user"
     user_dir.mkdir(parents=True, mode=0o700)
+    scratch_root.chmod(0o700)
     user_dir.chmod(0o755)
     foreign = user_dir / "foreign.keep"
     foreign.write_bytes(b"do-not-delete")
@@ -513,6 +620,32 @@ def test_scratch_allocator_rejects_a_symlinked_user_dir_and_preserves_target(
     assert "component is unavailable" in result.stderr
     assert sentinel.read_bytes() == b"unchanged"
     assert {path.name for path in foreign_target.iterdir()} == {"sentinel"}
+
+
+def test_scratch_allocator_rejects_a_symlinked_root_ancestor_and_preserves_target(
+    tmp_path: Path,
+) -> None:
+    """The fixed-root component walk never follows a rebound ancestor symlink."""
+    foreign_raid = tmp_path / "foreign-raid"
+    scratch_root = foreign_raid / "scratch"
+    scratch_root.mkdir(parents=True, mode=0o700)
+    sentinel = foreign_raid / "foreign.keep"
+    sentinel.write_bytes(b"unchanged-root-target")
+    (tmp_path / "raid").symlink_to(foreign_raid, target_is_directory=True)
+    allocator = _scratch_allocator_test_source(tmp_path / "raid" / "scratch")
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", "test_user", "75209087", ""],
+        input=allocator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "component is unavailable" in result.stderr
+    assert sentinel.read_bytes() == b"unchanged-root-target"
+    assert not (scratch_root / "test_user").exists()
 
 
 def test_scratch_allocator_rejects_unsafe_shared_root_mode(tmp_path: Path) -> None:

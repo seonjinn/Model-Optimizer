@@ -100,6 +100,7 @@ import sys
 
 scratch_root_path = "/raid/scratch"
 required_root_uids = {0}
+effective_group_ids = {os.getegid(), *os.getgroups()}
 open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
@@ -123,7 +124,17 @@ def require_root_component(metadata, label, *, shared_root=False):
     mode = stat.S_IMODE(metadata.st_mode)
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in required_root_uids:
         fail(f"{label} is not an approved root-owned directory")
-    if mode & 0o022 and (not shared_root or not metadata.st_mode & stat.S_ISVTX):
+    if shared_root:
+        if metadata.st_gid != 0 or mode != 0o1777:
+            fail(f"{label} has unsafe write permissions")
+        return
+    safe_root_group_write = (
+        mode & 0o020
+        and metadata.st_uid == 0
+        and metadata.st_gid == 0
+        and 0 not in effective_group_ids
+    )
+    if mode & 0o002 or mode & 0o020 and not safe_root_group_write:
         fail(f"{label} has unsafe write permissions")
 
 
