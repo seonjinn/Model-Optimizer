@@ -9,7 +9,8 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import pyarrow as pa  # pyright: ignore[reportMissingImports]
 import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
@@ -22,15 +23,19 @@ from examples.dataset.observe_q30t_ptv23_row_schemas import (
     observe_stage_schemas,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
-
 _TEST_RUNTIME = {
     "python_executable": "/usr/bin/python3.12",
     "python_executable_bytes": 123456,
     "python_executable_sha256": "b" * 64,
     "python_version": "3.12.0",
+    "python_stdlib_root": "/usr/lib/python3.12",
+    "python_stdlib_tree_file_count": 100,
+    "python_stdlib_tree_bytes": 1000,
+    "python_stdlib_tree_sha256": "c" * 64,
+    "site_packages_root": "/usr/lib/python3.12/site-packages",
+    "site_packages_tree_file_count": 200,
+    "site_packages_tree_bytes": 2000,
+    "site_packages_tree_sha256": "d" * 64,
     "pyarrow_version": "test-pyarrow",
     "pyarrow_origin": "/usr/lib/python3.12/site-packages/pyarrow/__init__.py",
     "pyarrow_tree_file_count": 1,
@@ -508,6 +513,26 @@ def test_observation_binds_the_authenticated_python_and_pyarrow_runtime(tmp_path
     observation = json.loads(observe_stage_schemas(fixture.inputs))
 
     assert observation["runtime"] == _TEST_RUNTIME
+
+
+def test_runtime_evidence_binds_stdlib_and_complete_site_packages() -> None:
+    """Runtime evidence must cover code loaded before and during the PyArrow import."""
+    assert _TEST_RUNTIME["python_stdlib_tree_file_count"] > 0
+    assert len(_TEST_RUNTIME["python_stdlib_tree_sha256"]) == 64
+    assert _TEST_RUNTIME["site_packages_tree_file_count"] > 0
+    assert len(_TEST_RUNTIME["site_packages_tree_sha256"]) == 64
+
+
+def test_runtime_rejects_a_loaded_dependency_outside_authenticated_trees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    foreign = tmp_path / "foreign_dependency.py"
+    foreign.write_text("FOREIGN = True\n")
+    module = type("ForeignModule", (), {"__file__": str(foreign)})()
+    monkeypatch.setitem(observer_module.sys.modules, "foreign_dependency", module)
+
+    with pytest.raises(ObservationError, match="outside authenticated runtime"):
+        observer_module._require_loaded_origins(Path("/usr/lib/python3.12"), Path("/approved/site"))
 
 
 def test_runtime_authentication_fails_closed_on_a_user_owned_python(

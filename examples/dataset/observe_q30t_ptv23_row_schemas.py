@@ -13,7 +13,6 @@ import json
 import os
 import stat
 import sys
-import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -31,8 +30,8 @@ _PTV2_PLAN_NAME = "SOURCE_PLAN.json"
 _PTV2_COMPLETION_NAME = "SOURCE_MANIFEST_COMPLETION.json"
 _PTV3_MANIFEST_NAME = "MANIFEST.json"
 _PTV3_COMPLETION_NAME = "completion.json"
-_MAX_RUNTIME_FILES = 4096
-_MAX_RUNTIME_BYTES = 1024 * 1024 * 1024
+_MAX_RUNTIME_FILES = 250_000
+_MAX_RUNTIME_BYTES = 64 * 1024 * 1024 * 1024
 _MAX_PYTHON_EXECUTABLE_BYTES = 1024 * 1024 * 1024
 
 
@@ -146,11 +145,11 @@ def _approved_regular_file_sha256(path: Path, label: str, maximum_bytes: int) ->
     return size, digest.hexdigest()
 
 
-def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
+def _runtime_tree_inventory(root: Path, label: str) -> tuple[int, int, str]:
     root_before = os.stat(root, follow_symlinks=False)
-    _require_root_owned_nonwritable(root_before, "PyArrow package root")
+    _require_root_owned_nonwritable(root_before, f"{label} root")
     if not stat.S_ISDIR(root_before.st_mode):
-        raise ObservationError("PyArrow package root is not a directory")
+        raise ObservationError(f"{label} root is not a directory")
     digest = hashlib.sha256()
     file_count = 0
     total_bytes = 0
@@ -159,21 +158,21 @@ def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
         filenames.sort()
         directory_path = Path(directory)
         directory_metadata = os.stat(directory_path, follow_symlinks=False)
-        _require_root_owned_nonwritable(directory_metadata, "PyArrow package directory")
+        _require_root_owned_nonwritable(directory_metadata, f"{label} directory")
         if not stat.S_ISDIR(directory_metadata.st_mode):
-            raise ObservationError("PyArrow package inventory contains a non-directory")
+            raise ObservationError(f"{label} inventory contains a non-directory")
         for name in names:
             child = os.stat(directory_path / name, follow_symlinks=False)
             if stat.S_ISLNK(child.st_mode):
-                raise ObservationError("PyArrow package inventory contains a symlink")
+                raise ObservationError(f"{label} inventory contains a symlink")
         for name in filenames:
             path = directory_path / name
             named = os.stat(path, follow_symlinks=False)
             if file_count >= _MAX_RUNTIME_FILES or named.st_size > _MAX_RUNTIME_BYTES - total_bytes:
-                raise ObservationError("PyArrow package inventory exceeds its bound")
-            _require_root_owned_nonwritable(named, "PyArrow package file")
-            if not stat.S_ISREG(named.st_mode) or named.st_nlink != 1:
-                raise ObservationError("PyArrow package inventory contains an unsafe file")
+                raise ObservationError(f"{label} inventory exceeds its bound")
+            _require_root_owned_nonwritable(named, f"{label} file")
+            if not stat.S_ISREG(named.st_mode) or named.st_nlink < 1:
+                raise ObservationError(f"{label} inventory contains an unsafe file")
             descriptor = os.open(
                 path,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
@@ -181,23 +180,23 @@ def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
             try:
                 opened = os.fstat(descriptor)
                 if _identity(opened) != _identity(named):
-                    raise ObservationError("PyArrow package file changed while opening")
+                    raise ObservationError(f"{label} file changed while opening")
                 file_digest = hashlib.sha256()
                 size = 0
                 while size < named.st_size:
                     block = os.read(descriptor, min(_READ_BLOCK_BYTES, named.st_size - size))
                     if not block:
-                        raise ObservationError("PyArrow package file shrank while hashing")
+                        raise ObservationError(f"{label} file shrank while hashing")
                     file_digest.update(block)
                     size += len(block)
                 if os.read(descriptor, 1):
-                    raise ObservationError("PyArrow package file grew while hashing")
+                    raise ObservationError(f"{label} file grew while hashing")
                 file_sha256 = file_digest.hexdigest()
                 after = os.fstat(descriptor)
             finally:
                 os.close(descriptor)
             if _identity(opened) != _identity(after) or size != named.st_size:
-                raise ObservationError("PyArrow package file changed while hashing")
+                raise ObservationError(f"{label} file changed while hashing")
             file_count += 1
             total_bytes += size
             relative = path.relative_to(root).as_posix().encode()
@@ -207,8 +206,44 @@ def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
             digest.update(bytes.fromhex(file_sha256))
     root_after = os.stat(root, follow_symlinks=False)
     if _identity(root_before) != _identity(root_after) or file_count < 1:
-        raise ObservationError("PyArrow package root changed while hashing")
+        raise ObservationError(f"{label} root changed while hashing")
     return file_count, total_bytes, digest.hexdigest()
+
+
+def _runtime_evidence_tuple(runtime: Mapping[str, object], prefix: str) -> tuple[int, int, str]:
+    values = (
+        runtime.get(f"{prefix}_file_count"),
+        runtime.get(f"{prefix}_bytes"),
+        runtime.get(f"{prefix}_sha256"),
+    )
+    if (
+        type(values[0]) is not int
+        or values[0] < 1
+        or type(values[1]) is not int
+        or values[1] < 1
+        or not _is_sha256(values[2])
+    ):
+        raise ObservationError(f"runtime bootstrap has invalid {prefix} evidence")
+    return cast("tuple[int, int, str]", values)
+
+
+def _require_loaded_origins(stdlib_root: Path, site_root: Path) -> None:
+    approved_roots = (stdlib_root, site_root)
+    for name, module in tuple(sys.modules.items()):
+        origin_value = getattr(module, "__file__", None)
+        if origin_value is None or origin_value in {"built-in", "frozen"}:
+            continue
+        if name == "__main__" and origin_value == "<stdin>":
+            continue
+        origin = Path(origin_value)
+        if str(origin).startswith("/proc/self/fd/"):
+            continue
+        try:
+            resolved = origin.resolve(strict=True)
+        except OSError as error:
+            raise ObservationError(f"loaded module origin is unavailable: {name}") from error
+        if not any(resolved == root or root in resolved.parents for root in approved_roots):
+            raise ObservationError(f"loaded module origin is outside authenticated runtime: {name}")
 
 
 def _authenticate_runtime() -> dict[str, object]:
@@ -217,6 +252,10 @@ def _authenticate_runtime() -> dict[str, object]:
         raise ObservationError("PyArrow is already loaded before runtime authentication")
     if sys.flags.isolated != 1 or sys.flags.no_site != 1:
         raise ObservationError("runtime authentication requires Python -I -S")
+    bootstrap = sys.modules.get("_q30t_runtime_bootstrap")
+    evidence = getattr(bootstrap, "evidence", None)
+    if not isinstance(evidence, dict):
+        raise ObservationError("authenticated runtime bootstrap evidence is unavailable")
     python_target = _approved_executable(Path(sys.executable))
     try:
         target_metadata = os.stat(python_target, follow_symlinks=False)
@@ -231,21 +270,29 @@ def _authenticate_runtime() -> dict[str, object]:
     python_size, python_sha256 = _approved_regular_file_sha256(
         python_target, "Python executable", _MAX_PYTHON_EXECUTABLE_BYTES
     )
-    site_candidates = {
-        Path(value)
-        for key in ("purelib", "platlib")
-        if (value := sysconfig.get_paths().get(key)) is not None
-    }
-    package_parents = [path for path in sorted(site_candidates) if (path / "pyarrow").is_dir()]
-    if len(package_parents) != 1:
-        raise ObservationError("approved PyArrow site-package location is not unique")
-    package_parent = package_parents[0]
-    parent_metadata = os.stat(package_parent, follow_symlinks=False)
-    _require_root_owned_nonwritable(parent_metadata, "PyArrow site-package parent")
-    if not stat.S_ISDIR(parent_metadata.st_mode):
-        raise ObservationError("PyArrow site-package parent is not a directory")
+    if evidence.get("python_executable") != str(python_target) or (
+        evidence.get("python_executable_bytes"),
+        evidence.get("python_executable_sha256"),
+    ) != (python_size, python_sha256):
+        raise ObservationError("Python differs from authenticated bootstrap evidence")
+    if evidence.get("python_version") != (
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    ):
+        raise ObservationError("Python version differs from authenticated bootstrap evidence")
+    stdlib_value = evidence.get("python_stdlib_root")
+    site_value = evidence.get("site_packages_root")
+    if type(stdlib_value) is not str or type(site_value) is not str:
+        raise ObservationError("runtime bootstrap root evidence is invalid")
+    stdlib_root = Path(stdlib_value)
+    package_parent = Path(site_value)
+    stdlib_inventory = _runtime_evidence_tuple(evidence, "python_stdlib_tree")
+    site_inventory = _runtime_evidence_tuple(evidence, "site_packages_tree")
+    if _runtime_tree_inventory(stdlib_root, "Python stdlib") != stdlib_inventory:
+        raise ObservationError("Python stdlib changed after runtime bootstrap")
+    if _runtime_tree_inventory(package_parent, "site-packages") != site_inventory:
+        raise ObservationError("site-packages changed after runtime bootstrap")
     root = package_parent / "pyarrow"
-    inventory = _pyarrow_tree_inventory(root)
+    inventory = _runtime_tree_inventory(root, "PyArrow package")
     sys.path.insert(0, str(package_parent))
     spec = importlib.util.find_spec("pyarrow")
     if spec is None or spec.origin is None or spec.submodule_search_locations is None:
@@ -261,13 +308,11 @@ def _authenticate_runtime() -> dict[str, object]:
     imported_origin = Path(getattr(pyarrow, "__file__", ""))
     if type(version) is not str or not version or imported_origin != origin:
         raise ObservationError("imported PyArrow differs from its authenticated origin")
-    if _pyarrow_tree_inventory(root) != inventory:
+    if _runtime_tree_inventory(root, "PyArrow package") != inventory:
         raise ObservationError("PyArrow package changed across import")
+    _require_loaded_origins(stdlib_root, package_parent)
     return {
-        "python_executable": str(python_target),
-        "python_executable_bytes": python_size,
-        "python_executable_sha256": python_sha256,
-        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        **evidence,
         "pyarrow_version": version,
         "pyarrow_origin": str(origin),
         "pyarrow_tree_file_count": inventory[0],
@@ -291,13 +336,24 @@ def _require_imported_runtime(runtime: Mapping[str, object]) -> None:
         runtime["python_executable_sha256"],
     ):
         raise ObservationError("Python executable changed while observing")
+    stdlib_root = Path(cast("str", runtime["python_stdlib_root"]))
+    site_root = Path(cast("str", runtime["site_packages_root"]))
+    if _runtime_tree_inventory(stdlib_root, "Python stdlib") != _runtime_evidence_tuple(
+        runtime, "python_stdlib_tree"
+    ):
+        raise ObservationError("Python stdlib changed while observing")
+    if _runtime_tree_inventory(site_root, "site-packages") != _runtime_evidence_tuple(
+        runtime, "site_packages_tree"
+    ):
+        raise ObservationError("site-packages changed while observing")
     pyarrow_root = Path(cast("str", runtime["pyarrow_origin"])).parent
-    if _pyarrow_tree_inventory(pyarrow_root) != (
+    if _runtime_tree_inventory(pyarrow_root, "PyArrow package") != (
         runtime["pyarrow_tree_file_count"],
         runtime["pyarrow_tree_bytes"],
         runtime["pyarrow_tree_sha256"],
     ):
         raise ObservationError("PyArrow package changed while observing")
+    _require_loaded_origins(stdlib_root, site_root)
 
 
 def _canonical_json(value: object, *, newline: bool = True) -> bytes:

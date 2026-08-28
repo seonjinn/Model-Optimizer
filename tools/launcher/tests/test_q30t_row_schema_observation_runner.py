@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import shutil
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pyarrow  # pyright: ignore[reportMissingImports]
+import pytest
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -23,6 +25,11 @@ RUNNER = ROOT / "launcher/common/specdec/run_q30t_row_schema_observation.sbatch"
 SUBMITTER = ROOT / "launcher/common/specdec/submit_q30t_row_schema_observation.sh"
 OBSERVER = ROOT.parent / "examples/dataset/observe_q30t_ptv23_row_schemas.py"
 ATOMIC = ROOT / "launcher/common/specdec/qwen4b_b_atomic.py"
+
+
+def _runner_embedded_python(marker: str) -> str:
+    runner = RUNNER.read_text()
+    return runner.split(f"# {marker}\n", 1)[1].split("\nPY\n", 1)[0]
 
 
 def _load_observer_test_support() -> ModuleType:
@@ -92,7 +99,7 @@ def test_completion_binder_rejects_a_file_beyond_the_declared_bound(tmp_path: Pa
     completion.write_bytes(b"x" * (1024 * 1024 + 1))
 
     result = subprocess.run(
-        [sys.executable, "-I", "-", str(completion)],
+        [sys.executable, "-I", "-S", "-", str(completion)],
         input=binder,
         text=True,
         capture_output=True,
@@ -114,7 +121,7 @@ def test_tool_authenticator_rejects_group_writable_executables(tmp_path: Path) -
     executable.chmod(0o775)
 
     result = subprocess.run(
-        [sys.executable, "-I", "-", "--test-owner", str(executable)],
+        [sys.executable, "-I", "-S", "-", "--test-owner", str(executable)],
         input=authenticator,
         text=True,
         capture_output=True,
@@ -124,6 +131,119 @@ def test_tool_authenticator_rejects_group_writable_executables(tmp_path: Path) -
     assert result.returncode != 0
     assert "writable" in result.stderr
     assert os.access(executable, os.X_OK)
+
+
+def test_immutable_bootstrap_rejects_replaced_materialized_observer(tmp_path: Path) -> None:
+    """A same-UID pathname replacement cannot substitute the authenticated code bytes."""
+    bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
+    observer = tmp_path / "observer.py"
+    trusted = b"def main():\n    return 0\n"
+    observer.write_bytes(trusted)
+    expected = hashlib.sha256(trusted).hexdigest()
+    marker = tmp_path / "substituted-code-ran"
+    observer.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+    atomic = tmp_path / "atomic.py"
+    atomic.write_bytes(ATOMIC.read_bytes())
+    atomic_sha256 = hashlib.sha256(atomic.read_bytes()).hexdigest()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-",
+            str(observer),
+            expected,
+            str(atomic),
+            atomic_sha256,
+        ],
+        input=bootstrap,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "observer blob SHA-256 mismatch" in result.stderr
+    assert not marker.exists()
+
+
+def test_immutable_bootstrap_executes_held_bytes_after_path_rebind(tmp_path: Path) -> None:
+    """A pathname replacement after authentication cannot change executed bytes."""
+    bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
+    primitives = bootstrap.split(
+        "observer_path, observer_sha256, atomic_path, atomic_sha256 = sys.argv[1:5]", 1
+    )[0]
+    trusted_marker = tmp_path / "trusted-code-ran"
+    substituted_marker = tmp_path / "substituted-code-ran"
+    observer = tmp_path / "observer.py"
+    trusted = f"from pathlib import Path\nPath({str(trusted_marker)!r}).touch()\n".encode()
+    observer.write_bytes(trusted)
+    replacement = tmp_path / "replacement.py"
+    replacement.write_text(f"from pathlib import Path\nPath({str(substituted_marker)!r}).touch()\n")
+    exercise = (
+        primitives
+        + "\npath, expected, replacement = sys.argv[1:4]\n"
+        + "descriptor, authenticated = open_blob(path, expected, 'observer')\n"
+        + "os.replace(replacement, path)\n"
+        + "try:\n    exec(compile(authenticated, f'/proc/self/fd/{descriptor}', 'exec'), {})\n"
+        + "finally:\n    os.close(descriptor)\n"
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-",
+            str(observer),
+            hashlib.sha256(trusted).hexdigest(),
+            str(replacement),
+        ],
+        input=exercise,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert trusted_marker.exists()
+    assert not substituted_marker.exists()
+
+
+def test_bootstrap_authenticates_runtime_before_observer_top_level(tmp_path: Path) -> None:
+    """An unapproved runtime must fail before any authenticated observer byte executes."""
+    bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
+    marker = tmp_path / "observer-top-level-ran"
+    observer = tmp_path / "observer.py"
+    observer.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef main():\n    return 0\n"
+    )
+    observer_sha256 = hashlib.sha256(observer.read_bytes()).hexdigest()
+    atomic = tmp_path / "atomic.py"
+    atomic.write_bytes(ATOMIC.read_bytes())
+    atomic_sha256 = hashlib.sha256(atomic.read_bytes()).hexdigest()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-",
+            str(observer),
+            observer_sha256,
+            str(atomic),
+            atomic_sha256,
+        ],
+        input=bootstrap,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "runtime" in result.stderr.lower()
+    assert not marker.exists()
 
 
 def test_submitter_behavior_rejects_wrong_arity_and_unapproved_roots(tmp_path: Path) -> None:
@@ -463,3 +583,88 @@ raise SystemExit(namespace["main"]())
     assert result.returncode == 0, result.stderr
     assert output.exists()
     assert support.json.loads(output.read_bytes())["runtime"] == support._TEST_RUNTIME
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="production runtime identity uses /proc/self/exe"
+)
+def test_linux_production_bootstrap_executes_exact_artifacts_without_guard_bypass(
+    tmp_path: Path,
+) -> None:
+    """Linux executes the held exact artifacts through all production runtime guards."""
+    approved_python = Path("/usr/bin/python3.12")
+    if not approved_python.is_file():
+        pytest.skip("approved production Python is unavailable")
+    probe = subprocess.run(
+        [
+            str(approved_python),
+            "-I",
+            "-S",
+            "-c",
+            (
+                "import os,sysconfig; p=sysconfig.get_paths(); "
+                "raise SystemExit(0 if any(os.path.isdir(os.path.join(p[k],'pyarrow')) "
+                "for k in ('purelib','platlib')) else 1)"
+            ),
+        ],
+        check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip("approved production PyArrow runtime is unavailable")
+    support = _load_observer_test_support()
+    fixture = support.stage_inputs(tmp_path / "fixture")
+    observer = tmp_path / "observe.py"
+    atomic = tmp_path / "atomic.py"
+    observer.write_bytes(OBSERVER.read_bytes())
+    atomic.write_bytes(ATOMIC.read_bytes())
+    observer.chmod(0o400)
+    atomic.chmod(0o400)
+    output_parent = tmp_path / "output"
+    output_parent.mkdir()
+    output = output_parent / "observation.json"
+    inputs = fixture.inputs
+    bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
+
+    result = subprocess.run(
+        [
+            str(approved_python),
+            "-I",
+            "-S",
+            "-",
+            str(observer),
+            hashlib.sha256(observer.read_bytes()).hexdigest(),
+            str(atomic),
+            hashlib.sha256(atomic.read_bytes()).hexdigest(),
+            "--ptv2-plan",
+            str(inputs.ptv2_plan_path),
+            "--ptv2-plan-sha256",
+            inputs.ptv2_plan_sha256,
+            "--ptv2-completion",
+            str(inputs.ptv2_completion_path),
+            "--ptv2-completion-sha256",
+            inputs.ptv2_completion_sha256,
+            "--ptv2-root",
+            str(inputs.ptv2_root),
+            "--ptv3-plan",
+            str(inputs.ptv3_plan_path),
+            "--ptv3-plan-sha256",
+            inputs.ptv3_plan_sha256,
+            "--ptv3-completion",
+            str(inputs.ptv3_completion_path),
+            "--ptv3-completion-sha256",
+            inputs.ptv3_completion_sha256,
+            "--ptv3-root",
+            str(inputs.ptv3_root),
+            "--output",
+            str(output),
+        ],
+        input=bootstrap,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    runtime = support.json.loads(output.read_bytes())["runtime"]
+    assert runtime["python_stdlib_tree_file_count"] > 0
+    assert runtime["site_packages_tree_file_count"] > 0
