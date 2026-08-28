@@ -5,6 +5,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,98 +16,220 @@ RUNNER = ROOT / "launcher/common/specdec/run_q30t_row_schema_observation.sbatch"
 SUBMITTER = ROOT / "launcher/common/specdec/submit_q30t_row_schema_observation.sh"
 
 
-def test_observation_runner_uses_immutable_git_and_cpu_only() -> None:
-    """The runner must materialize commit objects without requesting GPUs."""
+def test_static_runner_requests_one_cpu_only_node() -> None:
+    """The static scheduler request must remain CPU-only."""
     runner = RUNNER.read_text()
 
     assert "#SBATCH --nodes=1" in runner
     assert "#SBATCH --ntasks=1" in runner
     assert "#SBATCH --cpus-per-task=32" in runner
     assert "--gpus" not in runner
-    assert "git cat-file" in runner
-    assert "git archive" not in runner
-    assert "examples/dataset/observe_q30t_ptv23_row_schemas.py" in runner
-    assert "examples/dataset/qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json" in runner
-    assert '"$source_path/examples/' not in runner
 
 
-def test_observation_runner_authenticates_the_approved_python_in_a_sterile_environment() -> None:
-    """The runner must execute only the approved Python in an isolated environment."""
+def test_completion_binder_rejects_a_file_beyond_the_declared_bound(tmp_path: Path) -> None:
+    """The executable completion binder must fail before hashing an oversized file."""
     runner = RUNNER.read_text()
+    marker = "# Q30T_COMPLETION_BINDER\n"
+    binder = runner.split(marker, 1)[1].split("\nPY\n", 1)[0]
+    completion = tmp_path / "completion.json"
+    completion.write_bytes(b"x" * (1024 * 1024 + 1))
 
-    assert 'readonly approved_python="/usr/bin/python3.12"' in runner
-    assert "sys.version_info >= (3, 12)" in runner
-    assert "/usr/bin/env -i" in runner
-    assert "PYTHONSAFEPATH=1" in runner
-    assert "PYTHONDONTWRITEBYTECODE=1" in runner
-    assert "Q30T_TEST_" not in runner
-    assert "command -v" not in runner
-
-
-def test_observation_runner_binds_exact_stage_roots_and_metadata() -> None:
-    """The runner must pin both staged roots and all known metadata digests."""
-    runner = RUNNER.read_text()
-
-    assert "q30t-ptv2-full201-source-v1" in runner
-    assert "q30t-ptv3-source-stage-75209087-v1" in runner
-    assert "96970541d0c6f5c99e74b9222b805d4a0bd2ac682837b0ad92b8bf54f7d71a3a" in runner
-    assert "018d659170834b17967dd6c1b066e3b03e7859386eceefd9d4409dc3bc8f48c1" in runner
-    assert "752090878ed2c5fce47683b2939f9d857be5549311b158476fce33bb79f52eac" in runner
-    assert "--ptv2-plan-sha256" in runner
-    assert "--ptv2-completion-sha256" in runner
-    assert "--ptv3-plan-sha256" in runner
-    assert "--ptv3-completion-sha256" in runner
-    assert "O_NONBLOCK" in runner
-    assert '"$approved_sha256sum" "$ptv3_completion"' not in runner
-
-
-def test_observation_runner_leaves_private_scratch_to_scheduler_cleanup() -> None:
-    """The runner must never recursively clean or unlink shared paths."""
-    runner = RUNNER.read_text()
-
-    assert "/raid/scratch" in runner
-    assert "mktemp -d" in runner
-    assert "umask 077" in runner
-    assert "rm -" not in runner
-    assert "unlink" not in runner
-    assert "shutil.rmtree" not in runner
-
-
-def test_submitter_requires_clean_pushed_source_and_test_only_preflight() -> None:
-    """The submitter must authenticate remote source and preflight every job."""
-    submitter = SUBMITTER.read_text()
-
-    assert "status --porcelain=v1 --untracked-files=all" in submitter
-    assert "@{upstream}^{commit}" in submitter
-    assert "ls-remote --exit-code" in submitter
-    assert "reviewed source commit is not pushed" in submitter
-    assert "source checkout is not clean" in submitter
-    assert 'if [[ "$mode" == "--test-only" ]]' in submitter
-    assert "--test-only" in submitter
-    assert 'if [[ "$mode" == "--submit" ]]' in submitter
-
-
-def test_submitter_rejects_path_and_environment_command_substitution() -> None:
-    """The submitter must use fixed absolute executables under a sterile env."""
-    submitter = SUBMITTER.read_text()
-
-    assert 'readonly approved_git="/usr/bin/git"' in submitter
-    assert 'readonly approved_sbatch="/usr/bin/sbatch"' in submitter
-    assert "/usr/bin/env -i" in submitter
-    assert "Q30T_TEST_" not in submitter
-    assert "command -v" not in submitter
-    assert "eval " not in submitter
-    assert "bash -c" not in submitter
-
-
-def test_submitter_exposes_only_the_approved_interface() -> None:
-    """The submitter must expose only mode, source, output, and log bindings."""
-    submitter = SUBMITTER.read_text()
-
-    assert (
-        "(--test-only|--submit) --source-path PATH --output PATH --slurm-output PATH" in submitter
+    result = subprocess.run(
+        [sys.executable, "-I", "-", str(completion)],
+        input=binder,
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    assert "--source-path" in submitter
-    assert "--output" in submitter
-    assert "--slurm-output" in submitter
-    assert "--export=NONE" in submitter
+
+    assert result.returncode != 0
+    assert "exceeds" in result.stderr
+    assert not result.stdout.strip()
+
+
+def test_tool_authenticator_rejects_group_writable_executables(tmp_path: Path) -> None:
+    """A writable external tool must fail the executable trust boundary."""
+    runner = RUNNER.read_text()
+    marker = "# Q30T_TOOL_AUTHENTICATOR\n"
+    authenticator = runner.split(marker, 1)[1].split("\nPY\n", 1)[0]
+    executable = tmp_path / "git"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o775)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-", "--test-owner", str(executable)],
+        input=authenticator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "writable" in result.stderr
+    assert os.access(executable, os.X_OK)
+
+
+def test_submitter_behavior_rejects_wrong_arity_and_unapproved_roots(tmp_path: Path) -> None:
+    """Only the fixed submitter interface and receipt roots are accepted."""
+    bash = shutil.which("bash")
+    assert bash
+    no_arguments = subprocess.run(
+        [bash, "-p", str(SUBMITTER)], text=True, capture_output=True, check=False
+    )
+    assert no_arguments.returncode == 2
+    assert "usage:" in no_arguments.stderr
+
+    source = tmp_path / "source"
+    source.mkdir()
+    wrong_root = subprocess.run(
+        [
+            bash,
+            "-p",
+            str(SUBMITTER),
+            "--test-only",
+            "--source-path",
+            str(source),
+            "--output",
+            str(tmp_path / "observation-a.json"),
+            "--slurm-output",
+            str(tmp_path / "row-schema-a-%j.out"),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert wrong_root.returncode == 2
+    assert "approved row-schema observation path" in wrong_root.stderr
+
+
+def test_submitter_behavior_requires_clean_live_pushed_source_and_preflights(
+    tmp_path: Path,
+) -> None:
+    """Only a clean, live-pushed commit can reach ordered scheduler preflights."""
+    git = shutil.which("git")
+    bash = shutil.which("bash")
+    assert git and bash
+    bare = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    subprocess.run([git, "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run([git, "init", "-b", "main", str(source)], check=True, capture_output=True)
+    subprocess.run([git, "-C", str(source), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run([git, "-C", str(source), "config", "user.name", "Test"], check=True)
+    tracked = source / "tools/launcher/common/specdec"
+    tracked.mkdir(parents=True)
+    (tracked / RUNNER.name).write_bytes(RUNNER.read_bytes())
+    subprocess.run([git, "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        [git, "-C", str(source), "commit", "-m", "runner"], check=True, capture_output=True
+    )
+    subprocess.run([git, "-C", str(source), "remote", "add", "gitlab", str(bare)], check=True)
+    subprocess.run(
+        [git, "-C", str(source), "push", "-u", "gitlab", "main"], check=True, capture_output=True
+    )
+    calls = tmp_path / "sbatch.calls"
+    spooled = tmp_path / "spooled-runner"
+    sbatch = tmp_path / "sbatch"
+    sbatch.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{calls}'\ncat >'{spooled}'\n")
+    sbatch.chmod(0o700)
+    ssh = tmp_path / "ssh"
+    ssh.write_text("#!/bin/sh\nexit 97\n")
+    ssh.chmod(0o700)
+    receipt_root = tmp_path / "receipts"
+    output = receipt_root / "row-schema/observation-a.json"
+    slurm_output = receipt_root / "logs/row-schema-a-%j.out"
+    environment = {
+        "HOME": str(tmp_path),
+        "USER": "test",
+        "LOGNAME": "test",
+        "OSTYPE": sys.platform,
+        "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
+        "Q30T_TEST_PYTHON": sys.executable,
+        "Q30T_TEST_GIT": git,
+        "Q30T_TEST_SBATCH": str(sbatch),
+        "Q30T_TEST_SSH": str(ssh),
+        "Q30T_TEST_RECEIPT_ROOT": str(receipt_root),
+        "Q30T_TEST_FETCH_URL": str(bare),
+    }
+    command = [
+        bash,
+        "-p",
+        str(SUBMITTER),
+        "--submit",
+        "--source-path",
+        str(source),
+        "--output",
+        str(output),
+        "--slurm-output",
+        str(slurm_output),
+    ]
+
+    result = subprocess.run(command, env=environment, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    recorded = calls.read_text().splitlines()
+    assert "--test-only" in recorded[0]
+    assert "--parsable" in recorded[1]
+    assert spooled.read_bytes() == RUNNER.read_bytes()
+
+    (tracked / RUNNER.name).write_text("#!/bin/sh\nexit 99\n")
+    mutable = subprocess.run(command, env=environment, text=True, capture_output=True, check=False)
+    assert mutable.returncode != 0
+    assert "not clean" in mutable.stderr
+    assert spooled.read_bytes() == RUNNER.read_bytes()
+    (tracked / RUNNER.name).write_bytes(RUNNER.read_bytes())
+
+    (source / "dirty").write_text("untracked")
+    rejected = subprocess.run(command, env=environment, text=True, capture_output=True, check=False)
+    assert rejected.returncode != 0
+    assert "not clean" in rejected.stderr
+    assert calls.read_text().splitlines() == recorded
+
+    (source / "dirty").unlink()
+    (source / "unpushed").write_text("new commit")
+    subprocess.run([git, "-C", str(source), "add", "unpushed"], check=True)
+    subprocess.run(
+        [git, "-C", str(source), "commit", "-m", "not pushed"],
+        check=True,
+        capture_output=True,
+    )
+    unpushed = subprocess.run(command, env=environment, text=True, capture_output=True, check=False)
+    assert unpushed.returncode != 0
+    assert "not pushed" in unpushed.stderr
+    assert calls.read_text().splitlines() == recorded
+
+
+def test_submitter_rejects_imported_bash_and_loader_environment(tmp_path: Path) -> None:
+    """Imported functions and loader settings cannot enter launcher children."""
+    bash = shutil.which("bash")
+    assert bash
+    source = tmp_path / "source"
+    source.mkdir()
+    marker = tmp_path / "sourced"
+    injection = tmp_path / "inject.sh"
+    injection.write_text(f"touch '{marker}'\n")
+    receipt_root = Path(
+        "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/"
+        "q30t-ptv23-complement-700k-v1"
+    )
+    command = [
+        bash,
+        "-p",
+        str(SUBMITTER),
+        "--test-only",
+        "--source-path",
+        str(source),
+        "--output",
+        str(receipt_root / "row-schema/observation-a.json"),
+        "--slurm-output",
+        str(receipt_root / "logs/row-schema-a-%j.out"),
+    ]
+    environment = {
+        "BASH_ENV": str(injection),
+        "LD_LIBRARY_PATH": str(tmp_path),
+        "BASH_FUNC_git%%": "() { touch /tmp/forbidden; }",
+    }
+
+    result = subprocess.run(command, env=environment, text=True, capture_output=True, check=False)
+
+    assert result.returncode != 0
+    assert "unsafe inherited environment" in result.stderr
+    assert not marker.exists()

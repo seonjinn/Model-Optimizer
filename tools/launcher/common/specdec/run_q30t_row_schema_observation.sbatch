@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -44,28 +44,48 @@ readonly approved_mkdir="/usr/bin/mkdir"
 readonly approved_mktemp="/usr/bin/mktemp"
 readonly approved_python="/usr/bin/python3.12"
 readonly approved_sha256sum="/usr/bin/sha256sum"
-for executable in /usr/bin/env "$approved_chmod" "$approved_git" "$approved_mkdir" \
-    "$approved_mktemp" "$approved_python" "$approved_sha256sum"; do
-    [[ -f "$executable" && -x "$executable" && ! -L "$executable" ]] \
-        || fail "approved executable is unavailable: $executable"
+readonly approved_env="/usr/bin/env"
+[[ "$-" == *p* ]] || fail "privileged Bash mode is required"
+for name in $(compgen -e); do
+    [[ "$name" != BASH_FUNC_* && "$name" != LD_* && "$name" != DYLD_* \
+        && "$name" != BASH_ENV && "$name" != ENV && "$name" != CDPATH \
+        && "$name" != PYTHONPATH && "$name" != PYTHONHOME ]] \
+        || fail "unsafe inherited environment variable: $name"
 done
+unset PATH
+PATH=/usr/bin:/bin
+export PATH
 
-/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    "$approved_python" -I - <<'PY'
+"$approved_python" -I -S - /bin/bash "$approved_env" "$approved_chmod" "$approved_git" \
+    "$approved_mkdir" "$approved_mktemp" "$approved_python" "$approved_sha256sum" <<'PY'
+# Q30T_TOOL_AUTHENTICATOR
 import os
 import stat
 import sys
 
-approved = os.stat("/usr/bin/python3.12", follow_symlinks=False)
-running = os.stat("/proc/self/exe")
-if not (
-    sys.version_info >= (3, 12)
-    and stat.S_ISREG(approved.st_mode)
-    and approved.st_uid == 0
-    and stat.S_IMODE(approved.st_mode) & 0o022 == 0
-    and (approved.st_dev, approved.st_ino) == (running.st_dev, running.st_ino)
-):
-    raise SystemExit("approved Python identity or version mismatch")
+arguments = sys.argv[1:]
+test_owner = arguments[:1] == ["--test-owner"]
+if test_owner:
+    arguments = arguments[1:]
+required_uid = os.getuid() if test_owner else 0
+for value in arguments:
+    path = value
+    if not os.path.isabs(path):
+        raise SystemExit("approved executable path is not absolute")
+    for _ in range(16):
+        metadata = os.lstat(path)
+        if metadata.st_uid != required_uid or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise SystemExit(f"approved executable is not owned safely or is writable: {value}")
+        if not stat.S_ISLNK(metadata.st_mode):
+            if not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK):
+                raise SystemExit(f"approved executable is not regular and executable: {value}")
+            break
+        target = os.readlink(path)
+        path = os.path.normpath(target if os.path.isabs(target) else os.path.join(os.path.dirname(path), target))
+    else:
+        raise SystemExit(f"approved executable symlink chain is too deep: {value}")
+if not test_owner and sys.version_info < (3, 12):
+    raise SystemExit("approved Python must be Python 3.12 or newer")
 PY
 
 readonly scratch_parent="${SLURM_TMPDIR:-}"
@@ -79,20 +99,30 @@ readonly scratch_root
 
 readonly observer_path="examples/dataset/observe_q30t_ptv23_row_schemas.py"
 readonly ptv3_plan_path="examples/dataset/qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json"
-readonly observer="$scratch_root/observe_q30t_ptv23_row_schemas.py"
-readonly ptv3_plan="$scratch_root/qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json"
+readonly atomic_path="tools/launcher/common/specdec/qwen4b_b_atomic.py"
+readonly observer="$scratch_root/$observer_path"
+readonly ptv3_plan="$scratch_root/$ptv3_plan_path"
+readonly atomic="$scratch_root/$atomic_path"
+"$approved_mkdir" -p -- "${observer%/*}" "${atomic%/*}"
 
 # git cat-file binds both executable and plan bytes to the reviewed commit object.
-/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_NO_REPLACE_OBJECTS=1 "$approved_git" -C "$source_path" \
+/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
+    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
     cat-file -e "$source_commit^{commit}"
-/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_NO_REPLACE_OBJECTS=1 "$approved_git" -C "$source_path" \
+/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
+    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
     cat-file blob "$source_commit:$observer_path" >"$observer"
-/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
-    GIT_NO_REPLACE_OBJECTS=1 "$approved_git" -C "$source_path" \
+/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
+    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
     cat-file blob "$source_commit:$ptv3_plan_path" >"$ptv3_plan"
-"$approved_chmod" 0400 "$observer" "$ptv3_plan"
+/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
+    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
+    cat-file blob "$source_commit:$atomic_path" >"$atomic"
+"$approved_chmod" 0400 "$observer" "$ptv3_plan" "$atomic"
 
 readonly ptv2_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/assets/q30t-ptv2-full201-source-v1"
 readonly ptv2_plan="$ptv2_root/SOURCE_PLAN.json"
@@ -109,6 +139,7 @@ observed_ptv3_plan_sha256="$(/usr/bin/env -i LC_ALL=C \
     || fail "immutable PTV3 plan blob SHA-256 mismatch"
 ptv3_completion_sha256="$(/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
     PYTHONSAFEPATH=1 "$approved_python" -I - "$ptv3_completion" <<'PY'
+# Q30T_COMPLETION_BINDER
 import hashlib
 import os
 import stat
@@ -116,6 +147,9 @@ import sys
 
 path = sys.argv[1]
 before = os.stat(path, follow_symlinks=False)
+maximum_bytes = 1024 * 1024
+if before.st_size > maximum_bytes:
+    raise SystemExit("PTV3 completion exceeds its declared byte bound")
 descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
 try:
     opened = os.fstat(descriptor)
@@ -126,8 +160,15 @@ try:
     ):
         raise SystemExit("PTV3 completion is not a stable single-link regular file")
     digest = hashlib.sha256()
-    while chunk := os.read(descriptor, 1024 * 1024):
+    counted = 0
+    while counted < before.st_size:
+        chunk = os.read(descriptor, min(1024 * 1024, before.st_size - counted))
+        if not chunk:
+            raise SystemExit("PTV3 completion shrank while binding its SHA-256")
         digest.update(chunk)
+        counted += len(chunk)
+    if os.read(descriptor, 1):
+        raise SystemExit("PTV3 completion grew while binding its SHA-256")
     after = os.fstat(descriptor)
     current = os.stat(path, follow_symlinks=False)
     identity = lambda value: (
@@ -139,7 +180,11 @@ try:
         value.st_mtime_ns,
         value.st_ctime_ns,
     )
-    if identity(before) != identity(after) or identity(after) != identity(current):
+    if (
+        counted != before.st_size
+        or identity(before) != identity(after)
+        or identity(after) != identity(current)
+    ):
         raise SystemExit("PTV3 completion changed while binding its SHA-256")
     print(digest.hexdigest())
 finally:
@@ -152,7 +197,9 @@ readonly ptv3_completion_sha256
 
 "$approved_mkdir" -p -- "$receipt_root/row-schema"
 /usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    "$approved_python" -I "$observer" \
+    "$approved_python" -I -c \
+    'import runpy,sys; root=sys.argv.pop(1); script=sys.argv.pop(1); sys.path.insert(0,root); sys.argv[0]=script; runpy.run_path(script,run_name="__main__")' \
+    "$scratch_root" "$observer" \
     --ptv2-plan "$ptv2_plan" \
     --ptv2-plan-sha256 "$ptv2_plan_sha256" \
     --ptv2-completion "$ptv2_completion" \

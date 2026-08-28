@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -27,6 +30,8 @@ _PTV2_PLAN_NAME = "SOURCE_PLAN.json"
 _PTV2_COMPLETION_NAME = "SOURCE_MANIFEST_COMPLETION.json"
 _PTV3_MANIFEST_NAME = "MANIFEST.json"
 _PTV3_COMPLETION_NAME = "completion.json"
+_MAX_RUNTIME_FILES = 4096
+_MAX_RUNTIME_BYTES = 1024 * 1024 * 1024
 
 
 class ObservationError(RuntimeError):
@@ -79,6 +84,123 @@ class _AuthenticatedStage:
         os.close(self.ptv3_root_fd)
         os.close(self.ptv2_data_fd)
         os.close(self.ptv2_root_fd)
+
+
+def _require_root_owned_nonwritable(metadata: os.stat_result, label: str) -> None:
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ObservationError(f"{label} is not root-owned and non-writable")
+
+
+def _approved_executable(path: Path) -> Path:
+    if not path.is_absolute():
+        raise ObservationError("Python executable path is not absolute")
+    current = path
+    for _ in range(16):
+        metadata = os.lstat(current)
+        _require_root_owned_nonwritable(metadata, "Python executable path")
+        if not stat.S_ISLNK(metadata.st_mode):
+            if not stat.S_ISREG(metadata.st_mode) or not os.access(current, os.X_OK):
+                raise ObservationError("Python executable is not an approved regular file")
+            return current
+        target = Path(os.readlink(current))
+        current = target if target.is_absolute() else current.parent / target
+        current = Path(os.path.normpath(current))
+    raise ObservationError("Python executable symlink chain is too deep")
+
+
+def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
+    root_before = os.stat(root, follow_symlinks=False)
+    _require_root_owned_nonwritable(root_before, "PyArrow package root")
+    if not stat.S_ISDIR(root_before.st_mode):
+        raise ObservationError("PyArrow package root is not a directory")
+    digest = hashlib.sha256()
+    file_count = 0
+    total_bytes = 0
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        names.sort()
+        filenames.sort()
+        directory_path = Path(directory)
+        directory_metadata = os.stat(directory_path, follow_symlinks=False)
+        _require_root_owned_nonwritable(directory_metadata, "PyArrow package directory")
+        if not stat.S_ISDIR(directory_metadata.st_mode):
+            raise ObservationError("PyArrow package inventory contains a non-directory")
+        for name in names:
+            child = os.stat(directory_path / name, follow_symlinks=False)
+            if stat.S_ISLNK(child.st_mode):
+                raise ObservationError("PyArrow package inventory contains a symlink")
+        for name in filenames:
+            path = directory_path / name
+            named = os.stat(path, follow_symlinks=False)
+            if file_count >= _MAX_RUNTIME_FILES or named.st_size > _MAX_RUNTIME_BYTES - total_bytes:
+                raise ObservationError("PyArrow package inventory exceeds its bound")
+            _require_root_owned_nonwritable(named, "PyArrow package file")
+            if not stat.S_ISREG(named.st_mode) or named.st_nlink != 1:
+                raise ObservationError("PyArrow package inventory contains an unsafe file")
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if _identity(opened) != _identity(named):
+                    raise ObservationError("PyArrow package file changed while opening")
+                size, file_sha256, _ = _read_descriptor(descriptor, retain=False)
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if _identity(opened) != _identity(after) or size != named.st_size:
+                raise ObservationError("PyArrow package file changed while hashing")
+            file_count += 1
+            total_bytes += size
+            relative = path.relative_to(root).as_posix().encode()
+            digest.update(len(relative).to_bytes(4, "big"))
+            digest.update(relative)
+            digest.update(size.to_bytes(8, "big"))
+            digest.update(bytes.fromhex(file_sha256))
+    root_after = os.stat(root, follow_symlinks=False)
+    if _identity(root_before) != _identity(root_after) or file_count < 1:
+        raise ObservationError("PyArrow package root changed while hashing")
+    return file_count, total_bytes, digest.hexdigest()
+
+
+def _authenticate_runtime() -> dict[str, object]:
+    """Authenticate the concrete Python/PyArrow runtime before importing PyArrow."""
+    python_target = _approved_executable(Path(sys.executable))
+    spec = importlib.util.find_spec("pyarrow")
+    if spec is None or spec.origin is None or spec.submodule_search_locations is None:
+        raise ObservationError("an approved PyArrow package is unavailable")
+    origin = Path(spec.origin)
+    roots = tuple(Path(value) for value in spec.submodule_search_locations)
+    if len(roots) != 1 or not origin.is_absolute() or not roots[0].is_absolute():
+        raise ObservationError("PyArrow package origin is not uniquely absolute")
+    root = roots[0]
+    if origin.parent != root:
+        raise ObservationError("PyArrow origin is outside its package root")
+    inventory = _pyarrow_tree_inventory(root)
+    pyarrow = importlib.import_module("pyarrow")
+    version = getattr(pyarrow, "__version__", None)
+    imported_origin = Path(getattr(pyarrow, "__file__", ""))
+    if type(version) is not str or not version or imported_origin != origin:
+        raise ObservationError("imported PyArrow differs from its authenticated origin")
+    if _pyarrow_tree_inventory(root) != inventory:
+        raise ObservationError("PyArrow package changed across import")
+    return {
+        "python_executable": str(python_target),
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "pyarrow_version": version,
+        "pyarrow_origin": str(origin),
+        "pyarrow_tree_file_count": inventory[0],
+        "pyarrow_tree_bytes": inventory[1],
+        "pyarrow_tree_sha256": inventory[2],
+    }
+
+
+def _require_imported_runtime(runtime: Mapping[str, object]) -> None:
+    pyarrow = sys.modules.get("pyarrow")
+    if pyarrow is None or getattr(pyarrow, "__version__", None) != runtime["pyarrow_version"]:
+        raise ObservationError("observed PyArrow runtime changed")
+    if Path(getattr(pyarrow, "__file__", "")) != Path(cast("str", runtime["pyarrow_origin"])):
+        raise ObservationError("observed PyArrow origin changed")
 
 
 def _canonical_json(value: object, *, newline: bool = True) -> bytes:
@@ -896,6 +1018,7 @@ def observe_stage_schemas(inputs: StageInputs) -> bytes:
     """Return a canonical, self-hashed physical row-schema observation."""
     if not isinstance(inputs, StageInputs):
         raise ObservationError("inputs must be a StageInputs value")
+    runtime = _authenticate_runtime()
     stage = _authenticate_stage(inputs)
     try:
         files = [_observe_file(record, stage) for record in stage.records]
@@ -912,10 +1035,15 @@ def observe_stage_schemas(inputs: StageInputs) -> bytes:
             inputs.ptv3_completion_sha256,
             "PTV3 completion",
         )
+        _require_stage_stable(stage, inputs)
     finally:
         stage.close()
+    _require_imported_runtime(runtime)
+    if _authenticate_runtime() != runtime:
+        raise ObservationError("Python/PyArrow runtime changed while observing")
     payload: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
+        "runtime": runtime,
         "inputs": {
             "ptv2": {
                 "plan_path": inputs.ptv2_plan_path.name,
@@ -963,36 +1091,96 @@ def _publish_observation(output: Path, payload: bytes) -> None:
     parent_fd, _ = _open_root(output.parent, "observation output parent")
     descriptor: int | None = None
     try:
+        _require_absolute_parent_binding(output.parent, parent_fd)
+        partial_name = f".{output.name}.partial-{hashlib.sha256(payload).hexdigest()[:20]}"
+        try:
+            os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ObservationError("observation output already exists")
         flags = (
-            os.O_WRONLY
+            os.O_RDWR
             | os.O_CREAT
             | os.O_EXCL
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
         )
-        descriptor = os.open(output.name, flags, 0o440, dir_fd=parent_fd)
+        descriptor = os.open(partial_name, flags, 0o440, dir_fd=parent_fd)
+        created = os.fstat(descriptor)
         offset = 0
         while offset < len(payload):
-            offset += os.write(descriptor, payload[offset:])
+            written = os.write(descriptor, payload[offset:])
+            if written < 1:
+                raise ObservationError("observation partial write stalled")
+            offset += written
         os.fsync(descriptor)
-        created = os.fstat(descriptor)
-        os.close(descriptor)
-        descriptor = None
-        current = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+        after_write = os.fstat(descriptor)
+        current = os.stat(partial_name, dir_fd=parent_fd, follow_symlinks=False)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        reread = bytearray()
+        while block := os.read(descriptor, _READ_BLOCK_BYTES):
+            reread.extend(block)
         if (
             not stat.S_ISREG(created.st_mode)
             or created.st_nlink != 1
-            or _identity(created) != _identity(current)
-            or created.st_size != len(payload)
+            or (created.st_dev, created.st_ino) != (after_write.st_dev, after_write.st_ino)
+            or _identity(after_write) != _identity(current)
+            or after_write.st_size != len(payload)
+            or bytes(reread) != payload
+        ):
+            raise ObservationError("observation partial identity mismatch")
+        _require_absolute_parent_binding(output.parent, parent_fd)
+        from tools.launcher.common.specdec import qwen4b_b_atomic
+
+        qwen4b_b_atomic._native_rename_no_replace(  # pyright: ignore[reportPrivateUsage]
+            output.with_name(partial_name), output, parent_fd=parent_fd
+        )
+        after_rename = os.fstat(descriptor)
+        installed = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        final_reread = bytearray()
+        while block := os.read(descriptor, _READ_BLOCK_BYTES):
+            final_reread.extend(block)
+        if (
+            _identity(installed) != _identity(after_rename)
+            or (after_write.st_dev, after_write.st_ino)
+            != (after_rename.st_dev, after_rename.st_ino)
+            or bytes(final_reread) != payload
         ):
             raise ObservationError("published observation identity mismatch")
         os.fsync(parent_fd)
+        _require_absolute_parent_binding(output.parent, parent_fd)
+        absolute = os.stat(output, follow_symlinks=False)
+        if _identity(absolute) != _identity(installed):
+            raise ObservationError("published observation path rebound")
     except FileExistsError as error:
         raise ObservationError("observation output already exists") from error
     finally:
         if descriptor is not None:
             os.close(descriptor)
         os.close(parent_fd)
+
+
+def _require_absolute_parent_binding(parent: Path, parent_fd: int) -> None:
+    """Reopen every absolute component and bind it to the held output parent."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open("/", flags)
+    try:
+        for component in parent.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        held = os.fstat(parent_fd)
+        rebound = os.fstat(descriptor)
+        if _identity(held) != _identity(rebound):
+            raise ObservationError("observation output parent identity changed")
+    except ObservationError:
+        raise
+    except OSError as error:
+        raise ObservationError("observation output parent identity changed") from error
+    finally:
+        os.close(descriptor)
 
 
 def main() -> int:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -14,6 +15,7 @@ import pyarrow as pa  # pyright: ignore[reportMissingImports]
 import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
 import pytest
 
+import examples.dataset.observe_q30t_ptv23_row_schemas as observer_module
 from examples.dataset.observe_q30t_ptv23_row_schemas import (
     ObservationError,
     StageInputs,
@@ -22,6 +24,24 @@ from examples.dataset.observe_q30t_ptv23_row_schemas import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+_TEST_RUNTIME = {
+    "python_executable": "/usr/bin/python3.12",
+    "python_version": "3.12.0",
+    "pyarrow_version": "test-pyarrow",
+    "pyarrow_origin": "/usr/lib/python3.12/site-packages/pyarrow/__init__.py",
+    "pyarrow_tree_file_count": 1,
+    "pyarrow_tree_bytes": 1,
+    "pyarrow_tree_sha256": "a" * 64,
+}
+_REAL_AUTHENTICATE_RUNTIME = observer_module._authenticate_runtime
+
+
+@pytest.fixture(autouse=True)
+def approved_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(observer_module, "_authenticate_runtime", lambda: _TEST_RUNTIME)
+    monkeypatch.setattr(observer_module, "_require_imported_runtime", lambda runtime: None)
 
 
 def _canonical(value: object) -> bytes:
@@ -432,6 +452,33 @@ def test_observer_rejects_growth_during_iteration(
         observe_stage_schemas(fixture.inputs)
 
 
+def test_observer_rechecks_tree_binding_after_final_metadata_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = stage_inputs(tmp_path)
+    replacement = tmp_path / "replacement-ptv2"
+    displaced = tmp_path / "displaced-ptv2"
+    shutil.copytree(fixture.inputs.ptv2_root, replacement)
+    import examples.dataset.observe_q30t_ptv23_row_schemas as observer
+
+    original = observer._read_bound_path
+    calls = 0
+
+    def replace_root_after_final_plan_read(path: Path, expected_sha256: str, label: str) -> bytes:
+        nonlocal calls
+        calls += 1
+        raw = original(path, expected_sha256, label)
+        if calls == 5:
+            fixture.inputs.ptv2_root.rename(displaced)
+            replacement.rename(fixture.inputs.ptv2_root)
+        return raw
+
+    monkeypatch.setattr(observer, "_read_bound_path", replace_root_after_final_plan_read)
+
+    with pytest.raises(ObservationError, match="staged trees changed"):
+        observe_stage_schemas(fixture.inputs)
+
+
 def test_observer_reports_the_exact_late_invalid_jsonl_row(tmp_path: Path) -> None:
     fixture = stage_inputs(tmp_path)
     physical = fixture.ptv3_files[0]
@@ -451,6 +498,26 @@ def test_observer_reports_the_exact_late_invalid_jsonl_row(tmp_path: Path) -> No
 
     with pytest.raises(ObservationError, match=r"file 2.*row 2"):
         observe_stage_schemas(inputs)
+
+
+def test_observation_binds_the_authenticated_python_and_pyarrow_runtime(tmp_path: Path) -> None:
+    fixture = stage_inputs(tmp_path)
+
+    observation = json.loads(observe_stage_schemas(fixture.inputs))
+
+    assert observation["runtime"] == _TEST_RUNTIME
+
+
+def test_runtime_authentication_fails_closed_on_a_user_owned_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python = tmp_path / "python3.12"
+    python.write_bytes(b"not an approved interpreter")
+    python.chmod(0o755)
+    monkeypatch.setattr(observer_module.sys, "executable", str(python))
+
+    with pytest.raises(ObservationError, match="root-owned"):
+        _REAL_AUTHENTICATE_RUNTIME()
 
 
 def test_cli_publishes_exact_observation_without_clobbering(
@@ -496,3 +563,112 @@ def test_cli_publishes_exact_observation_without_clobbering(
     assert output.read_bytes() == observe_stage_schemas(fixture.inputs)
     with pytest.raises(ObservationError, match="already exists"):
         observer.main()
+
+
+def test_publication_rebinds_absolute_parent_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "output"
+    output_parent.mkdir()
+    displaced = tmp_path / "displaced"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    output = output_parent / "observation.json"
+    import examples.dataset.observe_q30t_ptv23_row_schemas as observer
+
+    original = observer._open_root
+
+    def swap_after_open(path: Path, label: str) -> tuple[int, tuple[int, ...]]:
+        descriptor, identity = original(path, label)
+        if label == "observation output parent":
+            output_parent.rename(displaced)
+            replacement.rename(output_parent)
+        return descriptor, identity
+
+    monkeypatch.setattr(observer, "_open_root", swap_after_open)
+
+    with pytest.raises(ObservationError, match=r"output parent.*changed"):
+        observer._publish_observation(output, b"authenticated\n")
+
+    assert not output.exists()
+    assert not (displaced / output.name).exists()
+
+
+def test_publication_failure_never_leaves_a_partial_final_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "output"
+    output_parent.mkdir()
+    output = output_parent / "observation.json"
+    foreign = output_parent / "foreign"
+    foreign.write_text("owned elsewhere")
+    import examples.dataset.observe_q30t_ptv23_row_schemas as observer
+
+    original = observer.os.fsync
+
+    def fail_file_fsync(descriptor: int) -> None:
+        if os.path.isfile(f"/dev/fd/{descriptor}"):
+            raise OSError("injected file fsync failure")
+        original(descriptor)
+
+    monkeypatch.setattr(observer.os, "fsync", fail_file_fsync)
+
+    with pytest.raises(OSError, match="injected file fsync failure"):
+        observer._publish_observation(output, b"authenticated\n")
+
+    assert not output.exists()
+    assert foreign.read_text() == "owned elsewhere"
+    assert [path.name for path in output_parent.iterdir() if ".partial-" in path.name]
+
+
+def test_stalled_partial_write_never_creates_the_final_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "output"
+    output_parent.mkdir()
+    output = output_parent / "observation.json"
+    original = observer_module.os.write
+    stalled = False
+
+    def stall_once(descriptor: int, payload: bytes) -> int:
+        nonlocal stalled
+        if not stalled:
+            stalled = True
+            return 0
+        return original(descriptor, payload)
+
+    monkeypatch.setattr(observer_module.os, "write", stall_once)
+
+    with pytest.raises(ObservationError, match="write stalled"):
+        observer_module._publish_observation(output, b"authenticated\n")
+
+    assert not output.exists()
+
+
+def test_publication_rebinds_absolute_parent_after_durability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_parent = tmp_path / "output"
+    output_parent.mkdir()
+    displaced = tmp_path / "displaced"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    output = output_parent / "observation.json"
+    original = observer_module._require_absolute_parent_binding
+    calls = 0
+
+    def swap_after_durability(parent: Path, parent_fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            output_parent.rename(displaced)
+            replacement.rename(output_parent)
+        original(parent, parent_fd)
+
+    monkeypatch.setattr(observer_module, "_require_absolute_parent_binding", swap_after_durability)
+
+    with pytest.raises(ObservationError, match=r"output parent.*changed"):
+        observer_module._publish_observation(output, b"authenticated\n")
+
+    assert not output.exists()
+    assert (displaced / output.name).read_bytes() == b"authenticated\n"
