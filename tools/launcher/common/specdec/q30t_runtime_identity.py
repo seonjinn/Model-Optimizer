@@ -95,7 +95,7 @@ def runtime_tree_identity(root: Path) -> RuntimeTreeIdentity:
 
 
 def _open_absolute_directory(path: Path) -> tuple[int, os.stat_result]:
-    if not path.is_absolute() or path == Path("/") or ".." in path.parts:
+    if not path.is_absolute() or path.parts[0] != "/" or path == Path("/") or ".." in path.parts:
         raise ValueError(f"runtime root must be an absolute non-root path: {path}")
     descriptor = os.open(Path("/"), _directory_open_flags())
     try:
@@ -190,6 +190,7 @@ def _read_symlink_entry(
         raise ValueError(f"runtime symlink entry is unreadable: {path}") from error
     if not stat.S_ISLNK(named_after.st_mode) or _identity(named) != _identity(named_after):
         raise ValueError(f"runtime symlink entry changed while reading: {path}")
+    _require_utf8(target, "symlink target")
     return RuntimeTreeEntry(path, "symlink", None, None, target)
 
 
@@ -226,6 +227,7 @@ def _require_directory_stable(directory_fd: int, path: str, before: os.stat_resu
 
 
 def _require_canonical_relative_path(path: str) -> None:
+    _require_utf8(path, "entry path")
     canonical = PurePosixPath(path)
     if (
         not path
@@ -234,6 +236,13 @@ def _require_canonical_relative_path(path: str) -> None:
         or any(component in {"", ".", ".."} for component in canonical.parts)
     ):
         raise ValueError(f"runtime entry path is not canonical: {path!r}")
+
+
+def _require_utf8(value: str, label: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"runtime {label} is not UTF-8 representable") from error
 
 
 def _directory_open_flags() -> int:

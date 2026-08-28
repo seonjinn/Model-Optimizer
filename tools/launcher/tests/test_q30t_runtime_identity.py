@@ -6,14 +6,11 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 from common.specdec import q30t_runtime_identity as module
 from common.specdec.q30t_runtime_identity import runtime_tree_identity
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_shared_runtime_identity_matches_frozen_legacy_digest(tmp_path: Path) -> None:
@@ -61,3 +58,31 @@ def test_runtime_identity_changes_when_symlink_target_changes(tmp_path: Path) ->
     link.unlink()
     link.symlink_to("python3")
     assert runtime_tree_identity(runtime).sha256 != before
+
+
+def test_runtime_identity_rejects_root_alias_before_opening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The double-slash filesystem-root alias cannot start a tree traversal."""
+
+    def unexpected_open(*args: object, **kwargs: object) -> int:
+        raise AssertionError(f"runtime identity opened root alias: {args}, {kwargs}")
+
+    monkeypatch.setattr(module.os, "open", unexpected_open)
+    with pytest.raises(ValueError, match="absolute non-root"):
+        runtime_tree_identity(Path("//"))
+
+
+def test_runtime_identity_rejects_non_utf8_entry_path() -> None:
+    """A surrogateescaped entry name cannot escape as an encoding error."""
+    with pytest.raises(ValueError, match="UTF-8"):
+        module._require_canonical_relative_path(os.fsdecode(b"\xff"))
+
+
+def test_runtime_identity_rejects_non_utf8_symlink_target(tmp_path: Path) -> None:
+    """A surrogateescaped symlink target cannot escape as an encoding error."""
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    os.symlink(b"\xff", os.fsencode(runtime / "python"))
+    with pytest.raises(ValueError, match="UTF-8"):
+        runtime_tree_identity(runtime)
