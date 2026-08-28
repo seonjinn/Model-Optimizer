@@ -97,6 +97,7 @@ def _mask_block_size(head_dim):
         return _PINNED_TILE_MASK_BLOCK_SIZE
     return _DEFAULT_TILE_MASK_BLOCK_SIZE
 
+
 _flex_attention_compiled = None
 _create_block_mask_compiled = None
 
@@ -126,7 +127,13 @@ def is_block_mask(mask) -> bool:
 
 
 def build_draft_block_mask(
-    seq_len, anchor_positions, block_keep_mask, n_blocks, block_size, window, device,
+    seq_len,
+    anchor_positions,
+    block_keep_mask,
+    n_blocks,
+    block_size,
+    window,
+    device,
     head_dim,
 ):
     """BlockMask equivalent of ``HFDFlashModel._build_draft_attention_mask``.
@@ -156,7 +163,12 @@ def build_draft_block_mask(
         return (ctx_ok | draft_ok) & keep[b, q_block]
 
     return create_block_mask(
-        mask_mod, bsz, None, q_len, kv_len, device=device,
+        mask_mod,
+        bsz,
+        None,
+        q_len,
+        kv_len,
+        device=device,
         BLOCK_SIZE=_mask_block_size(head_dim),
     )
 

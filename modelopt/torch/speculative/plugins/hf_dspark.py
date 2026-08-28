@@ -80,9 +80,7 @@ __all__ = ["HFDSparkModel"]
 
 def _tvd_chunk(a, b):
     """Per-token TVD for one row chunk: ``(softmax(a) - softmax(b)).abs().sum(-1)``."""
-    return (
-        (torch.softmax(a.float(), dim=-1) - torch.softmax(b.float(), dim=-1)).abs().sum(dim=-1)
-    )
+    return (torch.softmax(a.float(), dim=-1) - torch.softmax(b.float(), dim=-1)).abs().sum(dim=-1)
 
 
 # torch.compile of _tvd_chunk, built once per process and reused. Eager, this chain is
