@@ -1006,110 +1006,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ptv3-root", type=Path, required=True)
     parser.add_argument("--runtime-evidence", type=Path, required=True)
     parser.add_argument("--runtime-evidence-sha256", required=True)
-    parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
-def _publish_observation(output: Path, payload: bytes) -> None:
-    if not output.is_absolute() or output.name in {"", ".", ".."}:
-        raise ObservationError("output path must be absolute")
-    parent_fd, _ = _open_root(output.parent, "observation output parent")
-    descriptor: int | None = None
-    try:
-        _require_absolute_parent_binding(output.parent, parent_fd)
-        partial_name = f".{output.name}.partial-{hashlib.sha256(payload).hexdigest()[:20]}"
-        try:
-            os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise ObservationError("observation output already exists")
-        flags = (
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        descriptor = os.open(partial_name, flags, 0o440, dir_fd=parent_fd)
-        created = os.fstat(descriptor)
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written < 1:
-                raise ObservationError("observation partial write stalled")
-            offset += written
-        os.fsync(descriptor)
-        after_write = os.fstat(descriptor)
-        current = os.stat(partial_name, dir_fd=parent_fd, follow_symlinks=False)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        reread = bytearray()
-        while block := os.read(descriptor, _READ_BLOCK_BYTES):
-            reread.extend(block)
-        if (
-            not stat.S_ISREG(created.st_mode)
-            or created.st_nlink != 1
-            or (created.st_dev, created.st_ino) != (after_write.st_dev, after_write.st_ino)
-            or _identity(after_write) != _identity(current)
-            or after_write.st_size != len(payload)
-            or bytes(reread) != payload
-        ):
-            raise ObservationError("observation partial identity mismatch")
-        _require_absolute_parent_binding(output.parent, parent_fd)
-        from tools.launcher.common.specdec import qwen4b_b_atomic
-
-        qwen4b_b_atomic._native_rename_no_replace(  # pyright: ignore[reportPrivateUsage]
-            output.with_name(partial_name), output, parent_fd=parent_fd
-        )
-        after_rename = os.fstat(descriptor)
-        installed = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        final_reread = bytearray()
-        while block := os.read(descriptor, _READ_BLOCK_BYTES):
-            final_reread.extend(block)
-        if (
-            _identity(installed) != _identity(after_rename)
-            or (after_write.st_dev, after_write.st_ino)
-            != (after_rename.st_dev, after_rename.st_ino)
-            or bytes(final_reread) != payload
-        ):
-            raise ObservationError("published observation identity mismatch")
-        os.fsync(parent_fd)
-        _require_absolute_parent_binding(output.parent, parent_fd)
-        absolute = os.stat(output, follow_symlinks=False)
-        if _identity(absolute) != _identity(installed):
-            raise ObservationError("published observation path rebound")
-    except FileExistsError as error:
-        raise ObservationError("observation output already exists") from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        os.close(parent_fd)
-
-
-def _require_absolute_parent_binding(parent: Path, parent_fd: int) -> None:
-    """Reopen every absolute component and bind it to the held output parent."""
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open("/", flags)
-    try:
-        for component in parent.parts[1:]:
-            child = os.open(component, flags, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = child
-        held = os.fstat(parent_fd)
-        rebound = os.fstat(descriptor)
-        if _identity(held) != _identity(rebound):
-            raise ObservationError("observation output parent identity changed")
-    except ObservationError:
-        raise
-    except OSError as error:
-        raise ObservationError("observation output parent identity changed") from error
-    finally:
-        os.close(descriptor)
-
-
-def main() -> int:
-    """Run the authenticated row-schema observer CLI."""
+def main() -> bytes:
+    """Return the canonical observation for the held bootstrap to retain."""
     arguments = _parse_args()
     payload = observe_stage_schemas(
         StageInputs(
@@ -1127,9 +1028,8 @@ def main() -> int:
             runtime_evidence_sha256=arguments.runtime_evidence_sha256,
         )
     )
-    _publish_observation(arguments.output, payload)
-    return 0
+    return payload
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit("the observer must run through its held bootstrap")

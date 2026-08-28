@@ -572,13 +572,10 @@ def test_observation_excludes_operation_specific_runtime_values(tmp_path: Path) 
     assert observe_stage_schemas(first) == observe_stage_schemas(second)
 
 
-def test_cli_publishes_exact_observation_without_clobbering(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_cli_returns_exact_observation_bytes_without_output_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fixture = stage_inputs(tmp_path)
-    output_parent = tmp_path / "output"
-    output_parent.mkdir()
-    output = output_parent / "observation.json"
     import examples.dataset.observe_q30t_ptv23_row_schemas as observer
 
     monkeypatch.setattr(
@@ -610,121 +607,8 @@ def test_cli_publishes_exact_observation_without_clobbering(
             str(fixture.inputs.runtime_evidence_path),
             "--runtime-evidence-sha256",
             fixture.inputs.runtime_evidence_sha256,
-            "--output",
-            str(output),
         ],
     )
 
-    assert observer.main() == 0
-    assert output.read_bytes() == observe_stage_schemas(fixture.inputs)
-    with pytest.raises(ObservationError, match="already exists"):
-        observer.main()
-
-
-def test_publication_rebinds_absolute_parent_before_mutation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    output_parent = tmp_path / "output"
-    output_parent.mkdir()
-    displaced = tmp_path / "displaced"
-    replacement = tmp_path / "replacement"
-    replacement.mkdir()
-    output = output_parent / "observation.json"
-    import examples.dataset.observe_q30t_ptv23_row_schemas as observer
-
-    original = observer._open_root
-
-    def swap_after_open(path: Path, label: str) -> tuple[int, tuple[int, ...]]:
-        descriptor, identity = original(path, label)
-        if label == "observation output parent":
-            output_parent.rename(displaced)
-            replacement.rename(output_parent)
-        return descriptor, identity
-
-    monkeypatch.setattr(observer, "_open_root", swap_after_open)
-
-    with pytest.raises(ObservationError, match=r"output parent.*changed"):
-        observer._publish_observation(output, b"authenticated\n")
-
-    assert not output.exists()
-    assert not (displaced / output.name).exists()
-
-
-def test_publication_failure_never_leaves_a_partial_final_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    output_parent = tmp_path / "output"
-    output_parent.mkdir()
-    output = output_parent / "observation.json"
-    foreign = output_parent / "foreign"
-    foreign.write_text("owned elsewhere")
-    import examples.dataset.observe_q30t_ptv23_row_schemas as observer
-
-    original = observer.os.fsync
-
-    def fail_file_fsync(descriptor: int) -> None:
-        if os.path.isfile(f"/dev/fd/{descriptor}"):
-            raise OSError("injected file fsync failure")
-        original(descriptor)
-
-    monkeypatch.setattr(observer.os, "fsync", fail_file_fsync)
-
-    with pytest.raises(OSError, match="injected file fsync failure"):
-        observer._publish_observation(output, b"authenticated\n")
-
-    assert not output.exists()
-    assert foreign.read_text() == "owned elsewhere"
-    assert [path.name for path in output_parent.iterdir() if ".partial-" in path.name]
-
-
-def test_stalled_partial_write_never_creates_the_final_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    output_parent = tmp_path / "output"
-    output_parent.mkdir()
-    output = output_parent / "observation.json"
-    original = observer_module.os.write
-    stalled = False
-
-    def stall_once(descriptor: int, payload: bytes) -> int:
-        nonlocal stalled
-        if not stalled:
-            stalled = True
-            return 0
-        return original(descriptor, payload)
-
-    monkeypatch.setattr(observer_module.os, "write", stall_once)
-
-    with pytest.raises(ObservationError, match="write stalled"):
-        observer_module._publish_observation(output, b"authenticated\n")
-
-    assert not output.exists()
-
-
-def test_publication_rebinds_absolute_parent_after_durability(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    output_parent = tmp_path / "output"
-    output_parent.mkdir()
-    displaced = tmp_path / "displaced"
-    replacement = tmp_path / "replacement"
-    replacement.mkdir()
-    output = output_parent / "observation.json"
-    original = observer_module._require_absolute_parent_binding
-    calls = 0
-
-    def swap_after_durability(parent: Path, parent_fd: int) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 3:
-            output_parent.rename(displaced)
-            replacement.rename(output_parent)
-        original(parent, parent_fd)
-
-    monkeypatch.setattr(observer_module, "_require_absolute_parent_binding", swap_after_durability)
-
-    with pytest.raises(ObservationError, match=r"output parent.*changed"):
-        observer_module._publish_observation(output, b"authenticated\n")
-
-    assert not output.exists()
-    assert (displaced / output.name).read_bytes() == b"authenticated\n"
+    assert observer.main() == observe_stage_schemas(fixture.inputs)
+    assert capsys.readouterr().out == ""

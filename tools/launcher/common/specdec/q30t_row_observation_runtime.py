@@ -193,9 +193,12 @@ def _stable_single_link_bytes(path: Path) -> tuple[str, bytes]:
             raise ValueError("runtime evidence grew while reading")
         after = os.fstat(descriptor)
         rebound = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if _file_identity(before) != _file_identity(after) or _file_identity(
-            after
-        ) != _file_identity(rebound):
+        absolute = _require_absolute_path_binding(path, parent_fd, descriptor)
+        if (
+            _file_identity(before) != _file_identity(after)
+            or _file_identity(after) != _file_identity(rebound)
+            or _file_identity(after) != _file_identity(absolute)
+        ):
             raise ValueError("runtime evidence changed while reading")
         return digest.hexdigest(), bytes(raw)
     finally:
@@ -210,6 +213,32 @@ def _open_parent(path: Path) -> int:
         return os.open(path.parent, flags)
     except OSError as error:
         raise ValueError("runtime evidence parent is unavailable") from error
+
+
+def _require_absolute_path_binding(path: Path, parent_fd: int, descriptor: int) -> os.stat_result:
+    """Require the held file and parent to remain reachable through ``path``."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    absolute_parent_fd = os.open("/", flags)
+    try:
+        for component in path.parent.parts[1:]:
+            child_fd = os.open(component, flags, dir_fd=absolute_parent_fd)
+            os.close(absolute_parent_fd)
+            absolute_parent_fd = child_fd
+        held_parent = os.fstat(parent_fd)
+        absolute_parent = os.fstat(absolute_parent_fd)
+        absolute_file = os.stat(path.name, dir_fd=absolute_parent_fd, follow_symlinks=False)
+        held_file = os.fstat(descriptor)
+        if _file_identity(held_parent) != _file_identity(absolute_parent) or _file_identity(
+            held_file
+        ) != _file_identity(absolute_file):
+            raise ValueError("runtime evidence absolute path changed while reading")
+        return absolute_file
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError("runtime evidence absolute path changed while reading") from error
+    finally:
+        os.close(absolute_parent_fd)
 
 
 def _open_stable_regular(parent_fd: int, name: str) -> tuple[int, os.stat_result]:

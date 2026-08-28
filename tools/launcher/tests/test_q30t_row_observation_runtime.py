@@ -162,3 +162,34 @@ def test_runtime_evidence_rejects_linked_and_oversized_evidence(tmp_path: Path) 
     path.write_bytes(b"x" * (1024 * 1024 + 1))
     with pytest.raises(ValueError, match="size limit"):
         load_row_observation_runtime_evidence(path, expected_sha256=_file_sha256(path))
+
+
+def test_runtime_evidence_rejects_absolute_parent_rebinding_after_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held parent descriptor must remain bound to the caller's absolute path."""
+    import common.specdec.q30t_row_observation_runtime as runtime_module
+
+    parent = tmp_path / "runtime-evidence-parent"
+    parent.mkdir()
+    path, _ = _materialize(parent)
+    expected_sha256 = _file_sha256(path)
+    displaced = tmp_path / "displaced-runtime-evidence-parent"
+    replacement = tmp_path / "replacement-runtime-evidence-parent"
+    replacement.mkdir()
+    original_read = runtime_module.os.read
+    rebound = False
+
+    def rebind_after_read(descriptor: int, count: int) -> bytes:
+        nonlocal rebound
+        block = original_read(descriptor, count)
+        if block and not rebound:
+            rebound = True
+            parent.rename(displaced)
+            replacement.rename(parent)
+        return block
+
+    monkeypatch.setattr(runtime_module.os, "read", rebind_after_read)
+
+    with pytest.raises(ValueError, match=r"absolute path.*changed"):
+        load_row_observation_runtime_evidence(path, expected_sha256=expected_sha256)
