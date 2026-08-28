@@ -16,6 +16,7 @@ __all__ = [
     "ExclusionIndex",
     "UUIDCollisionError",
     "canonicalize_prompt",
+    "normalize_storage_fields",
     "prompt_messages",
     "prompt_uuid",
     "validate_and_admit",
@@ -48,13 +49,15 @@ class UUIDCollisionError(ValueError):
     pass
 
 
-def _normalize(value: object) -> object:
+def normalize_storage_fields(value: object) -> object:
     if isinstance(value, dict):
         return {
-            key: _normalize(item) for key, item in value.items() if key not in STORAGE_ONLY_FIELDS
+            key: normalize_storage_fields(item)
+            for key, item in value.items()
+            if key not in STORAGE_ONLY_FIELDS
         }
     if isinstance(value, list):
-        return [_normalize(item) for item in value]
+        return [normalize_storage_fields(item) for item in value]
     return value
 
 
@@ -67,16 +70,25 @@ def prompt_messages(messages: object) -> list[dict[str, object]]:
     return retained
 
 
-def canonicalize_prompt(
-    messages: list[dict[str, object]], tools: list[dict[str, object]] | None
-) -> bytes:
+def _prompt_tools(tools: object) -> list[dict[str, object]]:
+    if tools is None:
+        return []
+    if not isinstance(tools, list) or any(not isinstance(item, dict) for item in tools):
+        raise ValueError("tools must be a list of mappings")
+    return [dict(item) for item in tools]
+
+
+def canonicalize_prompt(messages: object, tools: object) -> bytes:
     """Preserve semantic conversation structure while removing storage metadata."""
     return canonical_json(
-        {"messages": _normalize(prompt_messages(messages)), "tools": _normalize(tools or [])}
+        {
+            "messages": normalize_storage_fields(prompt_messages(messages)),
+            "tools": normalize_storage_fields(_prompt_tools(tools)),
+        }
     )
 
 
-def prompt_uuid(messages: list[dict[str, object]], tools: list[dict[str, object]] | None) -> str:
+def prompt_uuid(messages: object, tools: object) -> str:
     return sha256_bytes(canonicalize_prompt(messages, tools))
 
 

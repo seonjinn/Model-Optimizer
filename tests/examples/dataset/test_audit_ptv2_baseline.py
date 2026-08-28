@@ -144,6 +144,37 @@ def test_audit_uuid_excludes_source_assistant_completion(tmp_path: Path) -> None
     assert audit.duplicate_uuid_multiplicity == {audit.occurrence_prompt_ids[0]: 2}
 
 
+@pytest.mark.parametrize(
+    ("messages", "tools", "match"),
+    [
+        (json.dumps({"role": "user", "content": "not a list"}), None, "messages must be a list"),
+        (
+            json.dumps([{"role": "user", "content": "valid"}]),
+            json.dumps({"type": "function"}),
+            "tools must be a list",
+        ),
+    ],
+)
+def test_audit_rejects_malformed_decoded_identity_inputs(
+    tmp_path: Path, messages: str, tools: str | None, match: str
+) -> None:
+    module = _load()
+    root = tmp_path / "data"
+    root.mkdir()
+    target = tmp_path / "raw-chat.parquet"
+    columns: dict[str, list[str]] = {"messages": [messages]}
+    if tools is not None:
+        columns["tools"] = [tools]
+    pq.write_table(pa.table(columns), target)
+    (root / "chat-0.parquet").symlink_to(target)
+    expected = module.BaselineExpectation(
+        "5c89e01dd720ae0f4058445ed49c5fb68a03c76e", 1, {"chat": 1}
+    )
+
+    with pytest.raises(ValueError, match=match):
+        module.audit_baseline(root, expected)
+
+
 def test_audit_still_fails_closed_on_histogram_mismatch(tmp_path: Path) -> None:
     module = _load()
     root = tmp_path / "data"

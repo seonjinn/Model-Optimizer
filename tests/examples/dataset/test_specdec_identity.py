@@ -46,9 +46,7 @@ def test_prompt_uuid_strips_storage_fields_but_preserves_order_and_tools() -> No
     stored = [dict(messages[0], row_index=9), messages[1], messages[2]]
     assert module.prompt_uuid(stored, tools) == module.prompt_uuid(messages, tools)
     reordered = [messages[1], messages[0], messages[2]]
-    assert module.prompt_uuid(reordered, tools) != module.prompt_uuid(
-        messages, tools
-    )
+    assert module.prompt_uuid(reordered, tools) != module.prompt_uuid(messages, tools)
     assert module.prompt_uuid(messages, []) != module.prompt_uuid(messages, tools)
 
 
@@ -74,6 +72,40 @@ def test_prompt_messages_rejects_a_conversation_without_prompt_roles() -> None:
     module = _load("specdec_identity")
     with pytest.raises(ValueError, match="prompt-bearing"):
         module.prompt_messages([{"role": "assistant", "content": "only completion"}])
+
+
+def test_normalize_storage_fields_removes_only_storage_metadata_recursively() -> None:
+    module = _load("specdec_identity")
+    source = {
+        "role": "user",
+        "content": "fix it",
+        "cache_path": "/tmp/cache",
+        "metadata": {"row_index": 7, "keep": "value"},
+        "tool_calls": [{"id": "call-1", "download_path": "/tmp/download"}],
+    }
+
+    assert module.normalize_storage_fields(source) == {
+        "role": "user",
+        "content": "fix it",
+        "metadata": {"keep": "value"},
+        "tool_calls": [{"id": "call-1"}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("messages", "tools", "match"),
+    [
+        ({"role": "user", "content": "not a list"}, [], "messages must be a list"),
+        ([{"role": "user", "content": "valid"}], {"type": "function"}, "tools must be a list"),
+    ],
+)
+def test_prompt_uuid_rejects_malformed_decoded_identity_inputs(
+    messages: object, tools: object, match: str
+) -> None:
+    module = _load("specdec_identity")
+
+    with pytest.raises(ValueError, match=match):
+        module.prompt_uuid(messages, tools)
 
 
 def test_exclusion_rejects_prior_heldout_duplicate_and_collision() -> None:
