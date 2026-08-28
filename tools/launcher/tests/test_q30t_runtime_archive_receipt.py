@@ -12,7 +12,9 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -36,6 +38,21 @@ _APPROVED_ARCHIVE = (
 )
 _APPROVED_ARCHIVE_SHA256 = "4a20aee61f290c48bed22a84b4a0ae0cbdc54e3e3910854d253188c8854f5dc9"
 _RUNNER = Path(__file__).parents[1] / "common/specdec/run_q30t_runtime_archive_receipt.sbatch"
+
+
+@pytest.fixture(autouse=True)
+def _explicit_non_linux_functional_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enable an explicitly unsealed fallback only for non-security local tests."""
+    if sys.platform == "linux":
+        return
+
+    def open_unsealed_snapshot(parent: Path) -> int:
+        with tempfile.TemporaryFile(prefix="q30t-test-snapshot-", dir=parent) as temporary:
+            return os.dup(temporary.fileno())
+
+    monkeypatch.setattr(module, "_UNSEALED_TEST_SNAPSHOT_FACTORY", open_unsealed_snapshot)
 
 
 @dataclass(frozen=True)
@@ -86,7 +103,6 @@ def _runner_harness(tmp_path: Path) -> RunnerHarness:
         + '\n: > "$capture"\nfor argument in "$@"; do printf \'%s\\n\' "$argument" >> "$capture"; done',
     )
     environment = {
-        "OSTYPE": "darwin-test",
         "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
         "Q30T_TEST_BASH": str(tools["bash"]),
         "Q30T_TEST_ENV": str(tools["env"]),
@@ -267,6 +283,9 @@ def test_archive_receipt_rejects_rebound_archive(
         produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="immutable snapshot trust requires sealed memfd"
+)
 def test_archive_extraction_uses_private_snapshot_after_source_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -290,6 +309,22 @@ def test_archive_extraction_uses_private_snapshot_after_source_mutation(
     with pytest.raises(ValueError, match="changed while extracting"):
         produce_runtime_archive_tree_receipt(**arguments)
     assert (tmp_path / "runtime/bin/python").read_bytes() == b"python"
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="Linux production uses sealed memfd")
+def test_non_linux_production_rejects_unsealed_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production cannot qualify an archive without kernel-enforced sealing."""
+    archive = make_runtime_archive(
+        tmp_path,
+        {"bin/python": b"python", "pyvenv.cfg": b"home=x\n"},
+    )
+    monkeypatch.setattr(module, "_UNSEALED_TEST_SNAPSHOT_FACTORY", None)
+
+    with pytest.raises(RuntimeError, match="sealed snapshots require Linux"):
+        produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
+    assert not (tmp_path / "runtime").exists()
 
 
 def test_archive_extraction_rejects_root_rebind_before_tar_side_effects(
@@ -750,7 +785,15 @@ def test_sbatch_behaviorally_rejects_wrong_fixed_archive_identity(
 
 @pytest.mark.parametrize(
     ("name", "value"),
-    [("SLURM_JOB_GPUS", "0"), ("SLURM_GPUS_ON_NODE", "1"), ("SLURM_TRES_PER_NODE", "gpu:1")],
+    [
+        ("SLURM_JOB_GPUS", "0"),
+        ("SLURM_STEP_GPUS", "0"),
+        ("SLURM_GPUS_ON_NODE", "0"),
+        ("SLURM_GPUS", "0"),
+        ("SLURM_GPUS_PER_NODE", "0"),
+        ("SLURM_GPUS_PER_TASK", "0"),
+        ("SLURM_TRES_PER_NODE", "gpu:1"),
+    ],
 )
 def test_sbatch_behaviorally_rejects_gpu_environment(tmp_path: Path, name: str, value: str) -> None:
     """GPU variables and GPU TRES fail the CPU-only allocation boundary."""
@@ -781,6 +824,17 @@ def test_sbatch_behaviorally_rejects_prohibited_python_environment(tmp_path: Pat
 
     assert result.returncode == 2
     assert "prohibited exported environment variable: PYTHONPATH" in result.stderr
+    assert not harness.capture_path.exists()
+
+
+def test_sbatch_behaviorally_rejects_exported_spoofed_ostype(tmp_path: Path) -> None:
+    """An exported platform claim cannot authorize user-controlled tools."""
+    harness = _runner_harness(tmp_path)
+
+    result = _run_runner(harness, environment_updates={"OSTYPE": "darwin-test"})
+
+    assert result.returncode == 2
+    assert "prohibited exported environment variable: OSTYPE" in result.stderr
     assert not harness.capture_path.exists()
 
 

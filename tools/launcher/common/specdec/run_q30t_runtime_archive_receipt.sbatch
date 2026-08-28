@@ -39,7 +39,7 @@ reject_prohibited_environment() {
     local exported_name
     while IFS= builtin read -r exported_name; do
         case "$exported_name" in
-            BASH_ENV|ENV|BASH_FUNC_*|CDPATH|GLOBIGNORE|SHELLOPTS|BASHOPTS|LD_*|DYLD_*|PYTHON*|PERL5LIB|RUBYLIB)
+            BASH_ENV|ENV|BASH_FUNC_*|CDPATH|GLOBIGNORE|SHELLOPTS|BASHOPTS|OSTYPE|LD_*|DYLD_*|PYTHON*|PERL5LIB|RUBYLIB)
                 builtin printf 'prohibited exported environment variable: %s\n' "$exported_name" >&2
                 return 2
                 ;;
@@ -73,7 +73,6 @@ readonly slurm_gpus_per_node="${SLURM_GPUS_PER_NODE:-}"
 readonly slurm_gpus_per_task="${SLURM_GPUS_PER_TASK:-}"
 readonly slurm_tres_per_node="${SLURM_TRES_PER_NODE:-}"
 readonly runtime_user="${USER:-}"
-readonly shell_ostype="${OSTYPE:-}"
 readonly q30t_test_allow_system_executables="${Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES:-}"
 readonly q30t_test_bash="${Q30T_TEST_BASH:-}"
 readonly q30t_test_env="${Q30T_TEST_ENV:-}"
@@ -91,6 +90,8 @@ readonly approved_tar="/usr/bin/tar"
 readonly approved_zstd="/usr/bin/zstd"
 readonly approved_dirname="/usr/bin/dirname"
 readonly approved_mkdir="/bin/mkdir"
+readonly approved_validator="/usr/bin/python3"
+readonly approved_uname="/usr/bin/uname"
 system_bash="$approved_bash"
 system_env="$approved_env"
 system_python="$approved_python"
@@ -115,10 +116,33 @@ if not (valid_entry and valid_target):
     raise SystemExit(2)
 print(resolved)'
 
+[[ -f "$approved_validator" && -x "$approved_validator" ]] || {
+    builtin printf '%s\n' "approved bootstrap validator is unavailable" >&2
+    builtin exit 2
+}
+system_validator="$($approved_validator -S -I -c "$validate_executable" "$approved_validator")" || {
+    builtin printf '%s\n' "approved bootstrap validator failed ownership validation" >&2
+    builtin exit 2
+}
+system_uname="$($system_validator -S -I -c "$validate_executable" "$approved_uname")" || {
+    builtin printf '%s\n' "approved uname executable failed ownership validation" >&2
+    builtin exit 2
+}
+readonly system_validator system_uname
+kernel_name="$("$system_uname" -s)" || {
+    builtin printf '%s\n' "authenticated uname execution failed" >&2
+    builtin exit 2
+}
+readonly kernel_name
+[[ "$kernel_name" =~ ^[A-Za-z0-9._-]+$ ]] || {
+    builtin printf '%s\n' "authenticated kernel identity is invalid" >&2
+    builtin exit 2
+}
+
 if [[ -n "$q30t_test_allow_system_executables" || -n "$q30t_test_bash" \
     || -n "$q30t_test_env" || -n "$q30t_test_python" || -n "$q30t_test_tar" \
     || -n "$q30t_test_zstd" || -n "$q30t_test_dirname" || -n "$q30t_test_mkdir" ]]; then
-    [[ "$shell_ostype" != linux* \
+    [[ "$kernel_name" != Linux \
         && "$q30t_test_allow_system_executables" == non-linux-test \
         && "$q30t_test_bash" == /* && "$q30t_test_env" == /* \
         && "$q30t_test_python" == /* && "$q30t_test_tar" == /* \
@@ -143,11 +167,7 @@ if [[ -n "$q30t_test_allow_system_executables" || -n "$q30t_test_bash" \
     done
     test_executables=1
 else
-    [[ -f "$approved_python" && -x "$approved_python" ]] || {
-        builtin printf '%s\n' "approved Python validator is unavailable" >&2
-        builtin exit 2
-    }
-    system_python="$($approved_python -S -I -c "$validate_executable" "$approved_python")" || {
+    system_python="$($system_validator -S -I -c "$validate_executable" "$approved_python")" || {
         builtin printf '%s\n' "approved Python executable failed ownership validation" >&2
         builtin exit 2
     }
@@ -191,10 +211,8 @@ readonly expected_archive_sha256="4a20aee61f290c48bed22a84b4a0ae0cbdc54e3e391085
     builtin exit 2
 }
 [[ -z "$slurm_job_gpus" && -z "$slurm_step_gpus" \
-    && ( -z "$slurm_gpus_on_node" || "$slurm_gpus_on_node" == 0 ) \
-    && ( -z "$slurm_gpus" || "$slurm_gpus" == 0 ) \
-    && ( -z "$slurm_gpus_per_node" || "$slurm_gpus_per_node" == 0 ) \
-    && ( -z "$slurm_gpus_per_task" || "$slurm_gpus_per_task" == 0 ) \
+    && -z "$slurm_gpus_on_node" && -z "$slurm_gpus" \
+    && -z "$slurm_gpus_per_node" && -z "$slurm_gpus_per_task" \
     && "$slurm_tres_per_node" != *gpu* ]] || {
     builtin printf '%s\n' "Q30 runtime archive receipt requires a CPU-only allocation" >&2
     builtin exit 2

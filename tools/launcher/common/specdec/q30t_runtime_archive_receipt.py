@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import tarfile
-import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -50,6 +49,7 @@ def _post_hash_hook() -> None:
 
 _POST_HASH_HOOK: Callable[[], None] = _post_hash_hook
 _PRE_EXTRACT_HOOK: Callable[[], None] = _post_hash_hook
+_UNSEALED_TEST_SNAPSHOT_FACTORY: Callable[[Path], int] | None = None
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -583,7 +583,7 @@ def _snapshot_open_regular(
         if _file_identity(source_before) != _file_identity(source_after):
             raise ValueError(f"runtime archive input changed while hashing: {source_path}")
         os.fsync(snapshot_fd)
-        snapshot_fd = _make_snapshot_immutable(snapshot_fd, private_parent)
+        snapshot_fd = _finalize_snapshot_descriptor(snapshot_fd, private_parent)
         snapshot = os.fstat(snapshot_fd)
         if not stat.S_ISREG(snapshot.st_mode) or snapshot.st_size != source_before.st_size:
             raise ValueError("runtime archive private snapshot is invalid")
@@ -602,16 +602,12 @@ def _new_snapshot_descriptor(private_parent: Path) -> int:
             "q30t-runtime-archive",
             getattr(os, "MFD_CLOEXEC", 0) | allow_sealing,
         )
-    private_directory = Path(tempfile.mkdtemp(prefix=".q30t-runtime-snapshot-", dir=private_parent))
-    private_directory.chmod(0o700)
-    return os.open(
-        private_directory / "archive.tar.zst",
-        os.O_RDWR | os.O_CREAT | os.O_EXCL | _nofollow_flag() | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
+    if _UNSEALED_TEST_SNAPSHOT_FACTORY is None:
+        raise RuntimeError("runtime archive sealed snapshots require Linux memfd sealing")
+    return _UNSEALED_TEST_SNAPSHOT_FACTORY(private_parent)
 
 
-def _make_snapshot_immutable(descriptor: int, private_parent: Path) -> int:
+def _finalize_snapshot_descriptor(descriptor: int, private_parent: Path) -> int:
     if sys.platform == "linux" and hasattr(fcntl, "F_ADD_SEALS"):
         seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
         fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
@@ -619,19 +615,13 @@ def _make_snapshot_immutable(descriptor: int, private_parent: Path) -> int:
             raise ValueError("runtime archive private snapshot sealing failed")
         return descriptor
     status = os.fstat(descriptor)
-    os.fchmod(descriptor, 0o400)
-    snapshot_path = Path(_descriptor_path(descriptor)).resolve()
-    readonly = os.open(snapshot_path, os.O_RDONLY | _nofollow_flag() | getattr(os, "O_CLOEXEC", 0))
-    opened = os.fstat(readonly)
-    if (status.st_dev, status.st_ino, status.st_size) != (
-        opened.st_dev,
-        opened.st_ino,
-        opened.st_size,
+    if (
+        _UNSEALED_TEST_SNAPSHOT_FACTORY is None
+        or not stat.S_ISREG(status.st_mode)
+        or status.st_nlink != 0
     ):
-        os.close(readonly)
-        raise ValueError(f"runtime archive private snapshot changed under {private_parent}")
-    os.close(descriptor)
-    return readonly
+        raise RuntimeError(f"runtime archive sealed snapshots require Linux under {private_parent}")
+    return descriptor
 
 
 def _write_all(descriptor: int, block: bytes) -> None:
