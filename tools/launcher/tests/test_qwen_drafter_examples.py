@@ -16,6 +16,7 @@
 """Structural contracts for Qwen3 DFlash and DSpark streaming launchers."""
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -247,8 +248,25 @@ def _write_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
 
 
+def _stage_streaming_wrapper(tmp_path: Path, layout: str) -> tuple[Path, Path, Path]:
+    source = tmp_path / "source"
+    wrapper = source / "tools/launcher/common/eagle3/train_eagle_streaming.sh"
+    wrapper.parent.mkdir(parents=True)
+    shutil.copyfile(_LAUNCHER_DIR / "common/eagle3/train_eagle_streaming.sh", wrapper)
+    shutil.copyfile(
+        _LAUNCHER_DIR / "common/service_utils.sh",
+        source / "tools/launcher/common/service_utils.sh",
+    )
+    if layout == "direct":
+        modelopt_root = source
+    else:
+        modelopt_root = source / "tools/launcher/modules/Model-Optimizer"
+    return source, wrapper, modelopt_root
+
+
 def test_streaming_serve_uses_activated_runtime_python(tmp_path: Path) -> None:
-    """The vLLM console script must not bypass the activated shared runtime."""
+    """The staged wrapper must use runtime Python and repo-local training artifacts."""
+    source, wrapper, modelopt_root = _stage_streaming_wrapper(tmp_path, "direct")
     runtime = tmp_path / "runtime"
     invocation_log = tmp_path / "invocations.log"
     serve_ready = tmp_path / "serve-ready"
@@ -287,8 +305,14 @@ printf '2\\n'
 """,
     )
 
-    trainer = tmp_path / "modules/Model-Optimizer/examples/speculative_decoding/launch_train.sh"
-    _write_executable(trainer, "#!/bin/sh\nexit 0\n")
+    trainer = modelopt_root / "examples/speculative_decoding/launch_train.sh"
+    _write_executable(
+        trainer,
+        f'#!/bin/sh\nprintf \'repo-trainer %s\\n\' "$*" >> "{invocation_log}"\n',
+    )
+    exporter = modelopt_root / "examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+    exporter.parent.mkdir(parents=True)
+    exporter.write_text("# exporter fixture\n")
 
     env = {
         **os.environ,
@@ -306,10 +330,10 @@ printf '2\\n'
     result = subprocess.run(
         [
             "bash",
-            str(_LAUNCHER_DIR / "common" / "eagle3" / "train_eagle_streaming.sh"),
+            str(wrapper),
             "training.output_dir=/scratchspace/dflash",
         ],
-        cwd=tmp_path,
+        cwd=source / "tools/launcher",
         env=env,
         capture_output=True,
         text=True,
@@ -322,6 +346,81 @@ printf '2\\n'
         "runtime-python -m vllm.entrypoints.cli.main serve target-model"
         in invocation_log.read_text()
     )
+    assert "repo-trainer training.output_dir=/scratchspace/dflash" in invocation_log.read_text()
+    assert str(exporter) in invocation_log.read_text()
+
+
+@pytest.mark.parametrize("layout", ["direct", "packaged"])
+def test_streaming_fallback_uses_one_modelopt_root(layout: str, tmp_path: Path) -> None:
+    """Fallback install, training, and export must share the detected source root."""
+    source, wrapper, modelopt_root = _stage_streaming_wrapper(tmp_path, layout)
+    invocation_log = tmp_path / "invocations.log"
+    serve_ready = tmp_path / "serve-ready"
+    os.mkfifo(serve_ready)
+    fake_bin = tmp_path / "bin"
+
+    fake_python = f"""#!/bin/sh
+printf 'python %s\\n' "$*" >> "{invocation_log}"
+if [ "$1" = "-m" ]; then
+    printf 'ready\\n' > "{serve_ready}"
+    sleep 1
+fi
+exit 0
+"""
+    _write_executable(fake_bin / "python", fake_python)
+    _write_executable(fake_bin / "python3", fake_python)
+    _write_executable(
+        fake_bin / "pip",
+        f'#!/bin/sh\nprintf \'pip %s\\n\' "$*" >> "{invocation_log}"\n',
+    )
+    _write_executable(
+        fake_bin / "curl",
+        f'#!/bin/sh\nread -r _ < "{serve_ready}"\n',
+    )
+    _write_executable(fake_bin / "nvidia-smi", "#!/bin/sh\nprintf '2\\n'\n")
+
+    trainer = modelopt_root / "examples/speculative_decoding/launch_train.sh"
+    _write_executable(
+        trainer,
+        f'#!/bin/sh\nprintf \'trainer %s\\n\' "$*" >> "{invocation_log}"\n',
+    )
+    exporter = modelopt_root / "examples/speculative_decoding/scripts/export_hf_checkpoint.py"
+    exporter.parent.mkdir(parents=True)
+    exporter.write_text("# exporter fixture\n")
+    requirements = modelopt_root / "examples/speculative_decoding/requirements.txt"
+    requirements.write_text("# requirements fixture\n")
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "HF_MODEL_CKPT": "target-model",
+        "EAGLE_CAPTURE_IDS": "[2,10,18,26,34,36]",
+        "SLURM_NNODES": "1",
+        "SLURM_NODEID": "0",
+        "SERVE_GPU": "0",
+        "SERVE_TP": "1",
+        "TRAIN_GPUS": "1",
+        "SERVE_READY_TIMEOUT": "5",
+        "SERVE_LOG": str(tmp_path / "vllm-serve.log"),
+    }
+    env.pop("MODELOPT_RUNTIME", None)
+    result = subprocess.run(
+        ["bash", str(wrapper), "training.output_dir=/scratchspace/dflash"],
+        cwd=source / "tools/launcher",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    invocations = invocation_log.read_text()
+    assert (modelopt_root / "pyproject.toml").is_file()
+    assert f"pip install --no-cache-dir -e {modelopt_root}/" in invocations
+    assert f"pip install --no-cache-dir -r {requirements}" in invocations
+    assert "trainer training.output_dir=/scratchspace/dflash" in invocations
+    assert f"python {exporter}" in invocations
 
 
 def test_training_launcher_uses_activated_python_for_accelerate(tmp_path: Path) -> None:

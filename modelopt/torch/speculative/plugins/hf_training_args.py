@@ -42,8 +42,10 @@ class ModelArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
     model_name_or_path: str | None = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    tokenizer_name_or_path: str | None = None
     use_fake_base_for_offline: bool = False
     trust_remote_code: bool = False
+    initialization_policy: Literal["base", "converted-weights-only"] = "base"
 
 
 class DataArguments(BaseModel):
@@ -108,3 +110,11 @@ class TrainingArguments(BaseModel):
     answer_only_loss: bool = False
     cp_size: int = 1
     dp_shard_size: int | None = None
+    exact_exposure_count: int | None = None
+
+    @field_validator("exact_exposure_count")
+    @classmethod
+    def _check_exact_exposure_count(cls, value: int | None) -> int | None:
+        if value is not None and (type(value) is not int or value != 700_000):
+            raise ValueError("exact_exposure_count currently supports only the Q30 exact 700K run")
+        return value

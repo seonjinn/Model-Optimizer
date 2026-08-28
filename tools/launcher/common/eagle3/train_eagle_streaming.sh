@@ -62,6 +62,19 @@
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/../service_utils.sh"
 
+DIRECT_SOURCE_ROOT="${SCRIPT_DIR}/../../../.."
+PACKAGED_SOURCE_ROOT="${SCRIPT_DIR}/../../modules/Model-Optimizer"
+if [ -f "${DIRECT_SOURCE_ROOT}/examples/speculative_decoding/launch_train.sh" ] \
+    && [ -f "${DIRECT_SOURCE_ROOT}/examples/speculative_decoding/scripts/export_hf_checkpoint.py" ]; then
+    MODELOPT_SOURCE_ROOT="$(readlink -f "$DIRECT_SOURCE_ROOT")"
+elif [ -f "${PACKAGED_SOURCE_ROOT}/examples/speculative_decoding/launch_train.sh" ] \
+    && [ -f "${PACKAGED_SOURCE_ROOT}/examples/speculative_decoding/scripts/export_hf_checkpoint.py" ]; then
+    MODELOPT_SOURCE_ROOT="$(readlink -f "$PACKAGED_SOURCE_ROOT")"
+else
+    echo "ERROR: cannot locate a ModelOpt source root from ${SCRIPT_DIR}." >&2
+    exit 1
+fi
+
 ###################################################################################################
 # Container provisioning. Production jobs reuse one immutable shared runtime to avoid
 # creating package inodes on every node and every launch. The fallback keeps existing
@@ -75,7 +88,7 @@ if [ -n "${MODELOPT_RUNTIME:-}" ]; then
     source "$MODELOPT_RUNTIME/bin/activate"
 else
 
-TOML=modules/Model-Optimizer/pyproject.toml
+TOML="$MODELOPT_SOURCE_ROOT/pyproject.toml"
 if [ ! -f "$TOML" ]; then
     cat > "$TOML" <<'EOF'
 [build-system]
@@ -103,8 +116,13 @@ dependencies = [
 include = ["modelopt*", "modelopt_recipes*"]
 EOF
 fi
-pip install --no-cache-dir -e modules/Model-Optimizer/
-pip install --no-cache-dir -r modules/Model-Optimizer/examples/speculative_decoding/requirements.txt
+REQUIREMENTS="$MODELOPT_SOURCE_ROOT/examples/speculative_decoding/requirements.txt"
+if [ ! -f "$REQUIREMENTS" ]; then
+    echo "ERROR: speculative decoding requirements not found: $REQUIREMENTS" >&2
+    exit 1
+fi
+pip install --no-cache-dir -e "$MODELOPT_SOURCE_ROOT/"
+pip install --no-cache-dir -r "$REQUIREMENTS"
 pip install --no-cache-dir 'datasets' 'huggingface-hub>=1.2.1'
 fi
 export PATH=$PATH:/workspace/.local/bin
@@ -265,7 +283,7 @@ run_trainer_and_export() {
     if [ "${num_tnodes}" -gt 1 ]; then
         mn_args=(--num_nodes "$num_tnodes" --head_node_ip "$head_ip" --machine_rank "$mrank")
     fi
-    "${gpu_env[@]}" bash modules/Model-Optimizer/examples/speculative_decoding/launch_train.sh \
+    "${gpu_env[@]}" bash "$MODELOPT_SOURCE_ROOT/examples/speculative_decoding/launch_train.sh" \
         "${SCRIPT_ARGS[@]}" \
         "${mn_args[@]}" \
         data.streaming_server_url="$url" \
@@ -290,7 +308,7 @@ run_trainer_and_export() {
         echo "ERROR: no training.output_dir= forwarded in SCRIPT_ARGS; cannot locate checkpoint to export." >&2
         return 1
     fi
-    python3 modules/Model-Optimizer/examples/speculative_decoding/scripts/export_hf_checkpoint.py \
+    python3 "$MODELOPT_SOURCE_ROOT/examples/speculative_decoding/scripts/export_hf_checkpoint.py" \
         --model_path "$out_dir" \
         --export_path "${EXPORT_PATH:-/scratchspace/export}" \
         ${EXPORT_EXTRA_ARGS:-}

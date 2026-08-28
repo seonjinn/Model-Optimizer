@@ -26,8 +26,12 @@ exercise the orchestration + format chain, not real byte movement.
 """
 
 import base64
+import itertools
+import json
 import sys
 import types
+from pathlib import Path
+from typing import Any, cast, get_type_hints
 from unittest.mock import MagicMock
 
 import httpx
@@ -39,6 +43,7 @@ pytest.importorskip("transformers")
 
 from modelopt.torch.speculative.plugins import hf_streaming_dataset
 from modelopt.torch.speculative.plugins.hf_streaming_dataset import (
+    EagleFormattedSample,
     EagleVllmStreamingConfig,
     EagleVllmStreamingDataset,
     StreamingConfig,
@@ -46,6 +51,21 @@ from modelopt.torch.speculative.plugins.hf_streaming_dataset import (
     normalize_streaming_entry,
     resolve_streaming_data_source,
 )
+
+
+def test_eagle_formatted_sample_has_precise_per_key_types() -> None:
+    """Trainer tensor fields must not be widened by the boolean metadata field."""
+    hints = get_type_hints(EagleFormattedSample)
+
+    assert hints == {
+        "input_ids": torch.Tensor,
+        "base_model_hidden_states": torch.Tensor,
+        "aux_hidden_states": torch.Tensor,
+        "attention_mask": torch.Tensor,
+        "loss_mask": torch.Tensor,
+        "labels": torch.Tensor,
+        "base_hidden_prenorm": bool,
+    }
 
 
 def _entries(n: int) -> list[dict]:
@@ -79,12 +99,113 @@ def test_normalize_openperfectblend_entry_has_stable_id_and_roles():
 
     assert first == second
     assert first is not None
-    cid, conversations = first
+    cid, conversations, tools = first
     assert len(cid) == 64
+    assert tools is None
     assert conversations == [
         {"role": "user", "content": "Question"},
         {"role": "assistant", "content": "Answer"},
     ]
+
+
+def test_tool_bearing_entry_preserves_exact_template_inputs_and_token_ids():
+    """PTV3 tool declarations and structured tool calls reach the actual tokenizer unchanged."""
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read one repository file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+    ]
+    messages = [
+        {"role": "user", "content": "Inspect the failing test."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"tests/test_bug.py"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "read_file",
+            "content": "assert actual == expected",
+        },
+        {"role": "assistant", "content": "The implementation drops the expected value."},
+    ]
+    tokenizer = MagicMock()
+
+    def apply_chat_template(actual_messages, **kwargs):
+        assert actual_messages == messages
+        assert kwargs["tools"] == tools
+        return {"input_ids": torch.tensor([[101, 202, 303]])}
+
+    tokenizer.apply_chat_template.side_effect = apply_chat_template
+    dataset = StreamingDataset(
+        [{"conversation_id": "swe-tool-1", "messages": messages, "tools": tools}],
+        tokenizer=tokenizer,
+        config=StreamingConfig(answer_only_loss=False),
+    )
+
+    sample = dataset._tokenize_entry(dataset.entries[0])
+
+    assert sample is not None
+    assert sample["token_ids"] == [101, 202, 303]
+    tokenizer.apply_chat_template.assert_called_once()
+
+
+def test_tool_declarations_are_part_of_derived_conversation_identity():
+    """Changing only the tool schema changes the stable identity of an otherwise equal prompt."""
+    base = {
+        "messages": [{"role": "user", "content": "Use the repository tool."}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    }
+    changed = {
+        **base,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "open_file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    }
+
+    normalized_base = normalize_streaming_entry(base)
+    normalized_changed = normalize_streaming_entry(changed)
+
+    assert normalized_base is not None and normalized_changed is not None
+    base_id, base_messages, base_tools = normalized_base
+    changed_id, changed_messages, changed_tools = normalized_changed
+    assert base_messages == changed_messages
+    assert base_tools == base["tools"]
+    assert changed_tools == changed["tools"]
+    assert base_id != changed_id
 
 
 def test_pretokenized_entry_preserves_exact_loss_mask_without_retokenizing():
@@ -137,6 +258,24 @@ def test_len_matches_corpus():
     assert len(ds) == 37
 
 
+def test_map_corpus_is_not_materialized_per_rank():
+    class _MapCorpus:
+        def __len__(self):
+            return 700_000
+
+        def __getitem__(self, index):
+            return {"id": index}
+
+        def __iter__(self):
+            raise AssertionError("authenticated map corpus must not be materialized")
+
+    corpus = _MapCorpus()
+    ds = StreamingDataset(corpus, tokenizer=MagicMock(), config=StreamingConfig())
+
+    assert ds.entries is corpus
+    assert len(ds) == 700_000
+
+
 def test_getitem_resamples_past_unfit_entries():
     """An unfit entry (tokenize -> None) must not be returned; __getitem__ probes
     forward to the next fetchable index and returns that instead."""
@@ -163,6 +302,177 @@ def test_getitem_resamples_past_unfit_entries():
     assert fetched_cids == [1]
     # An already-fit index is returned directly.
     assert ds[3] == {"sentinel": 3}
+
+
+def test_q30_strict_exposure_retries_only_same_occurrence_and_records_uuid(tmp_path, monkeypatch):
+    """Strict Q30 mode cannot probe/cycle/substitute a different dataset occurrence."""
+    fetched_cids: list[str] = []
+
+    class StrictDataset(StreamingDataset):
+        def _tokenize_entry(self, entry):
+            return {
+                "cid": entry["prompt_uuid"],
+                "prompt_uuid": entry["prompt_uuid"],
+                "token_ids": [1],
+                "loss_mask": None,
+            }
+
+        def _fetch(self, sample):
+            fetched_cids.append(sample["cid"])
+            if len(fetched_cids) == 1:
+                raise httpx.ConnectError("retry same occurrence")
+            return sample
+
+        def _format(self, fetched):
+            return {"sentinel": fetched["cid"]}
+
+    evidence = tmp_path / "exposure"
+    monkeypatch.setenv("Q30_STRICT_EXPOSURE", "1")
+    monkeypatch.setenv("Q30_EXPOSURE_EVIDENCE_DIR", str(evidence))
+    monkeypatch.setenv("RANK", "3")
+    dataset = StrictDataset(
+        [{"prompt_uuid": "a" * 64}, {"prompt_uuid": "b" * 64}],
+        tokenizer=MagicMock(),
+        config=StreamingConfig(fail_after_consecutive_skips=2),
+    )
+
+    sample = dataset[0]
+    collator = hf_streaming_dataset.Q30StrictExposureCollator(lambda features: dict(features[0]))
+    batch = collator([sample])
+    hf_streaming_dataset.record_q30_consumed_exposure(batch)
+
+    assert batch == {"sentinel": "a" * 64}
+    assert fetched_cids == ["a" * 64, "a" * 64]
+    records = [
+        json.loads(line) for line in (evidence / "rank-00003.jsonl").read_text().splitlines()
+    ]
+    assert records == [{"dataset_index": 0, "prompt_uuid": "a" * 64}]
+
+
+def test_q30_strict_exposure_records_consumed_not_prefetched_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accelerate's one-batch lookahead may fetch, but must not evidence, batch 81."""
+    accelerate = pytest.importorskip("accelerate")
+    assert accelerate.__version__ == "1.14.0"
+    from accelerate.data_loader import DataLoaderShard
+
+    fetched_indices: list[int] = []
+
+    class StrictDataset(StreamingDataset):
+        def _tokenize_entry(self, entry):
+            return {
+                "cid": entry["prompt_uuid"],
+                "prompt_uuid": entry["prompt_uuid"],
+                "token_ids": [entry["dataset_index"]],
+                "loss_mask": None,
+            }
+
+        def _fetch(self, sample):
+            index = sample["token_ids"][0]
+            fetched_indices.append(index)
+            return {"index": index}
+
+        def _format(self, fetched):
+            return {"value": torch.tensor(fetched["index"])}
+
+    evidence_root = tmp_path / "exposure"
+    monkeypatch.setenv("Q30_STRICT_EXPOSURE", "1")
+    monkeypatch.setenv("Q30_EXPOSURE_EVIDENCE_DIR", str(evidence_root))
+    monkeypatch.setenv("RANK", "0")
+    entries = [{"dataset_index": index, "prompt_uuid": f"{index:064x}"} for index in range(400)]
+    dataset = StrictDataset(entries, tokenizer=MagicMock(), config=StreamingConfig())
+    loader = DataLoaderShard(dataset, batch_size=4, shuffle=False)
+    record_consumed = getattr(hf_streaming_dataset, "record_q30_consumed_exposure", None)
+
+    for batch in itertools.islice(loader, 80):
+        if callable(record_consumed):
+            record_consumed(batch)
+
+    assert fetched_indices == list(range(324))
+    records = [
+        json.loads(line) for line in (evidence_root / "rank-00000.jsonl").read_text().splitlines()
+    ]
+    assert records == [
+        {"dataset_index": index, "prompt_uuid": f"{index:064x}"} for index in range(320)
+    ]
+
+
+def test_q30_exact_batch_sampler_gives_every_rank_three_final_examples_without_padding() -> None:
+    """Pinned Accelerate must consume 700K once, ending with local batch three on all ranks."""
+    accelerate = pytest.importorskip("accelerate")
+    assert accelerate.__version__ == "1.14.0"
+    from accelerate.data_loader import BatchSamplerShard, SeedableRandomSampler
+
+    sampler_type = cast("Any", getattr(hf_streaming_dataset, "Q30ExactBatchSampler", None))
+    assert callable(sampler_type), "exact final-global-batch sampler is missing"
+    indices_by_rank: list[list[int]] = []
+    final_batch_sizes: list[int] = []
+    microsteps_by_rank: list[int] = []
+    for rank in range(32):
+        sampler = SeedableRandomSampler(range(700_000), data_seed=42)
+        batches = sampler_type(
+            sampler,
+            local_batch_size=4,
+            trainer_ranks=32,
+            exact_exposure_count=700_000,
+        )
+        sharded = BatchSamplerShard(
+            batches,
+            num_processes=32,
+            process_index=rank,
+            split_batches=False,
+            even_batches=True,
+        )
+        rank_batches = cast("list[list[int]]", list(sharded))
+        indices_by_rank.append(list(itertools.chain.from_iterable(rank_batches)))
+        final_batch_sizes.append(len(rank_batches[-1]))
+        microsteps_by_rank.append(len(rank_batches))
+
+    flattened = list(itertools.chain.from_iterable(indices_by_rank))
+    assert microsteps_by_rank == [5_469] * 32
+    assert final_batch_sizes == [3] * 32
+    assert len(flattened) == 700_000
+    assert len(set(flattened)) == 700_000
+    assert set(flattened) == set(range(700_000))
+
+
+def test_q30_strict_exposure_rejects_unfit_occurrence_without_forward_probe(tmp_path, monkeypatch):
+    """An unusable selected occurrence fails instead of consuming the next UUID."""
+
+    class StrictDataset(StreamingDataset):
+        def _tokenize_entry(self, entry):
+            return None if entry["id"] == 0 else {"cid": "next", "token_ids": [1]}
+
+    monkeypatch.setenv("Q30_STRICT_EXPOSURE", "1")
+    monkeypatch.setenv("Q30_EXPOSURE_EVIDENCE_DIR", str(tmp_path / "exposure"))
+    monkeypatch.setenv("RANK", "0")
+    dataset = StrictDataset([{"id": 0}, {"id": 1}], tokenizer=MagicMock())
+
+    with pytest.raises(RuntimeError, match=r"strict exposure.*occurrence 0"):
+        dataset[0]
+
+
+def test_q30_strict_exposure_still_validates_fetch_payload(tmp_path, monkeypatch):
+    class RequiredPayload:
+        __required_keys__ = frozenset({"required"})
+
+    class StrictDataset(StreamingDataset):
+        fetch_payload_cls = RequiredPayload
+
+        def _tokenize_entry(self, entry):
+            return {"cid": entry["prompt_uuid"], "prompt_uuid": entry["prompt_uuid"]}
+
+        def _fetch(self, sample):
+            return {"substituted": True}
+
+    monkeypatch.setenv("Q30_STRICT_EXPOSURE", "1")
+    monkeypatch.setenv("Q30_EXPOSURE_EVIDENCE_DIR", str(tmp_path / "exposure"))
+    monkeypatch.setenv("RANK", "0")
+    dataset = StrictDataset([{"prompt_uuid": "a" * 64}], tokenizer=MagicMock())
+
+    with pytest.raises(RuntimeError, match="missing required keys"):
+        dataset[0]
 
 
 def test_circuit_breaker_trips_on_consecutive_failures():
@@ -251,8 +561,8 @@ def test_resume_skips_consumed_samples_without_refetching():
             fetched.append(cid)  # stands in for the RDMA fetch
             return {"cid": cid}
 
-        def _format(self, payload):
-            return torch.tensor(payload["cid"])
+        def _format(self, fetched):
+            return torch.tensor(fetched["cid"])
 
     n, batch_size, skip_batches = 20, 2, 3
     ds = _Recording(_entries(n), tokenizer=MagicMock(), config=StreamingConfig())
@@ -504,6 +814,62 @@ def test_lapped_slot_is_treated_as_miss(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="no fetchable sample"):
         ds[0]
+
+
+def test_q30_strict_exposure_requires_explicit_true_done_ack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing ``valid`` bit cannot authorize exposure of the fetched occurrence."""
+    seq, n_layers, hidden = 8, 3, 16
+    completions: list[list[int]] = []
+    done_calls = 0
+    base_handler = _rdma_sidecar_handler(
+        seq,
+        n_layers,
+        hidden,
+        on_completion=lambda request: completions.append(json.loads(request.content)["prompt"]),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal done_calls
+        if request.url.path == "/done":
+            done_calls += 1
+            if done_calls == 1:
+                return httpx.Response(200, json={"freed": "req-1"})
+        return base_handler(request)
+
+    _mock_rdma(monkeypatch, handler)
+    monkeypatch.setenv("Q30_STRICT_EXPOSURE", "1")
+    monkeypatch.setenv("Q30_EXPOSURE_EVIDENCE_DIR", str(tmp_path / "exposure"))
+    monkeypatch.setenv("RANK", "0")
+    prompt_uuid = "a" * 64
+    ds = EagleVllmStreamingDataset(
+        entries=[
+            {
+                "prompt_uuid": prompt_uuid,
+                "messages": [{"role": "user", "content": "x"}],
+            }
+        ],
+        tokenizer=_tokenizer_returning(seq),
+        config=EagleVllmStreamingConfig(
+            server_urls="http://mock:8000",
+            model="mock-model",
+            max_seq_len=seq,
+            fail_after_consecutive_skips=2,
+        ),
+    )
+
+    sample = ds[0]
+    collator = hf_streaming_dataset.Q30StrictExposureCollator(lambda features: dict(features[0]))
+    batch = collator([sample])
+    hf_streaming_dataset.record_q30_consumed_exposure(batch)
+
+    assert completions == [list(range(seq)), list(range(seq))]
+    assert done_calls == 2
+    records = (tmp_path / "exposure/rank-00000.jsonl").read_text().splitlines()
+    assert [json.loads(record) for record in records] == [
+        {"dataset_index": 0, "prompt_uuid": prompt_uuid}
+    ]
 
 
 def test_oversize_server_response_raises(monkeypatch):

@@ -32,6 +32,7 @@
 import argparse
 import dataclasses
 import os
+from typing import Any, Protocol, cast
 
 import fsdp2_buffer_patch
 import torch
@@ -45,6 +46,8 @@ from eagle_utils import (
     patch_ring_attention_for_ttt,
 )
 from rich.pretty import pprint
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset as TorchDataset
 from transformers.trainer_utils import get_last_checkpoint
 
 import modelopt.torch.opt as mto
@@ -57,8 +60,21 @@ from modelopt.recipe.config import (
     ModelOptSpeculativeRecipeBase,
 )
 from modelopt.torch.speculative.plugins.hf_domino import DominoLambdaCallback
+from modelopt.torch.speculative.plugins.hf_streaming_dataset import (
+    Q30ExactBatchSampler,
+    Q30StrictExposureCollator,
+    record_q30_consumed_exposure,
+)
 from modelopt.torch.speculative.plugins.hf_training_args import (
     TrainingArguments as SpecTrainingArgs,
+)
+from modelopt.torch.speculative.plugins.hf_weight_only_initialization import (
+    initialization_action,
+    load_converted_parent,
+    requested_dflash_method,
+    resolve_tokenizer_name_or_path,
+    validate_converted_modelopt_state,
+    validate_dflash_trainable_parameter_identity,
 )
 from modelopt.torch.speculative.utils import load_vlm_or_llm, patch_transformers5_params_loading
 from modelopt.torch.utils import print_rank_0
@@ -83,6 +99,53 @@ HfTrainingArguments = dataclasses.make_dataclass(
     ],
     bases=(transformers.TrainingArguments,),
 )
+
+
+class _ParallelTrainingArguments(Protocol):
+    cp_size: int
+    dp_shard_size: int | None
+    parallelism_config: object
+
+
+class _Q30ConsumptionEvidenceTrainer(EagleTrainerWithAccLog):
+    """Commit strict exposure only when Trainer consumes the prefetched batch."""
+
+    def compute_loss(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if len(args) >= 2:
+            inputs = args[1]
+        else:
+            inputs = kwargs.get("inputs")
+        if not isinstance(inputs, dict):
+            raise TypeError("Q30 strict exposure compute_loss requires mapping inputs")
+        record_q30_consumed_exposure(inputs)
+        return cast("torch.Tensor", super().compute_loss(*args, **kwargs))
+
+    def get_train_dataloader(self) -> DataLoader:
+        """Use synchronized local-3 final batches only for the exact Q30 full run."""
+        exact_exposure_count = getattr(self.args, "exact_exposure_count", None)
+        if exact_exposure_count is None:
+            return super().get_train_dataloader()
+        if self.train_dataset is None:
+            raise ValueError("Trainer requires a train dataset")
+        train_dataset = cast("TorchDataset[Any]", self.train_dataset)
+        sampler = self._get_train_sampler(train_dataset)
+        if sampler is None:
+            raise ValueError("Q30 exact exposure requires a map-style train sampler")
+        batches = Q30ExactBatchSampler(
+            sampler,
+            local_batch_size=self._train_batch_size,
+            trainer_ranks=self.accelerator.num_processes,
+            exact_exposure_count=exact_exposure_count,
+        )
+        dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=batches,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            persistent_workers=self.args.dataloader_persistent_workers,
+        )
+        return self.accelerator.prepare(dataloader)
 
 
 def _parse_cli() -> tuple[str, bool, list[str]]:
@@ -111,7 +174,7 @@ def _parse_cli() -> tuple[str, bool, list[str]]:
     return args.config, args.dry_run, overrides
 
 
-def init_distributed_env(training_args: transformers.TrainingArguments) -> None:
+def init_distributed_env(training_args: _ParallelTrainingArguments) -> None:
     """Resolve dp_shard_size from the live env and attach a ParallelismConfig in-place.
 
     Reads ``WORLD_SIZE`` / ``torch.cuda.device_count()`` and (when actually distributed)
@@ -180,11 +243,12 @@ def train():
     # Pydantic-typed sections flow straight through as *_args; only TrainingArguments is
     # reconstructed as an HF dataclass so it can be handed to transformers.Trainer.
     training_args = HfTrainingArguments(**recipe.training.model_dump())
-    init_distributed_env(training_args)
+    parallel_training_args = cast("_ParallelTrainingArguments", training_args)
+    init_distributed_env(parallel_training_args)
 
     if not dry_run and recipe.data.mode in ("online", "streaming") and not recipe.data.data_path:
         raise ValueError(f"data.mode={recipe.data.mode!r} requires data.data_path.")
-    if training_args.cp_size > 1:
+    if parallel_training_args.cp_size > 1:
         patch_ring_attention_for_ttt()
         # accelerate requires an fsdp_plugin when cp_size > 1; the --fsdp launcher flags that
         # used to provide one were dropped from launch_train.sh.
@@ -212,6 +276,17 @@ def train():
     # weights load via from_pretrained; FSDP sharded checkpoints load the base model and
     # resume through the Trainer.
     checkpoint_is_hf = _is_hf_format_checkpoint(checkpoint)
+    action = initialization_action(
+        recipe.model.initialization_policy,
+        checkpoint_is_hf=checkpoint_is_hf,
+        explicit_resume_checkpoint=training_args.resume_from_checkpoint,
+        auto_discovered_checkpoint=last_checkpoint,
+    )
+    if action == "validate-weight-only" and recipe.model.use_fake_base_for_offline:
+        raise ValueError(
+            "converted-weights-only initialization requires "
+            "model.use_fake_base_for_offline=false so ModelOpt draft tensors are restored"
+        )
 
     if checkpoint_is_hf:
         assert checkpoint is not None  # guaranteed by checkpoint_is_hf
@@ -235,19 +310,51 @@ def train():
             )
         # To avoid OOM for large models, we load and convert model on CPU first.
         # Model will be moved to GPU during HF trainer.init().
-        model = load_vlm_or_llm(
-            model_name_or_path,
-            use_fake_base=recipe.model.use_fake_base_for_offline,
-            use_offline_training=use_offline_training,
-            dtype="auto",
-            device_map="cpu",
-            trust_remote_code=recipe.model.trust_remote_code,
+        if action == "validate-weight-only":
+            model = load_converted_parent(
+                load_vlm_or_llm,
+                patch_transformers5_params_loading,
+                model_name_or_path,
+                use_fake_base=recipe.model.use_fake_base_for_offline,
+                use_offline_training=use_offline_training,
+                trust_remote_code=recipe.model.trust_remote_code,
+            )
+        else:
+            model = load_vlm_or_llm(
+                model_name_or_path,
+                use_fake_base=recipe.model.use_fake_base_for_offline,
+                use_offline_training=use_offline_training,
+                dtype="auto",
+                device_map="cpu",
+                trust_remote_code=recipe.model.trust_remote_code,
+            )
+        tokenizer_name_or_path = resolve_tokenizer_name_or_path(
+            recipe.model.initialization_policy,
+            model_name_or_path=model_name_or_path,
+            tokenizer_name_or_path=recipe.model.tokenizer_name_or_path,
         )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
-            model_name_or_path,
+            tokenizer_name_or_path,
             model_max_length=training_args.training_seq_len,
             trust_remote_code=recipe.model.trust_remote_code,
         )
+    if action == "validate-weight-only":
+        if not isinstance(recipe, ModelOptDFlashRecipe):
+            raise ValueError(
+                "converted-weights-only initialization currently supports DFlash-family recipes"
+            )
+        expected_method = requested_dflash_method(
+            recipe.dflash.dflash_architecture_config.get("projector_type")
+        )
+        validate_converted_modelopt_state(
+            mto.modelopt_state(model),
+            expected_method=expected_method,
+            expected_block_size=recipe.dflash.dflash_block_size,
+            expected_architecture=recipe.dflash.dflash_architecture_config,
+        )
+        validate_dflash_trainable_parameter_identity(model)
+        print_rank_0("Loaded converted ModelOpt drafter weights without applying a new conversion.")
+    elif action == "convert":
         if isinstance(recipe, ModelOptMedusaRecipe):
             medusa_cfg: dict = recipe.medusa.model_dump()
             mtsp.convert(model, [("medusa", medusa_cfg)])
@@ -292,8 +399,13 @@ def train():
         answer_only_loss=training_args.answer_only_loss,
         shift_labels=not is_dflash,
     )
+    strict_exposure = os.environ.get("Q30_STRICT_EXPOSURE") == "1"
+    if strict_exposure:
+        data_module["data_collator"] = Q30StrictExposureCollator(data_module["data_collator"])
 
-    callbacks = [EagleTrainingPlot(training_args.ar_validate_steps, training_args.estimate_ar)]
+    callbacks: list[transformers.TrainerCallback] = [
+        EagleTrainingPlot(training_args.ar_validate_steps, training_args.estimate_ar)
+    ]
     if (
         isinstance(recipe, ModelOptEagleRecipe)
         and recipe.eagle.eagle_base_lora
@@ -313,9 +425,10 @@ def train():
     # exact data position. Setting it True would restart the data order from the top.
 
     # Tell the draft model the CP degree so it skips the dense eagle mask under CP.
-    model.eagle_cp_size = training_args.cp_size
+    setattr(model, "eagle_cp_size", parallel_training_args.cp_size)
 
-    trainer = EagleTrainerWithAccLog(
+    trainer_class = _Q30ConsumptionEvidenceTrainer if strict_exposure else EagleTrainerWithAccLog
+    trainer = trainer_class(
         model=model,
         processing_class=tokenizer,
         args=training_args,

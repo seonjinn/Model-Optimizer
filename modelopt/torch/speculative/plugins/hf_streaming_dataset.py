@@ -44,14 +44,16 @@ import hashlib
 import json
 import os
 import re
+import stat
 import time
+from collections.abc import Callable, Iterator, Mapping, Sequence, Sized
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, Generic, Protocol, Self, TypedDict, TypeVar, cast
 
 import httpx
 import torch
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-from torch.utils.data import Dataset
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from torch.utils.data import Dataset, Sampler
 from transformers.trainer_pt_utils import LabelSmoother
 
 from modelopt.torch.utils import print_rank_0, warn_rank_0
@@ -59,15 +61,167 @@ from modelopt.torch.utils.loss_mask import get_loss_mask_recovery
 
 __all__ = [
     "EagleFetchPayload",
+    "EagleFormattedSample",
     "EagleVllmStreamingConfig",
     "EagleVllmStreamingDataset",
+    "Q30ExactBatchSampler",
+    "Q30StrictExposureCollator",
     "StreamingConfig",
     "StreamingDataset",
     "normalize_streaming_entry",
+    "record_q30_consumed_exposure",
     "resolve_streaming_data_source",
 ]
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+_Q30_DATASET_INDEX_KEY = "__q30_exposure_dataset_index"
+_Q30_PROMPT_UUID_KEY = "__q30_exposure_prompt_uuid"
+
+
+class Q30ExactBatchSampler(Sampler[list[int]]):
+    """Group the exact Q30 permutation into synchronized, variable-size rank batches."""
+
+    batch_size = None
+    drop_last = False
+
+    def __init__(
+        self,
+        sampler: Sampler[int],
+        *,
+        local_batch_size: int,
+        trainer_ranks: int,
+        exact_exposure_count: int,
+    ) -> None:
+        """Validate and retain the one-pass sampler and frozen Q30 topology."""
+        if not isinstance(sampler, Sized) or len(sampler) != exact_exposure_count:
+            raise ValueError("Q30 exact sampler must cover the authenticated exposure count")
+        if (local_batch_size, trainer_ranks, exact_exposure_count) != (4, 32, 700_000):
+            raise ValueError("Q30 exact sampler requires local batch 4, 32 ranks, and 700K")
+        final_global_batch_size = exact_exposure_count % (local_batch_size * trainer_ranks)
+        if final_global_batch_size != 96 or final_global_batch_size % trainer_ranks:
+            raise ValueError("Q30 exact sampler requires final global batch 96")
+        self.sampler = sampler
+        self.local_batch_size = local_batch_size
+        self.trainer_ranks = trainer_ranks
+        self.exact_exposure_count = exact_exposure_count
+        self.final_local_batch_size = final_global_batch_size // trainer_ranks
+
+    def __len__(self) -> int:
+        global_batch_size = self.local_batch_size * self.trainer_ranks
+        microsteps = (self.exact_exposure_count + global_batch_size - 1) // global_batch_size
+        return microsteps * self.trainer_ranks
+
+    def __iter__(self) -> Iterator[list[int]]:
+        source = iter(self.sampler)
+        consumed = 0
+        global_batch_size = self.local_batch_size * self.trainer_ranks
+        while consumed < self.exact_exposure_count:
+            remaining = self.exact_exposure_count - consumed
+            rank_batch_size = (
+                self.local_batch_size
+                if remaining >= global_batch_size
+                else self.final_local_batch_size
+            )
+            step_size = rank_batch_size * self.trainer_ranks
+            step = [next(source) for _ in range(step_size)]
+            consumed += step_size
+            for rank in range(self.trainer_ranks):
+                start = rank * rank_batch_size
+                yield step[start : start + rank_batch_size]
+        try:
+            next(source)
+        except StopIteration:
+            return
+        raise RuntimeError("Q30 exact sampler yielded beyond the authenticated exposure count")
+
+
+def _q30_exposure_evidence_path() -> Path:
+    evidence_root_raw = os.environ.get("Q30_EXPOSURE_EVIDENCE_DIR")
+    rank_raw = os.environ.get("RANK")
+    if not evidence_root_raw or not Path(evidence_root_raw).is_absolute():
+        raise RuntimeError("Q30 strict exposure requires an absolute evidence directory")
+    if rank_raw is None or not rank_raw.isdecimal():
+        raise RuntimeError("Q30 strict exposure requires a nonnegative exact RANK")
+    evidence_root = Path(evidence_root_raw)
+    if evidence_root.is_symlink() or not evidence_root.is_dir():
+        raise RuntimeError("Q30 strict exposure evidence directory is aliased")
+    return evidence_root / f"rank-{int(rank_raw):05d}.jsonl"
+
+
+def _append_q30_exposure_records(records: list[tuple[int, str]]) -> None:
+    payload = b"".join(
+        (
+            json.dumps(
+                {"dataset_index": index, "prompt_uuid": prompt_uuid},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+        for index, prompt_uuid in records
+    )
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(_q30_exposure_evidence_path(), flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or os.write(descriptor, payload) != len(payload):
+            raise RuntimeError("Q30 strict exposure evidence write failed")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class Q30StrictExposureCollator:
+    """Carry strict identity metadata through the ordinary Eagle collator."""
+
+    def __init__(self, delegate: Callable[[list[dict[str, Any]]], dict[str, Any]]) -> None:
+        """Wrap the model's collator while preserving exact occurrence identity."""
+        self.delegate = delegate
+
+    def __call__(self, features: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Collate clean features and attach their ordered private identity metadata."""
+        indices: list[int] = []
+        prompt_uuids: list[str] = []
+        clean_features: list[dict[str, Any]] = []
+        for feature in features:
+            clean = dict(feature)
+            index = clean.pop(_Q30_DATASET_INDEX_KEY, None)
+            prompt_uuid = clean.pop(_Q30_PROMPT_UUID_KEY, None)
+            if type(index) is not int or not isinstance(prompt_uuid, str):
+                raise RuntimeError("Q30 strict exposure feature identity is unavailable")
+            indices.append(index)
+            prompt_uuids.append(prompt_uuid)
+            clean_features.append(clean)
+        batch = self.delegate(clean_features)
+        batch[_Q30_DATASET_INDEX_KEY] = indices
+        batch[_Q30_PROMPT_UUID_KEY] = prompt_uuids
+        return batch
+
+
+def record_q30_consumed_exposure(inputs: dict[str, Any]) -> None:
+    """Pop and append only the strict batch that Trainer is about to consume."""
+    raw_indices = inputs.pop(_Q30_DATASET_INDEX_KEY, None)
+    raw_prompt_uuids = inputs.pop(_Q30_PROMPT_UUID_KEY, None)
+    if isinstance(raw_indices, torch.Tensor) and raw_indices.ndim == 1:
+        indices = raw_indices.tolist()
+    elif isinstance(raw_indices, (list, tuple)):
+        indices = list(raw_indices)
+    else:
+        raise RuntimeError("Q30 consumed exposure indices are unavailable")
+    if not isinstance(raw_prompt_uuids, (list, tuple)):
+        raise RuntimeError("Q30 consumed exposure UUIDs are unavailable")
+    if len(indices) != len(raw_prompt_uuids) or any(type(index) is not int for index in indices):
+        raise RuntimeError("Q30 consumed exposure batch identity is invalid")
+    records: list[tuple[int, str]] = []
+    for index, prompt_uuid in zip(indices, raw_prompt_uuids):
+        if (
+            not isinstance(prompt_uuid, str)
+            or len(prompt_uuid) != 64
+            or any(character not in "0123456789abcdef" for character in prompt_uuid)
+        ):
+            raise RuntimeError("Q30 consumed exposure prompt UUID is invalid")
+        records.append((index, prompt_uuid))
+    _append_q30_exposure_records(records)
 
 
 def resolve_streaming_data_source(data_path: str | Path) -> tuple[str, str | list[str]]:
@@ -86,26 +240,51 @@ def resolve_streaming_data_source(data_path: str | Path) -> tuple[str, str | lis
     return ("parquet" if str(data_path).endswith(".parquet") else "json", str(data_path))
 
 
-def normalize_streaming_entry(entry: dict) -> tuple[str, list[dict[str, str]]] | None:
-    """Normalize OpenAI or ShareGPT-style conversations and derive a stable ID if needed."""
+def normalize_streaming_entry(
+    entry: dict,
+) -> tuple[str, list[dict[str, object]], list[dict[str, object]] | None] | None:
+    """Preserve structured OpenAI/ShareGPT messages, tools, and their stable identity."""
     conversations = entry.get("conversations") or entry.get("messages")
     if not conversations or not isinstance(conversations, list):
         return None
 
     role_map = {"human": "user", "gpt": "assistant"}
-    normalized = []
+    normalized: list[dict[str, object]] = []
     for turn in conversations:
+        if not isinstance(turn, dict):
+            return None
         role = turn.get("role") or turn.get("from")
         content = turn.get("content") if "content" in turn else turn.get("value")
-        if role is None or content is None:
+        normalized_role = role_map.get(role, role) if isinstance(role, str) else role
+        has_tool_calls = isinstance(turn.get("tool_calls"), list) and bool(turn["tool_calls"])
+        if not isinstance(normalized_role, str) or (
+            content is None and not (normalized_role == "assistant" and has_tool_calls)
+        ):
             return None
-        normalized.append({"role": role_map.get(role, role), "content": content})
+        preserved = dict(turn)
+        preserved.pop("from", None)
+        preserved.pop("value", None)
+        preserved["role"] = normalized_role
+        preserved["content"] = content
+        normalized.append(preserved)
 
-    cid = entry.get("conversation_id") or entry.get("uuid")
+    raw_tools = entry.get("tools")
+    if raw_tools is not None and (
+        not isinstance(raw_tools, list) or any(not isinstance(tool, dict) for tool in raw_tools)
+    ):
+        raise ValueError("streaming entry tools must be an array of structured declarations")
+    tools = list(raw_tools) if raw_tools is not None else None
+    try:
+        canonical_payload = json.dumps(
+            [normalized, tools], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("streaming entry messages and tools must be JSON-structured") from error
+
+    cid = entry.get("conversation_id") or entry.get("uuid") or entry.get("prompt_uuid")
     if cid is None:
-        payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
-        cid = hashlib.sha256(payload.encode()).hexdigest()
-    return str(cid), normalized
+        cid = hashlib.sha256(canonical_payload.encode()).hexdigest()
+    return str(cid), normalized, tools
 
 
 def nixl_backends_from_env() -> list[str]:
@@ -128,11 +307,22 @@ def nixl_backends_from_env() -> list[str]:
 _TRANSIENT_FETCH_ERRORS = (httpx.HTTPError, OSError)
 
 
+class _MapCorpus(Protocol):
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, index: int) -> dict: ...
+
+
+_FetchPayload = TypeVar("_FetchPayload", bound=Mapping[str, object])
+_FormattedSample = TypeVar("_FormattedSample")
+
+
 def _tokenize_with_loss_mask(
     tokenizer,
     conversations: list,
     answer_only_loss: bool,
     max_seq_len: int | None = None,
+    tools: list[dict[str, object]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Tokenize one conversation and derive its loss mask in the same call.
 
@@ -176,16 +366,18 @@ def _tokenize_with_loss_mask(
                 "a loss-mask recovery (modelopt.torch.utils.loss_mask), or set "
                 "answer_only_loss=false."
             )
-    out = tokenizer.apply_chat_template(
-        conversations,
-        tokenize=True,
-        return_tensors="pt",
-        return_dict=True,
-        return_assistant_tokens_mask=answer_only_loss and recovery is None,
-        add_generation_prompt=False,
-        truncation=max_seq_len is not None,
-        max_length=max_seq_len,
-    )
+    template_arguments = {
+        "tokenize": True,
+        "return_tensors": "pt",
+        "return_dict": True,
+        "return_assistant_tokens_mask": answer_only_loss and recovery is None,
+        "add_generation_prompt": False,
+        "truncation": max_seq_len is not None,
+        "max_length": max_seq_len,
+    }
+    if tools is not None:
+        template_arguments["tools"] = tools
+    out = tokenizer.apply_chat_template(conversations, **template_arguments)
     input_ids = out["input_ids"]
     seq_len = input_ids.shape[-1]
     if not answer_only_loss:
@@ -223,7 +415,7 @@ class StreamingConfig(BaseModel):
     fail_after_consecutive_skips: int = Field(default=16, ge=1)
 
 
-class StreamingDataset(Dataset):
+class StreamingDataset(Dataset, Generic[_FetchPayload, _FormattedSample]):
     """Base class: map-style dataset that streams per-sample hidden states from a server.
 
     Backend- and algorithm-agnostic; subclasses implement :meth:`_fetch` (backend) and
@@ -244,7 +436,7 @@ class StreamingDataset(Dataset):
 
     def __init__(
         self,
-        entries: list[dict],
+        entries: object,
         tokenizer,
         config: StreamingConfig | None = None,
     ):
@@ -263,12 +455,29 @@ class StreamingDataset(Dataset):
             config: Tuning knobs (timeout, answer_only_loss, ...); defaults to
                 ``self.config_cls()``. See :class:`StreamingConfig`.
         """
-        if not entries:
+        if not hasattr(entries, "__len__") or not hasattr(entries, "__getitem__"):
+            raise TypeError("entries must be a map-style corpus")
+        map_entries = cast("_MapCorpus", entries)
+        if not map_entries:
             raise ValueError("entries is empty")
         self.tokenizer = tokenizer
         self.config = config if config is not None else self.config_cls()
-        # Materialize to a plain list so DataLoader worker processes fork it cheaply.
-        self.entries = list(entries)
+        self.entries = map_entries
+        strict_exposure = os.environ.get("Q30_STRICT_EXPOSURE", "0")
+        if strict_exposure not in {"0", "1"}:
+            raise ValueError("Q30_STRICT_EXPOSURE must be exact 0 or 1")
+        self._strict_exposure = strict_exposure == "1"
+        if self._strict_exposure:
+            evidence_root_raw = os.environ.get("Q30_EXPOSURE_EVIDENCE_DIR")
+            rank_raw = os.environ.get("RANK")
+            if not evidence_root_raw or not Path(evidence_root_raw).is_absolute():
+                raise ValueError("Q30 strict exposure requires an absolute evidence directory")
+            if rank_raw is None or not rank_raw.isdecimal():
+                raise ValueError("Q30 strict exposure requires a nonnegative exact RANK")
+            evidence_root = Path(evidence_root_raw)
+            evidence_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if evidence_root.is_symlink() or not evidence_root.is_dir():
+                raise ValueError("Q30 strict exposure evidence directory is aliased")
         # Per-process consecutive-failure counter for the circuit breaker. Reset to 0
         # on every successful fetch; tripped only by fetch failures (not unfit entries).
         self._consecutive_fail = 0
@@ -277,13 +486,15 @@ class StreamingDataset(Dataset):
     def __len__(self) -> int:
         return len(self.entries)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> _FormattedSample:
         """Tokenize -> fetch -> format the sample at ``idx``, resampling on miss.
 
         Always returns a valid sample. An unfit entry (tokenization yields nothing) or
         a fetch failure causes a forward probe to the next index; fetch failures bump
         the circuit breaker, which raises once ``fail_after_consecutive_skips`` is hit.
         """
+        if self._strict_exposure:
+            return self._strict_exposure_item(idx)
         n = len(self.entries)
         for offset in range(n):
             entry = self.entries[(idx + offset) % n]
@@ -306,22 +517,68 @@ class StreamingDataset(Dataset):
                     )
                 continue  # resample forward
             self._consecutive_fail = 0
-            if self.fetch_payload_cls is not None:
-                # ``__required_keys__`` is a TypedDict runtime attribute mypy doesn't
-                # track on ``type``; the assignment site guarantees it's a TypedDict.
-                required: frozenset[str] = self.fetch_payload_cls.__required_keys__  # type: ignore[attr-defined]
-                missing = required - set(fetched)
-                if missing:
-                    raise RuntimeError(
-                        f"{type(self).__name__}._fetch missing required keys {missing}; "
-                        f"{self.fetch_payload_cls.__name__} requires "
-                        f"{set(required)}, got {set(fetched)}"
-                    )
+            self._require_fetch_payload(fetched)
             return self._format(fetched)
         raise RuntimeError(
             f"{type(self).__name__}: no fetchable sample found in the entire corpus "
             f"({n} entries) starting at index {idx}."
         )
+
+    def _strict_exposure_item(self, idx: int) -> _FormattedSample:
+        """Retry only the selected Q30 occurrence and carry its identity to the trainer."""
+        if not 0 <= idx < len(self.entries):
+            raise IndexError(idx)
+        sample = self._tokenize_entry(self.entries[idx])
+        if sample is None:
+            raise RuntimeError(f"Q30 strict exposure cannot tokenize occurrence {idx}")
+        prompt_uuid = sample.get("prompt_uuid", sample.get("cid"))
+        if (
+            not isinstance(prompt_uuid, str)
+            or len(prompt_uuid) != 64
+            or any(character not in "0123456789abcdef" for character in prompt_uuid)
+            or sample.get("cid") != prompt_uuid
+        ):
+            raise RuntimeError(f"Q30 strict exposure occurrence {idx} lacks its exact prompt UUID")
+        for attempt in range(1, self.config.fail_after_consecutive_skips + 1):
+            try:
+                fetched = self._fetch(sample)
+            except _TRANSIENT_FETCH_ERRORS as error:
+                warn_rank_0(
+                    f"[streaming] strict exposure fetch error for {prompt_uuid} "
+                    f"(attempt {attempt}): {error!r}"
+                )
+                fetched = None
+            if fetched is not None:
+                self._require_fetch_payload(fetched)
+                formatted = self._format(fetched)
+                if not isinstance(formatted, dict):
+                    raise RuntimeError("Q30 strict exposure requires a mapping-formatted sample")
+                evidence_sample = cast("dict[str, object]", formatted)
+                if (
+                    _Q30_DATASET_INDEX_KEY in evidence_sample
+                    or _Q30_PROMPT_UUID_KEY in evidence_sample
+                ):
+                    raise RuntimeError("Q30 strict exposure metadata key collision")
+                evidence_sample[_Q30_DATASET_INDEX_KEY] = idx
+                evidence_sample[_Q30_PROMPT_UUID_KEY] = prompt_uuid
+                return cast("_FormattedSample", evidence_sample)
+        raise RuntimeError(
+            f"Q30 strict exposure occurrence {idx} ({prompt_uuid}) failed without substitution"
+        )
+
+    def _require_fetch_payload(self, fetched: Mapping[str, object]) -> None:
+        if self.fetch_payload_cls is None:
+            return
+        # ``__required_keys__`` is a TypedDict runtime attribute mypy doesn't track on
+        # ``type``; algorithm subclasses assign an actual TypedDict class.
+        required: frozenset[str] = self.fetch_payload_cls.__required_keys__  # type: ignore[attr-defined]
+        missing = required - set(fetched)
+        if missing:
+            raise RuntimeError(
+                f"{type(self).__name__}._fetch missing required keys {missing}; "
+                f"{self.fetch_payload_cls.__name__} requires "
+                f"{set(required)}, got {set(fetched)}"
+            )
 
     def _tokenize_entry(self, entry: dict) -> dict | None:
         """Tokenize a single entry.
@@ -338,7 +595,9 @@ class StreamingDataset(Dataset):
             if (
                 not isinstance(token_ids, list)
                 or not token_ids
-                or not all(isinstance(token, int) and not isinstance(token, bool) for token in token_ids)
+                or not all(
+                    isinstance(token, int) and not isinstance(token, bool) for token in token_ids
+                )
                 or not isinstance(raw_mask, list)
                 or len(raw_mask) != len(token_ids)
                 or any(value not in (0, 1) for value in raw_mask)
@@ -357,33 +616,41 @@ class StreamingDataset(Dataset):
                 entry.get("primary_id")
                 or entry.get("conversation_id")
                 or entry.get("uuid")
+                or entry.get("prompt_uuid")
             )
             if cid is None:
                 payload = json.dumps(
                     [token_ids, raw_mask], ensure_ascii=False, separators=(",", ":")
                 )
                 cid = hashlib.sha256(payload.encode()).hexdigest()
-            return {"cid": str(cid), "token_ids": token_ids, "loss_mask": loss_mask}
+            return {
+                "cid": str(cid),
+                "prompt_uuid": entry.get("prompt_uuid", str(cid)),
+                "token_ids": token_ids,
+                "loss_mask": loss_mask,
+            }
 
         normalized = normalize_streaming_entry(entry)
         if normalized is None:
             return None
-        cid, convs = normalized
+        cid, convs, tools = normalized
         input_ids, loss_mask = _tokenize_with_loss_mask(
             self.tokenizer,
             convs,
             self.config.answer_only_loss,
             max_seq_len=self.config.max_seq_len,
+            tools=tools,
         )
         if int(loss_mask.sum()) == 0:
             return None
         return {
             "cid": str(cid),
+            "prompt_uuid": entry.get("prompt_uuid", str(cid)),
             "token_ids": input_ids.squeeze(0).tolist(),
             "loss_mask": loss_mask,
         }
 
-    def _fetch(self, sample: dict) -> dict | None:
+    def _fetch(self, sample: dict) -> _FetchPayload | None:
         """Backend hook: send the request and decode the server's response.
 
         Override in subclass. Synchronous (called from a DataLoader worker). Any
@@ -400,7 +667,7 @@ class StreamingDataset(Dataset):
         """
         raise NotImplementedError("Subclasses must implement _fetch")
 
-    def _format(self, fetched: dict) -> dict[str, torch.Tensor]:
+    def _format(self, fetched: _FetchPayload) -> _FormattedSample:
         """Algorithm hook: shape the fetched dict into the trainer's per-sample batch.
 
         Override in subclass.
@@ -429,6 +696,18 @@ class EagleFetchPayload(TypedDict):
     loss_mask: torch.Tensor
 
 
+class EagleFormattedSample(TypedDict):
+    """Precisely typed Eagle batch consumed by ``model.forward``."""
+
+    input_ids: torch.Tensor
+    base_model_hidden_states: torch.Tensor
+    aux_hidden_states: torch.Tensor
+    attention_mask: torch.Tensor
+    loss_mask: torch.Tensor
+    labels: torch.Tensor
+    base_hidden_prenorm: bool
+
+
 class EagleVllmStreamingConfig(StreamingConfig):
     """Adds vLLM endpoint info on top of :class:`StreamingConfig`."""
 
@@ -437,12 +716,17 @@ class EagleVllmStreamingConfig(StreamingConfig):
     # (optionally comma-separated) string.
     server_urls: list[str]
     model: str
-    # Required here (the base field is optional): the RDMA recv buffer is pre-sized and
-    # registered once from max_seq_len, so it must be known before the first fetch.
-    max_seq_len: int = Field(gt=0)
     # vLLM captures the residual stream BEFORE the final norm, so the trainer must re-apply it
     # before lm_head (see HFDFlashModel.forward). Set False for a post-norm producer.
     base_hidden_prenorm: bool = True
+
+    @model_validator(mode="after")
+    def _require_max_seq_len(self) -> Self:
+        if self.max_seq_len is None or self.max_seq_len <= 0:
+            raise ValueError(
+                "max_seq_len must be a positive integer for the streaming RDMA receive buffer"
+            )
+        return self
 
     @field_validator("server_urls", mode="before")
     @classmethod
@@ -455,7 +739,7 @@ class EagleVllmStreamingConfig(StreamingConfig):
         return urls
 
 
-class EagleVllmStreamingDataset(StreamingDataset):
+class EagleVllmStreamingDataset(StreamingDataset[EagleFetchPayload, EagleFormattedSample]):
     """Eagle (algorithm) x vLLM (backend).
 
     Talks to a ``vllm serve`` instance configured with the ``RdmaHiddenStatesConnector``
@@ -471,7 +755,7 @@ class EagleVllmStreamingDataset(StreamingDataset):
 
     def __init__(
         self,
-        entries: list[dict],
+        entries: object,
         tokenizer,
         config: EagleVllmStreamingConfig,
     ):
@@ -571,6 +855,8 @@ class EagleVllmStreamingDataset(StreamingDataset):
         dtype = getattr(torch, desc["hs_dtype"])
         feat = shape[1:]
         maxtok = self.config.max_seq_len
+        if maxtok is None:
+            raise RuntimeError("validated streaming config lost its required max_seq_len")
         if shape[0] > maxtok:
             # The server captured more tokens than the recv buffer holds (its connector
             # max_tokens > our max_seq_len). Reading would silently truncate the slice;
@@ -610,16 +896,18 @@ class EagleVllmStreamingDataset(StreamingDataset):
             time.sleep(0.0002)
         agent.release_xfer_handle(h)
         hidden_states = view.clone()  # copy out before /done so the gen check brackets the read
-        # /done frees the slot + reports valid; valid=False -> ring lapped us mid-read, bytes
-        # stale -> resample. A failed /done can't prove staleness, so default valid=True.
+        # /done frees the slot + reports whether the read was bracketed by one slot generation.
+        # Anything except an explicit JSON boolean true leaves the fetched bytes unproven.
         try:
-            valid = self._http_rdma.get(
-                f"http://{host}:{port}/done", params={"req_id": rid}
-            ).json()["valid"]
+            done = self._http_rdma.get(f"http://{host}:{port}/done", params={"req_id": rid})
+            done.raise_for_status()
+            valid = done.json().get("valid")
         except Exception:
-            valid = True
-        if not valid:
-            warn_rank_0(f"[streaming] slot lapped mid-read for {sample['cid']}; resampling")
+            valid = None
+        if valid is not True:
+            warn_rank_0(
+                f"[streaming] slot read not explicitly valid for {sample['cid']}; resampling"
+            )
             return None
         token_ids = torch.tensor(desc["token_ids"], dtype=torch.long)
         client_ids = torch.as_tensor(sample["token_ids"], dtype=token_ids.dtype)
@@ -648,7 +936,7 @@ class EagleVllmStreamingDataset(StreamingDataset):
             return torch.cat([loss_mask, pad], dim=0)
         return loss_mask
 
-    def _format(self, fetched: EagleFetchPayload) -> dict[str, torch.Tensor]:
+    def _format(self, fetched: EagleFetchPayload) -> EagleFormattedSample:
         token_ids = fetched["token_ids"]
         hidden_states = fetched["hidden_states"]
         loss_mask = fetched["loss_mask"]
