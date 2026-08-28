@@ -670,6 +670,8 @@ def load_held_out_union(
         ):
             raise ComplementError("held-out receipt identity is invalid")
         prompt_uuids = payload["prompt_uuids"]
+        if required_names and prompt_uuids == []:
+            raise ComplementError("named held-out receipt cannot be empty")
         body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
         if (
             not isinstance(prompt_uuids, list)

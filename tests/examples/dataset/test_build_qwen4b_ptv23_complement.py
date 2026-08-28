@@ -470,6 +470,31 @@ def test_held_out_union_rejects_duplicate_names_before_set_reconciliation(
         module.load_held_out_union(arguments)
 
 
+def test_held_out_union_rejects_canonical_empty_named_receipt(tmp_path: Path) -> None:
+    module = _load_module()
+    receipts = {
+        name: _write_heldout_receipt(
+            tmp_path / f"{name}.json",
+            [] if name == "speed" else [f"{index:064x}"],
+        )
+        for index, name in enumerate(("speed", "math", "code", "swe", "tool"), start=1)
+    }
+
+    with pytest.raises(module.ComplementError, match="cannot be empty"):
+        module.load_held_out_union([(name, *receipt) for name, receipt in receipts.items()])
+
+
+def test_held_out_union_keeps_empty_unnamed_fixture_compatibility(tmp_path: Path) -> None:
+    module = _load_module()
+    empty = _write_heldout_receipt(tmp_path / "empty.json", [])
+
+    union = module.load_held_out_union([empty], required_names=frozenset())
+
+    assert union.prompt_uuids == frozenset()
+    assert union.receipt_file_sha256s == (empty[1],)
+    assert union.receipt_names == ("",)
+
+
 def test_production_held_out_union_requires_exact_named_receipt_set() -> None:
     module = _load_module()
 
