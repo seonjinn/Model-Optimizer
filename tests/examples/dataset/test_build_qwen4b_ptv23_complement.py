@@ -37,6 +37,22 @@ def _load_module():
         spec.loader.exec_module(module)
     finally:
         sys.path.pop(0)
+    baseline_type = type(getattr(module, "EXPECTED_BASELINE"))
+    setattr(
+        module,
+        "EXPECTED_BASELINE",
+        baseline_type(
+            "5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
+            1,
+            {"chat": 3},
+            2,
+            4,
+            1,
+            "chat",
+            True,
+            "b" * 64,
+        ),
+    )
     return module
 
 
@@ -109,14 +125,26 @@ def _write_historical_receipt(path: Path) -> tuple[Path, str]:
     occurrences = ["1" * 64, "2" * 64, "1" * 64]
     unique = sorted(set(occurrences))
     body = {
-        "schema_version": "ptv2-historical-occurrence-receipt-v1",
         "source_revision": "5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
+        "source_manifest_sha256": "b" * 64,
+        "row_count": 3,
+        "split_rows": {"chat": 3},
+        "files": [{"path": "/immutable/raw-chat.parquet", "bytes": 123, "sha256": "a" * 64}],
         "occurrence_count": len(occurrences),
-        "ordered_prompt_uuids": occurrences,
-        "ordered_prompt_uuids_sha256": hashlib.sha256(_canonical(occurrences)).hexdigest(),
-        "unique_prompt_uuids": unique,
-        "unique_prompt_uuids_sha256": hashlib.sha256(_canonical(unique)).hexdigest(),
+        "unique_prompt_count": len(unique),
+        "occurrence_prompt_ids": occurrences,
+        "occurrence_prompt_ids_sha256": hashlib.sha256(_canonical(occurrences)).hexdigest(),
+        "exclusion_prompt_ids": unique,
+        "exclusion_prompt_ids_sha256": hashlib.sha256(_canonical(unique)).hexdigest(),
         "duplicate_uuid_multiplicity": {"1" * 64: 2},
+        "physical_row_count": 4,
+        "selection_policy": "hf-streaming-sorted-parquet-take",
+        "selection_boundary": {
+            "file": "chat-0.parquet",
+            "rows_selected": 3,
+            "rows_available": 4,
+            "excluded_tail_rows": 1,
+        },
     }
     payload = body | {"receipt_sha256": hashlib.sha256(_canonical(body)).hexdigest()}
     path.write_bytes(_canonical(payload) + b"\n")
@@ -373,6 +401,27 @@ def test_historical_exclusion_requires_caller_pin_and_binds_order_and_multiplici
         == hashlib.sha256(_canonical(["1" * 64, "2" * 64, "1" * 64])).hexdigest()
     )
     assert receipt.duplicate_uuid_multiplicity == {"1" * 64: 2}
+
+
+def test_builder_authenticates_original_baseline_audit_without_derivative_schema(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    audit_path, file_sha256 = _write_historical_receipt(tmp_path / "AUDIT.json")
+    payload = json.loads(audit_path.read_bytes())
+    directory_entries = set(tmp_path.iterdir())
+
+    loaded = module.load_historical_exclusion(
+        audit_path,
+        expected_sha256=file_sha256,
+        expected_occurrence_count=3,
+    )
+
+    assert loaded.file_sha256 == file_sha256
+    assert loaded.receipt_sha256 == payload["receipt_sha256"]
+    assert loaded.ordered_prompt_uuids_sha256 == payload["occurrence_prompt_ids_sha256"]
+    assert loaded.prompt_uuids == frozenset(payload["exclusion_prompt_ids"])
+    assert set(tmp_path.iterdir()) == directory_entries
 
 
 def test_held_out_receipts_are_individually_authenticated_then_unioned(tmp_path: Path) -> None:

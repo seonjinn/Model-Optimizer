@@ -9,24 +9,36 @@ import argparse
 import json
 import os
 import re
+import stat
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
+from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 from specdec_corpus_contracts import SourceFile, canonical_json, sha256_bytes, sha256_canonical_json
 from specdec_identity import prompt_uuid
 
 __all__ = [
+    "CANONICAL_BASELINE_AUDIT_FILE_SHA256",
+    "CANONICAL_BASELINE_OCCURRENCE_PROMPT_IDS_SHA256",
     "EXPECTED_BASELINE",
     "AuditError",
     "BaselineAudit",
     "BaselineExpectation",
     "audit_baseline",
+    "load_baseline_audit_receipt",
 ]
+
+CANONICAL_BASELINE_AUDIT_FILE_SHA256 = (
+    "2469430c144d9b86850901df0a28cb810b437555ee894771b796b1386d1c18b5"
+)
+CANONICAL_BASELINE_OCCURRENCE_PROMPT_IDS_SHA256 = (
+    "863470b22925d74228d31b1c2433d9461d25e8d02a298cb3a08a6bc99be55060"
+)
 
 
 class AuditError(ValueError):
@@ -83,6 +95,287 @@ EXPECTED_BASELINE = BaselineExpectation(
     "multilingual_de",
     True,
 )
+
+_MAX_BASELINE_AUDIT_BYTES = 512 * 1024 * 1024
+_SELECTION_POLICY = "hf-streaming-sorted-parquet-take"
+_BASELINE_AUDIT_KEYS = frozenset(BaselineAudit.__dataclass_fields__)
+_SOURCE_FILE_KEYS = frozenset(SourceFile.__dataclass_fields__)
+_SELECTION_BOUNDARY_KEYS = frozenset(SelectionBoundary.__dataclass_fields__)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+
+def _stable_single_link_regular_bytes(path: Path, *, max_bytes: int) -> bytes:
+    if max_bytes < 0:
+        raise ValueError("baseline audit retention limit is invalid")
+    absolute_parent = path.parent.absolute()
+    absolute_path = absolute_parent / path.name
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        parent_descriptor = os.open(absolute_parent, flags | getattr(os, "O_DIRECTORY", 0))
+    except OSError as error:
+        raise AuditError(f"baseline audit parent is unreadable: {absolute_parent}") from error
+    try:
+        parent_before = os.fstat(parent_descriptor)
+        try:
+            named_before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        except OSError as error:
+            raise AuditError(f"baseline audit is unreadable: {path}") from error
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or (named_before.st_dev, named_before.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                raise AuditError(f"baseline audit is not a single-link regular file: {path}")
+            if before.st_size > max_bytes:
+                raise AuditError(f"baseline audit is too large to retain: {path}")
+            payload = bytearray()
+            while block := os.read(descriptor, min(8 * 1024 * 1024, max_bytes - len(payload) + 1)):
+                payload.extend(block)
+                if len(payload) > max_bytes:
+                    raise AuditError(f"baseline audit is too large to retain: {path}")
+            after = os.fstat(descriptor)
+            try:
+                named_after = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                absolute_named = os.stat(absolute_path, follow_symlinks=False)
+                absolute_parent_after = os.stat(absolute_parent, follow_symlinks=False)
+            except OSError as error:
+                raise AuditError(
+                    f"baseline audit pathname changed while reading: {path}"
+                ) from error
+            parent_after = os.fstat(parent_descriptor)
+            if (
+                _stat_identity(before) != _stat_identity(after)
+                or len(payload) != before.st_size
+                or after.st_nlink != 1
+                or named_after.st_nlink != 1
+                or absolute_named.st_nlink != 1
+                or (after.st_dev, after.st_ino) != (named_after.st_dev, named_after.st_ino)
+                or (after.st_dev, after.st_ino) != (absolute_named.st_dev, absolute_named.st_ino)
+                or _stat_identity(parent_before) != _stat_identity(parent_after)
+                or (parent_before.st_dev, parent_before.st_ino)
+                != (absolute_parent_after.st_dev, absolute_parent_after.st_ino)
+            ):
+                raise AuditError(f"baseline audit changed or rebound while reading: {path}")
+            return bytes(payload)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _is_lower_hex(value: object, length: int = 64) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _exact_mapping(value: object, keys: frozenset[str], label: str) -> Mapping[str, object]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise AuditError(f"baseline audit {label} key set is invalid")
+    return value
+
+
+def _baseline_audit_from_payload(payload: object) -> BaselineAudit:
+    record = _exact_mapping(payload, _BASELINE_AUDIT_KEYS, "top-level")
+    files_value = record["files"]
+    boundary_value = record["selection_boundary"]
+    if not isinstance(files_value, list):
+        raise AuditError("baseline audit files must be a list")
+    files: list[SourceFile] = []
+    for value in files_value:
+        source = _exact_mapping(value, _SOURCE_FILE_KEYS, "source file")
+        if (
+            not isinstance(source["path"], str)
+            or not source["path"]
+            or type(source["bytes"]) is not int
+            or source["bytes"] < 0
+            or not _is_lower_hex(source["sha256"])
+        ):
+            raise AuditError("baseline audit source file record is invalid")
+        files.append(
+            SourceFile(
+                cast("str", source["path"]),
+                cast("int", source["bytes"]),
+                cast("str", source["sha256"]),
+            )
+        )
+    boundary = _exact_mapping(boundary_value, _SELECTION_BOUNDARY_KEYS, "selection boundary")
+    if (
+        not isinstance(boundary["file"], str)
+        or not boundary["file"]
+        or any(type(boundary[key]) is not int for key in _SELECTION_BOUNDARY_KEYS - {"file"})
+    ):
+        raise AuditError("baseline audit selection boundary is invalid")
+    split_rows = record["split_rows"]
+    duplicate_multiplicity = record["duplicate_uuid_multiplicity"]
+    occurrences = record["occurrence_prompt_ids"]
+    exclusions = record["exclusion_prompt_ids"]
+    if (
+        not isinstance(split_rows, dict)
+        or any(
+            not isinstance(key, str) or not key or type(value) is not int or value < 0
+            for key, value in split_rows.items()
+        )
+        or not isinstance(duplicate_multiplicity, dict)
+        or any(
+            not _is_lower_hex(key) or type(value) is not int or value < 2
+            for key, value in duplicate_multiplicity.items()
+        )
+        or not isinstance(occurrences, list)
+        or not isinstance(exclusions, list)
+    ):
+        raise AuditError("baseline audit collection schema is invalid")
+    integer_fields = (
+        "row_count",
+        "occurrence_count",
+        "unique_prompt_count",
+        "physical_row_count",
+    )
+    if (
+        not isinstance(record["source_revision"], str)
+        or (
+            record["source_manifest_sha256"] is not None
+            and not _is_lower_hex(record["source_manifest_sha256"])
+        )
+        or any(not _is_nonnegative_int(record[key]) for key in integer_fields)
+        or not _is_lower_hex(record["occurrence_prompt_ids_sha256"])
+        or not _is_lower_hex(record["exclusion_prompt_ids_sha256"])
+        or not isinstance(record["selection_policy"], str)
+    ):
+        raise AuditError("baseline audit scalar schema is invalid")
+    return BaselineAudit(
+        source_revision=cast("str", record["source_revision"]),
+        source_manifest_sha256=cast("str | None", record["source_manifest_sha256"]),
+        row_count=cast("int", record["row_count"]),
+        split_rows=dict(split_rows),
+        files=tuple(files),
+        occurrence_count=cast("int", record["occurrence_count"]),
+        unique_prompt_count=cast("int", record["unique_prompt_count"]),
+        occurrence_prompt_ids=tuple(occurrences),
+        occurrence_prompt_ids_sha256=cast("str", record["occurrence_prompt_ids_sha256"]),
+        exclusion_prompt_ids=tuple(exclusions),
+        exclusion_prompt_ids_sha256=cast("str", record["exclusion_prompt_ids_sha256"]),
+        duplicate_uuid_multiplicity=dict(duplicate_multiplicity),
+        physical_row_count=cast("int", record["physical_row_count"]),
+        selection_policy=cast("str", record["selection_policy"]),
+        selection_boundary=SelectionBoundary(
+            cast("str", boundary["file"]),
+            cast("int", boundary["rows_selected"]),
+            cast("int", boundary["rows_available"]),
+            cast("int", boundary["excluded_tail_rows"]),
+        ),
+    )
+
+
+def _validate_baseline_audit(audit: BaselineAudit, expected: BaselineExpectation) -> None:
+    occurrences = list(audit.occurrence_prompt_ids)
+    exclusions = list(audit.exclusion_prompt_ids)
+    if audit.source_revision != expected.source_revision:
+        raise AuditError("baseline audit source revision mismatch")
+    if (expected.source_manifest_required and audit.source_manifest_sha256 is None) or (
+        expected.source_manifest_sha256 is not None
+        and audit.source_manifest_sha256 != expected.source_manifest_sha256
+    ):
+        raise AuditError("baseline audit source manifest identity mismatch")
+    if len(audit.files) != expected.shard_count:
+        raise AuditError("baseline audit shard count mismatch")
+    if audit.split_rows != dict(sorted(expected.split_rows.items())):
+        raise AuditError("baseline audit split row totals mismatch")
+    if (
+        audit.row_count != sum(audit.split_rows.values())
+        or audit.occurrence_count != audit.row_count
+        or len(occurrences) != audit.occurrence_count
+        or any(not _is_lower_hex(value) for value in occurrences)
+    ):
+        raise AuditError("baseline audit occurrence count mismatch")
+    expected_exclusions = sorted(set(occurrences))
+    if (
+        exclusions != expected_exclusions
+        or audit.unique_prompt_count != len(expected_exclusions)
+        or any(not _is_lower_hex(value) for value in exclusions)
+    ):
+        raise AuditError("baseline audit exclusion prompt UUIDs do not reconcile")
+    if (
+        expected.unique_prompt_count is not None
+        and audit.unique_prompt_count != expected.unique_prompt_count
+    ):
+        raise AuditError("baseline audit unique prompt count mismatch")
+    counts = Counter(occurrences)
+    multiplicity = {prompt_id: count for prompt_id, count in sorted(counts.items()) if count > 1}
+    if audit.duplicate_uuid_multiplicity != multiplicity:
+        raise AuditError("baseline audit duplicate UUID multiplicity mismatch")
+    if audit.occurrence_prompt_ids_sha256 != sha256_bytes(canonical_json(occurrences)):
+        raise AuditError("baseline audit occurrence prompt UUID digest mismatch")
+    if (
+        expected is EXPECTED_BASELINE
+        and audit.occurrence_prompt_ids_sha256 != CANONICAL_BASELINE_OCCURRENCE_PROMPT_IDS_SHA256
+    ):
+        raise AuditError("canonical baseline occurrence prompt UUID digest mismatch")
+    if audit.exclusion_prompt_ids_sha256 != sha256_bytes(canonical_json(exclusions)):
+        raise AuditError("baseline audit exclusion prompt UUID digest mismatch")
+    if (
+        expected.physical_row_count is not None
+        and audit.physical_row_count != expected.physical_row_count
+    ):
+        raise AuditError("baseline audit physical row count mismatch")
+    boundary = audit.selection_boundary
+    boundary_split = re.sub(r"-\d+(?:-of-\d+)?\.parquet$", "", boundary.file)
+    if (
+        audit.selection_policy != _SELECTION_POLICY
+        or boundary.rows_selected < 1
+        or boundary.rows_available < boundary.rows_selected
+        or boundary.excluded_tail_rows != boundary.rows_available - boundary.rows_selected
+        or audit.physical_row_count != audit.occurrence_count + boundary.excluded_tail_rows
+    ):
+        raise AuditError("baseline audit selection policy or boundary mismatch")
+    if (
+        expected.excluded_tail_rows is not None
+        and boundary.excluded_tail_rows != expected.excluded_tail_rows
+    ) or (
+        expected.excluded_tail_split is not None and boundary_split != expected.excluded_tail_split
+    ):
+        raise AuditError("baseline audit expected selection boundary mismatch")
+
+
+def load_baseline_audit_receipt(
+    path: Path,
+    expected_file_sha256: str,
+    expected: BaselineExpectation = EXPECTED_BASELINE,
+) -> tuple[BaselineAudit, str]:
+    """Authenticate and replay one original canonical BaselineAudit receipt."""
+    if (
+        expected is EXPECTED_BASELINE
+        and expected_file_sha256 != CANONICAL_BASELINE_AUDIT_FILE_SHA256
+    ):
+        raise AuditError("canonical baseline whole-file lineage SHA-256 mismatch")
+    raw = _stable_single_link_regular_bytes(path, max_bytes=_MAX_BASELINE_AUDIT_BYTES)
+    if sha256(raw).hexdigest() != expected_file_sha256:
+        raise AuditError("baseline audit whole-file SHA-256 mismatch")
+    try:
+        decoded = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AuditError("baseline audit JSON is invalid") from error
+    if not isinstance(decoded, dict) or raw != canonical_json(decoded) + b"\n":
+        raise AuditError("baseline audit must use canonical JSON bytes")
+    payload = dict(decoded)
+    receipt_sha256 = payload.pop("receipt_sha256", None)
+    if receipt_sha256 != sha256_bytes(canonical_json(payload)):
+        raise AuditError("baseline audit self-hash does not reconcile")
+    audit = _baseline_audit_from_payload(payload)
+    _validate_baseline_audit(audit, expected)
+    return audit, expected_file_sha256
 
 
 def _sha256_file(path: Path) -> str:

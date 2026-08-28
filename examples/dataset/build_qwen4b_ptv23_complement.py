@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, overload
@@ -55,6 +55,7 @@ except ModuleNotFoundError:
         canonical_tree_sha256 = None
         descriptor_stable_tree_entries = None
 
+from audit_ptv2_baseline import EXPECTED_BASELINE, load_baseline_audit_receipt
 from ptv23_complement_target_policy import (
     ComplementError,
     TargetTokenizerPolicy,
@@ -602,68 +603,19 @@ def load_historical_exclusion(
     expected_occurrence_count: int = 1_300_000,
 ) -> HistoricalExclusion:
     """Authenticate the exact historical PTV2 occurrence stream and UUID exclusion."""
-    if not _is_lower_hex(expected_sha256, 64):
-        raise ComplementError("historical receipt caller SHA-256 is invalid")
-    raw = _stable_regular_bytes(path, max_bytes=_MAX_HISTORICAL_RECEIPT_BYTES)
-    if sha256(raw).hexdigest() != expected_sha256:
-        raise ComplementError("historical receipt caller SHA-256 mismatch")
-    try:
-        payload: Any = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ComplementError("historical receipt JSON is invalid") from error
-    expected_keys = {
-        "schema_version",
-        "source_revision",
-        "occurrence_count",
-        "ordered_prompt_uuids",
-        "ordered_prompt_uuids_sha256",
-        "unique_prompt_uuids",
-        "unique_prompt_uuids_sha256",
-        "duplicate_uuid_multiplicity",
-        "receipt_sha256",
-    }
-    if (
-        not isinstance(payload, dict)
-        or raw != _canonical_json(payload) + b"\n"
-        or set(payload) != expected_keys
-        or payload["schema_version"] != "ptv2-historical-occurrence-receipt-v1"
-        or payload["source_revision"] != PTV2_REVISION
-        or payload["occurrence_count"] != expected_occurrence_count
-    ):
-        raise ComplementError("historical receipt identity is invalid")
-    occurrences = payload["ordered_prompt_uuids"]
-    unique = payload["unique_prompt_uuids"]
-    multiplicity = payload["duplicate_uuid_multiplicity"]
-    if (
-        not isinstance(occurrences, list)
-        or len(occurrences) != expected_occurrence_count
-        or any(not _is_lower_hex(value, 64) for value in occurrences)
-        or not isinstance(unique, list)
-        or unique != sorted(set(occurrences))
-        or not isinstance(multiplicity, dict)
-    ):
-        raise ComplementError("historical occurrence evidence is invalid")
-    counts = Counter(occurrences)
-    expected_multiplicity = {
-        prompt_uuid: count for prompt_uuid, count in sorted(counts.items()) if count > 1
-    }
-    body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
-    if (
-        multiplicity != expected_multiplicity
-        or payload["ordered_prompt_uuids_sha256"]
-        != sha256(_canonical_json(occurrences)).hexdigest()
-        or payload["unique_prompt_uuids_sha256"] != sha256(_canonical_json(unique)).hexdigest()
-        or payload["receipt_sha256"] != sha256(_canonical_json(body)).hexdigest()
-    ):
-        raise ComplementError("historical receipt hashes or multiplicity do not reconcile")
+    audit, file_sha256 = load_baseline_audit_receipt(
+        path, expected_sha256, expected=EXPECTED_BASELINE
+    )
+    if audit.occurrence_count != expected_occurrence_count:
+        raise ComplementError("historical occurrence count mismatch")
     return HistoricalExclusion(
-        file_sha256=expected_sha256,
-        receipt_sha256=payload["receipt_sha256"],
-        occurrence_count=expected_occurrence_count,
-        ordered_prompt_uuids_sha256=payload["ordered_prompt_uuids_sha256"],
-        prompt_uuids=frozenset(unique),
-        unique_prompt_uuids_sha256=payload["unique_prompt_uuids_sha256"],
-        duplicate_uuid_multiplicity=dict(multiplicity),
+        file_sha256=file_sha256,
+        receipt_sha256=sha256(_canonical_json(asdict(audit))).hexdigest(),
+        occurrence_count=audit.occurrence_count,
+        ordered_prompt_uuids_sha256=audit.occurrence_prompt_ids_sha256,
+        prompt_uuids=frozenset(audit.exclusion_prompt_ids),
+        unique_prompt_uuids_sha256=audit.exclusion_prompt_ids_sha256,
+        duplicate_uuid_multiplicity=dict(audit.duplicate_uuid_multiplicity),
     )
 
 

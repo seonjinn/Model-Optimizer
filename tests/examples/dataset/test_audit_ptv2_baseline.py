@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import os
+import stat
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -51,6 +54,188 @@ def _source_manifest(root: Path, revision: str) -> Path:
     manifest = root / "SOURCE_MANIFEST.json"
     manifest.write_bytes(module.canonical_json({"source_revision": revision, "files": files}))
     return manifest
+
+
+def _write_canonical_baseline_audit(tmp_path: Path):
+    module = _load()
+    occurrences = ("1" * 64, "2" * 64, "1" * 64)
+    unique = tuple(sorted(set(occurrences)))
+    expected = module.BaselineExpectation(
+        "5c89e01dd720ae0f4058445ed49c5fb68a03c76e",
+        1,
+        {"chat": 3},
+        2,
+        4,
+        1,
+        "chat",
+        True,
+        "b" * 64,
+    )
+    audit = module.BaselineAudit(
+        source_revision=expected.source_revision,
+        source_manifest_sha256=expected.source_manifest_sha256,
+        row_count=3,
+        split_rows={"chat": 3},
+        files=(module.SourceFile("/immutable/raw-chat.parquet", 123, "a" * 64),),
+        occurrence_count=3,
+        unique_prompt_count=2,
+        occurrence_prompt_ids=occurrences,
+        occurrence_prompt_ids_sha256=hashlib.sha256(module.canonical_json(occurrences)).hexdigest(),
+        exclusion_prompt_ids=unique,
+        exclusion_prompt_ids_sha256=hashlib.sha256(module.canonical_json(unique)).hexdigest(),
+        duplicate_uuid_multiplicity={"1" * 64: 2},
+        physical_row_count=4,
+        selection_policy="hf-streaming-sorted-parquet-take",
+        selection_boundary=module.SelectionBoundary("chat-0.parquet", 3, 4, 1),
+    )
+    path = tmp_path / "AUDIT.json"
+    module.write_audit_receipt(audit, path)
+    return module, path, audit, expected
+
+
+def _rewrite_payload(path: Path, mutate, *, reconcile_self_hash: bool = True) -> str:
+    payload = json.loads(path.read_bytes())
+    mutate(payload)
+    if reconcile_self_hash:
+        body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+        payload["receipt_sha256"] = hashlib.sha256(
+            json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    path.write_bytes(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        + b"\n"
+    )
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_loader_authenticates_exact_canonical_baseline_audit(tmp_path: Path) -> None:
+    module, path, audit, expected = _write_canonical_baseline_audit(tmp_path)
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    loaded, lineage_sha256 = module.load_baseline_audit_receipt(path, file_sha256, expected)
+
+    assert loaded == audit
+    assert lineage_sha256 == file_sha256
+    assert set(tmp_path.iterdir()) == {path}
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reconcile_self_hash", "match"),
+    [
+        (lambda payload: payload.__setitem__("smuggled", True), True, "key set"),
+        (
+            lambda payload: payload.__setitem__("receipt_sha256", "0" * 64),
+            False,
+            "self-hash",
+        ),
+        (
+            lambda payload: payload["duplicate_uuid_multiplicity"].clear(),
+            True,
+            "multiplicity",
+        ),
+        (
+            lambda payload: payload.__setitem__("occurrence_prompt_ids_sha256", "0" * 64),
+            True,
+            "occurrence prompt UUID digest",
+        ),
+        (
+            lambda payload: payload.__setitem__("exclusion_prompt_ids", ["2" * 64]),
+            True,
+            "exclusion prompt UUIDs",
+        ),
+    ],
+)
+def test_loader_replays_schema_self_hash_and_uuid_invariants(
+    tmp_path: Path, mutate, reconcile_self_hash: bool, match: str
+) -> None:
+    module, path, _, expected = _write_canonical_baseline_audit(tmp_path)
+    file_sha256 = _rewrite_payload(path, mutate, reconcile_self_hash=reconcile_self_hash)
+
+    with pytest.raises(module.AuditError, match=match):
+        module.load_baseline_audit_receipt(path, file_sha256, expected)
+
+
+def test_loader_rejects_wrong_whole_file_hash_and_noncanonical_bytes(tmp_path: Path) -> None:
+    module, path, _, expected = _write_canonical_baseline_audit(tmp_path)
+
+    with pytest.raises(module.AuditError, match="whole-file SHA-256"):
+        module.load_baseline_audit_receipt(path, "0" * 64, expected)
+
+    path.write_bytes(path.read_bytes().replace(b'"files":', b'"files" :', 1))
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(module.AuditError, match="canonical JSON"):
+        module.load_baseline_audit_receipt(path, file_sha256, expected)
+
+
+def test_loader_rejects_hardlink_fifo_and_oversized_inputs(tmp_path: Path) -> None:
+    module, path, _, expected = _write_canonical_baseline_audit(tmp_path)
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    alias = tmp_path / "AUDIT.alias.json"
+    os.link(path, alias)
+    with pytest.raises(module.AuditError, match="single-link regular file"):
+        module.load_baseline_audit_receipt(path, file_sha256, expected)
+
+    path.unlink()
+    alias.unlink()
+    fifo = tmp_path / "AUDIT.fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(module.AuditError, match="single-link regular file"):
+        module.load_baseline_audit_receipt(fifo, "0" * 64, expected)
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"123456789")
+    with pytest.raises(module.AuditError, match="too large"):
+        module._stable_single_link_regular_bytes(oversized, max_bytes=8)
+
+
+def test_loader_rejects_path_rebind_after_descriptor_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, path, _, expected = _write_canonical_baseline_audit(tmp_path)
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(path.read_bytes())
+    displaced = tmp_path / "displaced.json"
+    original_fstat = module.os.fstat
+    regular_fstats = 0
+
+    def swap_after_file_read(descriptor: int):
+        nonlocal regular_fstats
+        result = original_fstat(descriptor)
+        if stat.S_ISREG(result.st_mode):
+            regular_fstats += 1
+            if regular_fstats == 2:
+                path.rename(displaced)
+                replacement.rename(path)
+        return result
+
+    monkeypatch.setattr(module.os, "fstat", swap_after_file_read)
+
+    with pytest.raises(module.AuditError, match=r"changed|rebound"):
+        module.load_baseline_audit_receipt(path, file_sha256, expected)
+
+
+def test_loader_rejects_file_growth_at_the_read_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module, path, _, expected = _write_canonical_baseline_audit(tmp_path)
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    original_read = module.os.read
+    grew = False
+
+    def read_then_grow(descriptor: int, size: int) -> bytes:
+        nonlocal grew
+        block = original_read(descriptor, size)
+        if block and not grew:
+            grew = True
+            with path.open("ab") as stream:
+                stream.write(b"x")
+        return block
+
+    monkeypatch.setattr(module.os, "read", read_then_grow)
+
+    with pytest.raises(module.AuditError, match=r"changed|too large"):
+        module.load_baseline_audit_receipt(path, file_sha256, expected)
 
 
 def test_audit_resolves_hashes_counts_and_unique_canonical_uuids(tmp_path: Path) -> None:
@@ -207,6 +392,14 @@ def test_audit_reproduces_authoritative_sorted_stream_take_boundary(tmp_path: Pa
 
 def test_production_baseline_expectation_is_exact() -> None:
     module = _load()
+    assert (
+        module.CANONICAL_BASELINE_AUDIT_FILE_SHA256
+        == "2469430c144d9b86850901df0a28cb810b437555ee894771b796b1386d1c18b5"
+    )
+    assert (
+        module.CANONICAL_BASELINE_OCCURRENCE_PROMPT_IDS_SHA256
+        == "863470b22925d74228d31b1c2433d9461d25e8d02a298cb3a08a6bc99be55060"
+    )
     assert module.EXPECTED_BASELINE.source_revision == "5c89e01dd720ae0f4058445ed49c5fb68a03c76e"
     assert module.EXPECTED_BASELINE.shard_count == 26
     assert module.EXPECTED_BASELINE.split_rows == {
