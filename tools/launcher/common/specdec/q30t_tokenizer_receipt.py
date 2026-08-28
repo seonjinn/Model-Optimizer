@@ -5,18 +5,30 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import stat
 from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from common.specdec.q30t_tree_digest import (
+    canonical_tree_sha256,
+    reconcile_q30t_model_asset,
+    require_stable_absolute_tree_root,
+)
+from common.specdec.qwen4b_b_atomic import atomic_publish_bytes
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 __all__ = [
     "Q30T_TOKENIZER_REPOSITORY",
     "Q30T_TOKENIZER_TRUST_SCHEMA",
     "build_q30t_tokenizer_receipt",
+    "main",
     "snapshot_tree_sha256",
     "verify_q30t_tokenizer_receipt",
 ]
@@ -87,7 +99,9 @@ def _read_regular_at(
     return digest.hexdigest(), bytes(retained) if retained is not None else None
 
 
-def _walk_snapshot(snapshot: Path) -> tuple[str, dict[str, bytes]]:
+def _walk_snapshot(
+    snapshot: Path,
+) -> tuple[str, dict[str, bytes], list[dict[str, object]]]:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         root_before = os.stat(snapshot, follow_symlinks=False)
@@ -100,14 +114,10 @@ def _walk_snapshot(snapshot: Path) -> tuple[str, dict[str, bytes]]:
     if _identity(root_before) != _identity(root_opened):
         os.close(root_fd)
         raise ValueError("Q30 tokenizer snapshot changed while opening")
-    tree = sha256()
-    tree.update(b"[")
-    first_entry = True
-    file_count = 0
+    entries: list[dict[str, object]] = []
     files: dict[str, bytes] = {}
 
     def walk(directory_fd: int, relative: str) -> None:
-        nonlocal file_count, first_entry
         before = os.fstat(directory_fd)
         if not stat.S_ISDIR(before.st_mode):
             raise ValueError("Q30 tokenizer snapshot directory is invalid")
@@ -131,11 +141,9 @@ def _walk_snapshot(snapshot: Path) -> tuple[str, dict[str, bytes]]:
                     status,
                     path in {"tokenizer_config.json", "tokenizer.json"},
                 )
-                if not first_entry:
-                    tree.update(b",")
-                tree.update(_canonical_json([path, digest]))
-                first_entry = False
-                file_count += 1
+                entries.append(
+                    {"path": path, "type": "regular", "size": status.st_size, "sha256": digest}
+                )
                 if raw is not None:
                     files[path] = raw
                 continue
@@ -163,15 +171,15 @@ def _walk_snapshot(snapshot: Path) -> tuple[str, dict[str, bytes]]:
         walk(root_fd, "")
     finally:
         os.close(root_fd)
-    if file_count == 0:
+    require_stable_absolute_tree_root(snapshot, root_opened)
+    if not entries:
         raise ValueError("Q30 tokenizer snapshot is empty")
-    tree.update(b"]")
-    return tree.hexdigest(), files
+    return canonical_tree_sha256(entries), files, entries
 
 
 def snapshot_tree_sha256(snapshot: Path) -> str:
     """Return the descriptor-stable SHA-256 tree identity for one tokenizer snapshot."""
-    tree_sha256, _ = _walk_snapshot(snapshot)
+    tree_sha256, _, _ = _walk_snapshot(snapshot)
     return tree_sha256
 
 
@@ -233,7 +241,7 @@ def _special_token_ids(tokenizer_json: dict[str, Any]) -> tuple[int, int]:
 
 
 def _derived_snapshot_evidence(snapshot: Path) -> dict[str, object]:
-    snapshot_tree_sha256, files = _walk_snapshot(snapshot)
+    snapshot_tree_sha256, files, _ = _walk_snapshot(snapshot)
     try:
         config = _json_object(files["tokenizer_config.json"], "config")
         tokenizer_json = _json_object(files["tokenizer.json"], "vocabulary")
@@ -324,3 +332,143 @@ def verify_q30t_tokenizer_receipt(receipt: bytes) -> dict[str, object]:
     if any(payload[name] != value for name, value in observed.items()):
         raise ValueError("Q30 tokenizer receipt evidence does not reconcile")
     return payload
+
+
+def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build an immutable Q30 Thinking tokenizer receipt."
+    )
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--identity-path", type=Path, required=True)
+    parser.add_argument("--identity-sha256", required=True)
+    parser.add_argument("--model-sha256-path", type=Path, required=True)
+    parser.add_argument("--model-sha256-sha256", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args(argv)
+
+
+def _adopt_exact_receipt(output: Path, expected: bytes) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    try:
+        parent_fd = os.open(output.parent, directory_flags)
+    except OSError as error:
+        raise FileExistsError(
+            f"Q30 tokenizer receipt parent cannot be adopted: {output.parent}"
+        ) from error
+    try:
+        parent_before = os.fstat(parent_fd)
+        try:
+            expected_status = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+            descriptor = os.open(output.name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise FileExistsError(f"Q30 tokenizer receipt cannot be adopted: {output}") from error
+        try:
+            before = os.fstat(descriptor)
+            if (
+                _identity(expected_status) != _identity(before)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+            ):
+                raise FileExistsError(f"Q30 tokenizer receipt is not immutable: {output}")
+            retained = bytearray()
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                while block := stream.read(_READ_BLOCK_BYTES):
+                    retained.extend(block)
+                    if len(retained) > len(expected):
+                        break
+            after = os.fstat(descriptor)
+            rebound = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+            if _identity(before) != _identity(after) or _identity(after) != _identity(rebound):
+                raise FileExistsError(f"Q30 tokenizer receipt changed while adopting: {output}")
+            if bytes(retained) != expected:
+                raise FileExistsError(f"Q30 tokenizer receipt differs: {output}")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        parent_after = os.fstat(parent_fd)
+        if _identity(parent_before) != _identity(parent_after):
+            raise FileExistsError(f"Q30 tokenizer receipt parent changed: {output.parent}")
+        os.fsync(parent_fd)
+        final_parent = os.fstat(parent_fd)
+        try:
+            final_named = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+            final_descriptor = os.open(output.name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise FileExistsError(
+                f"Q30 tokenizer receipt cannot be rebound after durability: {output}"
+            ) from error
+        try:
+            final_opened = os.fstat(final_descriptor)
+            absolute = os.stat(output, follow_symlinks=False)
+            if (
+                _identity(final_parent) != _identity(parent_before)
+                or _identity(final_named) != _identity(after)
+                or _identity(final_opened) != _identity(after)
+                or _identity(absolute) != _identity(after)
+                or final_opened.st_nlink != 1
+            ):
+                raise FileExistsError(
+                    f"Q30 tokenizer receipt changed or rebound after durability: {output}"
+                )
+        finally:
+            os.close(final_descriptor)
+    finally:
+        os.close(parent_fd)
+
+
+def _publish_or_adopt_receipt(output: Path, receipt: bytes, *, job_id: str) -> None:
+    if os.path.lexists(output):
+        _adopt_exact_receipt(output, receipt)
+        return
+    try:
+        atomic_publish_bytes(output, receipt, job_id=job_id)
+    except Exception:
+        if not os.path.lexists(output):
+            raise
+        _adopt_exact_receipt(output, receipt)
+        return
+    _adopt_exact_receipt(output, receipt)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Reconcile two snapshot reads and publish one immutable canonical receipt."""
+    arguments = _arguments(argv)
+    output = arguments.output
+    if not output.is_absolute():
+        raise ValueError("Q30 tokenizer receipt output path must be absolute")
+    _, _, entries = _walk_snapshot(arguments.snapshot)
+    reviewed_tree_sha256 = reconcile_q30t_model_asset(
+        snapshot=arguments.snapshot,
+        entries=entries,
+        repository=arguments.repository,
+        revision=arguments.revision,
+        identity_path=arguments.identity_path,
+        identity_sha256=arguments.identity_sha256,
+        model_sha256_path=arguments.model_sha256_path,
+        model_sha256_sha256=arguments.model_sha256_sha256,
+    )
+
+    receipts: list[bytes] = []
+    for _ in range(2):
+        receipt = build_q30t_tokenizer_receipt(
+            snapshot=arguments.snapshot,
+            repository=arguments.repository,
+            revision=arguments.revision,
+        )
+        verified = verify_q30t_tokenizer_receipt(receipt)
+        if verified["snapshot_tree_sha256"] != reviewed_tree_sha256:
+            raise ValueError("Q30 tokenizer receipt does not use the reviewed model tree")
+        receipts.append(receipt)
+    if receipts[0] != receipts[1]:
+        raise ValueError("Q30 tokenizer snapshot changed between independent receipt builds")
+
+    job_id = os.environ.get("SLURM_JOB_ID", str(os.getpid()))
+    _publish_or_adopt_receipt(output, receipts[0], job_id=job_id)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
