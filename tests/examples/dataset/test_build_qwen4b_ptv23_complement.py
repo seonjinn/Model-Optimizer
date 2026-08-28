@@ -484,6 +484,19 @@ def test_held_out_union_rejects_canonical_empty_named_receipt(tmp_path: Path) ->
         module.load_held_out_union([(name, *receipt) for name, receipt in receipts.items()])
 
 
+def test_held_out_union_rejects_empty_named_receipt_when_required_names_is_empty(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    empty = _write_heldout_receipt(tmp_path / "speed.json", [])
+
+    with pytest.raises(module.ComplementError, match="cannot be empty"):
+        module.load_held_out_union(
+            [("speed", *empty)],
+            required_names=frozenset(),
+        )
+
+
 def test_held_out_union_keeps_empty_unnamed_fixture_compatibility(tmp_path: Path) -> None:
     module = _load_module()
     empty = _write_heldout_receipt(tmp_path / "empty.json", [])

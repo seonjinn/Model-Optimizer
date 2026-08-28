@@ -646,7 +646,7 @@ def load_held_out_union(
             raise ComplementError("required held-out receipt set is missing or has extras")
         normalized.sort(key=lambda receipt: HELD_OUT_ORDER.index(receipt[0]))
         names = [name for name, _, _ in normalized]
-    for _, path, expected_sha256 in normalized:
+    for name, path, expected_sha256 in normalized:
         if not _is_lower_hex(expected_sha256, 64):
             raise ComplementError("held-out receipt caller SHA-256 is invalid")
         raw = _stable_regular_bytes(path, max_bytes=_MAX_HELD_OUT_RECEIPT_BYTES)
@@ -670,7 +670,7 @@ def load_held_out_union(
         ):
             raise ComplementError("held-out receipt identity is invalid")
         prompt_uuids = payload["prompt_uuids"]
-        if required_names and prompt_uuids == []:
+        if name and prompt_uuids == []:
             raise ComplementError("named held-out receipt cannot be empty")
         body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
         if (
