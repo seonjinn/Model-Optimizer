@@ -27,6 +27,7 @@ __all__ = [
     "TOKEN_SHARES",
     "FromScratchStudyPolicy",
     "LanePolicy",
+    "LanguageAllocation",
     "TokenGate",
     "load_from_scratch_policy",
 ]
@@ -73,8 +74,16 @@ _POLICY_KEYS = frozenset(
     }
 )
 _LANE_KEYS = frozenset(
-    {"name", "token_numerator", "token_denominator", "canary_rows", "languages"}
+    {
+        "name",
+        "token_numerator",
+        "token_denominator",
+        "canary_rows",
+        "languages",
+        "language_allocations",
+    }
 )
+_LANGUAGE_ALLOCATION_KEYS = frozenset({"language", "token_numerator", "token_denominator"})
 _GATE_KEYS = frozenset({"name", "assistant_loss_tokens"})
 _SOURCE_REQUIREMENTS_KEYS = frozenset({"path", "sha256"})
 _EXPECTED_FRACTIONS = (
@@ -88,6 +97,16 @@ _EXPECTED_FRACTIONS = (
     (5, 100),
 )
 _EXPECTED_LANGUAGES = ((), (), (), (), (), (), (), ("de", "ja", "es", "fr", "it"))
+_EXPECTED_LANGUAGE_ALLOCATION_FRACTIONS = (
+    (),
+    (),
+    (),
+    (),
+    (),
+    (),
+    (),
+    ((1, 5), (1, 5), (1, 5), (1, 5), (1, 5)),
+)
 _GATE_NAMES = ("pilot", "primary", "scale")
 _GATE_TOKENS = (256_000_000, 1_000_000_000, 4_000_000_000)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -102,10 +121,25 @@ class LanePolicy:
     token_denominator: int
     canary_rows: int
     languages: tuple[str, ...]
+    language_allocations: tuple[LanguageAllocation, ...]
 
     @property
     def token_share(self) -> Fraction:
         """Return this lane's exact assistant-loss-token share."""
+        return Fraction(self.token_numerator, self.token_denominator)
+
+
+@dataclass(frozen=True)
+class LanguageAllocation:
+    """Exact token-capacity share for one language within a multilingual lane."""
+
+    language: str
+    token_numerator: int
+    token_denominator: int
+
+    @property
+    def token_share(self) -> Fraction:
+        """Return this language's exact share of the enclosing lane."""
         return Fraction(self.token_numerator, self.token_denominator)
 
 
@@ -222,12 +256,58 @@ def _parse_lanes(value: object) -> tuple[LanePolicy, ...]:
         languages = _string_tuple(lane["languages"], f"policy.lanes[{index}].languages")
         if languages != _EXPECTED_LANGUAGES[index]:
             raise ValueError(f"policy.lanes[{index}] does not match its exact languages")
-        lanes.append(LanePolicy(name, numerator, denominator, canary_rows, languages))
+        language_allocations = _parse_language_allocations(
+            lane["language_allocations"], languages, index
+        )
+        lanes.append(
+            LanePolicy(name, numerator, denominator, canary_rows, languages, language_allocations)
+        )
     parsed = tuple(lanes)
     if sum((lane.token_share for lane in parsed), Fraction()) != Fraction(1, 1):
         raise ValueError("policy lane token shares must sum to one")
     if sum(lane.canary_rows for lane in parsed) != 10_240:
         raise ValueError("policy lane canary rows must sum to 10240")
+    return parsed
+
+
+def _parse_language_allocations(
+    value: object, languages: tuple[str, ...], lane_index: int
+) -> tuple[LanguageAllocation, ...]:
+    entries = _list(value, f"policy.lanes[{lane_index}].language_allocations")
+    expected_fractions = _EXPECTED_LANGUAGE_ALLOCATION_FRACTIONS[lane_index]
+    if len(entries) != len(languages):
+        raise ValueError(f"policy.lanes[{lane_index}] does not match exact language allocations")
+    allocations: list[LanguageAllocation] = []
+    for language_index, entry in enumerate(entries):
+        allocation = _mapping(
+            entry, f"policy.lanes[{lane_index}].language_allocations[{language_index}]"
+        )
+        _require_exact_keys(
+            allocation,
+            _LANGUAGE_ALLOCATION_KEYS,
+            f"policy.lanes[{lane_index}].language_allocations[{language_index}]",
+        )
+        language = _literal(
+            allocation["language"],
+            languages[language_index],
+            f"policy.lanes[{lane_index}].language_allocations[{language_index}].language",
+        )
+        numerator = _positive_int(
+            allocation["token_numerator"],
+            f"policy.lanes[{lane_index}].language_allocations[{language_index}].token_numerator",
+        )
+        denominator = _positive_int(
+            allocation["token_denominator"],
+            f"policy.lanes[{lane_index}].language_allocations[{language_index}].token_denominator",
+        )
+        if (numerator, denominator) != expected_fractions[language_index]:
+            raise ValueError(f"policy.lanes[{lane_index}] does not match exact language allocation")
+        allocations.append(LanguageAllocation(language, numerator, denominator))
+    parsed = tuple(allocations)
+    if languages and sum((allocation.token_share for allocation in parsed), Fraction()) != Fraction(
+        1, 1
+    ):
+        raise ValueError(f"policy.lanes[{lane_index}] language allocations must sum to one")
     return parsed
 
 

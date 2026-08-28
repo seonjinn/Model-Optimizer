@@ -83,6 +83,51 @@ def test_policy_binds_the_expected_target_and_source_requirements() -> None:
     assert policy.source_requirements_sha256 == sha256(SOURCES_PATH.read_bytes()).hexdigest()
 
 
+def test_multilingual_policy_allocates_equal_capacity_to_each_language() -> None:
+    """The 5% multilingual lane cannot hide an unequal language allocation."""
+    policy = load_fixture_policy_for_test()
+    multilingual = next(lane for lane in policy.lanes if lane.name == "multilingual")
+
+    assert multilingual.token_share == Fraction(5, 100)
+    assert tuple(allocation.language for allocation in multilingual.language_allocations) == (
+        "de",
+        "ja",
+        "es",
+        "fr",
+        "it",
+    )
+    assert tuple(allocation.token_share for allocation in multilingual.language_allocations) == (
+        Fraction(1, 5),
+        Fraction(1, 5),
+        Fraction(1, 5),
+        Fraction(1, 5),
+        Fraction(1, 5),
+    )
+
+
+def test_policy_rejects_unequal_but_self_consistent_multilingual_allocations(
+    tmp_path: Path,
+) -> None:
+    """Five allocations summing to one still fail unless each language receives one fifth."""
+    payload = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
+    payload["lanes"][-1]["language_allocations"] = [
+        {"language": "de", "token_numerator": 2, "token_denominator": 5},
+        {"language": "ja", "token_numerator": 3, "token_denominator": 20},
+        {"language": "es", "token_numerator": 3, "token_denominator": 20},
+        {"language": "fr", "token_numerator": 3, "token_denominator": 20},
+        {"language": "it", "token_numerator": 3, "token_denominator": 20},
+    ]
+    policy_path = tmp_path / POLICY_PATH.name
+    policy_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / SOURCES_PATH.name).write_bytes(SOURCES_PATH.read_bytes())
+
+    with pytest.raises(ValueError, match="exact language allocation"):
+        _parse_from_scratch_policy_for_test(policy_path)
+
+
 def test_policy_has_no_parent_checkpoint_field() -> None:
     """The from-scratch policy cannot carry a continuation checkpoint input."""
     payload = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
