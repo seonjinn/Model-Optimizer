@@ -6,17 +6,23 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
+from common.specdec import q30t_runtime_gateway_client as gateway_module
 from common.specdec.q30t_runtime_gateway_client import (
     AuthenticatedController,
     AuthenticatedWrapper,
     GatewayBarrierSession,
     GatewayProtocolError,
     GatewayRPC,
+    GlobalOperationRegistration,
     KeeperSignalTrace,
     ProtectedControlEntry,
     ProtectedControlPublication,
@@ -30,17 +36,45 @@ from common.specdec.q30t_runtime_gateway_client import (
     probe_mandatory_service,
     validate_control_publications,
     validate_endpoint_observation,
+    validate_global_operation_registration,
     validate_protected_image_publication,
     validate_sigio_setup_order,
 )
 from common.specdec.q30t_runtime_platform_feasibility import FeasibilityStatus, KeeperSameOFDReady
 
 
-def _identity(tmp_path: Path, *, service_kind: str = "gateway") -> RuntimeServiceEndpointIdentity:
+def _identity(
+    tmp_path: Path,
+    *,
+    service_kind: str = "gateway",
+    node_name: str | None = None,
+) -> RuntimeServiceEndpointIdentity:
+    openssl = shutil.which("openssl")
+    assert openssl is not None
+    tmp_path.mkdir(parents=True, exist_ok=True)
     executable = tmp_path / f"{service_kind}-executable"
     public_key = tmp_path / f"{service_kind}.pub"
+    private_key = tmp_path / f"{service_kind}.key"
     executable.write_bytes(b"executable")
-    public_key.write_bytes(b"public key")
+    if not private_key.exists():
+        subprocess.run(
+            (openssl, "genpkey", "-algorithm", "ED25519", "-out", str(private_key)),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            (
+                openssl,
+                "pkey",
+                "-in",
+                str(private_key),
+                "-pubout",
+                "-out",
+                str(public_key),
+            ),
+            check=True,
+            capture_output=True,
+        )
     service_identity = (
         "systemd:q30t-runtime-gateway.service"
         if service_kind == "gateway"
@@ -53,17 +87,46 @@ def _identity(tmp_path: Path, *, service_kind: str = "gateway") -> RuntimeServic
         "control_socket_mode": 0o660,
         "control_socket_path": str(tmp_path / f"{service_kind}.sock"),
         "control_socket_uid": 0,
-        "endpoint_node_name": "ptyche-n001" if service_kind == "gateway" else "ptyche-build",
+        "endpoint_node_name": node_name
+        or ("ptyche-n001" if service_kind == "gateway" else "ptyche-build"),
         "executable_path": str(executable),
         "executable_sha256": canonical_sha256(b"executable"),
         "expected_service_gid": 1974,
         "expected_service_uid": 0,
         "public_key_path": str(public_key),
-        "public_key_sha256": canonical_sha256(b"public key"),
+        "public_key_sha256": canonical_sha256(public_key.read_bytes()),
         "service_identity": service_identity,
         "service_kind": service_kind,
     }
     return RuntimeServiceEndpointIdentity(identity_sha256=canonical_sha256(values), **values)
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return gateway_module._canonical(value)
+
+
+def _sign(identity: RuntimeServiceEndpointIdentity, body: object) -> str:
+    private_key = Path(identity.public_key_path).with_suffix(".key")
+    openssl = shutil.which("openssl")
+    assert openssl is not None
+    with tempfile.NamedTemporaryFile() as payload:
+        payload.write(_canonical_bytes(body))
+        payload.flush()
+        completed = subprocess.run(
+            (
+                openssl,
+                "pkeyutl",
+                "-sign",
+                "-inkey",
+                str(private_key),
+                "-rawin",
+                "-in",
+                payload.name,
+            ),
+            check=True,
+            capture_output=True,
+        )
+    return base64.b64encode(completed.stdout).decode()
 
 
 def _observation(identity: RuntimeServiceEndpointIdentity) -> ServiceEndpointObservation:
@@ -114,8 +177,12 @@ def _ready() -> KeeperSameOFDReady:
     return KeeperSameOFDReady(packet_sha256=canonical_sha256(values), **values)
 
 
-def _publication(ready: KeeperSameOFDReady, root: Path) -> ProtectedImagePublication:
-    return ProtectedImagePublication(
+def _publication(
+    ready: KeeperSameOFDReady,
+    root: Path,
+    identity: RuntimeServiceEndpointIdentity,
+) -> ProtectedImagePublication:
+    publication = ProtectedImagePublication(
         schema_version="q30t-protected-image-publication-v1",
         job_id=ready.job_id,
         node_name=ready.node_name,
@@ -129,13 +196,12 @@ def _publication(ready: KeeperSameOFDReady, root: Path) -> ProtectedImagePublica
         size=ready.staged_size,
         sha256=ready.staged_sha256,
         same_ofd_lease_validated=True,
-        gateway_signature="signed",
+        gateway_signature="",
     )
-
-
-def test_cached_peercred_can_never_replace_credentialed_keeper_identity() -> None:
-    with pytest.raises(GatewayProtocolError, match="SCM_CREDENTIALS"):
-        raise GatewayProtocolError("SCM_CREDENTIALS required; cached peercred is creator-only")
+    return dataclasses.replace(
+        publication,
+        gateway_signature=_sign(identity, publication.body_dict()),
+    )
 
 
 @pytest.mark.parametrize("missing", ["socket", "executable", "key"])
@@ -145,17 +211,45 @@ def test_missing_mandatory_service_is_blocked_not_unsupported_success(
 ) -> None:
     identity = _identity(tmp_path)
     if missing == "socket":
-        missing_path = Path(identity.control_socket_path)
+        pass
     elif missing == "executable":
         missing_path = Path(identity.executable_path)
         missing_path.unlink()
     else:
         missing_path = Path(identity.public_key_path)
         missing_path.unlink()
-    result = probe_mandatory_service(identity, missing_path=missing_path)
+    result = probe_mandatory_service(identity)
     assert result.status is FeasibilityStatus.BLOCKED
     assert result.receipt is None
     assert "unsupported-success" not in result.reason
+
+
+def test_mandatory_service_existing_paths_without_live_identity_are_blocked(
+    tmp_path: Path,
+) -> None:
+    identity = _identity(tmp_path)
+    Path(identity.control_socket_path).write_bytes(b"not a socket")
+    result = probe_mandatory_service(identity)
+    assert result.status is FeasibilityStatus.BLOCKED
+    assert result.receipt is None
+    assert "live" in result.reason
+
+
+def test_service_gid_equal_to_producer_uid_is_not_producer_owned(tmp_path: Path) -> None:
+    identity = _identity(tmp_path)
+    validate_endpoint_observation(identity, _observation(identity), producer_uid=1974)
+
+
+def test_producer_uid_equal_to_service_uid_is_rejected(tmp_path: Path) -> None:
+    identity = _identity(tmp_path)
+    with pytest.raises(GatewayProtocolError, match="producer-owned"):
+        validate_endpoint_observation(identity, _observation(identity), producer_uid=0)
+
+
+def test_public_provenance_registration_escape_does_not_exist() -> None:
+    assert not hasattr(gateway_module, "register_stable_loaded_feasibility")
+    assert not hasattr(gateway_module, "_register_stable_loaded_feasibility")
+    assert not hasattr(gateway_module, "_STABLE_LOADED_FEASIBILITY_IDS")
 
 
 @pytest.mark.parametrize(
@@ -220,7 +314,10 @@ def test_protected_link_rejects_copy_mode_link_count_or_bad_signature(
     message: str,
 ) -> None:
     ready = _ready()
-    publication = dataclasses.replace(_publication(ready, tmp_path / "protected"), **{field: value})
+    identity = _identity(tmp_path)
+    publication = dataclasses.replace(
+        _publication(ready, tmp_path / "protected", identity), **{field: value}
+    )
     parent = ProtectedParentIdentity(uid=0, gid=0, mode=0o555, replacable_by_producer=False)
     with pytest.raises(GatewayProtocolError, match=message):
         validate_protected_image_publication(
@@ -228,7 +325,7 @@ def test_protected_link_rejects_copy_mode_link_count_or_bad_signature(
             ready,
             protected_runtime_root=tmp_path / "protected",
             parent=parent,
-            signature_verified=bool(publication.gateway_signature),
+            gateway_identity=identity,
         )
 
 
@@ -244,7 +341,8 @@ def test_protected_operation_path_is_reconstructed_and_never_reused(tmp_path: Pa
 
 def test_protected_parent_must_not_be_writable_or_replacable(tmp_path: Path) -> None:
     ready = _ready()
-    publication = _publication(ready, tmp_path / "protected")
+    identity = _identity(tmp_path)
+    publication = _publication(ready, tmp_path / "protected", identity)
     with pytest.raises(GatewayProtocolError, match="protected parent"):
         validate_protected_image_publication(
             publication,
@@ -256,7 +354,81 @@ def test_protected_parent_must_not_be_writable_or_replacable(tmp_path: Path) -> 
                 mode=0o700,
                 replacable_by_producer=True,
             ),
-            signature_verified=True,
+            gateway_identity=identity,
+        )
+
+
+def test_protected_publication_requires_valid_f_bound_signature(tmp_path: Path) -> None:
+    identity = _identity(tmp_path)
+    ready = _ready()
+    publication = _publication(ready, tmp_path / "protected", identity)
+    parent = ProtectedParentIdentity(uid=0, gid=0, mode=0o555, replacable_by_producer=False)
+    assert (
+        validate_protected_image_publication(
+            publication,
+            ready,
+            protected_runtime_root=tmp_path / "protected",
+            parent=parent,
+            gateway_identity=identity,
+        )
+        == publication
+    )
+    with pytest.raises(GatewayProtocolError, match="signature"):
+        validate_protected_image_publication(
+            dataclasses.replace(publication, gateway_signature=base64.b64encode(b"x" * 64).decode()),
+            ready,
+            protected_runtime_root=tmp_path / "protected",
+            parent=parent,
+            gateway_identity=identity,
+        )
+    with pytest.raises(GatewayProtocolError, match="signature"):
+        validate_protected_image_publication(
+            publication,
+            ready,
+            protected_runtime_root=tmp_path / "protected",
+            parent=parent,
+            gateway_identity=_identity(tmp_path / "other"),
+        )
+
+
+def test_global_registration_recomputes_self_hash_and_signature(tmp_path: Path) -> None:
+    identity = _identity(tmp_path)
+    body = {
+        "controller_pid": 101,
+        "controller_start_ticks": 202,
+        "derived_image_sha256": "b" * 64,
+        "expected_nodes": ("ptyche-n001", "ptyche-n002"),
+        "job_id": "12345",
+        "operation_id": "a" * 64,
+        "policy": "GO_AFTER_ALL_READY",
+        "protected_runtime_path": str(
+            operation_runtime_path(tmp_path / "protected", "12345", "a" * 64)
+        ),
+        "schema_version": "q30t-global-operation-registration-v1",
+    }
+    registration = GlobalOperationRegistration(
+        registration_sha256=canonical_sha256(body),
+        gateway_signature="",
+        **body,
+    )
+    registration = dataclasses.replace(
+        registration,
+        gateway_signature=_sign(identity, registration.signed_body_dict()),
+    )
+    validate_global_operation_registration(
+        registration,
+        gateway_identity=identity,
+        expected_job_id="12345",
+        expected_nodes=("ptyche-n001", "ptyche-n002"),
+        protected_runtime_root=tmp_path / "protected",
+    )
+    with pytest.raises(GatewayProtocolError, match="self hash"):
+        validate_global_operation_registration(
+            dataclasses.replace(registration, registration_sha256="0" * 64),
+            gateway_identity=identity,
+            expected_job_id="12345",
+            expected_nodes=("ptyche-n001", "ptyche-n002"),
+            protected_runtime_root=tmp_path / "protected",
         )
 
 
@@ -295,7 +467,13 @@ def test_sigio_setup_order_is_exact_and_write_break_precedes_completion() -> Non
         )
 
 
-def _control_publication(node: str, *, root_inode: int, file_inode: int) -> ProtectedControlPublication:
+def _control_publication(
+    node: str,
+    identity: RuntimeServiceEndpointIdentity,
+    *,
+    root_inode: int,
+    file_inode: int,
+) -> ProtectedControlPublication:
     entries = (
         ProtectedControlEntry(
             entry_kind="commit-blob",
@@ -325,8 +503,20 @@ def _control_publication(node: str, *, root_inode: int, file_inode: int) -> Prot
         ),
     )
     values = {
-        "control_manifest_sha256": "e" * 64,
-        "gateway_signature": "signed",
+        "control_manifest_sha256": canonical_sha256(
+            tuple(
+                (
+                    entry.entry_kind,
+                    entry.repo_relative_path,
+                    entry.control_relative_path,
+                    entry.mode,
+                    entry.size,
+                    entry.sha256,
+                )
+                for entry in entries
+            )
+        ),
+        "gateway_signature": "",
         "job_id": "12345",
         "node_name": node,
         "operation_id": "a" * 64,
@@ -340,20 +530,43 @@ def _control_publication(node: str, *, root_inode: int, file_inode: int) -> Prot
         "schema_version": "q30t-protected-control-publication-v1",
         "source_commit": "f" * 40,
     }
-    body = {key: value for key, value in values.items() if key != "gateway_signature"}
-    return ProtectedControlPublication(publication_sha256=canonical_sha256(body), **values)
-
-
-def test_control_publications_require_identical_manifests_and_distinct_local_inodes() -> None:
-    publications = (
-        _control_publication("ptyche-n001", root_inode=100, file_inode=200),
-        _control_publication("ptyche-n002", root_inode=101, file_inode=300),
+    body = {
+        key: value
+        for key, value in values.items()
+        if key not in ("gateway_signature", "publication_sha256")
+    }
+    publication = ProtectedControlPublication(
+        publication_sha256=canonical_sha256(body), **values
     )
-    validate_control_publications(publications, expected_nodes=("ptyche-n001", "ptyche-n002"))
+    return dataclasses.replace(
+        publication,
+        gateway_signature=_sign(identity, publication.signed_body_dict()),
+    )
+
+
+def test_control_publications_require_identical_manifests_and_distinct_local_inodes(
+    tmp_path: Path,
+) -> None:
+    identities = (
+        _identity(tmp_path / "n1", node_name="ptyche-n001"),
+        _identity(tmp_path / "n2", node_name="ptyche-n002"),
+    )
+    publications = (
+        _control_publication("ptyche-n001", identities[0], root_inode=100, file_inode=200),
+        _control_publication("ptyche-n002", identities[1], root_inode=101, file_inode=300),
+    )
+    validate_control_publications(
+        publications,
+        expected_nodes=("ptyche-n001", "ptyche-n002"),
+        gateway_identities=identities,
+        expected_source_commit="f" * 40,
+    )
     with pytest.raises(GatewayProtocolError, match="distinct local inode"):
         validate_control_publications(
             (publications[0], dataclasses.replace(publications[1], root_inode=100)),
             expected_nodes=("ptyche-n001", "ptyche-n002"),
+            gateway_identities=identities,
+            expected_source_commit="f" * 40,
         )
 
 
@@ -362,12 +575,18 @@ def test_control_publications_require_identical_manifests_and_distinct_local_ino
     [
         (lambda value: dataclasses.replace(value, root_uid=os.getuid()), "root-owned"),
         (lambda value: dataclasses.replace(value, root_mode=0o755), "mode 0555"),
-        (lambda value: dataclasses.replace(value, protected_control_root="/different/control"), "same path"),
+        (
+            lambda value: dataclasses.replace(value, protected_control_root="/different/control"),
+            "same path",
+        ),
         (lambda value: dataclasses.replace(value, gateway_signature=""), "signature"),
         (
             lambda value: dataclasses.replace(
                 value,
-                ordered_entries=(dataclasses.replace(value.ordered_entries[0], nlink=2), *value.ordered_entries[1:]),
+                ordered_entries=(
+                    dataclasses.replace(value.ordered_entries[0], nlink=2),
+                    *value.ordered_entries[1:],
+                ),
             ),
             "single link",
         ),
@@ -380,13 +599,22 @@ def test_control_publications_require_identical_manifests_and_distinct_local_ino
 def test_control_publication_rejects_mutable_reordered_or_unsigned_tree(
     mutation: object,
     message: str,
+    tmp_path: Path,
 ) -> None:
-    first = _control_publication("ptyche-n001", root_inode=100, file_inode=200)
-    second = mutation(_control_publication("ptyche-n002", root_inode=101, file_inode=300))
+    identities = (
+        _identity(tmp_path / "n1", node_name="ptyche-n001"),
+        _identity(tmp_path / "n2", node_name="ptyche-n002"),
+    )
+    first = _control_publication("ptyche-n001", identities[0], root_inode=100, file_inode=200)
+    second = mutation(
+        _control_publication("ptyche-n002", identities[1], root_inode=101, file_inode=300)
+    )
     with pytest.raises(GatewayProtocolError, match=message):
         validate_control_publications(
             (first, second),
             expected_nodes=("ptyche-n001", "ptyche-n002"),
+            gateway_identities=identities,
+            expected_source_commit="f" * 40,
         )
 
 
@@ -472,6 +700,9 @@ def test_barrier_allows_one_go_after_every_authenticated_ready() -> None:
         session.accept_ready(frame_for(node))
     decision = session.decide("GO")
     assert decision.decision == "GO"
+    assert decision.test_only is True
+    assert decision.cryptographically_usable is False
+    assert not hasattr(decision, "gateway_signature")
     with pytest.raises(GatewayProtocolError, match="already decided"):
         session.decide("GO")
 

@@ -5,14 +5,19 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import dataclasses
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import stat
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -45,9 +50,9 @@ __all__ = [
     "probe_mandatory_service",
     "reconstruct_protected_build_service_endpoint",
     "reconstruct_runtime_gateway_endpoint",
-    "register_stable_loaded_feasibility",
     "validate_control_publications",
     "validate_endpoint_observation",
+    "validate_global_operation_registration",
     "validate_protected_image_publication",
     "validate_sigio_setup_order",
 ]
@@ -56,7 +61,6 @@ _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 _JOB_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _OPERATION_RE = _HASH_RE
-_STABLE_LOADED_FEASIBILITY_IDS: set[int] = set()
 
 
 class GatewayProtocolError(RuntimeError):
@@ -80,7 +84,9 @@ class GatewayRPC(str, Enum):
 
 def _jsonable(value: object) -> object:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {field.name: _jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)}
+        return {
+            field.name: _jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)
+        }
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
@@ -160,9 +166,10 @@ class RuntimeServiceEndpointIdentity:
             "gateway": "systemd:q30t-runtime-gateway.service",
             "build-service": "systemd:q30t-runtime-build.service",
         }
-        if self.service_kind not in expected_identity or self.service_identity != expected_identity[
-            self.service_kind
-        ]:
+        if (
+            self.service_kind not in expected_identity
+            or self.service_identity != expected_identity[self.service_kind]
+        ):
             raise GatewayProtocolError("endpoint identity has a swapped service identity")
         if not self.endpoint_node_name:
             raise GatewayProtocolError("endpoint identity node name is empty")
@@ -266,6 +273,14 @@ class ProtectedImagePublication:
     same_ofd_lease_validated: Literal[True]
     gateway_signature: str
 
+    def body_dict(self) -> dict[str, object]:
+        """Return the exact gateway-signed publication body."""
+        return {
+            field.name: _jsonable(getattr(self, field.name))
+            for field in dataclasses.fields(self)
+            if field.name != "gateway_signature"
+        }
+
     @classmethod
     def from_dict(cls, raw: object) -> ProtectedImagePublication:
         """Decode one exact protected-image publication."""
@@ -314,6 +329,18 @@ class ProtectedControlPublication:
     publication_sha256: str
     gateway_signature: str
 
+    def publication_body_dict(self) -> dict[str, object]:
+        """Return the self-hashed publication body."""
+        return {
+            field.name: _jsonable(getattr(self, field.name))
+            for field in dataclasses.fields(self)
+            if field.name not in ("publication_sha256", "gateway_signature")
+        }
+
+    def signed_body_dict(self) -> dict[str, object]:
+        """Return the complete body authenticated by the gateway."""
+        return self.publication_body_dict() | {"publication_sha256": self.publication_sha256}
+
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-compatible publication."""
         return cast("dict[str, object]", _jsonable(self))
@@ -327,7 +354,9 @@ class ProtectedControlPublication:
         entries = converted.get("ordered_entries")
         if not isinstance(entries, list):
             raise GatewayProtocolError("protected control publication entries must be an array")
-        converted["ordered_entries"] = tuple(ProtectedControlEntry.from_dict(item) for item in entries)
+        converted["ordered_entries"] = tuple(
+            ProtectedControlEntry.from_dict(item) for item in entries
+        )
         return _from_exact_dict(cls, converted, "protected control publication")
 
 
@@ -419,6 +448,19 @@ class OperationBarrierDecision:
 
 
 @dataclass(frozen=True)
+class ModeledBarrierDecision:
+    """Test-only barrier-model output which cannot authenticate a live decision."""
+
+    operation_id: str
+    expected_nodes: tuple[str, ...]
+    ordered_ready_frame_sha256s: tuple[str, ...]
+    decision: Literal["GO", "ABORT"]
+    attack_session: bool
+    test_only: Literal[True]
+    cryptographically_usable: Literal[False]
+
+
+@dataclass(frozen=True)
 class GlobalOperationRegistration:
     """Signed gateway registration for one global execution operation."""
 
@@ -433,6 +475,18 @@ class GlobalOperationRegistration:
     controller_start_ticks: int
     registration_sha256: str
     gateway_signature: str
+
+    def registration_body_dict(self) -> dict[str, object]:
+        """Return the self-hashed registration body."""
+        return {
+            field.name: _jsonable(getattr(self, field.name))
+            for field in dataclasses.fields(self)
+            if field.name not in ("registration_sha256", "gateway_signature")
+        }
+
+    def signed_body_dict(self) -> dict[str, object]:
+        """Return the complete gateway-authenticated registration body."""
+        return self.registration_body_dict() | {"registration_sha256": self.registration_sha256}
 
 
 class RuntimeGatewayClient(Protocol):
@@ -490,10 +544,15 @@ class _BuildSeqpacketClient:
             decoded = json.loads(response)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise GatewayProtocolError("build service returned malformed JSON") from error
-        if not isinstance(decoded, dict) or decoded.get("ok") is not True or set(decoded) != {
-            "ok",
-            "payload",
-        }:
+        if (
+            not isinstance(decoded, dict)
+            or decoded.get("ok") is not True
+            or set(decoded)
+            != {
+                "ok",
+                "payload",
+            }
+        ):
             raise GatewayProtocolError("build service rejected the request")
         return decoded["payload"]
 
@@ -528,7 +587,7 @@ class GatewayBarrierSession:
         self.expected_gid = expected_gid
         self._ready: dict[str, SlurmTaskReady] = {}
         self._abort_only = attack_session
-        self._decision: OperationBarrierDecision | None = None
+        self._decision: ModeledBarrierDecision | None = None
         self._event_channel_protected = True
         self.authenticate_controller(controller)
         for wrapper in wrappers:
@@ -576,7 +635,9 @@ class GatewayBarrierSession:
             raise GatewayProtocolError("READY step mismatch")
         if frame.operation_id != self.operation_id:
             raise GatewayProtocolError("READY operation mismatch")
-        if not frame.root_mount_readonly or frame.frame_sha256 != canonical_sha256(frame.body_dict()):
+        if not frame.root_mount_readonly or frame.frame_sha256 != canonical_sha256(
+            frame.body_dict()
+        ):
             raise GatewayProtocolError("READY frame self hash or mount identity mismatch")
         self._ready[frame.node_name] = frame
 
@@ -590,7 +651,7 @@ class GatewayBarrierSession:
         self._abort_only = True
         raise GatewayProtocolError("protected event channel was drained or withheld")
 
-    def decide(self, decision: Literal["GO", "ABORT"]) -> OperationBarrierDecision:
+    def decide(self, decision: Literal["GO", "ABORT"]) -> ModeledBarrierDecision:
         """Commit exactly one global GO/ABORT decision."""
         if decision not in ("GO", "ABORT"):
             raise GatewayProtocolError("barrier decision is invalid")
@@ -602,24 +663,17 @@ class GatewayBarrierSession:
             raise GatewayProtocolError("not all nodes ready")
         if not self._event_channel_protected:
             raise GatewayProtocolError("protected event channel is unavailable")
-        ordered_hashes = tuple(self._ready[node].frame_sha256 for node in self.expected_nodes if node in self._ready)
-        body = {
-            "attack_session": self.attack_session,
-            "decision": decision,
-            "expected_nodes": list(self.expected_nodes),
-            "operation_id": self.operation_id,
-            "ordered_ready_frame_sha256s": list(ordered_hashes),
-            "schema_version": "q30t-operation-barrier-decision-v1",
-        }
-        self._decision = OperationBarrierDecision(
-            schema_version="q30t-operation-barrier-decision-v1",
+        ordered_hashes = tuple(
+            self._ready[node].frame_sha256 for node in self.expected_nodes if node in self._ready
+        )
+        self._decision = ModeledBarrierDecision(
             operation_id=self.operation_id,
             expected_nodes=self.expected_nodes,
             ordered_ready_frame_sha256s=ordered_hashes,
             decision=decision,
             attack_session=self.attack_session,
-            gateway_transaction_sha256=canonical_sha256(body),
-            gateway_signature="model-only; live gateway signature required",
+            test_only=True,
+            cryptographically_usable=False,
         )
         return self._decision
 
@@ -694,7 +748,7 @@ def validate_endpoint_observation(
     )
     if observed != expected or observation.peer_pid <= 0 or observation.peer_start_ticks <= 0:
         raise GatewayProtocolError("endpoint identity does not match the live service")
-    if producer_uid in (identity.expected_service_uid, identity.expected_service_gid):
+    if producer_uid == identity.expected_service_uid:
         raise GatewayProtocolError("endpoint identity is producer-owned")
     if reviewed_peer_pid is not None and (
         observation.peer_pid != reviewed_peer_pid
@@ -706,36 +760,33 @@ def validate_endpoint_observation(
 
 def probe_mandatory_service(
     identity: RuntimeServiceEndpointIdentity,
-    *,
-    missing_path: Path | None = None,
 ) -> object:
-    """Return typed BLOCKED when any mandatory installed-service primitive is absent."""
+    """Return PASS only after a live service matches every reviewed identity field."""
     from common.specdec.q30t_runtime_platform_feasibility import (  # circular type boundary
         FeasibilityProbeResult,
         FeasibilityStatus,
     )
 
-    identity.validate()
-    paths = (
-        Path(identity.control_socket_path),
-        Path(identity.executable_path),
-        Path(identity.public_key_path),
-    )
-    absent = missing_path if missing_path is not None and not missing_path.exists() else next(
-        (path for path in paths if not path.exists()),
-        None,
-    )
-    if absent is not None:
+    try:
+        identity.validate()
+        connection, observation = _connect_identity_with_observation(
+            identity,
+            producer_uid=os.getuid(),
+        )
+    except (GatewayProtocolError, OSError, NotImplementedError) as error:
         return FeasibilityProbeResult(
             status=FeasibilityStatus.BLOCKED,
-            reason=f"mandatory administrator service primitive is missing: {absent}",
+            reason=f"mandatory administrator service live identity is unavailable: {error}",
             receipt=None,
         )
-    return FeasibilityProbeResult(
-        status=FeasibilityStatus.PASS,
-        reason="mandatory service paths exist; live identity remains required",
-        receipt=None,
-    )
+    try:
+        return FeasibilityProbeResult(
+            status=FeasibilityStatus.PASS,
+            reason="mandatory administrator service live identity verified",
+            receipt=observation,
+        )
+    finally:
+        connection.close()
 
 
 def validate_protected_image_publication(
@@ -744,7 +795,7 @@ def validate_protected_image_publication(
     *,
     protected_runtime_root: Path,
     parent: ProtectedParentIdentity,
-    signature_verified: bool,
+    gateway_identity: RuntimeServiceEndpointIdentity,
 ) -> ProtectedImagePublication:
     """Require a signed same-inode single-link mode-0400 protected image."""
     expected_path = operation_runtime_path(protected_runtime_root, ready.job_id, ready.operation_id)
@@ -771,8 +822,12 @@ def validate_protected_image_publication(
         raise GatewayProtocolError("protected image publication identity mismatch")
     if parent.uid != 0 or parent.replacable_by_producer or parent.mode & 0o222:
         raise GatewayProtocolError("protected parent is writable or replacable")
-    if not signature_verified or not publication.gateway_signature:
-        raise GatewayProtocolError("protected image gateway signature is invalid")
+    if (
+        gateway_identity.service_kind != "gateway"
+        or gateway_identity.endpoint_node_name != publication.node_name
+    ):
+        raise GatewayProtocolError("protected image gateway identity was swapped")
+    _verify_gateway_signature(publication.body_dict(), publication.gateway_signature, gateway_identity)
     return publication
 
 
@@ -822,9 +877,16 @@ def validate_control_publications(
     publications: tuple[ProtectedControlPublication, ...],
     *,
     expected_nodes: tuple[str, ...],
+    gateway_identities: tuple[RuntimeServiceEndpointIdentity, ...],
+    expected_source_commit: str,
 ) -> tuple[ProtectedControlPublication, ...]:
     """Join fresh root-owned per-node committed-control publications."""
-    if len(publications) != len(expected_nodes) or tuple(item.node_name for item in publications) != expected_nodes:
+    if (
+        not _COMMIT_RE.fullmatch(expected_source_commit)
+        or len(publications) != len(expected_nodes)
+        or len(gateway_identities) != len(expected_nodes)
+        or tuple(item.node_name for item in publications) != expected_nodes
+    ):
         raise GatewayProtocolError("control publication node tuple mismatch")
     if not publications:
         raise GatewayProtocolError("control publication tuple is empty")
@@ -832,25 +894,38 @@ def validate_control_publications(
     reference_manifest = _entry_manifest(reference)
     root_identities: set[tuple[int, int]] = set()
     file_identities: set[tuple[int, int]] = set()
-    for publication in publications:
+    for publication, gateway_identity in zip(publications, gateway_identities, strict=True):
+        if (
+            gateway_identity.service_kind != "gateway"
+            or gateway_identity.endpoint_node_name != publication.node_name
+        ):
+            raise GatewayProtocolError("control publication gateway identity was swapped")
         if publication.schema_version != "q30t-protected-control-publication-v1":
             raise GatewayProtocolError("control publication schema is invalid")
         if publication.root_uid != 0 or publication.root_gid != 0:
             raise GatewayProtocolError("control publication tree must be root-owned")
         if publication.root_mode != 0o555:
             raise GatewayProtocolError("control publication root must have mode 0555")
-        if not publication.gateway_signature:
-            raise GatewayProtocolError("control publication gateway signature is invalid")
+        if (
+            not _COMMIT_RE.fullmatch(publication.source_commit)
+            or publication.source_commit != expected_source_commit
+        ):
+            raise GatewayProtocolError("control publication source commit is invalid")
         if (
             publication.protected_control_root != reference.protected_control_root
             or publication.job_id != reference.job_id
             or publication.operation_id != reference.operation_id
             or publication.source_commit != reference.source_commit
         ):
-            raise GatewayProtocolError("control publications do not have the same path and operation")
+            raise GatewayProtocolError(
+                "control publications do not have the same path and operation"
+            )
         if _entry_manifest(publication) != reference_manifest:
             raise GatewayProtocolError("control publication ordered manifest mismatch")
-        if not publication.ordered_entries or publication.ordered_entries[-1].entry_kind != "generated-manifest":
+        if (
+            not publication.ordered_entries
+            or publication.ordered_entries[-1].entry_kind != "generated-manifest"
+        ):
             raise GatewayProtocolError("control publication ordered entries are invalid")
         commit_paths = [
             entry.control_relative_path
@@ -859,9 +934,13 @@ def validate_control_publications(
         ]
         if commit_paths != sorted(commit_paths) or len(set(commit_paths)) != len(commit_paths):
             raise GatewayProtocolError("control publication ordered commit blobs are invalid")
+        if publication.control_manifest_sha256 != canonical_sha256(_entry_manifest(publication)):
+            raise GatewayProtocolError("control publication manifest hash mismatch")
         root_identity = (publication.root_device, publication.root_inode)
         if root_identity in root_identities:
-            raise GatewayProtocolError("control publications must use a distinct local inode per root")
+            raise GatewayProtocolError(
+                "control publications must use a distinct local inode per root"
+            )
         root_identities.add(root_identity)
         for entry in publication.ordered_entries:
             if entry.uid != 0 or entry.gid != 0:
@@ -874,19 +953,123 @@ def validate_control_publications(
                 raise GatewayProtocolError("control publication file hash or size is invalid")
             identity = (entry.device, entry.inode)
             if identity in file_identities:
-                raise GatewayProtocolError("control publications must use distinct local inode identities")
+                raise GatewayProtocolError(
+                    "control publications must use distinct local inode identities"
+                )
             file_identities.add(identity)
+        if publication.publication_sha256 != canonical_sha256(publication.publication_body_dict()):
+            raise GatewayProtocolError("control publication self hash mismatch")
+        _verify_gateway_signature(
+            publication.signed_body_dict(),
+            publication.gateway_signature,
+            gateway_identity,
+        )
     return publications
 
 
-def register_stable_loaded_feasibility(feasibility: object) -> None:
-    """Mark one aggregate object as originating from the stable physical loader."""
-    _STABLE_LOADED_FEASIBILITY_IDS.add(id(feasibility))
+def validate_global_operation_registration(
+    registration: GlobalOperationRegistration,
+    *,
+    gateway_identity: RuntimeServiceEndpointIdentity,
+    expected_job_id: str,
+    expected_nodes: tuple[str, ...],
+    protected_runtime_root: Path,
+) -> GlobalOperationRegistration:
+    """Authenticate one exact fresh global-operation registration."""
+    if (
+        registration.schema_version != "q30t-global-operation-registration-v1"
+        or registration.job_id != expected_job_id
+        or registration.expected_nodes != expected_nodes
+        or len(expected_nodes) not in (1, 2, 16)
+        or len(set(expected_nodes)) != len(expected_nodes)
+        or not _is_hash(registration.operation_id)
+        or not _is_hash(registration.derived_image_sha256)
+        or registration.policy not in ("GO_AFTER_ALL_READY", "ABORT_ONLY")
+        or registration.controller_pid <= 0
+        or registration.controller_start_ticks <= 0
+        or registration.protected_runtime_path
+        != str(
+            operation_runtime_path(
+                protected_runtime_root,
+                expected_job_id,
+                registration.operation_id,
+            )
+        )
+    ):
+        raise GatewayProtocolError("global operation registration identity is invalid")
+    if registration.registration_sha256 != canonical_sha256(
+        registration.registration_body_dict()
+    ):
+        raise GatewayProtocolError("global operation registration self hash mismatch")
+    _verify_gateway_signature(
+        registration.signed_body_dict(),
+        registration.gateway_signature,
+        gateway_identity,
+    )
+    return registration
+
+
+def _verify_gateway_signature(
+    body: object,
+    encoded_signature: str,
+    identity: RuntimeServiceEndpointIdentity,
+) -> None:
+    """Verify an Ed25519 signature with the exact F-bound gateway public key."""
+    identity.validate()
+    if identity.service_kind != "gateway":
+        raise GatewayProtocolError("signature key is not an F-bound gateway identity")
+    key_path = Path(identity.public_key_path)
+    if _hash_regular(key_path) != identity.public_key_sha256:
+        raise GatewayProtocolError("F-bound gateway public key hash mismatch")
+    try:
+        signature = base64.b64decode(encoded_signature, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise GatewayProtocolError("gateway signature encoding is invalid") from error
+    search_path = "/opt/homebrew/bin:/usr/bin:/bin" if sys.platform == "darwin" else "/usr/bin:/bin"
+    openssl = shutil.which("openssl", path=search_path)
+    if openssl is None:
+        raise GatewayProtocolError("gateway signature verifier is unavailable")
+    with tempfile.NamedTemporaryFile() as payload_file, tempfile.NamedTemporaryFile() as signature_file:
+        payload_file.write(_canonical(body))
+        payload_file.flush()
+        signature_file.write(signature)
+        signature_file.flush()
+        completed = subprocess.run(
+            (
+                openssl,
+                "pkeyutl",
+                "-verify",
+                "-pubin",
+                "-inkey",
+                str(key_path),
+                "-rawin",
+                "-in",
+                payload_file.name,
+                "-sigfile",
+                signature_file.name,
+            ),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            close_fds=True,
+            env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+    if completed.returncode != 0:
+        raise GatewayProtocolError("gateway signature is invalid")
 
 
 def _require_stable_loaded(feasibility: object) -> None:
-    if id(feasibility) not in _STABLE_LOADED_FEASIBILITY_IDS:
-        raise GatewayProtocolError("service clients require a stable-loaded reviewed F receipt")
+    from common.specdec.q30t_runtime_platform_feasibility import (
+        FeasibilityError,
+        require_verified_platform_feasibility,
+    )
+
+    try:
+        require_verified_platform_feasibility(feasibility)
+    except FeasibilityError as error:
+        raise GatewayProtocolError(
+            "service clients require a stable-loaded reviewed F receipt"
+        ) from error
 
 
 def reconstruct_runtime_gateway_endpoint(
@@ -941,21 +1124,22 @@ def _hash_regular(path: Path) -> str:
 def _live_socket_observation(
     identity: RuntimeServiceEndpointIdentity,
     connection: socket.socket,
+    *,
+    peer_pid: int,
+    peer_uid: int,
+    peer_gid: int,
+    peer_start_ticks: int,
 ) -> ServiceEndpointObservation:
     metadata = os.lstat(identity.control_socket_path)
     if not stat.S_ISSOCK(metadata.st_mode):
         raise GatewayBlockedError("mandatory service socket is not a Unix socket")
     parent = Path(identity.control_socket_path).parent
     parent_metadata = os.lstat(parent)
-    peer_raw = connection.getsockopt(socket.SOL_SOCKET, getattr(socket, "SO_PEERCRED", 17), 12)
-    peer_pid = int.from_bytes(peer_raw[0:4], byteorder=sys.byteorder, signed=True)
-    peer_uid = int.from_bytes(peer_raw[4:8], byteorder=sys.byteorder)
-    peer_gid = int.from_bytes(peer_raw[8:12], byteorder=sys.byteorder)
     executable_path = os.readlink(f"/proc/{peer_pid}/exe")
     cgroup = Path(f"/proc/{peer_pid}/cgroup").read_text()
-    systemd_identity = identity.service_identity if identity.service_identity.split(":", 1)[1] in cgroup else ""
-    from common.specdec.q30t_runtime_platform_feasibility import read_process_start_ticks
-
+    systemd_identity = (
+        identity.service_identity if identity.service_identity.split(":", 1)[1] in cgroup else ""
+    )
     return ServiceEndpointObservation(
         socket_device=metadata.st_dev,
         socket_inode=metadata.st_ino,
@@ -965,7 +1149,7 @@ def _live_socket_observation(
         peer_pid=peer_pid,
         peer_uid=peer_uid,
         peer_gid=peer_gid,
-        peer_start_ticks=read_process_start_ticks(peer_pid),
+        peer_start_ticks=peer_start_ticks,
         executable_path=executable_path,
         executable_sha256=_hash_regular(Path(executable_path)),
         systemd_identity=systemd_identity,
@@ -975,28 +1159,90 @@ def _live_socket_observation(
     )
 
 
-def _connect_identity(identity: RuntimeServiceEndpointIdentity, *, producer_uid: int) -> socket.socket:
+def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
+    if sys.platform != "linux":
+        raise GatewayBlockedError("mandatory service identity requires Linux SO_PEERCRED")
+    peer_raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    return (
+        int.from_bytes(peer_raw[0:4], byteorder=sys.byteorder, signed=True),
+        int.from_bytes(peer_raw[4:8], byteorder=sys.byteorder),
+        int.from_bytes(peer_raw[8:12], byteorder=sys.byteorder),
+    )
+
+
+def _connect_identity_with_observation(
+    identity: RuntimeServiceEndpointIdentity, *, producer_uid: int
+) -> tuple[socket.socket, ServiceEndpointObservation]:
+    if sys.platform != "linux":
+        raise GatewayBlockedError("mandatory service identity requires Linux pidfds")
     for path in (
         Path(identity.control_socket_path),
         Path(identity.executable_path),
         Path(identity.public_key_path),
     ):
         if not path.exists():
-            raise GatewayBlockedError(f"mandatory administrator service primitive is missing: {path}")
+            raise GatewayBlockedError(
+                f"mandatory administrator service primitive is missing: {path}"
+            )
     connection = socket.socket(
         socket.AF_UNIX,
         socket.SOCK_SEQPACKET | getattr(socket, "SOCK_CLOEXEC", 0),
     )
     try:
         connection.connect(identity.control_socket_path)
+        peer_pid, peer_uid, peer_gid = _peer_credentials(connection)
+        from common.specdec.q30t_runtime_platform_feasibility import (
+            read_process_start_ticks,
+            require_pidfd_identity,
+        )
+
+        peer_start_ticks = read_process_start_ticks(peer_pid)
+        try:
+            pidfd = os.pidfd_open(peer_pid, 0)
+        except OSError as error:
+            raise GatewayProtocolError("service pidfd identity is unavailable") from error
+        try:
+            require_pidfd_identity(pidfd, peer_pid, peer_start_ticks)
+            observation = _live_socket_observation(
+                identity,
+                connection,
+                peer_pid=peer_pid,
+                peer_uid=peer_uid,
+                peer_gid=peer_gid,
+                peer_start_ticks=peer_start_ticks,
+            )
+            require_pidfd_identity(pidfd, peer_pid, peer_start_ticks)
+            if _peer_credentials(connection) != (peer_pid, peer_uid, peer_gid):
+                raise GatewayProtocolError("service peer restarted during identity review")
+            repeated = _live_socket_observation(
+                identity,
+                connection,
+                peer_pid=peer_pid,
+                peer_uid=peer_uid,
+                peer_gid=peer_gid,
+                peer_start_ticks=peer_start_ticks,
+            )
+            if repeated != observation:
+                raise GatewayProtocolError("service identity changed during live review")
+        finally:
+            os.close(pidfd)
         validate_endpoint_observation(
             identity,
-            _live_socket_observation(identity, connection),
+            observation,
             producer_uid=producer_uid,
+            reviewed_peer_pid=peer_pid,
+            reviewed_peer_start_ticks=peer_start_ticks,
         )
     except Exception:
         connection.close()
         raise
+    return connection, observation
+
+
+def _connect_identity(
+    identity: RuntimeServiceEndpointIdentity, *, producer_uid: int
+) -> socket.socket:
+    connection, _ = _connect_identity_with_observation(identity, producer_uid=producer_uid)
     return connection
 
 

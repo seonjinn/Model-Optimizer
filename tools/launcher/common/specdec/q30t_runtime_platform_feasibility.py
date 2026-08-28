@@ -19,6 +19,7 @@ import stat
 import struct
 import subprocess
 import sys
+import weakref
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -27,8 +28,8 @@ from typing import TYPE_CHECKING, Literal, cast
 from common.specdec.q30t_runtime_gateway_client import (
     ProtectedImagePublication,
     RuntimeServiceEndpointIdentity,
+    _verify_gateway_signature,
     canonical_sha256,
-    register_stable_loaded_feasibility,
 )
 
 if TYPE_CHECKING:
@@ -111,7 +112,9 @@ class FeasibilityProbeResult:
 
 def _jsonable(value: object) -> object:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {field.name: _jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)}
+        return {
+            field.name: _jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)
+        }
     if isinstance(value, dict):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
@@ -494,6 +497,14 @@ class PyxisDirectMountAttestation:
     persistent_rootfs_absent: Literal[True]
     gateway_signature: str
 
+    def body_dict(self) -> dict[str, object]:
+        """Return the exact gateway-signed live mount body."""
+        return {
+            field.name: _jsonable(getattr(self, field.name))
+            for field in dataclasses.fields(self)
+            if field.name != "gateway_signature"
+        }
+
 
 @dataclass(frozen=True)
 class StagingAgentTrace:
@@ -546,8 +557,19 @@ class RecursiveConfigManifest:
     manifest_sha256: str
     empty_user_config_root_device: int
     empty_user_config_root_inode: int
+    empty_user_config_root_uid: int
+    empty_user_config_root_gid: int
+    empty_user_config_root_mode: int
     home: str
     xdg_config_home: str
+
+    def body_dict(self) -> dict[str, object]:
+        """Return the exact recursive manifest and empty-root identity body."""
+        return {
+            field.name: _jsonable(getattr(self, field.name))
+            for field in dataclasses.fields(self)
+            if field.name != "manifest_sha256"
+        }
 
 
 @dataclass(frozen=True)
@@ -564,7 +586,9 @@ class RemoteStepExitProof:
     every_cgroup_populated_zero: Literal[True]
     local_srun_returncode: int
     exact_step_terminal_state: Literal["COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL"]
-    allocation_state: Literal["RUNNING", "COMPLETING", "COMPLETED", "CANCELLED", "FAILED", "NODE_FAIL"]
+    allocation_state: Literal[
+        "RUNNING", "COMPLETING", "COMPLETED", "CANCELLED", "FAILED", "NODE_FAIL"
+    ]
     cancel_elapsed_ms: int
     proof_completed_monotonic_ns: int
     proof_sha256: str
@@ -603,14 +627,26 @@ def validate_direct_pyxis_trace(trace: DirectPyxisTrace) -> DirectPyxisTrace:
 def validate_direct_mount_attestations(
     attestations: tuple[PyxisDirectMountAttestation, ...],
     publications: tuple[ProtectedImagePublication, ...],
+    gateway_identities: tuple[RuntimeServiceEndpointIdentity, ...],
 ) -> tuple[PyxisDirectMountAttestation, ...]:
     """Join every live actual-open fd to its node-local protected inode."""
-    if len(attestations) != len(publications) or not attestations:
+    if sys.platform != "linux":
+        raise FeasibilityError("live direct-mount attestation requires Linux /proc and pidfds")
+    if (
+        len(attestations) != len(publications)
+        or len(gateway_identities) != len(attestations)
+        or not attestations
+    ):
         raise FeasibilityError("direct mount attestation cardinality mismatch")
     process_ids: set[tuple[int, int]] = set()
     process_pids: set[int] = set()
     mount_ids: set[int] = set()
-    for attestation, publication in zip(attestations, publications, strict=True):
+    backing_fds: set[int] = set()
+    backing_inodes: set[tuple[int, int]] = set()
+    cgroups: set[str] = set()
+    for attestation, publication, gateway_identity in zip(
+        attestations, publications, gateway_identities, strict=True
+    ):
         if (
             attestation.schema_version != "q30t-pyxis-direct-mount-attestation-v1"
             or attestation.node_name != publication.node_name
@@ -619,6 +655,11 @@ def validate_direct_mount_attestations(
             or attestation.protected_path != publication.protected_path
         ):
             raise FeasibilityError("direct mount attestation identity mismatch")
+        if (
+            gateway_identity.endpoint_node_name != attestation.node_name
+            or gateway_identity.service_kind != "gateway"
+        ):
+            raise FeasibilityError("direct mount gateway identity was swapped")
         if (
             (attestation.image_device, attestation.image_inode)
             != (publication.device, publication.inode)
@@ -629,23 +670,105 @@ def validate_direct_mount_attestations(
         ):
             raise FeasibilityError("live backing fd does not join the protected inode")
         if (
-            not attestation.gateway_signature
-            or not attestation.root_mount_readonly
+            not attestation.root_mount_readonly
             or not attestation.temporary_rootfs
             or not attestation.container_creation_absent
             or not attestation.persistent_rootfs_absent
         ):
             raise FeasibilityError("direct mount attestation is incomplete")
+        try:
+            pidfd = os.pidfd_open(attestation.squashfuse_pid, 0)
+        except OSError as error:
+            raise FeasibilityError("live SquashFUSE process identity is unavailable") from error
+        try:
+            require_pidfd_identity(
+                pidfd,
+                attestation.squashfuse_pid,
+                attestation.squashfuse_start_ticks,
+            )
+            cgroup_lines = Path(f"/proc/{attestation.squashfuse_pid}/cgroup").read_text().splitlines()
+            if attestation.squashfuse_cgroup_relative_path not in {
+                line.split(":", 2)[2] for line in cgroup_lines if line.count(":") >= 2
+            }:
+                raise FeasibilityError("live SquashFUSE cgroup identity mismatch")
+            mountinfo_lines = Path(
+                f"/proc/{attestation.squashfuse_pid}/mountinfo"
+            ).read_text().splitlines()
+            matching_mounts = [
+                line.split()
+                for line in mountinfo_lines
+                if line.split() and line.split()[0] == str(attestation.root_mount_id)
+            ]
+            if len(matching_mounts) != 1 or "ro" not in matching_mounts[0][5].split(","):
+                raise FeasibilityError("live root mount identity or readonly state mismatch")
+            named_fd = os.open(
+                attestation.protected_path,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                named_metadata = os.fstat(named_fd)
+                if (named_metadata.st_dev, named_metadata.st_ino) != (
+                    publication.device,
+                    publication.inode,
+                ):
+                    raise FeasibilityError("protected image live inode identity mismatch")
+            finally:
+                os.close(named_fd)
+            live_fd = os.open(
+                f"/proc/{attestation.squashfuse_pid}/fd/{attestation.backing_fd_number}",
+                os.O_RDONLY | os.O_CLOEXEC,
+            )
+            try:
+                live_metadata = os.fstat(live_fd)
+                if (live_metadata.st_dev, live_metadata.st_ino) != (
+                    attestation.backing_fd_device,
+                    attestation.backing_fd_inode,
+                ):
+                    raise FeasibilityError("live backing fd inode identity mismatch")
+                fdinfo = Path(
+                    f"/proc/{attestation.squashfuse_pid}/fdinfo/{attestation.backing_fd_number}"
+                ).read_text()
+                flags_line = next(
+                    (line for line in fdinfo.splitlines() if line.startswith("flags:\t")),
+                    None,
+                )
+                if flags_line is None or int(flags_line.split("\t", 1)[1], 8) & os.O_ACCMODE:
+                    raise FeasibilityError("live backing fd is not O_RDONLY")
+            finally:
+                os.close(live_fd)
+            require_pidfd_identity(
+                pidfd,
+                attestation.squashfuse_pid,
+                attestation.squashfuse_start_ticks,
+            )
+        except (OSError, StopIteration, ValueError) as error:
+            raise FeasibilityError("live SquashFUSE identity is unavailable") from error
+        finally:
+            os.close(pidfd)
+        try:
+            _verify_gateway_signature(
+                attestation.body_dict(),
+                attestation.gateway_signature,
+                gateway_identity,
+            )
+        except Exception as error:
+            raise FeasibilityError("direct mount gateway signature is invalid") from error
         process = (attestation.squashfuse_pid, attestation.squashfuse_start_ticks)
         if (
             process in process_ids
             or attestation.squashfuse_pid in process_pids
             or attestation.root_mount_id in mount_ids
+            or attestation.backing_fd_number in backing_fds
+            or (attestation.backing_fd_device, attestation.backing_fd_inode) in backing_inodes
+            or attestation.squashfuse_cgroup_relative_path in cgroups
         ):
             raise FeasibilityError("fresh SquashFUSE process and mount are required")
         process_ids.add(process)
         process_pids.add(attestation.squashfuse_pid)
         mount_ids.add(attestation.root_mount_id)
+        backing_fds.add(attestation.backing_fd_number)
+        backing_inodes.add((attestation.backing_fd_device, attestation.backing_fd_inode))
+        cgroups.add(attestation.squashfuse_cgroup_relative_path)
     return attestations
 
 
@@ -655,7 +778,10 @@ def validate_multinode_feasibility_trace(
     """Require exact distinct per-node staging and one global 2/16-node step."""
     if trace.node_count not in (2, 16):
         raise FeasibilityError("multinode node count must be exactly 2 or 16")
-    if len(trace.ordered_nodes) != trace.node_count or len(set(trace.ordered_nodes)) != trace.node_count:
+    if (
+        len(trace.ordered_nodes) != trace.node_count
+        or len(set(trace.ordered_nodes)) != trace.node_count
+    ):
         raise FeasibilityError("multinode node count or node tuple mismatch")
     if (
         len(trace.ordered_staging_agents) != trace.node_count
@@ -664,33 +790,45 @@ def validate_multinode_feasibility_trace(
         raise FeasibilityError("multinode staging-agent tuple mismatch")
     if trace.global_execution_step_count != 1:
         raise FeasibilityError("exactly one global step is required")
-    if trace.global_rank_count != trace.node_count or trace.ordered_global_ranks != tuple(range(trace.node_count)):
+    if trace.global_rank_count != trace.node_count or trace.ordered_global_ranks != tuple(
+        range(trace.node_count)
+    ):
         raise FeasibilityError("global rank count or ordering mismatch")
-    required = {
-        f"--nodes={trace.node_count}",
-        f"--ntasks={trace.node_count}",
-        "--ntasks-per-node=1",
-        "--gpus-per-node=4",
+    required_flags = {
+        "--nodes": str(trace.node_count),
+        "--ntasks": str(trace.node_count),
+        "--ntasks-per-node": "1",
+        "--gpus-per-node": "4",
     }
-    if not required.issubset(trace.global_srun_argv):
-        raise FeasibilityError("global step argv topology mismatch")
+    for flag, expected in required_flags.items():
+        matches = tuple(
+            argument
+            for argument in trace.global_srun_argv
+            if argument == flag or argument.startswith(f"{flag}=")
+        )
+        if matches != (f"{flag}={expected}",):
+            raise FeasibilityError("global step argv topology or flag cardinality mismatch")
     if not _is_hash(trace.collective_token_sha256):
         raise FeasibilityError("global collective token is invalid")
     paths = {agent.protected_path for agent in trace.ordered_staging_agents}
     endpoint_ids = {agent.endpoint_identity_sha256 for agent in trace.ordered_staging_agents}
-    local_identities = {
-        (agent.agent_pid, agent.keeper_pid, agent.leased_fd, agent.device, agent.inode)
-        for agent in trace.ordered_staging_agents
-    }
     if len(paths) != 1:
         raise FeasibilityError("nodes do not share one identical protected path")
     if len(endpoint_ids) != trace.node_count:
         raise FeasibilityError("gateway endpoint reuse is forbidden")
-    if len(local_identities) != trace.node_count:
+    uniqueness_columns = (
+        {agent.agent_pid for agent in trace.ordered_staging_agents},
+        {agent.keeper_pid for agent in trace.ordered_staging_agents},
+        {agent.leased_fd for agent in trace.ordered_staging_agents},
+        {(agent.device, agent.inode) for agent in trace.ordered_staging_agents},
+    )
+    if any(len(column) != trace.node_count for column in uniqueness_columns):
         raise FeasibilityError("node-local keeper/fd/inode reuse is forbidden")
     if trace.node_count == 16:
         if trace.segment_count != 16 or not trace.canary_full_feasibility:
-            raise FeasibilityError("sixteen-node trace must prove segment-16 canary/full feasibility")
+            raise FeasibilityError(
+                "sixteen-node trace must prove segment-16 canary/full feasibility"
+            )
     elif trace.segment_count is not None or trace.canary_full_feasibility:
         raise FeasibilityError("two-node trace cannot be relabelled as segment-16 proof")
     return trace
@@ -701,18 +839,36 @@ def validate_recursive_config_manifest(
     reviewed: RecursiveConfigManifest,
 ) -> RecursiveConfigManifest:
     """Require exact recursive system config and protected empty user config."""
-    if observed.ordered_entries != reviewed.ordered_entries or observed.manifest_sha256 != reviewed.manifest_sha256:
-        raise FeasibilityError("recursive config manifest differs from reviewed F")
-    if observed.manifest_sha256 != canonical_sha256(
-        [dataclasses.asdict(entry) for entry in observed.ordered_entries]
+    if (
+        observed.ordered_entries != reviewed.ordered_entries
+        or observed.manifest_sha256 != reviewed.manifest_sha256
     ):
-        raise FeasibilityError("recursive config manifest self hash mismatch")
+        raise FeasibilityError("recursive config manifest differs from reviewed F")
     required_prefixes = (
         "etc/enroot/hooks.d/",
         "etc/enroot/mounts.d/",
         "etc/enroot/environ.d/",
     )
     paths = tuple(entry.relative_path for entry in observed.ordered_entries)
+    if paths != tuple(sorted(paths)) or len(set(paths)) != len(paths):
+        raise FeasibilityError("recursive config paths must be canonical and bytewise sorted")
+    for entry in observed.ordered_entries:
+        parsed = Path(entry.relative_path)
+        if (
+            parsed.is_absolute()
+            or str(parsed) != entry.relative_path
+            or ".." in parsed.parts
+            or entry.entry_type not in ("regular", "directory")
+            or entry.uid != 0
+            or entry.gid != 0
+            or entry.size < 0
+            or entry.mode & 0o022
+        ):
+            raise FeasibilityError("recursive config entry identity is invalid")
+        if entry.entry_type == "regular" and not _is_hash(entry.sha256):
+            raise FeasibilityError("recursive config regular-file hash is invalid")
+        if entry.entry_type == "directory" and (entry.sha256 is not None or entry.size != 0):
+            raise FeasibilityError("recursive config directory identity is invalid")
     if not all(any(path.startswith(prefix) for path in paths) for prefix in required_prefixes):
         raise FeasibilityError("recursive config manifest omits an enroot site directory")
     if not any(path.endswith("spank_pyxis.so") for path in paths):
@@ -726,8 +882,13 @@ def validate_recursive_config_manifest(
         or not observed.home.startswith("/run/q30t-empty-config")
         or observed.empty_user_config_root_device < 0
         or observed.empty_user_config_root_inode <= 0
+        or observed.empty_user_config_root_uid != 0
+        or observed.empty_user_config_root_gid != 0
+        or observed.empty_user_config_root_mode != 0o555
     ):
         raise FeasibilityError("gateway-owned empty user config root is invalid")
+    if observed.manifest_sha256 != canonical_sha256(observed.body_dict()):
+        raise FeasibilityError("recursive config manifest self hash mismatch")
     return observed
 
 
@@ -747,13 +908,49 @@ def validate_remote_step_exit_proof(
         raise FeasibilityError("remote exit proof does not name the exact step")
     if proof.ordered_nodes != expected_nodes:
         raise FeasibilityError("remote exit proof node tuple mismatch")
+    if not all(len(item) == 3 for item in proof.ordered_wrapper_pid_start) or not all(
+        len(item) == 3 for item in proof.ordered_cgroup_identities
+    ):
+        raise FeasibilityError("remote exit proof ordered identity joins are invalid")
+    if (
+        len(expected_nodes) not in (1, 2, 16)
+        or len(set(expected_nodes)) != len(expected_nodes)
+        or len(proof.ordered_wrapper_pid_start) != len(expected_nodes)
+        or tuple(item[0] for item in proof.ordered_wrapper_pid_start) != expected_nodes
+        or len(proof.ordered_cgroup_identities) != len(expected_nodes)
+        or tuple(item[0] for item in proof.ordered_cgroup_identities) != expected_nodes
+        or proof.authenticated_exit_nodes != expected_nodes
+    ):
+        raise FeasibilityError("remote exit proof ordered identity joins are invalid")
+    wrapper_identities = tuple(item[1:] for item in proof.ordered_wrapper_pid_start)
+    cgroup_identities = tuple(item[1:] for item in proof.ordered_cgroup_identities)
+    if (
+        any(pid <= 0 or ticks <= 0 for pid, ticks in wrapper_identities)
+        or len(set(wrapper_identities)) != len(expected_nodes)
+        or any(device < 0 or inode <= 0 for device, inode in cgroup_identities)
+        or len(set(cgroup_identities)) != len(expected_nodes)
+    ):
+        raise FeasibilityError("remote exit proof wrapper or cgroup identity is invalid")
     if not proof.every_cgroup_populated_zero:
         raise FeasibilityError("remote exit proof has a populated cgroup")
     if proof.local_srun_returncode >= 0:
         raise FeasibilityError("global srun reaped status is not a cancelled process")
-    if proof.exact_step_terminal_state not in ("COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL"):
+    if proof.exact_step_terminal_state not in (
+        "COMPLETED",
+        "CANCELLED",
+        "FAILED",
+        "TIMEOUT",
+        "NODE_FAIL",
+    ):
         raise FeasibilityError("scheduler step is not terminal")
-    if proof.allocation_state not in ("RUNNING", "COMPLETING", "COMPLETED", "CANCELLED", "FAILED", "NODE_FAIL"):
+    if proof.allocation_state not in (
+        "RUNNING",
+        "COMPLETING",
+        "COMPLETED",
+        "CANCELLED",
+        "FAILED",
+        "NODE_FAIL",
+    ):
         raise FeasibilityError("allocation state is missing or invalid")
     if proof.cancel_elapsed_ms >= 5000:
         raise FeasibilityError("remote cancellation must finish in less than five seconds")
@@ -782,27 +979,66 @@ class BoundedArtifactCollector:
 
     def __init__(self, *, node_root: Path) -> None:
         """Bind collection to one canonical node-local log root."""
-        self._node_root = node_root.resolve()
+        if not node_root.is_absolute() or str(node_root) != os.path.normpath(str(node_root)):
+            raise FeasibilityError("node-local log root must be canonical and absolute")
+        self._node_root = node_root
 
     def collect(self, path: Path, *, kind: str) -> BoundedArtifact:
         """Stable-open, cap, fsync, and hash one node-local log."""
-        resolved = path.resolve(strict=True)
+        if kind not in ("control", "batch", "staging", "pyxis", "task-stdout", "task-stderr"):
+            raise FeasibilityError("bounded log kind is invalid")
+        if not path.is_absolute() or str(path) != os.path.normpath(str(path)):
+            raise FeasibilityError("log path must be canonical and absolute")
         try:
-            resolved.relative_to(self._node_root)
+            relative = path.relative_to(self._node_root)
         except ValueError as error:
             raise FeasibilityError("log is outside the node-local bounded root") from error
+        if not relative.parts:
+            raise FeasibilityError("log path must name a file below the bounded root")
         cap = CONTROL_LOG_CAP_BYTES if kind == "control" else DATA_LOG_CAP_BYTES
-        descriptor = os.open(resolved, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        root_descriptor = os.open(
+            self._node_root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+        root_before = os.fstat(root_descriptor)
+        directory = os.dup(root_descriptor)
+        try:
+            for component in relative.parts[:-1]:
+                child = os.open(
+                    component,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                    dir_fd=directory,
+                )
+                os.close(directory)
+                directory = child
+            descriptor = os.open(
+                relative.parts[-1],
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+        except OSError as error:
+            os.close(directory)
+            os.close(root_descriptor)
+            raise FeasibilityError("bounded log nofollow stable open failed") from error
+        except Exception:
+            os.close(directory)
+            os.close(root_descriptor)
+            raise
         try:
             before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > cap:
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise FeasibilityError(f"{kind} log cap or regular-file invariant failed")
             os.fsync(descriptor)
             digest = hashlib.sha256()
-            while block := os.read(descriptor, 1024 * 1024):
+            size = 0
+            while block := os.read(descriptor, min(1024 * 1024, cap + 1 - size)):
+                size += len(block)
+                if size > cap:
+                    raise FeasibilityError(f"{kind} log cap or regular-file invariant failed")
                 digest.update(block)
             after = os.fstat(descriptor)
-            named = os.lstat(resolved)
+            named = os.stat(relative.parts[-1], dir_fd=directory, follow_symlinks=False)
+            root_named = os.lstat(self._node_root)
             if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
                 after.st_dev,
                 after.st_ino,
@@ -810,9 +1046,16 @@ class BoundedArtifactCollector:
                 after.st_mtime_ns,
             ) or (named.st_dev, named.st_ino) != (after.st_dev, after.st_ino):
                 raise FeasibilityError("log changed during stable collection")
-            return BoundedArtifact(resolved, after.st_size, digest.hexdigest(), True, True, True)
+            if (root_named.st_dev, root_named.st_ino) != (
+                root_before.st_dev,
+                root_before.st_ino,
+            ):
+                raise FeasibilityError("bounded log root changed during stable collection")
+            return BoundedArtifact(path, after.st_size, digest.hexdigest(), True, True, True)
         finally:
             os.close(descriptor)
+            os.close(directory)
+            os.close(root_descriptor)
 
 
 @dataclass(frozen=True)
@@ -906,7 +1149,9 @@ class RuntimePlatformFeasibilityRunReceipt:
         endpoints = converted.get("ordered_gateway_endpoint_identities")
         probe_hashes = converted.get("ordered_probe_artifact_file_sha256s")
         log_hashes = converted.get("ordered_bounded_log_file_sha256s")
-        if not all(isinstance(value, list) for value in (nodes, endpoints, probe_hashes, log_hashes)):
+        if not all(
+            isinstance(value, list) for value in (nodes, endpoints, probe_hashes, log_hashes)
+        ):
             raise FeasibilityError("run receipt arrays are invalid")
         node_items = cast("list[object]", nodes)
         endpoint_items = cast("list[object]", endpoints)
@@ -934,7 +1179,10 @@ class RuntimePlatformFeasibilityRunReceipt:
             expected_node_count is not None and self.node_count != expected_node_count
         ):
             raise FeasibilityError("run receipt node count mismatch")
-        if len(self.ordered_nodes) != self.node_count or len(set(self.ordered_nodes)) != self.node_count:
+        if (
+            len(self.ordered_nodes) != self.node_count
+            or len(set(self.ordered_nodes)) != self.node_count
+        ):
             raise FeasibilityError("run receipt node tuple is invalid")
         if len(self.ordered_gateway_endpoint_identities) != self.node_count:
             raise FeasibilityError("run receipt gateway endpoint cardinality mismatch")
@@ -951,7 +1199,10 @@ class RuntimePlatformFeasibilityRunReceipt:
             raise FeasibilityError("run receipt build endpoint is invalid")
         if self.producer_uid in (
             self.build_service_endpoint_identity.expected_service_uid,
-            *(endpoint.expected_service_uid for endpoint in self.ordered_gateway_endpoint_identities),
+            *(
+                endpoint.expected_service_uid
+                for endpoint in self.ordered_gateway_endpoint_identities
+            ),
         ):
             raise FeasibilityError("run receipt producer shares a service protection identity")
         if not _COMMIT_RE.fullmatch(self.producer_commit) or not _JOB_RE.fullmatch(self.job_id):
@@ -1002,6 +1253,8 @@ class RuntimePlatformFeasibilityRunReceipt:
                 raise FeasibilityError("run receipt segment-16 proof is invalid")
         elif self.segment_count is not None:
             raise FeasibilityError("run receipt segment must be null for node count 1/2")
+        if self.node_count in (2, 16) and not self.global_multinode_path_routing_proven:
+            raise FeasibilityError("run receipt multinode path routing proof is invalid")
         if self.node_count == 1:
             if any(
                 value is not None
@@ -1104,13 +1357,46 @@ class RuntimePlatformFeasibilityReceipt:
             raise FeasibilityError("aggregate receipt contains invalid values") from error
 
 
+_VERIFIED_PLATFORM_FEASIBILITY: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[RuntimePlatformFeasibilityReceipt],
+        Path,
+        str,
+    ],
+] = {}
+
+
+def require_verified_platform_feasibility(feasibility: object) -> None:
+    """Revalidate the exact live object returned by the physical aggregate loader."""
+    registered = _VERIFIED_PLATFORM_FEASIBILITY.get(id(feasibility))
+    if registered is None or registered[0]() is not feasibility:
+        raise FeasibilityError("aggregate is not the exact stable-loaded F receipt")
+    receipt_ref, path, file_sha256 = registered
+    current = RuntimePlatformFeasibilityReceipt.from_dict(_stable_load_json(path, file_sha256))
+    replayed = join_platform_feasibility_runs(
+        one_node_receipt_path=Path(current.one_node_receipt_path),
+        one_node_receipt_file_sha256=current.one_node_receipt_file_sha256,
+        two_node_receipt_path=Path(current.two_node_receipt_path),
+        two_node_receipt_file_sha256=current.two_node_receipt_file_sha256,
+        sixteen_node_receipt_path=Path(current.sixteen_node_receipt_path),
+        sixteen_node_receipt_file_sha256=current.sixteen_node_receipt_file_sha256,
+    )
+    if receipt_ref() is not feasibility or current != feasibility or replayed != current:
+        raise FeasibilityError("stable-loaded F receipt provenance is no longer valid")
+
+
 def _stable_load_json(path: Path, expected_file_sha256: str) -> object:
     if not path.is_absolute() or not _is_hash(expected_file_sha256):
         raise FeasibilityError("receipt path/hash is invalid")
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > _MAX_RECEIPT_BYTES:
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size > _MAX_RECEIPT_BYTES
+        ):
             raise FeasibilityError("receipt must be a bounded single-link regular file")
         chunks: list[bytes] = []
         digest = hashlib.sha256()
@@ -1164,7 +1450,9 @@ def _validate_shared_endpoint_identity(
 ) -> None:
     by_node: dict[str, RuntimeServiceEndpointIdentity] = {}
     for run in runs:
-        for node, endpoint in zip(run.ordered_nodes, run.ordered_gateway_endpoint_identities, strict=True):
+        for node, endpoint in zip(
+            run.ordered_nodes, run.ordered_gateway_endpoint_identities, strict=True
+        ):
             prior = by_node.setdefault(node, endpoint)
             if prior != endpoint:
                 raise FeasibilityError("shared gateway endpoint identity changed across F runs")
@@ -1205,13 +1493,16 @@ def join_platform_feasibility_runs(
         or sixteen.prerequisite_receipt_file_sha256 != two_node_receipt_file_sha256
     ):
         raise FeasibilityError("F aggregate prerequisite chain is invalid")
-    if len({run.producer_commit for run in runs}) != 1 or len(
-        {run.feasibility_bound_blobs_sha256 for run in runs}
-    ) != 1:
+    if (
+        len({run.producer_commit for run in runs}) != 1
+        or len({run.feasibility_bound_blobs_sha256 for run in runs}) != 1
+    ):
         raise FeasibilityError("F aggregate producer lineage changed across runs")
     if len({run.protected_runtime_root for run in runs}) != 1:
         raise FeasibilityError("F aggregate protected runtime root changed across runs")
-    if any(run.build_service_endpoint_identity != one.build_service_endpoint_identity for run in runs):
+    if any(
+        run.build_service_endpoint_identity != one.build_service_endpoint_identity for run in runs
+    ):
         raise FeasibilityError("F aggregate build coordinator identity changed across runs")
     if any(
         (
@@ -1283,7 +1574,18 @@ def load_platform_feasibility_receipt(
     )
     if replayed != receipt:
         raise FeasibilityError("aggregate receipt does not replay the physical F chain")
-    register_stable_loaded_feasibility(receipt)
+    object_id = id(receipt)
+
+    def discard(stale: weakref.ReferenceType[RuntimePlatformFeasibilityReceipt]) -> None:
+        registered = _VERIFIED_PLATFORM_FEASIBILITY.get(object_id)
+        if registered is not None and registered[0] is stale:
+            _VERIFIED_PLATFORM_FEASIBILITY.pop(object_id, None)
+
+    _VERIFIED_PLATFORM_FEASIBILITY[object_id] = (
+        weakref.ref(receipt, discard),
+        path,
+        expected_file_sha256,
+    )
     return receipt
 
 
@@ -1351,7 +1653,9 @@ def build_platform_feasibility_submission_argv(
         or not prerequisite_receipt_path.is_absolute()
         or not _is_hash(prerequisite_receipt_file_sha256)
     ):
-        raise FeasibilityError("dependent submission requires an absolute receipt and physical hash")
+        raise FeasibilityError(
+            "dependent submission requires an absolute receipt and physical hash"
+        )
     if submit_mode not in ("test-only", "parsable"):
         raise FeasibilityError("submission mode is invalid")
     runner = Path(__file__).with_name("run_q30t_runtime_platform_feasibility.sbatch")
