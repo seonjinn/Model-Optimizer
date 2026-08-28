@@ -109,7 +109,8 @@ APPROVED_QUOTAS = {
     "ptv3_general_tool_trajectories": 81_000,
 }
 APPROVED_QUOTA_CATEGORIES = tuple(APPROVED_QUOTAS)
-REQUIRED_HELD_OUT_RECEIPT_NAMES = frozenset({"speed", "math", "code", "swe", "tool"})
+HELD_OUT_ORDER = ("speed", "math", "code", "swe", "tool")
+REQUIRED_HELD_OUT_RECEIPT_NAMES = frozenset(HELD_OUT_ORDER)
 APPROVED_PTV3_SWE_SOURCE_PINS: tuple[tuple[str, str, str], ...] = ()
 APPROVED_ROW_SCHEMA_SHA256S: frozenset[str] = frozenset()
 APPROVED_SOURCE_INVENTORY_FILE_SHA256 = ""
@@ -638,8 +639,13 @@ def load_held_out_union(
         else:
             raise ComplementError("held-out receipt argument schema is invalid")
     names = [name for name, _, _ in normalized]
-    if required_names and (set(names) != set(required_names) or len(names) != len(required_names)):
-        raise ComplementError("required held-out receipt set is missing or has extras")
+    if required_names:
+        if len(names) != len(set(names)):
+            raise ComplementError("held-out receipt names contain a duplicate")
+        if set(names) != set(required_names) or len(names) != len(required_names):
+            raise ComplementError("required held-out receipt set is missing or has extras")
+        normalized.sort(key=lambda receipt: HELD_OUT_ORDER.index(receipt[0]))
+        names = [name for name, _, _ in normalized]
     for _, path, expected_sha256 in normalized:
         if not _is_lower_hex(expected_sha256, 64):
             raise ComplementError("held-out receipt caller SHA-256 is invalid")

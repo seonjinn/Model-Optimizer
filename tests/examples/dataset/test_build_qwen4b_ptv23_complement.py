@@ -439,6 +439,37 @@ def test_held_out_receipts_are_individually_authenticated_then_unioned(tmp_path:
     )
 
 
+def test_held_out_union_uses_fixed_name_order_independent_of_argument_order(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    by_name = {
+        name: _write_heldout_receipt(tmp_path / f"{name}.json", [f"{index:064x}"])
+        for index, name in enumerate(("speed", "math", "code", "swe", "tool"), start=1)
+    }
+    argument_order = ("tool", "speed", "swe", "code", "math")
+
+    union = module.load_held_out_union([(name, *by_name[name]) for name in argument_order])
+
+    assert union.receipt_names == ("speed", "math", "code", "swe", "tool")
+    assert union.receipt_file_sha256s == tuple(by_name[name][1] for name in union.receipt_names)
+
+
+def test_held_out_union_rejects_duplicate_names_before_set_reconciliation(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    receipts = {
+        name: _write_heldout_receipt(tmp_path / f"{name}.json", [f"{index:064x}"])
+        for index, name in enumerate(("speed", "math", "code", "swe", "tool"), start=1)
+    }
+    arguments = [(name, *receipt) for name, receipt in receipts.items()]
+    arguments.append(("speed", *receipts["speed"]))
+
+    with pytest.raises(module.ComplementError, match="duplicate"):
+        module.load_held_out_union(arguments)
+
+
 def test_production_held_out_union_requires_exact_named_receipt_set() -> None:
     module = _load_module()
 
