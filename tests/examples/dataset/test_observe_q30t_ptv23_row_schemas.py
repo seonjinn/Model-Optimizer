@@ -9,8 +9,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa  # pyright: ignore[reportMissingImports]
 import pyarrow.parquet as pq  # pyright: ignore[reportMissingImports]
@@ -22,33 +21,18 @@ from examples.dataset.observe_q30t_ptv23_row_schemas import (
     StageInputs,
     observe_stage_schemas,
 )
+from tools.launcher.common.specdec.q30t_row_observation_runtime import (
+    RowObservationRuntimeEvidence,
+    canonical_json_bytes,
+)
 
-_TEST_RUNTIME = {
-    "python_executable": "/usr/bin/python3.12",
-    "python_executable_bytes": 123456,
-    "python_executable_sha256": "b" * 64,
-    "python_version": "3.12.0",
-    "python_stdlib_root": "/usr/lib/python3.12",
-    "python_stdlib_tree_file_count": 100,
-    "python_stdlib_tree_bytes": 1000,
-    "python_stdlib_tree_sha256": "c" * 64,
-    "site_packages_root": "/usr/lib/python3.12/site-packages",
-    "site_packages_tree_file_count": 200,
-    "site_packages_tree_bytes": 2000,
-    "site_packages_tree_sha256": "d" * 64,
-    "pyarrow_version": "test-pyarrow",
-    "pyarrow_origin": "/usr/lib/python3.12/site-packages/pyarrow/__init__.py",
-    "pyarrow_tree_file_count": 1,
-    "pyarrow_tree_bytes": 1,
-    "pyarrow_tree_sha256": "a" * 64,
-}
-_REAL_AUTHENTICATE_RUNTIME = observer_module._authenticate_runtime
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture(autouse=True)
 def approved_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(observer_module, "_authenticate_runtime", lambda: _TEST_RUNTIME)
-    monkeypatch.setattr(observer_module, "_require_imported_runtime", lambda runtime: None)
+    monkeypatch.setattr(observer_module, "_import_qualified_pyarrow", lambda evidence: None)
 
 
 def _canonical(value: object) -> bytes:
@@ -77,6 +61,35 @@ class StageFixture:
     ptv3_files: tuple[Path, ...]
     ptv3_plan: dict[str, Any]
     ptv3_manifest: dict[str, Any]
+    runtime_evidence: RowObservationRuntimeEvidence
+
+
+def _write_runtime_evidence(tmp_path: Path) -> tuple[Path, str, RowObservationRuntimeEvidence]:
+    body: dict[str, object] = {
+        "approved_tool_sha256s": {"ptv23_node_keeper.py": "1" * 64},
+        "archive_sha256": "2" * 64,
+        "archive_tree_receipt_file_sha256": "3" * 64,
+        "base_image_sha256": "4" * 64,
+        "derived_image_receipt_file_sha256": "5" * 64,
+        "derived_image_sha256": "6" * 64,
+        "profile_file_sha256": "7" * 64,
+        "pyarrow_relative_path": "lib/python3.12/site-packages/pyarrow/__init__.py",
+        "pyarrow_tree_sha256": "8" * 64,
+        "pyarrow_version": "19.0.1",
+        "python_relative_path": "bin/python",
+        "python_version": "3.12.10",
+        "qualification_receipt_file_sha256": "9" * 64,
+        "qualification_receipt_sha256": "a" * 64,
+        "qualification_source_commit": "b" * 40,
+        "runtime_tree_sha256": "c" * 64,
+        "schema_version": "q30t-row-observation-runtime-evidence-v1",
+    }
+    record = body | {
+        "runtime_evidence_sha256": hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    }
+    path = tmp_path / "runtime-evidence.json"
+    path.write_bytes(canonical_json_bytes(record) + b"\n")
+    return path, _sha256(path), RowObservationRuntimeEvidence.from_dict(record)
 
 
 def _write_parquet(path: Path, rows: tuple[dict[str, object], ...], *, raw_json: bool) -> None:
@@ -236,6 +249,9 @@ def stage_inputs(
     }
     ptv3_completion_path = ptv3_root / "completion.json"
     ptv3_completion_path.write_bytes(_canonical(ptv3_completion))
+    runtime_evidence_path, runtime_evidence_sha256, runtime_evidence = _write_runtime_evidence(
+        tmp_path
+    )
 
     return StageFixture(
         inputs=StageInputs(
@@ -249,11 +265,14 @@ def stage_inputs(
             ptv3_completion_path=ptv3_completion_path,
             ptv3_completion_sha256=_sha256(ptv3_completion_path),
             ptv3_root=ptv3_root,
+            runtime_evidence_path=runtime_evidence_path,
+            runtime_evidence_sha256=runtime_evidence_sha256,
         ),
         ptv2_file=ptv2_file,
         ptv3_files=tuple(ptv3_files),
         ptv3_plan=ptv3_plan,
         ptv3_manifest=ptv3_manifest,
+        runtime_evidence=runtime_evidence,
     )
 
 
@@ -281,7 +300,7 @@ def test_observer_records_every_file_and_every_row_shape(tmp_path: Path) -> None
 
     payload = json.loads(observe_stage_schemas(fixture.inputs))
 
-    assert payload["schema_version"] == "q30t-ptv23-row-schema-observation-v1"
+    assert payload["schema_version"] == "q30t-ptv23-row-schema-observation-v2"
     assert len(payload["files"]) == 2
     assert [item["row_count"] for item in payload["files"]] == [1, 2]
     assert all(item["messages_field"] == "messages" for item in payload["files"])
@@ -512,62 +531,45 @@ def test_observation_binds_the_authenticated_python_and_pyarrow_runtime(tmp_path
 
     observation = json.loads(observe_stage_schemas(fixture.inputs))
 
-    assert observation["runtime"] == _TEST_RUNTIME
+    assert observation["runtime"] == fixture.runtime_evidence.to_dict()
 
 
-def test_runtime_evidence_binds_stdlib_and_complete_site_packages() -> None:
-    """Runtime evidence must cover code loaded before and during the PyArrow import."""
-    assert _TEST_RUNTIME["python_stdlib_tree_file_count"] > 0
-    assert len(_TEST_RUNTIME["python_stdlib_tree_sha256"]) == 64
-    assert _TEST_RUNTIME["site_packages_tree_file_count"] > 0
-    assert len(_TEST_RUNTIME["site_packages_tree_sha256"]) == 64
-
-
-def test_runtime_rejects_a_loaded_dependency_outside_authenticated_trees(
+def test_observer_loads_runtime_evidence_before_importing_pyarrow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    foreign = tmp_path / "foreign_dependency.py"
-    foreign.write_text("FOREIGN = True\n")
-    module = type("ForeignModule", (), {"__file__": str(foreign)})()
-    monkeypatch.setitem(observer_module.sys.modules, "foreign_dependency", module)
+    """A runtime-evidence rejection must prevent the PyArrow import boundary."""
+    fixture = stage_inputs(tmp_path)
+    imported = False
 
-    with pytest.raises(ObservationError, match="outside authenticated runtime"):
-        observer_module._require_loaded_origins(Path("/usr/lib/python3.12"), Path("/approved/site"))
+    def reject_runtime(path: Path, *, expected_sha256: str) -> RowObservationRuntimeEvidence:
+        raise ValueError("bad runtime evidence")
 
+    def record_import(evidence: RowObservationRuntimeEvidence) -> None:
+        nonlocal imported
+        imported = True
 
-def test_runtime_authentication_fails_closed_on_a_user_owned_python(
-    tmp_path: Path,
-) -> None:
-    python = tmp_path / "python3.12"
-    python.write_bytes(b"not an approved interpreter")
-    python.chmod(0o755)
-    with pytest.raises(ObservationError, match="root-owned"):
-        observer_module._approved_executable(python)
+    monkeypatch.setattr(observer_module, "load_row_observation_runtime_evidence", reject_runtime)
+    monkeypatch.setattr(observer_module, "_import_qualified_pyarrow", record_import)
 
-
-def test_runtime_authentication_requires_isolated_no_site_python(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for name in tuple(observer_module.sys.modules):
-        if name == "pyarrow" or name.startswith("pyarrow."):
-            monkeypatch.delitem(observer_module.sys.modules, name)
-
-    with pytest.raises(ObservationError, match=r"-I -S"):
-        _REAL_AUTHENTICATE_RUNTIME()
+    with pytest.raises(ObservationError, match="runtime evidence is invalid"):
+        observe_stage_schemas(fixture.inputs)
+    assert not imported
 
 
-def test_runtime_authentication_rejects_preloaded_pyarrow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        observer_module,
-        "_approved_executable",
-        lambda path: observer_module.Path("/usr/bin/python3.12"),
-    )
-    monkeypatch.setitem(observer_module.sys.modules, "pyarrow", object())
+def test_observation_excludes_operation_specific_runtime_values(tmp_path: Path) -> None:
+    """Changing job-only materialization names cannot change scientific observation bytes."""
+    fixture = stage_inputs(tmp_path)
+    first_path = tmp_path / "job-1-scratch" / "container-a" / "runtime-evidence.json"
+    second_path = tmp_path / "job-2-scratch" / "container-b" / "runtime-evidence.json"
+    first_path.parent.mkdir(parents=True)
+    second_path.parent.mkdir(parents=True)
+    payload = fixture.inputs.runtime_evidence_path.read_bytes()
+    first_path.write_bytes(payload)
+    second_path.write_bytes(payload)
+    first = replace(fixture.inputs, runtime_evidence_path=first_path)
+    second = replace(fixture.inputs, runtime_evidence_path=second_path)
 
-    with pytest.raises(ObservationError, match="already loaded"):
-        _REAL_AUTHENTICATE_RUNTIME()
+    assert observe_stage_schemas(first) == observe_stage_schemas(second)
 
 
 def test_cli_publishes_exact_observation_without_clobbering(
@@ -604,6 +606,10 @@ def test_cli_publishes_exact_observation_without_clobbering(
             fixture.inputs.ptv3_completion_sha256,
             "--ptv3-root",
             str(fixture.inputs.ptv3_root),
+            "--runtime-evidence",
+            str(fixture.inputs.runtime_evidence_path),
+            "--runtime-evidence-sha256",
+            fixture.inputs.runtime_evidence_sha256,
             "--output",
             str(output),
         ],

@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib
-import importlib.util
 import json
 import os
 import stat
@@ -17,12 +15,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from tools.launcher.common.specdec.q30t_row_observation_runtime import (
+    RowObservationRuntimeEvidence,
+    load_row_observation_runtime_evidence,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
 __all__ = ["ObservationError", "StageInputs", "observe_stage_schemas"]
 
-_SCHEMA_VERSION = "q30t-ptv23-row-schema-observation-v1"
+_SCHEMA_VERSION = "q30t-ptv23-row-schema-observation-v2"
 _SHA256_LENGTH = 64
 _READ_BLOCK_BYTES = 8 * 1024 * 1024
 _MAX_METADATA_BYTES = 64 * 1024 * 1024
@@ -30,9 +33,7 @@ _PTV2_PLAN_NAME = "SOURCE_PLAN.json"
 _PTV2_COMPLETION_NAME = "SOURCE_MANIFEST_COMPLETION.json"
 _PTV3_MANIFEST_NAME = "MANIFEST.json"
 _PTV3_COMPLETION_NAME = "completion.json"
-_MAX_RUNTIME_FILES = 250_000
-_MAX_RUNTIME_BYTES = 64 * 1024 * 1024 * 1024
-_MAX_PYTHON_EXECUTABLE_BYTES = 1024 * 1024 * 1024
+_RUNTIME_ROOT = Path("/opt/q30t-runtime")
 
 
 class ObservationError(RuntimeError):
@@ -53,6 +54,8 @@ class StageInputs:
     ptv3_completion_path: Path
     ptv3_completion_sha256: str
     ptv3_root: Path
+    runtime_evidence_path: Path
+    runtime_evidence_sha256: str
 
 
 @dataclass(frozen=True)
@@ -87,273 +90,43 @@ class _AuthenticatedStage:
         os.close(self.ptv2_root_fd)
 
 
-def _require_root_owned_nonwritable(metadata: os.stat_result, label: str) -> None:
-    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
-        raise ObservationError(f"{label} is not root-owned and non-writable")
-
-
-def _approved_executable(path: Path) -> Path:
-    if not path.is_absolute():
-        raise ObservationError("Python executable path is not absolute")
-    current = path
-    for _ in range(16):
-        metadata = os.lstat(current)
-        _require_root_owned_nonwritable(metadata, "Python executable path")
-        if not stat.S_ISLNK(metadata.st_mode):
-            if not stat.S_ISREG(metadata.st_mode) or not os.access(current, os.X_OK):
-                raise ObservationError("Python executable is not an approved regular file")
-            return current
-        target = Path(os.readlink(current))
-        current = target if target.is_absolute() else current.parent / target
-        current = Path(os.path.normpath(current))
-    raise ObservationError("Python executable symlink chain is too deep")
-
-
-def _approved_regular_file_sha256(path: Path, label: str, maximum_bytes: int) -> tuple[int, str]:
-    named = os.stat(path, follow_symlinks=False)
-    _require_root_owned_nonwritable(named, label)
-    if not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or named.st_size > maximum_bytes:
-        raise ObservationError(f"{label} is not a bounded single-link regular file")
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
-    )
+def _load_and_import_runtime(inputs: StageInputs) -> RowObservationRuntimeEvidence:
+    """Replay fixed runtime evidence before importing the Parquet implementation."""
     try:
-        opened = os.fstat(descriptor)
-        if _identity(opened) != _identity(named):
-            raise ObservationError(f"{label} changed while opening")
-        digest = hashlib.sha256()
-        size = 0
-        while size < named.st_size:
-            block = os.read(descriptor, min(_READ_BLOCK_BYTES, named.st_size - size))
-            if not block:
-                raise ObservationError(f"{label} shrank while hashing")
-            digest.update(block)
-            size += len(block)
-        if os.read(descriptor, 1):
-            raise ObservationError(f"{label} grew while hashing")
-        after = os.fstat(descriptor)
-        rebound = os.stat(path, follow_symlinks=False)
-    finally:
-        os.close(descriptor)
-    if (
-        size != named.st_size
-        or _identity(named) != _identity(after)
-        or _identity(after) != _identity(rebound)
-    ):
-        raise ObservationError(f"{label} changed while hashing")
-    return size, digest.hexdigest()
+        evidence = load_row_observation_runtime_evidence(
+            inputs.runtime_evidence_path,
+            expected_sha256=inputs.runtime_evidence_sha256,
+        )
+    except ValueError as error:
+        raise ObservationError("runtime evidence is invalid") from error
+    _import_qualified_pyarrow(evidence)
+    return evidence
 
 
-def _runtime_tree_inventory(root: Path, label: str) -> tuple[int, int, str]:
-    root_before = os.stat(root, follow_symlinks=False)
-    _require_root_owned_nonwritable(root_before, f"{label} root")
-    if not stat.S_ISDIR(root_before.st_mode):
-        raise ObservationError(f"{label} root is not a directory")
-    digest = hashlib.sha256()
-    file_count = 0
-    total_bytes = 0
-    for directory, names, filenames in os.walk(root, followlinks=False):
-        names.sort()
-        filenames.sort()
-        directory_path = Path(directory)
-        directory_metadata = os.stat(directory_path, follow_symlinks=False)
-        _require_root_owned_nonwritable(directory_metadata, f"{label} directory")
-        if not stat.S_ISDIR(directory_metadata.st_mode):
-            raise ObservationError(f"{label} inventory contains a non-directory")
-        for name in names:
-            child = os.stat(directory_path / name, follow_symlinks=False)
-            if stat.S_ISLNK(child.st_mode):
-                raise ObservationError(f"{label} inventory contains a symlink")
-        for name in filenames:
-            path = directory_path / name
-            named = os.stat(path, follow_symlinks=False)
-            if file_count >= _MAX_RUNTIME_FILES or named.st_size > _MAX_RUNTIME_BYTES - total_bytes:
-                raise ObservationError(f"{label} inventory exceeds its bound")
-            _require_root_owned_nonwritable(named, f"{label} file")
-            if not stat.S_ISREG(named.st_mode) or named.st_nlink < 1:
-                raise ObservationError(f"{label} inventory contains an unsafe file")
-            descriptor = os.open(
-                path,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
-            )
-            try:
-                opened = os.fstat(descriptor)
-                if _identity(opened) != _identity(named):
-                    raise ObservationError(f"{label} file changed while opening")
-                file_digest = hashlib.sha256()
-                size = 0
-                while size < named.st_size:
-                    block = os.read(descriptor, min(_READ_BLOCK_BYTES, named.st_size - size))
-                    if not block:
-                        raise ObservationError(f"{label} file shrank while hashing")
-                    file_digest.update(block)
-                    size += len(block)
-                if os.read(descriptor, 1):
-                    raise ObservationError(f"{label} file grew while hashing")
-                file_sha256 = file_digest.hexdigest()
-                after = os.fstat(descriptor)
-            finally:
-                os.close(descriptor)
-            if _identity(opened) != _identity(after) or size != named.st_size:
-                raise ObservationError(f"{label} file changed while hashing")
-            file_count += 1
-            total_bytes += size
-            relative = path.relative_to(root).as_posix().encode()
-            digest.update(len(relative).to_bytes(4, "big"))
-            digest.update(relative)
-            digest.update(size.to_bytes(8, "big"))
-            digest.update(bytes.fromhex(file_sha256))
-    root_after = os.stat(root, follow_symlinks=False)
-    if _identity(root_before) != _identity(root_after) or file_count < 1:
-        raise ObservationError(f"{label} root changed while hashing")
-    return file_count, total_bytes, digest.hexdigest()
-
-
-def _runtime_evidence_tuple(runtime: Mapping[str, object], prefix: str) -> tuple[int, int, str]:
-    values = (
-        runtime.get(f"{prefix}_file_count"),
-        runtime.get(f"{prefix}_bytes"),
-        runtime.get(f"{prefix}_sha256"),
-    )
-    if (
-        type(values[0]) is not int
-        or values[0] < 1
-        or type(values[1]) is not int
-        or values[1] < 1
-        or not _is_sha256(values[2])
-    ):
-        raise ObservationError(f"runtime bootstrap has invalid {prefix} evidence")
-    return cast("tuple[int, int, str]", values)
-
-
-def _require_loaded_origins(stdlib_root: Path, site_root: Path) -> None:
-    approved_roots = (stdlib_root, site_root)
-    for name, module in tuple(sys.modules.items()):
-        origin_value = getattr(module, "__file__", None)
-        if origin_value is None or origin_value in {"built-in", "frozen"}:
-            continue
-        if name == "__main__" and origin_value == "<stdin>":
-            continue
-        origin = Path(origin_value)
-        if str(origin).startswith("/proc/self/fd/"):
-            continue
-        try:
-            resolved = origin.resolve(strict=True)
-        except OSError as error:
-            raise ObservationError(f"loaded module origin is unavailable: {name}") from error
-        if not any(resolved == root or root in resolved.parents for root in approved_roots):
-            raise ObservationError(f"loaded module origin is outside authenticated runtime: {name}")
-
-
-def _authenticate_runtime() -> dict[str, object]:
-    """Authenticate the concrete Python/PyArrow runtime before importing PyArrow."""
+def _import_qualified_pyarrow(evidence: RowObservationRuntimeEvidence) -> None:
     if any(name == "pyarrow" or name.startswith("pyarrow.") for name in sys.modules):
-        raise ObservationError("PyArrow is already loaded before runtime authentication")
+        raise ObservationError("PyArrow is already loaded before runtime evidence replay")
     if sys.flags.isolated != 1 or sys.flags.no_site != 1:
-        raise ObservationError("runtime authentication requires Python -I -S")
-    bootstrap = sys.modules.get("_q30t_runtime_bootstrap")
-    evidence = getattr(bootstrap, "evidence", None)
-    if not isinstance(evidence, dict):
-        raise ObservationError("authenticated runtime bootstrap evidence is unavailable")
-    python_target = _approved_executable(Path(sys.executable))
+        raise ObservationError("qualified runtime import requires Python -I -S")
+    if Path(sys.executable) != _RUNTIME_ROOT / evidence.python_relative_path:
+        raise ObservationError("running Python differs from runtime evidence")
+    version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if version != evidence.python_version:
+        raise ObservationError("Python version differs from runtime evidence")
+    site_packages = _RUNTIME_ROOT / "lib/python3.12/site-packages"
+    sys.path.insert(0, str(site_packages))
     try:
-        target_metadata = os.stat(python_target, follow_symlinks=False)
-        running_metadata = os.stat("/proc/self/exe")
-    except OSError as error:
-        raise ObservationError("running Python executable identity is unavailable") from error
-    if (target_metadata.st_dev, target_metadata.st_ino) != (
-        running_metadata.st_dev,
-        running_metadata.st_ino,
-    ):
-        raise ObservationError("running Python differs from the approved executable")
-    python_size, python_sha256 = _approved_regular_file_sha256(
-        python_target, "Python executable", _MAX_PYTHON_EXECUTABLE_BYTES
-    )
-    if evidence.get("python_executable") != str(python_target) or (
-        evidence.get("python_executable_bytes"),
-        evidence.get("python_executable_sha256"),
-    ) != (python_size, python_sha256):
-        raise ObservationError("Python differs from authenticated bootstrap evidence")
-    if evidence.get("python_version") != (
-        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    ):
-        raise ObservationError("Python version differs from authenticated bootstrap evidence")
-    stdlib_value = evidence.get("python_stdlib_root")
-    site_value = evidence.get("site_packages_root")
-    if type(stdlib_value) is not str or type(site_value) is not str:
-        raise ObservationError("runtime bootstrap root evidence is invalid")
-    stdlib_root = Path(stdlib_value)
-    package_parent = Path(site_value)
-    stdlib_inventory = _runtime_evidence_tuple(evidence, "python_stdlib_tree")
-    site_inventory = _runtime_evidence_tuple(evidence, "site_packages_tree")
-    if _runtime_tree_inventory(stdlib_root, "Python stdlib") != stdlib_inventory:
-        raise ObservationError("Python stdlib changed after runtime bootstrap")
-    if _runtime_tree_inventory(package_parent, "site-packages") != site_inventory:
-        raise ObservationError("site-packages changed after runtime bootstrap")
-    root = package_parent / "pyarrow"
-    inventory = _runtime_tree_inventory(root, "PyArrow package")
-    sys.path.insert(0, str(package_parent))
-    spec = importlib.util.find_spec("pyarrow")
-    if spec is None or spec.origin is None or spec.submodule_search_locations is None:
-        raise ObservationError("an approved PyArrow package is unavailable")
-    origin = Path(spec.origin)
-    roots = tuple(Path(value) for value in spec.submodule_search_locations)
-    if len(roots) != 1 or not origin.is_absolute() or not roots[0].is_absolute():
-        raise ObservationError("PyArrow package origin is not uniquely absolute")
-    if roots[0] != root or origin.parent != root:
-        raise ObservationError("PyArrow origin is outside its package root")
-    pyarrow = importlib.import_module("pyarrow")
-    version = getattr(pyarrow, "__version__", None)
-    imported_origin = Path(getattr(pyarrow, "__file__", ""))
-    if type(version) is not str or not version or imported_origin != origin:
-        raise ObservationError("imported PyArrow differs from its authenticated origin")
-    if _runtime_tree_inventory(root, "PyArrow package") != inventory:
-        raise ObservationError("PyArrow package changed across import")
-    _require_loaded_origins(stdlib_root, package_parent)
-    return {
-        **evidence,
-        "pyarrow_version": version,
-        "pyarrow_origin": str(origin),
-        "pyarrow_tree_file_count": inventory[0],
-        "pyarrow_tree_bytes": inventory[1],
-        "pyarrow_tree_sha256": inventory[2],
-    }
-
-
-def _require_imported_runtime(runtime: Mapping[str, object]) -> None:
-    pyarrow = sys.modules.get("pyarrow")
-    if pyarrow is None or getattr(pyarrow, "__version__", None) != runtime["pyarrow_version"]:
-        raise ObservationError("observed PyArrow runtime changed")
-    if Path(getattr(pyarrow, "__file__", "")) != Path(cast("str", runtime["pyarrow_origin"])):
-        raise ObservationError("observed PyArrow origin changed")
-    python_target = Path(cast("str", runtime["python_executable"]))
-    python_evidence = _approved_regular_file_sha256(
-        python_target, "Python executable", _MAX_PYTHON_EXECUTABLE_BYTES
-    )
-    if python_evidence != (
-        runtime["python_executable_bytes"],
-        runtime["python_executable_sha256"],
-    ):
-        raise ObservationError("Python executable changed while observing")
-    stdlib_root = Path(cast("str", runtime["python_stdlib_root"]))
-    site_root = Path(cast("str", runtime["site_packages_root"]))
-    if _runtime_tree_inventory(stdlib_root, "Python stdlib") != _runtime_evidence_tuple(
-        runtime, "python_stdlib_tree"
-    ):
-        raise ObservationError("Python stdlib changed while observing")
-    if _runtime_tree_inventory(site_root, "site-packages") != _runtime_evidence_tuple(
-        runtime, "site_packages_tree"
-    ):
-        raise ObservationError("site-packages changed while observing")
-    pyarrow_root = Path(cast("str", runtime["pyarrow_origin"])).parent
-    if _runtime_tree_inventory(pyarrow_root, "PyArrow package") != (
-        runtime["pyarrow_tree_file_count"],
-        runtime["pyarrow_tree_bytes"],
-        runtime["pyarrow_tree_sha256"],
-    ):
-        raise ObservationError("PyArrow package changed while observing")
-    _require_loaded_origins(stdlib_root, site_root)
+        import pyarrow  # pyright: ignore[reportMissingImports]
+    except ImportError as error:
+        raise ObservationError("qualified runtime PyArrow is unavailable") from error
+    if getattr(pyarrow, "__version__", None) != evidence.pyarrow_version:
+        raise ObservationError("PyArrow version differs from runtime evidence")
+    try:
+        relative_origin = Path(getattr(pyarrow, "__file__", "")).relative_to(_RUNTIME_ROOT)
+    except ValueError as error:
+        raise ObservationError("PyArrow origin is outside the qualified runtime") from error
+    if relative_origin.as_posix() != evidence.pyarrow_relative_path:
+        raise ObservationError("PyArrow origin differs from runtime evidence")
 
 
 def _canonical_json(value: object, *, newline: bool = True) -> bytes:
@@ -393,6 +166,7 @@ def _require_absolute_paths(inputs: StageInputs) -> None:
         inputs.ptv3_plan_path,
         inputs.ptv3_completion_path,
         inputs.ptv3_root,
+        inputs.runtime_evidence_path,
     )
     if any(not isinstance(path, Path) or not path.is_absolute() for path in paths):
         raise ObservationError("stage input paths must be absolute")
@@ -403,6 +177,7 @@ def _require_absolute_paths(inputs: StageInputs) -> None:
             inputs.ptv2_completion_sha256,
             inputs.ptv3_plan_sha256,
             inputs.ptv3_completion_sha256,
+            inputs.runtime_evidence_sha256,
         )
     ):
         raise ObservationError("stage input SHA-256 bindings are invalid")
@@ -1171,7 +946,7 @@ def observe_stage_schemas(inputs: StageInputs) -> bytes:
     """Return a canonical, self-hashed physical row-schema observation."""
     if not isinstance(inputs, StageInputs):
         raise ObservationError("inputs must be a StageInputs value")
-    runtime = _authenticate_runtime()
+    runtime = _load_and_import_runtime(inputs)
     stage = _authenticate_stage(inputs)
     try:
         files = [_observe_file(record, stage) for record in stage.records]
@@ -1191,24 +966,21 @@ def observe_stage_schemas(inputs: StageInputs) -> bytes:
         _require_stage_stable(stage, inputs)
     finally:
         stage.close()
-    _require_imported_runtime(runtime)
     payload: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
-        "runtime": runtime,
+        "runtime": runtime.to_dict(),
         "inputs": {
             "ptv2": {
                 "plan_path": inputs.ptv2_plan_path.name,
                 "plan_sha256": inputs.ptv2_plan_sha256,
                 "completion_path": inputs.ptv2_completion_path.name,
                 "completion_sha256": inputs.ptv2_completion_sha256,
-                "root": str(inputs.ptv2_root),
             },
             "ptv3": {
                 "plan_path": inputs.ptv3_plan_path.name,
                 "plan_sha256": inputs.ptv3_plan_sha256,
                 "completion_path": inputs.ptv3_completion_path.name,
                 "completion_sha256": inputs.ptv3_completion_sha256,
-                "root": str(inputs.ptv3_root),
             },
         },
         "source_file_counts": {"ptv2": stage.ptv2_count, "ptv3": stage.ptv3_count},
@@ -1232,6 +1004,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ptv3-completion", type=Path, required=True)
     parser.add_argument("--ptv3-completion-sha256", required=True)
     parser.add_argument("--ptv3-root", type=Path, required=True)
+    parser.add_argument("--runtime-evidence", type=Path, required=True)
+    parser.add_argument("--runtime-evidence-sha256", required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -1349,6 +1123,8 @@ def main() -> int:
             ptv3_completion_path=arguments.ptv3_completion,
             ptv3_completion_sha256=arguments.ptv3_completion_sha256,
             ptv3_root=arguments.ptv3_root,
+            runtime_evidence_path=arguments.runtime_evidence,
+            runtime_evidence_sha256=arguments.runtime_evidence_sha256,
         )
     )
     _publish_observation(arguments.output, payload)
