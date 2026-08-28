@@ -1537,7 +1537,7 @@ def test_q30t_builder_recomputes_tokenizer_receipt_evidence(
     receipt_path = tmp_path / "receipt.json"
     receipt_path.write_bytes(receipt)
     monkeypatch.setattr(
-        builder,
+        receipt_module,
         "APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S",
         frozenset({hashlib.sha256(receipt).hexdigest()}),
     )
@@ -1564,6 +1564,13 @@ def test_q30t_builder_recomputes_tokenizer_receipt_evidence(
     )
 
     assert (trust.im_start_token_id, trust.im_end_token_id) == (17, 18)
+    (snapshot / "assets/tokenizer.model").write_bytes(b"mutated tokenizer asset")
+    with pytest.raises(builder.ComplementError, match="receipt evidence does not reconcile"):
+        builder.load_tokenizer_trust(
+            receipt_path,
+            expected_sha256=hashlib.sha256(receipt).hexdigest(),
+            policy=policy,
+        )
 
 
 def test_q30t_builder_fails_closed_without_a_reviewed_receipt_root(tmp_path: Path) -> None:
@@ -1593,7 +1600,10 @@ def test_q30t_builder_fails_closed_without_a_reviewed_receipt_root(tmp_path: Pat
         file_sha256="3" * 64,
     )
 
-    with pytest.raises(builder.ComplementError, match="reviewed Q30 tokenizer receipt"):
+    with pytest.raises(
+        builder.ComplementError,
+        match="Q30 tokenizer trust is invalid: Q30 tokenizer receipt is not independently reviewed",
+    ):
         builder.load_tokenizer_trust(
             receipt_path,
             expected_sha256=hashlib.sha256(receipt).hexdigest(),
