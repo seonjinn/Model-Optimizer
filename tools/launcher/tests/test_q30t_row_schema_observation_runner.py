@@ -9,6 +9,7 @@ import hashlib
 import importlib.util
 import inspect
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,19 @@ ATOMIC = ROOT / "launcher/common/specdec/qwen4b_b_atomic.py"
 def _runner_embedded_python(marker: str) -> str:
     runner = RUNNER.read_text()
     return runner.split(f"# {marker}\n", 1)[1].split("\nPY\n", 1)[0]
+
+
+def _scratch_allocator_test_source(scratch_root: Path) -> str:
+    runner = RUNNER.read_text()
+    marker = "# Q30T_SCRATCH_ALLOCATOR\n"
+    assert marker in runner, "runner lacks the bounded scratch allocator"
+    source = runner.split(marker, 1)[1].split("\nPY\n", 1)[0]
+    source = source.replace(
+        'scratch_root_path = "/raid/scratch"',
+        f"scratch_root_path = {str(scratch_root.resolve())!r}",
+    )
+    source = source.replace("required_root_uids = {0}", "required_root_uids = {0, os.getuid()}")
+    return source
 
 
 def _load_observer_test_support() -> ModuleType:
@@ -89,6 +103,262 @@ def test_static_runner_requests_one_cpu_only_node() -> None:
     assert "#SBATCH --ntasks=1" in runner
     assert "#SBATCH --cpus-per-task=32" in runner
     assert "--gpus" not in runner
+
+
+def test_scratch_allocator_falls_back_when_slurm_tmpdir_is_absent(tmp_path: Path) -> None:
+    """Ptyche without SLURM_TMPDIR receives a private bounded node-scratch directory."""
+    scratch_root = tmp_path / "raid" / "scratch"
+    scratch_root.mkdir(parents=True, mode=0o700)
+    scratch_root.chmod(0o1777)
+    allocator = _scratch_allocator_test_source(scratch_root)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", "test_user", "75209087", ""],
+        input=allocator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    path_value, device, inode = result.stdout.strip().split("\t")
+    path = Path(path_value)
+    assert path.parent == scratch_root / "test_user"
+    assert re.fullmatch(r"q30t-row-schema-75209087-[0-9a-f]{32}", path.name)
+    assert path.stat().st_mode & 0o777 == 0o700
+    assert (path.stat().st_dev, path.stat().st_ino) == (int(device), int(inode))
+
+
+def test_scratch_allocator_preserves_safe_slurm_tmpdir_path(tmp_path: Path) -> None:
+    """A safe scheduler-provided directory remains the scratch parent."""
+    scratch_root = tmp_path / "raid" / "scratch"
+    slurm_tmpdir = scratch_root / "slurm-job-75209087"
+    slurm_tmpdir.mkdir(parents=True, mode=0o700)
+    foreign = slurm_tmpdir / "foreign.keep"
+    foreign.write_bytes(b"preserve-exactly")
+    foreign_identity = (foreign.stat().st_dev, foreign.stat().st_ino)
+    allocator = _scratch_allocator_test_source(scratch_root)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", "test_user", "75209087", str(slurm_tmpdir)],
+        input=allocator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    path = Path(result.stdout.split("\t", 1)[0])
+    assert path.parent == slurm_tmpdir
+    assert not (scratch_root / "test_user").exists()
+    assert foreign.read_bytes() == b"preserve-exactly"
+    assert (foreign.stat().st_dev, foreign.stat().st_ino) == foreign_identity
+
+
+def test_scratch_adopter_rejects_path_rebind_while_preserving_both_namespaces(
+    tmp_path: Path,
+) -> None:
+    """Held-FD adoption fails if the returned scratch pathname is rebound."""
+    adopter = _runner_embedded_python("Q30T_SCRATCH_ADOPTER")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    original_sentinel = scratch / "original.keep"
+    original_sentinel.write_bytes(b"original")
+    descriptor = os.open(scratch, os.O_RDONLY)
+    metadata = os.fstat(descriptor)
+    moved = tmp_path / "scratch-moved"
+    scratch.rename(moved)
+    scratch.mkdir(mode=0o700)
+    replacement_sentinel = scratch / "replacement.keep"
+    replacement_sentinel.write_bytes(b"replacement")
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-",
+                str(descriptor),
+                str(scratch),
+                str(metadata.st_dev),
+                str(metadata.st_ino),
+            ],
+            input=adopter,
+            text=True,
+            capture_output=True,
+            pass_fds=(descriptor,),
+            check=False,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert result.returncode != 0
+    assert "namespace changed" in result.stderr
+    assert (moved / "original.keep").read_bytes() == b"original"
+    assert replacement_sentinel.read_bytes() == b"replacement"
+
+
+def test_scratch_adopter_accepts_the_exact_held_descriptor(tmp_path: Path) -> None:
+    """The shell-to-Python handoff retains the authenticated directory descriptor."""
+    adopter = _runner_embedded_python("Q30T_SCRATCH_ADOPTER")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    descriptor = os.open(scratch, os.O_RDONLY)
+    metadata = os.fstat(descriptor)
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-",
+                str(descriptor),
+                str(scratch),
+                str(metadata.st_dev),
+                str(metadata.st_ino),
+            ],
+            input=adopter,
+            text=True,
+            capture_output=True,
+            pass_fds=(descriptor,),
+            check=False,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_scratch_allocator_rejects_unsafe_existing_user_dir_without_deletion(
+    tmp_path: Path,
+) -> None:
+    """An unsafe fallback namespace fails without touching foreign contents."""
+    scratch_root = tmp_path / "raid" / "scratch"
+    user_dir = scratch_root / "test_user"
+    user_dir.mkdir(parents=True, mode=0o700)
+    user_dir.chmod(0o755)
+    foreign = user_dir / "foreign.keep"
+    foreign.write_bytes(b"do-not-delete")
+    foreign_identity = (foreign.stat().st_dev, foreign.stat().st_ino)
+    allocator = _scratch_allocator_test_source(scratch_root)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", "test_user", "75209087", ""],
+        input=allocator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "mode-0700" in result.stderr
+    assert foreign.read_bytes() == b"do-not-delete"
+    assert (foreign.stat().st_dev, foreign.stat().st_ino) == foreign_identity
+    assert {path.name for path in user_dir.iterdir()} == {"foreign.keep"}
+
+
+def test_scratch_allocator_rejects_a_symlinked_user_dir_and_preserves_target(
+    tmp_path: Path,
+) -> None:
+    """Fallback adoption never follows a user-directory symlink."""
+    scratch_root = tmp_path / "raid" / "scratch"
+    scratch_root.mkdir(parents=True, mode=0o700)
+    foreign_target = tmp_path / "foreign-target"
+    foreign_target.mkdir(mode=0o700)
+    sentinel = foreign_target / "sentinel"
+    sentinel.write_bytes(b"unchanged")
+    (scratch_root / "test_user").symlink_to(foreign_target, target_is_directory=True)
+    allocator = _scratch_allocator_test_source(scratch_root)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", "test_user", "75209087", ""],
+        input=allocator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "component is unavailable" in result.stderr
+    assert sentinel.read_bytes() == b"unchanged"
+    assert {path.name for path in foreign_target.iterdir()} == {"sentinel"}
+
+
+def test_scratch_allocator_rejects_unsafe_shared_root_mode(tmp_path: Path) -> None:
+    """A writable shared root without sticky semantics cannot host fallback state."""
+    scratch_root = tmp_path / "raid" / "scratch"
+    scratch_root.mkdir(parents=True, mode=0o700)
+    scratch_root.chmod(0o777)
+    allocator = _scratch_allocator_test_source(scratch_root)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", "test_user", "75209087", ""],
+        input=allocator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "unsafe write permissions" in result.stderr
+    assert not (scratch_root / "test_user").exists()
+
+
+def test_scratch_allocator_rejects_root_namespace_swap_without_deletion(tmp_path: Path) -> None:
+    """A fixed-root rebind is detected through the held ancestor descriptor."""
+    scratch_root = tmp_path / "raid" / "scratch"
+    scratch_root.mkdir(parents=True, mode=0o700)
+    foreign = scratch_root / "foreign.keep"
+    foreign.write_bytes(b"original-root")
+    allocator = _scratch_allocator_test_source(scratch_root)
+    primitives = allocator.rsplit("\nmain()", 1)[0]
+    exercise = (
+        primitives
+        + "\nroot_parent_fd, root_fd, root_name = open_fixed_root(scratch_root_path)\n"
+        + "replacement = scratch_root_path + '-replacement'\n"
+        + "os.rename(scratch_root_path, replacement)\n"
+        + "os.mkdir(scratch_root_path, 0o700)\n"
+        + "try:\n    require_named_binding(root_parent_fd, root_name, root_fd, 'scratch root')\n"
+        + "finally:\n    os.close(root_fd); os.close(root_parent_fd)\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-"],
+        input=exercise,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "scratch root namespace changed" in result.stderr
+    assert (Path(f"{scratch_root}-replacement") / "foreign.keep").read_bytes() == b"original-root"
+    assert not any(scratch_root.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("username", "job_id", "message"),
+    [("../user", "75209087", "scratch user name"), ("test_user", "job-7", "SLURM job id")],
+)
+def test_scratch_allocator_rejects_invalid_user_and_job_names(
+    tmp_path: Path, username: str, job_id: str, message: str
+) -> None:
+    """Untrusted identity strings cannot become scratch path components."""
+    scratch_root = tmp_path / "raid" / "scratch"
+    scratch_root.mkdir(parents=True, mode=0o700)
+    allocator = _scratch_allocator_test_source(scratch_root)
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-", username, job_id, ""],
+        input=allocator,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not any(scratch_root.iterdir())
 
 
 def test_completion_binder_rejects_a_file_beyond_the_declared_bound(tmp_path: Path) -> None:

@@ -40,8 +40,8 @@ readonly receipt_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-dr
 
 readonly approved_chmod="/usr/bin/chmod"
 readonly approved_git="/usr/bin/git"
+readonly approved_id="/usr/bin/id"
 readonly approved_mkdir="/usr/bin/mkdir"
-readonly approved_mktemp="/usr/bin/mktemp"
 readonly approved_python="/usr/bin/python3.12"
 readonly approved_sha256sum="/usr/bin/sha256sum"
 readonly approved_env="/usr/bin/env"
@@ -57,7 +57,7 @@ PATH=/usr/bin:/bin
 export PATH
 
 "$approved_python" -I -S - /bin/bash "$approved_env" "$approved_chmod" "$approved_git" \
-    "$approved_mkdir" "$approved_mktemp" "$approved_python" "$approved_sha256sum" <<'PY'
+    "$approved_id" "$approved_mkdir" "$approved_python" "$approved_sha256sum" <<'PY'
 # Q30T_TOOL_AUTHENTICATOR
 import os
 import stat
@@ -88,14 +88,265 @@ if not test_owner and sys.version_info < (3, 12):
     raise SystemExit("approved Python must be Python 3.12 or newer")
 PY
 
-readonly scratch_parent="${SLURM_TMPDIR:-}"
-[[ "$scratch_parent" == /raid/scratch/* && -d "$scratch_parent" && ! -L "$scratch_parent" ]] \
-    || fail "scheduler node-local scratch is unavailable"
-scratch_root="$($approved_mktemp -d \
-    "$scratch_parent/q30t-row-schema-${SLURM_JOB_ID}.XXXXXXXX")"
-readonly scratch_root
-[[ "$scratch_root" == "$scratch_parent"/* && -d "$scratch_root" && ! -L "$scratch_root" ]] \
-    || fail "private node-local scratch creation failed"
+scratch_user="$(/usr/bin/env -i LC_ALL=C "$approved_id" -un)"
+readonly scratch_user
+[[ "$scratch_user" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+    || fail "approved scratch user name is invalid"
+scratch_record="$(/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    "$approved_python" -I -S - "$scratch_user" "$SLURM_JOB_ID" "${SLURM_TMPDIR:-}" <<'PY'
+# Q30T_SCRATCH_ALLOCATOR
+import os
+import secrets
+import stat
+import sys
+
+scratch_root_path = "/raid/scratch"
+required_root_uids = {0}
+open_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_ctime_ns,
+    )
+
+
+def require_root_component(metadata, label, *, shared_root=False):
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in required_root_uids:
+        fail(f"{label} is not an approved root-owned directory")
+    if mode & 0o022 and (not shared_root or not metadata.st_mode & stat.S_ISVTX):
+        fail(f"{label} has unsafe write permissions")
+
+
+def require_private_directory(metadata, label, owner_uid):
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != owner_uid
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail(f"{label} is not an exact-owner mode-0700 directory")
+
+
+def require_named_binding(parent_fd, name, descriptor, label):
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        fail(f"{label} namespace binding is unavailable: {error}")
+    if identity(named) != identity(opened):
+        fail(f"{label} namespace changed")
+    return opened
+
+
+def open_fixed_root(path):
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        fail("scratch root path is invalid")
+    components = [component for component in path.split("/") if component]
+    if not components:
+        fail("scratch root path has no components")
+    descriptor = os.open("/", open_flags)
+    try:
+        require_root_component(os.fstat(descriptor), "scratch root ancestor")
+        for ordinal, component in enumerate(components):
+            try:
+                child = os.open(component, open_flags, dir_fd=descriptor)
+            except OSError as error:
+                fail(f"scratch root component is unavailable: {error}")
+            metadata = os.fstat(child)
+            require_root_component(
+                metadata,
+                "scratch root" if ordinal == len(components) - 1 else "scratch root ancestor",
+                shared_root=ordinal == len(components) - 1,
+            )
+            if ordinal == len(components) - 1:
+                require_named_binding(descriptor, component, child, "scratch root")
+                return descriptor, child, component
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    fail("scratch root traversal failed")
+
+
+def validate_name(value, label, *, username=False):
+    if username:
+        valid = (
+            1 <= len(value) <= 32
+            and (value[0].islower() or value[0] == "_")
+            and value.isascii()
+            and all(
+                character.islower() or character.isdigit() or character in "_-"
+                for character in value
+            )
+        )
+    else:
+        valid = 1 <= len(value) <= 20 and value.isascii() and value.isdecimal()
+    if not valid:
+        fail(f"{label} is invalid")
+
+
+def open_private_relative(root_fd, relative, owner_uid, label):
+    components = relative.split("/")
+    if not components or any(component in {"", ".", ".."} for component in components):
+        fail(f"{label} path components are invalid")
+    parent_fd = os.dup(root_fd)
+    try:
+        for ordinal, component in enumerate(components):
+            try:
+                child = os.open(component, open_flags, dir_fd=parent_fd)
+            except OSError as error:
+                fail(f"{label} component is unavailable: {error}")
+            metadata = os.fstat(child)
+            if ordinal == len(components) - 1:
+                require_private_directory(metadata, label, owner_uid)
+                require_named_binding(parent_fd, component, child, label)
+                return parent_fd, child, component
+            mode = stat.S_IMODE(metadata.st_mode)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid not in required_root_uids | {owner_uid}
+                or mode & 0o022
+            ):
+                fail(f"{label} ancestor is unsafe")
+            os.close(parent_fd)
+            parent_fd = child
+    except BaseException:
+        os.close(parent_fd)
+        raise
+    fail(f"{label} traversal failed")
+
+
+def create_or_adopt_user(root_fd, username, owner_uid):
+    try:
+        os.mkdir(username, 0o700, dir_fd=root_fd)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        fail(f"scratch user directory creation failed: {error}")
+    return open_private_relative(root_fd, username, owner_uid, "scratch user directory")
+
+
+def create_private_child(parent_fd, job_id, owner_uid):
+    for _ in range(32):
+        name = f"q30t-row-schema-{job_id}-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            fail(f"private scratch creation failed: {error}")
+        try:
+            descriptor = os.open(name, open_flags, dir_fd=parent_fd)
+        except OSError as error:
+            fail(f"private scratch adoption failed: {error}")
+        metadata = require_named_binding(parent_fd, name, descriptor, "private scratch")
+        require_private_directory(metadata, "private scratch", owner_uid)
+        return descriptor, name
+    fail("private scratch random namespace was exhausted")
+
+
+def main():
+    if len(sys.argv) != 4:
+        fail("usage: allocator USER JOB_ID SLURM_TMPDIR")
+    username, job_id, slurm_tmpdir = sys.argv[1:]
+    validate_name(username, "scratch user name", username=True)
+    validate_name(job_id, "SLURM job id")
+    owner_uid = os.getuid()
+    root_parent_fd, root_fd, root_name = open_fixed_root(scratch_root_path)
+    private_parent_fd = private_fd = private_name = None
+    scratch_fd = None
+    try:
+        if slurm_tmpdir:
+            if (
+                not os.path.isabs(slurm_tmpdir)
+                or any(ord(character) < 32 for character in slurm_tmpdir)
+                or os.path.normpath(slurm_tmpdir) != slurm_tmpdir
+                or os.path.commonpath((scratch_root_path, slurm_tmpdir)) != scratch_root_path
+                or slurm_tmpdir == scratch_root_path
+            ):
+                fail("SLURM_TMPDIR is outside approved node scratch")
+            relative = os.path.relpath(slurm_tmpdir, scratch_root_path)
+            private_parent_fd, private_fd, private_name = open_private_relative(
+                root_fd, relative, owner_uid, "SLURM_TMPDIR"
+            )
+            scratch_parent_fd = private_fd
+            display_parent = slurm_tmpdir
+        else:
+            private_parent_fd, private_fd, private_name = create_or_adopt_user(
+                root_fd, username, owner_uid
+            )
+            scratch_parent_fd = private_fd
+            display_parent = os.path.join(scratch_root_path, username)
+        scratch_fd, scratch_name = create_private_child(scratch_parent_fd, job_id, owner_uid)
+        require_named_binding(root_parent_fd, root_name, root_fd, "scratch root")
+        require_named_binding(private_parent_fd, private_name, private_fd, "scratch parent")
+        scratch_metadata = require_named_binding(
+            scratch_parent_fd, scratch_name, scratch_fd, "private scratch"
+        )
+        require_private_directory(scratch_metadata, "private scratch", owner_uid)
+        print(
+            f"{os.path.join(display_parent, scratch_name)}\t"
+            f"{scratch_metadata.st_dev}\t{scratch_metadata.st_ino}",
+            flush=True,
+        )
+    finally:
+        if scratch_fd is not None:
+            os.close(scratch_fd)
+        if private_fd is not None:
+            os.close(private_fd)
+        if private_parent_fd is not None:
+            os.close(private_parent_fd)
+        os.close(root_fd)
+        os.close(root_parent_fd)
+
+
+main()
+PY
+)"
+readonly scratch_record
+IFS=$'\t' read -r scratch_path scratch_device scratch_inode scratch_extra <<<"$scratch_record"
+readonly scratch_path scratch_device scratch_inode scratch_extra
+[[ "$scratch_path" == /raid/scratch/* && "$scratch_device" =~ ^[0-9]+$ \
+    && "$scratch_inode" =~ ^[0-9]+$ && -z "$scratch_extra" ]] \
+    || fail "private node-local scratch allocation failed"
+exec 9<"$scratch_path" || fail "private node-local scratch adoption failed"
+readonly scratch_fd=9
+/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    "$approved_python" -I -S - "$scratch_fd" "$scratch_path" \
+    "$scratch_device" "$scratch_inode" <<'PY'
+# Q30T_SCRATCH_ADOPTER
+import os
+import stat
+import sys
+
+descriptor = int(sys.argv[1])
+path = sys.argv[2]
+expected = (int(sys.argv[3]), int(sys.argv[4]))
+opened = os.fstat(descriptor)
+named = os.stat(path, follow_symlinks=False)
+if (
+    not stat.S_ISDIR(opened.st_mode)
+    or opened.st_uid != os.getuid()
+    or stat.S_IMODE(opened.st_mode) != 0o700
+    or (opened.st_dev, opened.st_ino) != expected
+    or (named.st_dev, named.st_ino) != expected
+):
+    raise SystemExit("private node-local scratch namespace changed before adoption")
+PY
+readonly scratch_root="/proc/self/fd/$scratch_fd"
+[[ -d "$scratch_root" ]] || fail "held private node-local scratch is unavailable"
 
 readonly observer_path="examples/dataset/observe_q30t_ptv23_row_schemas.py"
 readonly ptv3_plan_path="examples/dataset/qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json"
