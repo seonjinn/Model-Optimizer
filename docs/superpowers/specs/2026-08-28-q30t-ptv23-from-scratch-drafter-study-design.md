@@ -232,18 +232,19 @@ shortfall. A short domain blocks that view rather than redistributing quota.
 
 ## Corpus cardinality
 
-For `M-synth`, the former 1.3M value is a minimum comparison boundary, not an
-upper bound. Its production row count is derived deterministically after
-target generation:
+`M-synth` has no row-count floor or ceiling. Its production row count is
+derived deterministically from the assistant-loss-token capacity required by
+each domain after target generation:
 
 1. Build an eligible, held-out-clean prompt inventory per lane.
 2. Order each lane by SHA-256 of the corpus policy, seed, lane, source identity,
    source row, and prompt UUID.
-3. Generate and validate target responses into an immutable candidate reserve.
-4. Merge lane orders with deterministic largest-remainder scheduling.
-5. Let `N1` be the smallest merged candidate prefix that contains at least
-   1,300,000 unique prompts and enough accepted assistant-loss-token capacity
-   in every lane to construct its exact 1B quota.
+3. Generate and validate target responses in bounded shards, continuing each
+   lane until its next declared token gate is satisfied. Eligible rows that
+   have not been attempted remain inventory, not corpus rows.
+4. Let `N1` be the union of the smallest accepted prefix in every lane that has
+   enough assistant-loss-token capacity to construct its exact 1B quota.
+5. Merge those lane prefixes with deterministic largest-remainder scheduling.
 6. Construct nested 0-to-256M and 256M-to-1B segments per lane. Mask excess
    assistant tokens in each segment's boundary row and do not recycle those
    masked tokens. Merge the lane segments with the same deterministic
@@ -254,14 +255,21 @@ target generation:
    exact 4B quota. Build its 1B-to-4B segment by the same rule, with the 1B
    training schedule as a byte-identical prefix.
 
-`N1` and `N4` may exceed 1.3M rows without another design change. Their exact
-values are outputs of signed capacity and build receipts, not hand-selected
-constants. The builder prioritizes new unique prompts. It never pads, cycles,
-duplicates, or silently adds epochs to meet a unique-data view. If source or
-generation capacity cannot produce a view, it publishes a blocker receipt.
+`N1` and `N4` may contain fewer or more than 1.3M rows. Their exact values are
+outputs of signed capacity and build receipts, not hand-selected constants.
+The builder prioritizes new unique prompts. It never pads, cycles, duplicates,
+or silently adds epochs to meet a unique-data view. If source or generation
+capacity cannot produce a view, it publishes a blocker receipt.
 `N1` and `N4` describe immutable candidate reserves. Every report separately
 states how many unique rows have actually contributed unmasked assistant-loss
 tokens at each checkpoint; reserve rows are never counted as training exposure.
+
+Every capacity and training report contains one row per domain, and one row per
+language inside multilingual, with `eligible`, `attempted`, `accepted`,
+`rejected`, `selected_256m`, `selected_1b`, and `selected_4b` row counts plus
+accepted and selected assistant-loss tokens. Rejection counts are also broken
+down by stable validation reason. This is the authoritative sample-count
+answer; a planned row estimate is never substituted for observed counts.
 
 Repeated exposure is allowed only as a separately named scale ablation with an
 explicit epoch count and is never described as additional unique corpus data.
@@ -482,7 +490,8 @@ Implementation follows TDD and must prove:
 - JSON-string and object tool arguments canonicalize identically;
 - divergent non-executable agentic actions are rejected;
 - exact 10,240-row and 256M/1B/4B token arithmetic;
-- `N1` and `N4` expand beyond 1.3M when token capacity requires it;
+- `N1` and `N4` are determined only by exact per-lane token capacity, without a
+  1.3M row floor or ceiling;
 - source order changes do not change selected bytes;
 - all methods start without a drafter checkpoint or trainer state;
 - DFlash2 convolution is a numerical identity at initialization;

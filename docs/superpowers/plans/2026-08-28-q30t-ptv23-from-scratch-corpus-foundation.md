@@ -17,6 +17,7 @@
 - `H-native` and `H-synth` contain the exact historical 1,300,000 prompt occurrences in the authenticated historical order. `H-native` retains the source response; `H-synth` removes it before generation.
 - `M-synth` lane shares are exactly agentless SWE 15%, interactive SWE 10%, general tool 10%, Math 25%, Code 15%, STEM 15%, instruction 5%, and multilingual 5%.
 - The `M-synth` canary row counts are exactly 1,536, 1,024, 1,024, 2,560, 1,536, 1,536, 512, and 512 in that lane order, totaling 10,240.
+- `M-synth` has no 1.3M row floor or ceiling. The prompt reserve inventories every eligible held-out-clean unique candidate per lane; synthesis later consumes the smallest deterministic accepted prefix that satisfies each declared assistant-token gate.
 - Multilingual token capacity is divided equally among DE, JA, ES, FR, and IT. Its 512-row canary uses deterministic largest-remainder order `DE=103`, `JA=103`, `ES=102`, `FR=102`, and `IT=102`. A short language or lane blocks the reserve; it is never backfilled from another lane.
 - The canonical prompt UUID is computed before target generation and binds the immutable message prefix, tool declarations, source repository/revision/file/split/row, reasoning mode, and response lane. It excludes target output and selection rank.
 - The five held-out names and order are exactly `speed`, `math`, `code`, `swe`, and `tool`. This plan consumes only an independently approved `q30t-held-out-sources-v2` bundle; state `P`, missing catalogs, empty catalogs, or producer self-approval fail closed.
@@ -90,7 +91,6 @@ def test_policy_freezes_lane_order_and_arithmetic() -> None:
     assert tuple(lane.name for lane in policy.lanes) == LANE_ORDER
     assert sum(lane.canary_rows for lane in policy.lanes) == 10_240
     assert sum((lane.token_share for lane in policy.lanes), Fraction()) == Fraction(1, 1)
-    assert policy.minimum_unique_prompts == 1_300_000
     assert tuple(gate.assistant_loss_tokens for gate in policy.gates) == (
         256_000_000,
         1_000_000_000,
@@ -143,7 +143,6 @@ class FromScratchStudyPolicy:
     scientific_identity: str
     target_repository: str
     target_revision: str
-    minimum_unique_prompts: int
     seed: int
     lanes: tuple[LanePolicy, ...]
     gates: tuple[TokenGate, ...]
@@ -684,14 +683,12 @@ def test_short_lane_emits_capacity_blocker_without_redistribution() -> None:
     assert reserve.count("general_tool") == sum(row.lane == "general_tool" for row in available)
 
 
-def test_m_reserve_requires_the_policy_minimum_unique_prompts() -> None:
-    small_policy = replace(policy(), minimum_unique_prompts=13)
-    reserve = build_m_synth_reserve(
-        small_policy, candidates(total_unique=12), exclusions()
-    )
-    assert reserve.publishable is False
-    blocker = next(item for item in reserve.blockers if item.lane == "__all__")
-    assert blocker.required_unique_rows == 13
+def test_m_reserve_reports_every_domain_without_a_global_row_floor() -> None:
+    available = candidates(total_unique=12)
+    reserve = build_m_synth_reserve(policy(), available, exclusions())
+    assert sum(item.eligible_rows for item in reserve.capacities) == 12
+    assert {item.lane for item in reserve.capacities} == set(LANE_ORDER)
+    assert all(item.required_unique_rows == 0 for item in reserve.capacities)
 ```
 
 - [ ] **Step 2: Run reserve tests and verify RED**
@@ -777,7 +774,15 @@ def reserve_rank(policy_sha256: str, seed: int, candidate: PromptCandidate) -> s
     )
 ```
 
-Sort M-synth independently per lane by `(rank_sha256, prompt_uuid)`. Deduplicate its prompt UUID and normalized row identity before admission, and require at least 1,300,000 unique eligible prompts across lanes. For multilingual, enforce the exact per-language canary allocation in the global constraints. H reserves do not deduplicate historical occurrences: they retain the exact authenticated order, require exactly 1,300,000 occurrences, and report both occurrence and unique-prompt counts.
+Sort M-synth independently per lane by `(rank_sha256, prompt_uuid)`. Deduplicate
+its prompt UUID and normalized row identity before admission, but impose no
+global row minimum or maximum. Retain every eligible candidate in the prompt
+inventory so the synthesis stage can consume as many rows as each token gate
+requires. Report eligible counts per lane and per multilingual language. For
+multilingual, enforce the exact per-language canary allocation in the global
+constraints. H reserves do not deduplicate historical occurrences: they retain
+the exact authenticated order, require exactly 1,300,000 occurrences, and
+report both occurrence and unique-prompt counts.
 
 - [ ] **Step 4: Run reserve and inventory GREEN tests**
 
