@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import os
 import shutil
 import subprocess
@@ -585,6 +586,15 @@ raise SystemExit(namespace["main"]())
     assert support.json.loads(output.read_bytes())["runtime"] == support._TEST_RUNTIME
 
 
+def test_linux_production_gate_cannot_skip_missing_runtime() -> None:
+    """A designated Linux gate must fail if its approved runtime closure is absent."""
+    source = inspect.getsource(
+        test_linux_production_bootstrap_executes_exact_artifacts_without_guard_bypass
+    )
+
+    assert "pytest.skip" not in source
+
+
 @pytest.mark.skipif(
     sys.platform != "linux", reason="production runtime identity uses /proc/self/exe"
 )
@@ -593,8 +603,7 @@ def test_linux_production_bootstrap_executes_exact_artifacts_without_guard_bypas
 ) -> None:
     """Linux executes the held exact artifacts through all production runtime guards."""
     approved_python = Path("/usr/bin/python3.12")
-    if not approved_python.is_file():
-        pytest.skip("approved production Python is unavailable")
+    assert approved_python.is_file(), "approved production Python is unavailable"
     probe = subprocess.run(
         [
             str(approved_python),
@@ -607,10 +616,14 @@ def test_linux_production_bootstrap_executes_exact_artifacts_without_guard_bypas
                 "for k in ('purelib','platlib')) else 1)"
             ),
         ],
+        text=True,
+        capture_output=True,
         check=False,
     )
-    if probe.returncode != 0:
-        pytest.skip("approved production PyArrow runtime is unavailable")
+    assert probe.returncode == 0, (
+        "approved production PyArrow runtime is unavailable: "
+        f"stdout={probe.stdout!r} stderr={probe.stderr!r}"
+    )
     support = _load_observer_test_support()
     fixture = support.stage_inputs(tmp_path / "fixture")
     observer = tmp_path / "observe.py"
