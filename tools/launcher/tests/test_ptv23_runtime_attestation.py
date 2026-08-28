@@ -14,7 +14,8 @@ import os
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, replace
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from common.specdec import ptv23_runtime_attestation as module
@@ -32,10 +33,10 @@ from common.specdec.ptv23_runtime_attestation import (
     reconcile_runtime_receipts,
 )
 from common.specdec.q30t_runtime_archive_receipt import RuntimeArchiveTreeReceipt
+from common.specdec.q30t_runtime_identity import RuntimeTreeIdentity, runtime_tree_identity
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 
 def canonical(value: object) -> bytes:
@@ -46,17 +47,22 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def publish_model(path: Path, value: object) -> str:
+def publish_model(path: Path, value: Any) -> str:
     payload = value.to_dict() if hasattr(value, "to_dict") else asdict(value)
     path.write_bytes(canonical(payload) + b"\n")
     return file_sha256(path)
 
 
-def self_hash(body: dict[str, object]) -> str:
+def self_hash(body: object) -> str:
     return hashlib.sha256(canonical(body)).hexdigest()
 
 
-def make_archive_receipt(path: Path, *, source_commit: str = "a" * 40) -> tuple[Path, str]:
+def make_archive_receipt(
+    path: Path,
+    *,
+    runtime_identity: RuntimeTreeIdentity,
+    source_commit: str,
+) -> tuple[Path, str]:
     archive = path.parent / "runtime.tar.zst"
     producer = path.parent / "archive-producer.py"
     archive.write_bytes(b"runtime-archive")
@@ -67,10 +73,10 @@ def make_archive_receipt(path: Path, *, source_commit: str = "a" * 40) -> tuple[
         "archive_size": archive.stat().st_size,
         "producer_path": str(producer),
         "producer_sha256": file_sha256(producer),
-        "runtime_file_count": 8,
-        "runtime_symlink_count": 1,
-        "runtime_total_regular_bytes": 4096,
-        "runtime_tree_sha256": "b" * 64,
+        "runtime_file_count": runtime_identity.file_count,
+        "runtime_symlink_count": runtime_identity.symlink_count,
+        "runtime_total_regular_bytes": runtime_identity.total_regular_bytes,
+        "runtime_tree_sha256": runtime_identity.sha256,
         "schema_version": "q30t-runtime-archive-tree-v1",
         "sentinel_inventory_sha256": "c" * 64,
         "sentinel_paths": ["bin/python", "pyvenv.cfg"],
@@ -187,6 +193,14 @@ def make_observation(**overrides: object) -> RuntimeNodeObservation:
     return RuntimeNodeObservation.from_dict(body | {"observation_sha256": self_hash(body)})
 
 
+def rehash_observation(
+    observation: RuntimeNodeObservation, **overrides: object
+) -> RuntimeNodeObservation:
+    body = observation.body_dict()
+    body.update(overrides)
+    return RuntimeNodeObservation.from_dict(body | {"observation_sha256": self_hash(body)})
+
+
 def make_reuse(
     observation: RuntimeNodeObservation, **overrides: object
 ) -> RuntimeNodeReuseEvidence:
@@ -256,18 +270,53 @@ def runtime_fixture(
     source = asset_root / "source"
     (runtime / "lib/python3.12/site-packages").mkdir(parents=True, exist_ok=True)
     (source / "modelopt").mkdir(parents=True, exist_ok=True)
+    python_executable = runtime / "bin/python"
+    python_executable.parent.mkdir(parents=True, exist_ok=True)
+    python_executable.write_bytes(b"#!/usr/bin/env python3\n")
+    for package in ("accelerate", "datasets", "wandb"):
+        origin = runtime / f"lib/python3.12/site-packages/{package}/__init__.py"
+        origin.parent.mkdir(parents=True, exist_ok=True)
+        origin.write_bytes(f"{package}\n".encode())
+    (source / "modelopt/__init__.py").write_bytes(b"modelopt\n")
     tools = {}
     for name in ("contract", "runner", "keeper", "attestation"):
         tool = source / f"{name}.py"
         tool.write_bytes(name.encode())
         tools[name] = tool
+    if not (source / ".git").exists():
+        subprocess.run(("/usr/bin/git", "-C", str(source), "init", "-q"), check=True)
+        subprocess.run(("/usr/bin/git", "-C", str(source), "add", "--all"), check=True)
+        subprocess.run(
+            (
+                "/usr/bin/git",
+                "-C",
+                str(source),
+                "-c",
+                "user.name=Runtime Test",
+                "-c",
+                "user.email=runtime@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ),
+            check=True,
+        )
+    source_commit = subprocess.run(
+        ("/usr/bin/git", "-C", str(source), "rev-parse", "HEAD"),
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    runtime_identity = runtime_tree_identity(runtime)
     archive_receipt_path = (common_root or root) / "archive-receipt.json"
     archive_receipt_path.parent.mkdir(parents=True, exist_ok=True)
     if archive_receipt_path.exists():
         archive_receipt_file_sha256 = file_sha256(archive_receipt_path)
     else:
         archive_receipt_path, archive_receipt_file_sha256 = make_archive_receipt(
-            archive_receipt_path
+            archive_receipt_path,
+            runtime_identity=runtime_identity,
+            source_commit=source_commit,
         )
     archive_receipt = module.load_runtime_archive_tree_receipt(
         archive_receipt_path, archive_receipt_file_sha256
@@ -303,7 +352,7 @@ def runtime_fixture(
         observed_image_sha256=image_sha256,
         phase=phase,
         profile_file_sha256=file_sha256(profile),
-        python_executable=str(runtime / "bin/python"),
+        python_executable=str(python_executable),
         python_import_origins=[
             [
                 "accelerate",
@@ -316,6 +365,7 @@ def runtime_fixture(
         runner_sha256=file_sha256(tools["runner"]),
         runtime_tree_sha256=archive_receipt.runtime_tree_sha256,
         sentinel_inventory_sha256=archive_receipt.sentinel_inventory_sha256,
+        source_commit=source_commit,
         visible_gpu_identities=[
             f"GPU-{gpu_offset + index:04d}|NVIDIA GB200" for index in range(1, 5)
         ],
@@ -368,6 +418,81 @@ def test_node_attestation_binds_observed_runtime_and_keeper(tmp_path: Path) -> N
         load_runtime_node_receipt(tmp_path / "node.json", file_sha256(tmp_path / "node.json"))
         == receipt
     )
+
+
+@pytest.mark.parametrize("missing", ["python", "accelerate", "datasets", "modelopt", "wandb"])
+def test_node_attestation_requires_existing_python_runtime_files(
+    tmp_path: Path, missing: str
+) -> None:
+    fixture = runtime_fixture(tmp_path)
+    if missing == "python":
+        observation = rehash_observation(
+            fixture.inputs.observation,
+            python_executable=str(fixture.inputs.extracted_runtime_path / "bin/missing-python"),
+        )
+        message = "Python executable"
+    else:
+        origins = [list(item) for item in fixture.inputs.observation.python_import_origins]
+        for origin in origins:
+            if origin[0] == missing:
+                origin[1] = str(Path(origin[1]).with_name("missing.py"))
+        observation = rehash_observation(fixture.inputs.observation, python_import_origins=origins)
+        message = f"{missing} import origin"
+    inputs = replace(
+        fixture.inputs,
+        observation=observation,
+        reuse_evidence=make_reuse(observation),
+        keeper_loss_evidence=make_keeper_loss(observation),
+    )
+
+    with pytest.raises(AttestationError, match=message):
+        attest_runtime_node(inputs, output_path=tmp_path / "node.json", publication_job_id="unit")
+
+
+def test_node_attestation_authenticates_runtime_and_source_trees(tmp_path: Path) -> None:
+    changed_runtime = runtime_fixture(tmp_path / "runtime-changed")
+    changed_runtime.inputs.extracted_runtime_path.joinpath("bin/python").write_bytes(b"changed\n")
+    with pytest.raises(AttestationError, match="runtime tree"):
+        attest_runtime_node(
+            changed_runtime.inputs,
+            output_path=tmp_path / "runtime-node.json",
+            publication_job_id="runtime",
+        )
+
+    changed_source = runtime_fixture(tmp_path / "source-changed")
+    (changed_source.inputs.source_checkout / "untracked.txt").write_bytes(b"untracked\n")
+    with pytest.raises(AttestationError, match="source checkout"):
+        attest_runtime_node(
+            changed_source.inputs,
+            output_path=tmp_path / "source-node.json",
+            publication_job_id="source",
+        )
+
+    changed_commit = runtime_fixture(tmp_path / "source-commit-changed")
+    source_root = changed_commit.inputs.source_checkout
+    (source_root / "modelopt/__init__.py").write_bytes(b"new commit\n")
+    subprocess.run(("/usr/bin/git", "-C", str(source_root), "add", "--all"), check=True)
+    subprocess.run(
+        (
+            "/usr/bin/git",
+            "-C",
+            str(source_root),
+            "-c",
+            "user.name=Runtime Test",
+            "-c",
+            "user.email=runtime@example.invalid",
+            "commit",
+            "-qm",
+            "changed",
+        ),
+        check=True,
+    )
+    with pytest.raises(AttestationError, match="source checkout"):
+        attest_runtime_node(
+            changed_commit.inputs,
+            output_path=tmp_path / "source-commit-node.json",
+            publication_job_id="source-commit",
+        )
 
 
 @pytest.mark.parametrize(
@@ -450,6 +575,7 @@ def test_proof_evidence_rejects_false_boolean(factory: Callable[..., object], fi
         ({"visible_gpu_identities": ["GPU-x|GB200"] * 4}, "GPU"),
         ({"visible_gpu_count": 3}, "GPU"),
         ({"cuda_visible_devices": "0,0,1,2"}, "CUDA"),
+        ({"cuda_visible_devices": "0, 0,1,2"}, "CUDA"),
         ({"observed_image_sha256": "9" * 64}, "image"),
         ({"anchor_target": "/proc/999/fd/17"}, "anchor target"),
         ({"python_version": "3.12\nforged"}, "control"),
@@ -545,6 +671,92 @@ def reconcile_one(
         publication_job_id=node.receipt.job_id,
     )
     return receipt, path, file_sha256(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("job_id", "unit\nforged"),
+        ("ordered_nodes", ["ptyche-n001\nforged"]),
+        ("ordered_nodes", ["n" * 4097]),
+    ],
+)
+def test_qualification_rejects_unbounded_job_and_node_identities(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    node = make_node(
+        tmp_path,
+        node="ptyche-n001",
+        keeper_pid=91,
+        anchor_inode=191,
+        gpu_offset=0,
+        phase="one-node",
+        job_id="unit-one",
+    )
+    qualification, _, _ = reconcile_one(tmp_path, node)
+    body = qualification.body_dict()
+    body[field] = value
+    if field == "ordered_nodes":
+        nodes = cast("list[str]", value)
+        receipt_hashes = cast("list[str]", body["ordered_node_receipt_file_sha256s"])
+        body["ordered_node_receipts_sha256"] = self_hash(
+            [
+                {
+                    "node_name": nodes[0],
+                    "receipt_file_sha256": receipt_hashes[0],
+                }
+            ]
+        )
+
+    with pytest.raises(AttestationError, match=r"control|bounded"):
+        module.RuntimeQualificationReceipt.from_dict(body | {"receipt_sha256": self_hash(body)})
+
+
+def test_reconciliation_rejects_control_node_before_set_comparison(tmp_path: Path) -> None:
+    node = make_node(
+        tmp_path,
+        node="ptyche-n001",
+        keeper_pid=91,
+        anchor_inode=191,
+        gpu_offset=0,
+        phase="one-node",
+        job_id="unit-one",
+    )
+    with pytest.raises(AttestationError, match="control"):
+        reconcile_runtime_receipts(
+            receipts=(node.receipt,),
+            receipt_file_sha256s=(node.file_sha256,),
+            expected_nodes=("ptyche-n001\nforged",),
+            context=one_node_context(node, tmp_path),
+            output_path=tmp_path / "aggregate.json",
+            publication_job_id="unit-one",
+        )
+
+
+def test_node_reference_list_rejects_cardinality_before_loading_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    references = [
+        {
+            "node_name": f"ptyche-n00{index}",
+            "path": str(tmp_path / f"node-{index}.json"),
+            "sha256": f"{index}" * 64,
+        }
+        for index in (1, 2, 3)
+    ]
+    reference_path = tmp_path / "references.json"
+    reference_path.write_bytes(canonical(references) + b"\n")
+    loaded: list[Path] = []
+
+    def forbidden_load(path: Path, expected_file_sha256: str) -> None:
+        del expected_file_sha256
+        loaded.append(path)
+        raise AssertionError("referenced receipt loaded before cardinality validation")
+
+    monkeypatch.setattr(module, "load_runtime_node_receipt", forbidden_load)
+    with pytest.raises(AttestationError, match="one or two"):
+        module._load_node_receipt_list(reference_path, None)
+    assert loaded == []
 
 
 def two_node_context(
@@ -926,6 +1138,26 @@ def test_publication_adopts_only_exact_bytes(tmp_path: Path) -> None:
         attest_runtime_node(fixture.inputs, output_path=output, publication_job_id="third")
 
 
+def test_publication_rejects_intermediate_symlink_without_foreign_mutation(
+    tmp_path: Path,
+) -> None:
+    fixture = runtime_fixture(tmp_path / "fixture")
+    lexical = tmp_path / "lexical"
+    foreign = tmp_path / "foreign"
+    lexical.mkdir()
+    foreign.mkdir()
+    (lexical / "redirect").symlink_to(foreign, target_is_directory=True)
+
+    with pytest.raises((AttestationError, OSError)):
+        attest_runtime_node(
+            fixture.inputs,
+            output_path=lexical / "redirect/nested/node.json",
+            publication_job_id="symlink",
+        )
+
+    assert list(foreign.iterdir()) == []
+
+
 def test_exact_adoption_does_not_bypass_publication_job_validation(tmp_path: Path) -> None:
     fixture = runtime_fixture(tmp_path)
     output = tmp_path / "node.json"
@@ -946,7 +1178,7 @@ def test_publication_does_not_adopt_after_unrelated_failure(
     def fail(*args: object, **kwargs: object) -> None:
         raise PermissionError("publication parent denied")
 
-    monkeypatch.setattr(module, "atomic_publish_bytes", fail)
+    monkeypatch.setattr(module, "_publish_fresh_at", fail)
     with pytest.raises(PermissionError, match="denied"):
         attest_runtime_node(
             fixture.inputs, output_path=tmp_path / "node.json", publication_job_id="fail"

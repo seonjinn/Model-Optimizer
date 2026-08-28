@@ -13,6 +13,7 @@ import re
 import stat
 import sys
 import unicodedata
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -22,7 +23,8 @@ from common.specdec.q30t_runtime_archive_receipt import (
     RuntimeArchiveTreeReceipt,
     load_runtime_archive_tree_receipt,
 )
-from common.specdec.qwen4b_b_atomic import atomic_publish_bytes
+from common.specdec.q30t_runtime_identity import runtime_tree_identity
+from common.specdec.qwen4b_b_atomic import _native_rename_no_replace
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -461,6 +463,7 @@ def _validate_observation(value: RuntimeNodeObservation) -> None:
         len(visible_devices) != 4
         or len(set(visible_devices)) != 4
         or any(not device.strip() for device in visible_devices)
+        or any(device != device.strip() for device in visible_devices)
     ):
         raise AttestationError("runtime observation CUDA visibility must name four unique devices")
     if value.visible_gpu_count != 4:
@@ -977,6 +980,9 @@ class RuntimeQualificationReceipt:
             raise AttestationError("qualification receipt schema version is invalid")
         if self.phase not in {"one-node", "two-node"} or self.cluster != "ptyche":
             raise AttestationError("qualification phase or cluster is invalid")
+        _require_bounded_text(self.job_id, "qualification job identity")
+        for node_name in self.ordered_nodes:
+            _require_bounded_text(node_name, "qualification node identity")
         expected_count = 1 if self.phase == "one-node" else 2
         if self.expected_node_count != expected_count:
             raise AttestationError("qualification node count does not match phase")
@@ -1278,14 +1284,76 @@ def _cross_replay_node_inputs(inputs: RuntimeNodeAttestationInput) -> None:
         inputs.extracted_runtime_path, "extracted runtime"
     )
     source_root = _require_canonical_absolute_path(inputs.source_checkout, "source checkout")
-    if not _is_within(Path(observation.python_executable), runtime_root):
+    python_executable = _require_canonical_absolute_path(
+        observation.python_executable, "Python executable"
+    )
+    if not _is_within(python_executable, runtime_root):
         raise AttestationError("Python executable is outside the extracted runtime")
     origins = dict(observation.python_import_origins)
-    if not _is_within(Path(origins["modelopt"]), source_root):
+    origin_paths = {
+        name: _require_canonical_absolute_path(path, f"{name} import origin")
+        for name, path in origins.items()
+    }
+    if not _is_within(origin_paths["modelopt"], source_root):
         raise AttestationError("modelopt import origin is outside the source checkout")
     for name in ("accelerate", "datasets", "wandb"):
-        if not _is_within(Path(origins[name]), runtime_root):
+        if not _is_within(origin_paths[name], runtime_root):
             raise AttestationError(f"{name} import origin is outside the extracted runtime")
+    try:
+        runtime_identity = runtime_tree_identity(runtime_root)
+    except (OSError, ValueError) as error:
+        raise AttestationError("extracted runtime tree cannot be authenticated") from error
+    if (
+        runtime_identity.sha256 != observation.runtime_tree_sha256
+        or runtime_identity.file_count != archive_receipt.runtime_file_count
+        or runtime_identity.symlink_count != archive_receipt.runtime_symlink_count
+        or runtime_identity.total_regular_bytes != archive_receipt.runtime_total_regular_bytes
+    ):
+        raise AttestationError("extracted runtime tree identity mismatch")
+    _authenticate_source_checkout(source_root, observation.source_commit)
+    try:
+        _stable_file_sha256(python_executable, maximum_bytes=_MAX_TOOL_BYTES)
+    except (AttestationError, OSError) as error:
+        raise AttestationError(
+            "Python executable is not a stable single-link regular file"
+        ) from error
+    for name, origin in origin_paths.items():
+        _authenticate_import_origin(name, origin)
+
+
+def _authenticate_import_origin(name: str, origin: Path) -> None:
+    try:
+        _stable_file_sha256(origin, maximum_bytes=_MAX_TOOL_BYTES)
+    except (AttestationError, OSError) as error:
+        raise AttestationError(
+            f"{name} import origin is not a stable single-link regular file"
+        ) from error
+
+
+def _authenticate_source_checkout(source_root: Path, expected_commit: str) -> None:
+    from common.specdec.q30t_ptv23_continuation import _source_checkout_identity
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = _open_absolute_directory(source_root, directory_flags)
+    try:
+        _require_stable_directory_path(source_root, descriptor, "authenticating source checkout")
+        try:
+            tree_oid, inventory_sha256 = _source_checkout_identity(
+                source_root, expected_commit=expected_commit
+            )
+        except (OSError, ValueError) as error:
+            raise AttestationError("source checkout identity mismatch") from error
+        if not _is_lower_hex(tree_oid, 40) or not _is_lower_hex(inventory_sha256, 64):
+            raise AttestationError("source checkout identity is invalid")
+        _require_stable_directory_path(source_root, descriptor, "authenticating source checkout")
+    finally:
+        os.close(descriptor)
 
 
 def _match_reuse_evidence(
@@ -1344,6 +1412,8 @@ def reconcile_runtime_receipts(
     expected_count = 1 if context.phase == "one-node" else 2
     if len(receipts) != expected_count or len(expected_nodes) != expected_count:
         raise AttestationError("qualification node set has a missing or extra node")
+    for node_name in expected_nodes:
+        _require_bounded_text(node_name, "qualification expected node identity")
     if len(set(expected_nodes)) != expected_count:
         raise AttestationError("qualification expected node set contains duplicates")
     if {receipt.node_name for receipt in receipts} != set(expected_nodes):
@@ -1697,6 +1767,8 @@ def _load_keeper_receipt(path: Path, expected_file_sha256: str) -> KeeperReceipt
     )
     if receipt.schema_version != "ptv23-node-keeper-v1":
         raise AttestationError("keeper receipt schema is invalid")
+    _require_bounded_text(receipt.job_id, "keeper job identity")
+    _require_bounded_text(receipt.node_name, "keeper node identity")
     if receipt.keeper_pid <= 0 or receipt.keeper_start_ticks < 0:
         raise AttestationError("keeper receipt process identity is invalid")
     _require_hash(receipt.receipt_sha256, "keeper receipt")
@@ -1859,29 +1931,159 @@ def _require_stable_name(
         raise AttestationError(f"attestation input changed while {phase}: {path}")
 
 
-def _adopt_exact(path: Path, expected: bytes) -> None:
+def _open_or_create_absolute_directory(path: Path, flags: int) -> int:
+    descriptor = os.open(Path("/"), flags)
     try:
-        observed, _ = stable_single_link_bytes(path, maximum_bytes=len(expected))
+        for component in path.parts[1:]:
+            try:
+                named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            child = os.open(component, flags, dir_fd=descriptor)
+            opened = os.fstat(child)
+            if not stat.S_ISDIR(named.st_mode) or _directory_identity(named) != _directory_identity(
+                opened
+            ):
+                os.close(child)
+                raise AttestationError(f"attestation output directory changed: {path}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _require_stable_directory_path(path: Path, descriptor: int, phase: str) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    rebound: int | None = None
+    try:
+        rebound = _open_absolute_directory(path, flags)
+        if _directory_identity(os.fstat(rebound)) != _directory_identity(os.fstat(descriptor)):
+            raise AttestationError(f"attestation output directory changed while {phase}: {path}")
+    finally:
+        if rebound is not None:
+            os.close(rebound)
+
+
+def _adopt_exact_at(parent_fd: int, name: str, expected: bytes, path: Path) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor: int | None = None
+    try:
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _file_identity(named) != _file_identity(opened)
+        ):
+            raise AttestationError("published output is not the expected single-link regular file")
+        observed = bytearray()
+        while len(observed) <= len(expected):
+            block = os.read(descriptor, min(1024 * 1024, len(expected) + 1 - len(observed)))
+            if not block:
+                break
+            observed.extend(block)
+        after = os.fstat(descriptor)
+        rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not (_file_identity(opened) == _file_identity(after) == _file_identity(rebound)):
+            raise AttestationError("published output changed while adopting")
     except (AttestationError, OSError) as error:
         raise FileExistsError(f"runtime attestation cannot adopt existing path: {path}") from error
-    if observed != expected:
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if bytes(observed) != expected:
         raise FileExistsError(f"runtime attestation existing bytes differ: {path}")
+
+
+def _publish_fresh_at(
+    parent_fd: int,
+    destination: Path,
+    payload: bytes,
+    *,
+    publication_job_id: str,
+) -> None:
+    partial = destination.with_name(f".{destination.name}.partial-{publication_job_id}")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(partial.name, flags, 0o600, dir_fd=parent_fd)
+    try:
+        created = os.fstat(descriptor)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written < 1:
+                raise AttestationError("runtime attestation partial write stalled")
+            view = view[written:]
+        os.fsync(descriptor)
+        named = os.stat(partial.name, dir_fd=parent_fd, follow_symlinks=False)
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (created.st_dev, created.st_ino) != (after.st_dev, after.st_ino)
+            or _file_identity(named) != _file_identity(after)
+        ):
+            raise AttestationError("runtime attestation partial changed before publication")
+    finally:
+        os.close(descriptor)
+    _native_rename_no_replace(partial, destination, parent_fd=parent_fd)
+    _adopt_exact_at(parent_fd, destination.name, payload, destination)
+    os.fsync(parent_fd)
 
 
 def _publish_or_adopt(path: Path, payload: bytes, *, publication_job_id: str) -> None:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", publication_job_id) is None:
         raise ValueError("runtime attestation publication job identity is unsafe")
-    if os.path.lexists(path):
-        _adopt_exact(path, payload)
-        return
+    destination = Path(os.path.abspath(path))
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_fd = _open_or_create_absolute_directory(destination.parent, directory_flags)
     try:
-        atomic_publish_bytes(path, payload, job_id=publication_job_id)
-    except FileExistsError:
-        if not os.path.lexists(path):
-            raise
-        _adopt_exact(path, payload)
-        return
-    _adopt_exact(path, payload)
+        _require_stable_directory_path(destination.parent, parent_fd, "opening")
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                _publish_fresh_at(
+                    parent_fd,
+                    destination,
+                    payload,
+                    publication_job_id=publication_job_id,
+                )
+            except FileExistsError:
+                _adopt_exact_at(parent_fd, destination.name, payload, destination)
+        else:
+            _adopt_exact_at(parent_fd, destination.name, payload, destination)
+        _require_stable_directory_path(destination.parent, parent_fd, "publishing")
+    finally:
+        os.close(parent_fd)
 
 
 def _require_python_runtime() -> None:
@@ -2128,6 +2330,8 @@ def _load_node_receipt_list(
     decoded = _decode_json(raw, "node receipt list")
     if not isinstance(decoded, list):
         raise AttestationError("node receipt list must be an array")
+    if len(decoded) not in {1, 2}:
+        raise AttestationError("node receipt list must contain exactly one or two references")
     receipts: list[RuntimeNodeAttestationReceipt] = []
     hashes: list[str] = []
     nodes: list[str] = []
@@ -2138,6 +2342,7 @@ def _load_node_receipt_list(
             "node receipt reference",
         )
         node = _required_text(item, "node_name")
+        _require_bounded_text(node, "node receipt reference identity")
         receipt_path = Path(_required_text(item, "path"))
         file_sha256 = _required_text(item, "sha256")
         receipt = load_runtime_node_receipt(receipt_path, file_sha256)
