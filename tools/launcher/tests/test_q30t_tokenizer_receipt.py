@@ -255,6 +255,7 @@ def _tokenizer_runner_environment(
 def _tokenizer_runner_command(environment: dict[str, str]) -> list[str]:
     return [
         "/bin/bash",
+        "-p",
         str(RUNNER_PATH),
         environment["SOURCE_PATH"],
         environment["SOURCE_SHA"],
@@ -403,32 +404,33 @@ def test_q30t_tokenizer_runner_requires_slurm_export_none_boundary(tmp_path: Pat
     assert not calls.exists()
 
 
-def test_q30t_tokenizer_runner_strips_ptyche_debuginfod_environment() -> None:
-    """Ptyche's site-injected debuginfod setting does not reject an export-none job."""
+def test_q30t_tokenizer_runner_requires_bash_privileged_mode() -> None:
+    """Direct non-privileged Bash invocation cannot enter the receipt boundary."""
     result = subprocess.run(
         ["/bin/bash", str(RUNNER_PATH)],
-        env={
-            "DEBUGINFOD_URLS": "https://debuginfod.ubuntu.com",
-            "SLURM_EXPORT_ENV": "NONE",
-        },
+        env={},
         check=False,
         capture_output=True,
         text=True,
     )
 
     assert result.returncode == 2
-    assert "usage:" in result.stderr
-    assert "unexpected exported environment variable" not in result.stderr
+    assert "requires Bash privileged mode" in result.stderr
 
 
-def test_q30t_tokenizer_runner_accepts_only_ptyche_batch_environment_marker() -> None:
-    """Ptyche's literal BATCH marker is the reviewed Slurm batch-job baseline."""
+def test_q30t_tokenizer_runner_strips_standard_ptyche_batch_environment() -> None:
+    """Standard site, login, and unknown benign state is cleared at the job boundary."""
     result = subprocess.run(
-        ["/bin/bash", str(RUNNER_PATH)],
+        ["/bin/bash", "-p", str(RUNNER_PATH)],
         env={
             "DEBUGINFOD_URLS": "https://debuginfod.ubuntu.com",
             "ENVIRONMENT": "BATCH",
+            "HOME": "/home/sna",
+            "LOGNAME": "sna",
+            "PATH": "/usr/bin:/bin",
+            "Q30T_UNKNOWN_SITE_STATE": "injected",
             "SLURM_EXPORT_ENV": "NONE",
+            "USER": "sna",
         },
         check=False,
         capture_output=True,
@@ -440,11 +442,18 @@ def test_q30t_tokenizer_runner_accepts_only_ptyche_batch_environment_marker() ->
     assert "unexpected exported environment variable" not in result.stderr
 
 
-def test_q30t_tokenizer_runner_rejects_nonbatch_environment_marker() -> None:
-    """A non-batch site marker cannot widen the export-none boundary."""
+def test_q30t_tokenizer_runner_fails_closed_when_exported_state_is_readonly() -> None:
+    """An ambient variable that Bash cannot clear aborts before external code."""
     result = subprocess.run(
-        ["/bin/bash", str(RUNNER_PATH)],
-        env={"ENVIRONMENT": "INTERACTIVE", "SLURM_EXPORT_ENV": "NONE"},
+        [
+            "/bin/bash",
+            "-p",
+            "-c",
+            'export HOME=/home/sna SLURM_EXPORT_ENV=NONE; readonly HOME; source "$1"',
+            "q30t-tokenizer-test",
+            str(RUNNER_PATH),
+        ],
+        env={},
         check=False,
         capture_output=True,
         text=True,
@@ -452,20 +461,51 @@ def test_q30t_tokenizer_runner_rejects_nonbatch_environment_marker() -> None:
 
     assert result.returncode == 2
     assert "usage:" not in result.stderr
+    assert "cannot clear exported environment variable: HOME" in result.stderr
 
 
-def test_q30t_tokenizer_runner_still_rejects_unknown_site_environment() -> None:
-    """Only explicitly reviewed site state may cross the export-none boundary."""
+@pytest.mark.parametrize(
+    ("name", "marker"),
+    [("compgen", "COMPGEN_MARKER"), ("unset", "UNSET_MARKER")],
+)
+def test_q30t_tokenizer_runner_rejects_imported_boundary_functions(name: str, marker: str) -> None:
+    """Imported functions cannot execute or shadow the pre-exec environment boundary."""
     result = subprocess.run(
-        ["/bin/bash", str(RUNNER_PATH)],
-        env={"Q30T_UNKNOWN_SITE_STATE": "injected", "SLURM_EXPORT_ENV": "NONE"},
+        ["/bin/bash", "-p", str(RUNNER_PATH)],
+        env={
+            f"BASH_FUNC_{name}%%": f"() {{ printf {marker} >&2; }}",
+            "SLURM_EXPORT_ENV": "NONE",
+        },
         check=False,
         capture_output=True,
         text=True,
     )
 
     assert result.returncode == 2
-    assert "unexpected exported environment variable" in result.stderr
+    assert marker not in result.stderr
+    assert "prohibited exported environment variable" in result.stderr
+
+
+def test_q30t_tokenizer_runner_rejects_an_existing_function_namespace() -> None:
+    """Sourcing from a privileged shell with existing functions fails before execution."""
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-p",
+            "-c",
+            'compgen() { printf FUNCTION_MARKER >&2; }; source "$1"',
+            "q30t-tokenizer-test",
+            str(RUNNER_PATH),
+        ],
+        env={},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "FUNCTION_MARKER" not in result.stderr
+    assert "imported shell functions are prohibited" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -1163,7 +1203,7 @@ def test_q30t_tokenizer_runner_is_one_node_ptyche_cpu_only_and_checks_identities
     assert "#SBATCH --nodes=1" in runner
     assert "#SBATCH --gpus" not in runner
     assert "#SBATCH --gres" not in runner
-    assert runner.startswith("#!/bin/bash\n")
+    assert runner.startswith("#!/bin/bash -p\n")
     assert " -S -I -c " in runner
     assert 'readonly approved_env="/usr/bin/env"' in runner
     assert "stat.S_ISLNK(entry.st_mode)" in runner

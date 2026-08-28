@@ -160,6 +160,7 @@ def _runner_environment(tmp_path: Path, repo: Path, commit: str) -> tuple[dict[s
 def _runner_command(environment: dict[str, str]) -> list[str]:
     return [
         BASH,
+        "-p",
         str(RUNNER),
         environment["REPO_ROOT"],
         environment["SOURCE_COMMIT"],
@@ -309,32 +310,33 @@ def test_parent_runner_requires_slurm_export_none_boundary(tmp_path: Path) -> No
     assert not calls.exists()
 
 
-def test_parent_runner_strips_ptyche_debuginfod_environment() -> None:
-    """Ptyche's site-injected debuginfod setting does not reject an export-none job."""
+def test_parent_runner_requires_bash_privileged_mode() -> None:
+    """Direct non-privileged Bash invocation cannot enter the receipt boundary."""
     result = subprocess.run(
         [BASH, str(RUNNER)],
-        env={
-            "DEBUGINFOD_URLS": "https://debuginfod.ubuntu.com",
-            "SLURM_EXPORT_ENV": "NONE",
-        },
+        env={},
         check=False,
         capture_output=True,
         text=True,
     )
 
     assert result.returncode == 2
-    assert "usage:" in result.stderr
-    assert "unexpected exported environment variable" not in result.stderr
+    assert "requires Bash privileged mode" in result.stderr
 
 
-def test_parent_runner_accepts_only_ptyche_batch_environment_marker() -> None:
-    """Ptyche's literal BATCH marker is the reviewed Slurm batch-job baseline."""
+def test_parent_runner_strips_standard_ptyche_batch_environment() -> None:
+    """Standard site, login, and unknown benign state is cleared at the job boundary."""
     result = subprocess.run(
-        [BASH, str(RUNNER)],
+        [BASH, "-p", str(RUNNER)],
         env={
             "DEBUGINFOD_URLS": "https://debuginfod.ubuntu.com",
             "ENVIRONMENT": "BATCH",
+            "HOME": "/home/sna",
+            "LOGNAME": "sna",
+            "PATH": "/usr/bin:/bin",
+            "Q30T_UNKNOWN_SITE_STATE": "injected",
             "SLURM_EXPORT_ENV": "NONE",
+            "USER": "sna",
         },
         check=False,
         capture_output=True,
@@ -346,11 +348,18 @@ def test_parent_runner_accepts_only_ptyche_batch_environment_marker() -> None:
     assert "unexpected exported environment variable" not in result.stderr
 
 
-def test_parent_runner_rejects_nonbatch_environment_marker() -> None:
-    """A non-batch site marker cannot widen the export-none boundary."""
+def test_parent_runner_fails_closed_when_exported_state_is_readonly() -> None:
+    """An ambient variable that Bash cannot clear aborts before external code."""
     result = subprocess.run(
-        [BASH, str(RUNNER)],
-        env={"ENVIRONMENT": "INTERACTIVE", "SLURM_EXPORT_ENV": "NONE"},
+        [
+            BASH,
+            "-p",
+            "-c",
+            'export HOME=/home/sna SLURM_EXPORT_ENV=NONE; readonly HOME; source "$1"',
+            "q30t-parent-test",
+            str(RUNNER),
+        ],
+        env={},
         check=False,
         capture_output=True,
         text=True,
@@ -358,20 +367,51 @@ def test_parent_runner_rejects_nonbatch_environment_marker() -> None:
 
     assert result.returncode == 2
     assert "usage:" not in result.stderr
+    assert "cannot clear exported environment variable: HOME" in result.stderr
 
 
-def test_parent_runner_still_rejects_unknown_site_environment() -> None:
-    """Only explicitly reviewed site state may cross the export-none boundary."""
+@pytest.mark.parametrize(
+    ("name", "marker"),
+    [("compgen", "COMPGEN_MARKER"), ("unset", "UNSET_MARKER")],
+)
+def test_parent_runner_rejects_imported_boundary_functions(name: str, marker: str) -> None:
+    """Imported functions cannot execute or shadow the pre-exec environment boundary."""
     result = subprocess.run(
-        [BASH, str(RUNNER)],
-        env={"Q30T_UNKNOWN_SITE_STATE": "injected", "SLURM_EXPORT_ENV": "NONE"},
+        [BASH, "-p", str(RUNNER)],
+        env={
+            f"BASH_FUNC_{name}%%": f"() {{ printf {marker} >&2; }}",
+            "SLURM_EXPORT_ENV": "NONE",
+        },
         check=False,
         capture_output=True,
         text=True,
     )
 
     assert result.returncode == 2
-    assert "unexpected exported environment variable" in result.stderr
+    assert marker not in result.stderr
+    assert "prohibited exported environment variable" in result.stderr
+
+
+def test_parent_runner_rejects_an_existing_function_namespace() -> None:
+    """Sourcing from a privileged shell with existing functions fails before execution."""
+    result = subprocess.run(
+        [
+            BASH,
+            "-p",
+            "-c",
+            'compgen() { printf FUNCTION_MARKER >&2; }; source "$1"',
+            "q30t-parent-test",
+            str(RUNNER),
+        ],
+        env={},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "FUNCTION_MARKER" not in result.stderr
+    assert "imported shell functions are prohibited" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -440,7 +480,7 @@ def test_parent_runner_uses_one_cpu_node_and_defers_hashes_to_the_cli(tmp_path: 
     repo, commit = _pushed_checkout(tmp_path)
     environment, calls = _runner_environment(tmp_path, repo, commit)
     runner = RUNNER.read_text(encoding="utf-8")
-    assert runner.startswith("#!/bin/bash\n")
+    assert runner.startswith("#!/bin/bash -p\n")
     assert " -S -I -c " in runner
     assert 'readonly approved_env="/usr/bin/env"' in runner
     assert "stat.S_ISLNK(entry.st_mode)" in runner

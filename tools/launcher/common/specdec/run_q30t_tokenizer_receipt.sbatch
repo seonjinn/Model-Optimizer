@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -p
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,44 +14,62 @@
 set -euo pipefail
 LC_ALL=C
 
+[[ "$-" == *p* ]] || {
+    builtin printf '%s\n' "Q30 tokenizer receipt requires Bash privileged mode" >&2
+    builtin exit 2
+}
+if builtin compgen -A function >/dev/null; then
+    builtin printf '%s\n' "imported shell functions are prohibited" >&2
+    builtin exit 2
+fi
+
 reject_prohibited_environment() {
     local exported_name
-    while IFS= read -r exported_name; do
+    while IFS= builtin read -r exported_name; do
         case "$exported_name" in
-            BASH_ENV|ENV|CDPATH|GLOBIGNORE|SHELLOPTS|BASHOPTS|LD_*|DYLD_*|PYTHON*|PERL5LIB|RUBYLIB|GIT_*|SSH_ASKPASS|SSH_ASKPASS_REQUIRE)
+            BASH_ENV|ENV|BASH_FUNC_*|CDPATH|GLOBIGNORE|SHELLOPTS|BASHOPTS|LD_*|DYLD_*|PYTHON*|PERL5LIB|RUBYLIB|GIT_*|SSH_ASKPASS|SSH_ASKPASS_REQUIRE)
                 echo "prohibited exported environment variable: $exported_name" >&2
                 return 2
                 ;;
         esac
-    done < <(compgen -e)
+    done < <(builtin compgen -e)
 }
 
-require_reserved_environment() {
+clear_exported_environment() {
     local exported_name
-    while IFS= read -r exported_name; do
-        case "$exported_name" in
-            PWD|SHLVL|_|SLURM_*|SPANK_*) ;;
-            *)
-                echo "unexpected exported environment variable under --export=NONE: $exported_name" >&2
-                return 2
-                ;;
-        esac
-    done < <(compgen -e)
+    while IFS= builtin read -r exported_name; do
+        builtin unset -v "$exported_name" || {
+            echo "cannot clear exported environment variable: $exported_name" >&2
+            return 2
+        }
+    done < <(builtin compgen -e)
+    if builtin compgen -e >/dev/null; then
+        echo "exported environment remains after clearing" >&2
+        return 2
+    fi
 }
 
 [[ "${SLURM_EXPORT_ENV:-}" == NONE ]] || {
     echo "Q30 tokenizer receipt requires the Slurm --export=NONE boundary" >&2
     exit 2
 }
-if [[ -n "${ENVIRONMENT+x}" ]]; then
-    [[ "$ENVIRONMENT" == BATCH ]] || {
-        echo "unexpected ENVIRONMENT under --export=NONE" >&2
-        exit 2
-    }
-    unset -v ENVIRONMENT
-fi
-unset -v DEBUGINFOD_URLS
 reject_prohibited_environment
+readonly slurm_job_id="${SLURM_JOB_ID:-}"
+readonly slurm_nnodes="${SLURM_NNODES:-}"
+readonly slurm_cpus_per_task="${SLURM_CPUS_PER_TASK:-}"
+readonly slurm_job_gpus="${SLURM_JOB_GPUS:-}"
+readonly slurm_step_gpus="${SLURM_STEP_GPUS:-}"
+readonly slurm_gpus_on_node="${SLURM_GPUS_ON_NODE:-}"
+readonly slurm_gpus="${SLURM_GPUS:-}"
+readonly slurm_gpus_per_node="${SLURM_GPUS_PER_NODE:-}"
+readonly slurm_gpus_per_task="${SLURM_GPUS_PER_TASK:-}"
+readonly slurm_tres_per_node="${SLURM_TRES_PER_NODE:-}"
+readonly q30t_test_allow_system_executables="${Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES:-}"
+readonly q30t_test_git="${Q30T_TEST_GIT:-}"
+readonly q30t_test_python="${Q30T_TEST_PYTHON:-}"
+readonly q30t_test_git_evidence="${Q30T_TEST_GIT_EVIDENCE:-}"
+readonly q30t_test_real_git="${Q30T_TEST_REAL_GIT:-}"
+clear_exported_environment
 
 readonly approved_git="/usr/bin/git"
 readonly approved_python="/usr/bin/python3"
@@ -63,24 +81,22 @@ system_ssh="$approved_ssh"
 system_env="$approved_env"
 test_executables=0
 git_test_arguments=()
-if [[ -n "${Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES:-}" \
-    || -n "${Q30T_TEST_GIT:-}" || -n "${Q30T_TEST_PYTHON:-}" \
-    || -n "${Q30T_TEST_GIT_EVIDENCE:-}" || -n "${Q30T_TEST_REAL_GIT:-}" ]]; then
+if [[ -n "$q30t_test_allow_system_executables" \
+    || -n "$q30t_test_git" || -n "$q30t_test_python" \
+    || -n "$q30t_test_git_evidence" || -n "$q30t_test_real_git" ]]; then
     [[ "$OSTYPE" != linux* \
-        && "${Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES:-}" == non-linux-test \
-        && "${Q30T_TEST_GIT:-}" == /* && "${Q30T_TEST_PYTHON:-}" == /* \
-        && "${Q30T_TEST_GIT_EVIDENCE:-}" == /* && "${Q30T_TEST_REAL_GIT:-}" == /* ]] || {
+        && "$q30t_test_allow_system_executables" == non-linux-test \
+        && "$q30t_test_git" == /* && "$q30t_test_python" == /* \
+        && "$q30t_test_git_evidence" == /* && "$q30t_test_real_git" == /* ]] || {
         echo "system executable test override is forbidden" >&2
         exit 2
     }
-    system_git="$Q30T_TEST_GIT"
-    system_python="$Q30T_TEST_PYTHON"
+    system_git="$q30t_test_git"
+    system_python="$q30t_test_python"
     git_test_arguments=(
-        --q30t-test-exec "$Q30T_TEST_GIT_EVIDENCE" "$Q30T_TEST_REAL_GIT"
+        --q30t-test-exec "$q30t_test_git_evidence" "$q30t_test_real_git"
     )
     test_executables=1
-else
-    require_reserved_environment
 fi
 
 readonly validate_executable='import os,stat,sys
@@ -100,7 +116,7 @@ print(resolved)'
 
 if ((test_executables)); then
     for executable in "$system_git" "$system_python" "$system_ssh" "$system_env" \
-        "$Q30T_TEST_REAL_GIT"; do
+        "$q30t_test_real_git"; do
         [[ -f "$executable" && -x "$executable" && ! -L "$executable" ]] || {
             echo "approved test executable is unavailable" >&2
             exit 2
@@ -142,17 +158,17 @@ readonly MODEL_SHA256_PATH="$9"
 readonly MODEL_SHA256_SHA256="${10}"
 readonly OUTPUT_PATH="${11}"
 
-[[ "${SLURM_NNODES:-}" == 1 && "${SLURM_CPUS_PER_TASK:-}" == 64 \
-    && "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || {
+[[ "$slurm_nnodes" == 1 && "$slurm_cpus_per_task" == 64 \
+    && "$slurm_job_id" =~ ^[0-9]+$ ]] || {
     echo "invalid one-node Slurm CPU identity" >&2
     exit 2
 }
-[[ -z "${SLURM_JOB_GPUS:-}" && -z "${SLURM_STEP_GPUS:-}" \
-    && ( -z "${SLURM_GPUS_ON_NODE:-}" || "${SLURM_GPUS_ON_NODE:-}" == 0 ) \
-    && ( -z "${SLURM_GPUS:-}" || "${SLURM_GPUS:-}" == 0 ) \
-    && ( -z "${SLURM_GPUS_PER_NODE:-}" || "${SLURM_GPUS_PER_NODE:-}" == 0 ) \
-    && ( -z "${SLURM_GPUS_PER_TASK:-}" || "${SLURM_GPUS_PER_TASK:-}" == 0 ) \
-    && "${SLURM_TRES_PER_NODE:-}" != *gpu* ]] || {
+[[ -z "$slurm_job_gpus" && -z "$slurm_step_gpus" \
+    && ( -z "$slurm_gpus_on_node" || "$slurm_gpus_on_node" == 0 ) \
+    && ( -z "$slurm_gpus" || "$slurm_gpus" == 0 ) \
+    && ( -z "$slurm_gpus_per_node" || "$slurm_gpus_per_node" == 0 ) \
+    && ( -z "$slurm_gpus_per_task" || "$slurm_gpus_per_task" == 0 ) \
+    && "$slurm_tres_per_node" != *gpu* ]] || {
     echo "Q30 tokenizer receipt generation requires a CPU-only allocation" >&2
     exit 2
 }
@@ -235,7 +251,7 @@ remote_evidence="$(run_remote_git ls-remote --exit-code "$remote_url" "$remote_b
     exit 2
 }
 [[ "$remote_evidence" != *$'\n'* ]] || exit 2
-IFS=$'\t' read -r remote_commit remote_name remote_extra <<<"$remote_evidence"
+IFS=$'\t' builtin read -r remote_commit remote_name remote_extra <<<"$remote_evidence"
 [[ "$remote_commit" == "$SOURCE_SHA" && "$remote_name" == "$remote_branch" \
     && -z "$remote_extra" ]] || {
     echo "requested commit is not the pushed branch tip" >&2
