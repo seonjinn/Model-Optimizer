@@ -44,6 +44,7 @@ require_reserved_environment() {
     echo "Q30 parent receipt requires the Slurm --export=NONE boundary" >&2
     exit 2
 }
+unset -v DEBUGINFOD_URLS
 reject_prohibited_environment
 
 readonly approved_git="/usr/bin/git"

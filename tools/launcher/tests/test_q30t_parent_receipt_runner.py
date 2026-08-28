@@ -309,6 +309,38 @@ def test_parent_runner_requires_slurm_export_none_boundary(tmp_path: Path) -> No
     assert not calls.exists()
 
 
+def test_parent_runner_strips_ptyche_debuginfod_environment() -> None:
+    """Ptyche's site-injected debuginfod setting does not reject an export-none job."""
+    result = subprocess.run(
+        [BASH, str(RUNNER)],
+        env={
+            "DEBUGINFOD_URLS": "https://debuginfod.ubuntu.com",
+            "SLURM_EXPORT_ENV": "NONE",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+    assert "unexpected exported environment variable" not in result.stderr
+
+
+def test_parent_runner_still_rejects_unknown_site_environment() -> None:
+    """Only explicitly reviewed site state may cross the export-none boundary."""
+    result = subprocess.run(
+        [BASH, str(RUNNER)],
+        env={"Q30T_UNKNOWN_SITE_STATE": "injected", "SLURM_EXPORT_ENV": "NONE"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "unexpected exported environment variable" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
