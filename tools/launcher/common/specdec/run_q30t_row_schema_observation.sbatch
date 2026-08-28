@@ -349,9 +349,7 @@ readonly scratch_root="/proc/self/fd/$scratch_fd"
 readonly observer_path="examples/dataset/observe_q30t_ptv23_row_schemas.py"
 readonly ptv3_plan_path="examples/dataset/qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json"
 readonly atomic_path="tools/launcher/common/specdec/qwen4b_b_atomic.py"
-readonly observer="$scratch_root/$observer_path"
 readonly ptv3_plan="$scratch_root/$ptv3_plan_path"
-readonly atomic="$scratch_root/$atomic_path"
 materialized_record="$(/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     "$approved_python" -I -S - "$scratch_fd" "$approved_git" "$source_path" \
     "$source_commit" "$observer_path" "$ptv3_plan_path" "$atomic_path" <<'PY'
@@ -522,78 +520,6 @@ readonly observer_device observer_inode observer_size observer_sha256 \
     && "$atomic_size" =~ ^[0-9]+$ && "$atomic_sha256" =~ ^[0-9a-f]{64}$ \
     && -z "$materialized_extra" ]] || fail "materialized blob identity capture failed"
 
-exec 10<"$observer" || fail "materialized observer adoption failed"
-exec 11<"$ptv3_plan" || fail "materialized PTV3 plan adoption failed"
-exec 12<"$atomic" || fail "materialized atomic dependency adoption failed"
-/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    "$approved_python" -I -S - "$scratch_fd" \
-    "$observer_path" 10 "$observer_device" "$observer_inode" "$observer_size" "$observer_sha256" \
-    "$ptv3_plan_path" 11 "$ptv3_plan_device" "$ptv3_plan_inode" "$ptv3_plan_size" "$observed_ptv3_plan_sha256" \
-    "$atomic_path" 12 "$atomic_device" "$atomic_inode" "$atomic_size" "$atomic_sha256" <<'PY'
-# Q30T_BLOB_ADOPTER
-import hashlib
-import os
-import stat
-import sys
-
-root_fd = int(sys.argv[1])
-arguments = sys.argv[2:]
-if len(arguments) != 18:
-    raise SystemExit("materialized blob adoption arguments are invalid")
-
-
-def identity(metadata):
-    return metadata.st_dev, metadata.st_ino
-
-
-for offset in range(0, len(arguments), 6):
-    relative, fd_text, device, inode, size, expected_sha256 = arguments[offset : offset + 6]
-    descriptor = int(fd_text)
-    expected_identity = int(device), int(inode)
-    expected_size = int(size)
-    components = relative.split("/")
-    parent = os.dup(root_fd)
-    try:
-        for component in components[:-1]:
-            child = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=parent,
-            )
-            os.close(parent)
-            parent = child
-        opened = os.fstat(descriptor)
-        named = os.stat(components[-1], dir_fd=parent, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != os.getuid()
-            or stat.S_IMODE(opened.st_mode) != 0o400
-            or opened.st_nlink != 1
-            or opened.st_size != expected_size
-            or identity(opened) != expected_identity
-            or identity(named) != expected_identity
-        ):
-            raise SystemExit("materialized blob changed before descriptor adoption")
-        digest = hashlib.sha256()
-        counted = 0
-        while counted < expected_size:
-            block = os.pread(descriptor, min(1024 * 1024, expected_size - counted), counted)
-            if not block:
-                raise SystemExit("materialized blob shrank during descriptor adoption")
-            digest.update(block)
-            counted += len(block)
-        if os.pread(descriptor, 1, expected_size):
-            raise SystemExit("materialized blob grew during descriptor adoption")
-        after = os.fstat(descriptor)
-        rebound = os.stat(components[-1], dir_fd=parent, follow_symlinks=False)
-        if identity(after) != expected_identity or identity(rebound) != expected_identity:
-            raise SystemExit("materialized blob rebound during descriptor adoption")
-        if digest.hexdigest() != expected_sha256:
-            raise SystemExit("materialized blob SHA-256 mismatch during descriptor adoption")
-    finally:
-        os.close(parent)
-PY
-
 readonly ptv2_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/assets/q30t-ptv2-full201-source-v1"
 readonly ptv2_plan="$ptv2_root/SOURCE_PLAN.json"
 readonly ptv2_plan_sha256="96970541d0c6f5c99e74b9222b805d4a0bd2ac682837b0ad92b8bf54f7d71a3a"
@@ -665,7 +591,10 @@ readonly ptv3_completion_sha256
 
 "$approved_mkdir" -p -- "$receipt_root/row-schema"
 /usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    "$approved_python" -I -S - "fd:10" "$observer_sha256" "fd:12" "$atomic_sha256" \
+    "$approved_python" -I -S - "$scratch_fd" \
+    "$observer_path" "$observer_device" "$observer_inode" "$observer_size" "$observer_sha256" \
+    "$ptv3_plan_path" "$ptv3_plan_device" "$ptv3_plan_inode" "$ptv3_plan_size" "$observed_ptv3_plan_sha256" \
+    "$atomic_path" "$atomic_device" "$atomic_inode" "$atomic_size" "$atomic_sha256" \
     --ptv2-plan "$ptv2_plan" \
     --ptv2-plan-sha256 "$ptv2_plan_sha256" \
     --ptv2-completion "$ptv2_completion" \
@@ -743,6 +672,78 @@ def open_blob(path, expected_sha256, label):
         os.close(descriptor)
         raise SystemExit(f"{label} blob SHA-256 mismatch")
     return descriptor, b"".join(chunks)
+
+
+def adopt_materialized_blob(
+    root_descriptor,
+    relative,
+    expected_device,
+    expected_inode,
+    expected_size,
+    expected_sha256,
+    label,
+):
+    if os.path.isabs(relative) or os.path.normpath(relative) != relative:
+        raise SystemExit(f"{label} materialized path is unsafe")
+    components = relative.split("/")
+    if len(components) < 2 or any(not value or value in (".", "..") for value in components):
+        raise SystemExit(f"{label} materialized path has unsafe components")
+    parent = os.dup(root_descriptor)
+    descriptor = None
+    try:
+        for component in components[:-1]:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=parent,
+            )
+            os.close(parent)
+            parent = child
+        descriptor = os.open(
+            components[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent,
+        )
+        before = os.fstat(descriptor)
+        named = os.stat(components[-1], dir_fd=parent, follow_symlinks=False)
+        expected_identity = int(expected_device), int(expected_inode)
+        size = int(expected_size)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_nlink != 1
+            or before.st_size != size
+            or (before.st_dev, before.st_ino) != expected_identity
+            or identity(before) != identity(named)
+            or size > MAX_BLOB_BYTES
+        ):
+            raise SystemExit(f"{label} changed before descriptor adoption")
+        chunks = []
+        digest = hashlib.sha256()
+        counted = 0
+        while counted < size:
+            block = os.read(descriptor, min(1024 * 1024, size - counted))
+            if not block:
+                raise SystemExit(f"{label} shrank during descriptor adoption")
+            chunks.append(block)
+            digest.update(block)
+            counted += len(block)
+        if os.read(descriptor, 1):
+            raise SystemExit(f"{label} grew during descriptor adoption")
+        after = os.fstat(descriptor)
+        rebound = os.stat(components[-1], dir_fd=parent, follow_symlinks=False)
+        if identity(before) != identity(after) or identity(after) != identity(rebound):
+            raise SystemExit(f"{label} rebound during descriptor adoption")
+        if digest.hexdigest() != expected_sha256:
+            raise SystemExit(f"{label} SHA-256 mismatch during descriptor adoption")
+        return descriptor, b"".join(chunks)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    finally:
+        os.close(parent)
 
 
 def require_root_owned_nonwritable(metadata, label):
@@ -875,10 +876,46 @@ def authenticate_python_runtime():
     }
 
 
-observer_path, observer_sha256, atomic_path, atomic_sha256 = sys.argv[1:5]
-arguments = sys.argv[5:]
-observer_fd, observer_bytes = open_blob(observer_path, observer_sha256, "observer")
-atomic_fd, atomic_bytes = open_blob(atomic_path, atomic_sha256, "atomic dependency")
+# Q30T_BOOTSTRAP_ENTRY
+if len(sys.argv) >= 17 and sys.argv[1].isdigit():
+    scratch_fd = int(sys.argv[1])
+    observer_path, observer_device, observer_inode, observer_size, observer_sha256 = sys.argv[2:7]
+    ptv3_plan_path, ptv3_device, ptv3_inode, ptv3_size, ptv3_sha256 = sys.argv[7:12]
+    atomic_path, atomic_device, atomic_inode, atomic_size, atomic_sha256 = sys.argv[12:17]
+    arguments = sys.argv[17:]
+    observer_fd, observer_bytes = adopt_materialized_blob(
+        scratch_fd,
+        observer_path,
+        observer_device,
+        observer_inode,
+        observer_size,
+        observer_sha256,
+        "observer",
+    )
+    ptv3_plan_fd, _ = adopt_materialized_blob(
+        scratch_fd,
+        ptv3_plan_path,
+        ptv3_device,
+        ptv3_inode,
+        ptv3_size,
+        ptv3_sha256,
+        "PTV3 plan",
+    )
+    atomic_fd, atomic_bytes = adopt_materialized_blob(
+        scratch_fd,
+        atomic_path,
+        atomic_device,
+        atomic_inode,
+        atomic_size,
+        atomic_sha256,
+        "atomic dependency",
+    )
+else:
+    observer_path, observer_sha256, atomic_path, atomic_sha256 = sys.argv[1:5]
+    arguments = sys.argv[5:]
+    observer_fd, observer_bytes = open_blob(observer_path, observer_sha256, "observer")
+    atomic_fd, atomic_bytes = open_blob(atomic_path, atomic_sha256, "atomic dependency")
+    ptv3_plan_fd = None
 try:
     runtime_evidence = authenticate_python_runtime()
     import types
@@ -905,6 +942,8 @@ try:
     sys.argv = [observer_path, *arguments]
     raise SystemExit(observer_module.main())
 finally:
+    if ptv3_plan_fd is not None:
+        os.close(ptv3_plan_fd)
     os.close(atomic_fd)
     os.close(observer_fd)
 PY

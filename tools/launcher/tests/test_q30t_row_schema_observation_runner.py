@@ -91,6 +91,52 @@ def _run_current_materialization_segment(
         os.close(descriptor)
 
 
+def _run_current_observer_adoption(
+    scratch_root: Path, materialized_record: str
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
+    primitives = bootstrap.split("# Q30T_BOOTSTRAP_ENTRY", 1)[0]
+    observer_device, observer_inode, observer_size, observer_sha256 = (
+        materialized_record.strip().split("\t")[:4]
+    )
+    exercise = (
+        primitives
+        + "\nroot_fd = int(sys.argv[1])\n"
+        + "descriptor, _ = adopt_materialized_blob(root_fd, *sys.argv[2:7], 'observer')\n"
+        + "os.close(descriptor)\n"
+    )
+    root_descriptor = os.open(scratch_root, os.O_RDONLY)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-",
+            str(root_descriptor),
+            "examples/dataset/observe_q30t_ptv23_row_schemas.py",
+            observer_device,
+            observer_inode,
+            observer_size,
+            observer_sha256,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        pass_fds=(root_descriptor,),
+    )
+    try:
+        stdout, stderr = process.communicate(exercise, timeout=0.5)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        stdout, stderr = process.communicate()
+    finally:
+        os.close(root_descriptor)
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr), timed_out
+
+
 def _load_observer_test_support() -> ModuleType:
     path = ROOT.parent / "tests/examples/dataset/test_observe_q30t_ptv23_row_schemas.py"
     spec = importlib.util.spec_from_file_location("q30t_observer_test_support", path)
@@ -238,6 +284,80 @@ def test_materialization_creates_exact_read_only_single_link_blobs(tmp_path: Pat
             str(len(content)),
             hashlib.sha256(content).hexdigest(),
         ]
+
+
+def test_post_materialization_fifo_rebind_never_reaches_a_bash_pathname_open(
+    tmp_path: Path,
+) -> None:
+    """A descendant rebind to a foreign FIFO must reject without blocking."""
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir(mode=0o700)
+    materialized = _run_current_materialization_segment(tmp_path, scratch_root)
+    assert materialized.returncode == 0, materialized.stderr
+    (scratch_root / "examples").rename(scratch_root / "examples-held")
+    foreign = tmp_path / "foreign"
+    (foreign / "dataset").mkdir(parents=True)
+    sentinel = foreign / "preserve.keep"
+    sentinel.write_bytes(b"foreign-preserved")
+    sentinel_identity = (sentinel.stat().st_dev, sentinel.stat().st_ino)
+    os.mkfifo(foreign / "dataset/observe_q30t_ptv23_row_schemas.py", 0o600)
+    (scratch_root / "examples").symlink_to(foreign, target_is_directory=True)
+
+    result, timed_out = _run_current_observer_adoption(scratch_root, materialized.stdout)
+
+    assert 'exec 10<"$observer"' not in RUNNER.read_text()
+    assert not timed_out, "Bash pathname adoption blocked on the rebound foreign FIFO"
+    assert result.returncode != 0
+    assert sentinel.read_bytes() == b"foreign-preserved"
+    assert (sentinel.stat().st_dev, sentinel.stat().st_ino) == sentinel_identity
+
+
+def test_post_materialization_hardlink_rebind_preserves_foreign_bytes(tmp_path: Path) -> None:
+    """A substituted hardlink rejects without reading it as the reviewed blob."""
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir(mode=0o700)
+    materialized = _run_current_materialization_segment(tmp_path, scratch_root)
+    assert materialized.returncode == 0, materialized.stderr
+    (scratch_root / "examples").rename(scratch_root / "examples-held")
+    foreign = tmp_path / "foreign"
+    (foreign / "dataset").mkdir(parents=True)
+    sentinel = foreign / "preserve.keep"
+    sentinel.write_bytes(b"foreign-hardlink-preserved")
+    target = foreign / "dataset/observe_q30t_ptv23_row_schemas.py"
+    os.link(sentinel, target)
+    sentinel_identity = (
+        sentinel.stat().st_dev,
+        sentinel.stat().st_ino,
+        sentinel.stat().st_nlink,
+    )
+    (scratch_root / "examples").symlink_to(foreign, target_is_directory=True)
+
+    result, timed_out = _run_current_observer_adoption(scratch_root, materialized.stdout)
+
+    assert not timed_out
+    assert result.returncode != 0
+    assert sentinel.read_bytes() == b"foreign-hardlink-preserved"
+    assert target.read_bytes() == b"foreign-hardlink-preserved"
+    assert (
+        sentinel.stat().st_dev,
+        sentinel.stat().st_ino,
+        sentinel.stat().st_nlink,
+    ) == sentinel_identity
+
+
+def test_descriptor_relative_handoff_adopts_the_exact_materialized_blob(
+    tmp_path: Path,
+) -> None:
+    """The bootstrap accepts the exact reviewed identity without a Bash reopen."""
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir(mode=0o700)
+    materialized = _run_current_materialization_segment(tmp_path, scratch_root)
+    assert materialized.returncode == 0, materialized.stderr
+
+    result, timed_out = _run_current_observer_adoption(scratch_root, materialized.stdout)
+
+    assert not timed_out
+    assert result.returncode == 0, result.stderr
 
 
 def test_scratch_allocator_preserves_safe_slurm_tmpdir_path(tmp_path: Path) -> None:
@@ -553,9 +673,7 @@ def test_immutable_bootstrap_rejects_replaced_materialized_observer(tmp_path: Pa
 def test_immutable_bootstrap_executes_held_bytes_after_path_rebind(tmp_path: Path) -> None:
     """A pathname replacement after authentication cannot change executed bytes."""
     bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
-    primitives = bootstrap.split(
-        "observer_path, observer_sha256, atomic_path, atomic_sha256 = sys.argv[1:5]", 1
-    )[0]
+    primitives = bootstrap.split("# Q30T_BOOTSTRAP_ENTRY", 1)[0]
     trusted_marker = tmp_path / "trusted-code-ran"
     substituted_marker = tmp_path / "substituted-code-ran"
     observer = tmp_path / "observer.py"
@@ -598,9 +716,7 @@ def test_immutable_bootstrap_executes_adopted_descriptor_after_name_rebind(
 ) -> None:
     """Production's fd:N interface never reopens a rebound scratch pathname."""
     bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
-    primitives = bootstrap.split(
-        "observer_path, observer_sha256, atomic_path, atomic_sha256 = sys.argv[1:5]", 1
-    )[0]
+    primitives = bootstrap.split("# Q30T_BOOTSTRAP_ENTRY", 1)[0]
     trusted_marker = tmp_path / "trusted-code-ran"
     substituted_marker = tmp_path / "substituted-code-ran"
     observer = tmp_path / "observer.py"
