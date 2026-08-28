@@ -1270,6 +1270,42 @@ def test_q30_builder_rejects_malformed_controller_payload(
         )
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "receipt_sha256",
+        "repository",
+        "revision",
+        "snapshot_path",
+        "snapshot_tree_sha256",
+        "chat_template_sha256",
+        "training_chat_template_sha256",
+        "im_start_token_id",
+        "im_end_token_id",
+    ],
+)
+def test_q30_builder_rejects_omitted_controller_payload_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    module = _load_module()
+    payload = _q30_tokenizer_payload(tmp_path)
+    del payload[field]
+    monkeypatch.setattr(
+        module,
+        "load_q30t_tokenizer_receipt",
+        lambda _path, *, expected_sha256: payload,
+    )
+
+    with pytest.raises(module.ComplementError, match=rf"Q30 tokenizer {field} is invalid"):
+        module.load_tokenizer_trust(
+            tmp_path / "receipt.json",
+            expected_sha256="5ba642c455e60b67eca295dce92dd7da47292fdba66c5f9d269669c14cafc509",
+            policy=_approved_q30_policy(module),
+        )
+
+
 def test_production_selection_spools_selected_conversations_to_raid_backed_sqlite(
     tmp_path: Path,
 ) -> None:

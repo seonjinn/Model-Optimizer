@@ -724,7 +724,7 @@ def _tokenizer_trust_from_q30_payload(
     payload: dict[str, object], file_sha256: str
 ) -> TokenizerTrust:
     def text(name: str) -> str:
-        value = payload[name]
+        value = payload.get(name)
         if not isinstance(value, str) or not value:
             raise ComplementError(f"Q30 tokenizer {name} is invalid")
         return value
@@ -736,7 +736,7 @@ def _tokenizer_trust_from_q30_payload(
         return value
 
     def integer(name: str) -> int:
-        value = payload[name]
+        value = payload.get(name)
         if type(value) is not int or value < 0:
             raise ComplementError(f"Q30 tokenizer {name} is invalid")
         return value
