@@ -43,6 +43,13 @@ require_reserved_environment() {
     echo "Q30 tokenizer receipt requires the Slurm --export=NONE boundary" >&2
     exit 2
 }
+if [[ -n "${ENVIRONMENT+x}" ]]; then
+    [[ "$ENVIRONMENT" == BATCH ]] || {
+        echo "unexpected ENVIRONMENT under --export=NONE" >&2
+        exit 2
+    }
+    unset -v ENVIRONMENT
+fi
 unset -v DEBUGINFOD_URLS
 reject_prohibited_environment
 

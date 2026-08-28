@@ -327,6 +327,39 @@ def test_parent_runner_strips_ptyche_debuginfod_environment() -> None:
     assert "unexpected exported environment variable" not in result.stderr
 
 
+def test_parent_runner_accepts_only_ptyche_batch_environment_marker() -> None:
+    """Ptyche's literal BATCH marker is the reviewed Slurm batch-job baseline."""
+    result = subprocess.run(
+        [BASH, str(RUNNER)],
+        env={
+            "DEBUGINFOD_URLS": "https://debuginfod.ubuntu.com",
+            "ENVIRONMENT": "BATCH",
+            "SLURM_EXPORT_ENV": "NONE",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+    assert "unexpected exported environment variable" not in result.stderr
+
+
+def test_parent_runner_rejects_nonbatch_environment_marker() -> None:
+    """A non-batch site marker cannot widen the export-none boundary."""
+    result = subprocess.run(
+        [BASH, str(RUNNER)],
+        env={"ENVIRONMENT": "INTERACTIVE", "SLURM_EXPORT_ENV": "NONE"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "usage:" not in result.stderr
+
+
 def test_parent_runner_still_rejects_unknown_site_environment() -> None:
     """Only explicitly reviewed site state may cross the export-none boundary."""
     result = subprocess.run(
