@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import tracemalloc
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,15 @@ from common.specdec.q30t_ptv23_cluster_profile import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import TypedDict
+
+    class ProfileArguments(TypedDict):
+        source_checkout: Path
+        source_commit: str
+        durable_receipt_root: Path
+        output_path: Path
+        job_id: str
+
 
 _TOOL_CONTENTS = {
     "tools/launcher/common/specdec/q30t_runtime_archive_receipt.py": b"archive producer\n",
@@ -39,13 +49,27 @@ class ProfileFixture:
     durable_receipt_root: Path
     output_path: Path
 
-    def arguments(self) -> dict[str, object]:
+    def arguments(
+        self,
+        *,
+        source_checkout: Path | None = None,
+        source_commit: str | None = None,
+        durable_receipt_root: Path | None = None,
+        output_path: Path | None = None,
+        job_id: str = "profile-unit-1",
+    ) -> ProfileArguments:
         return {
-            "source_checkout": self.source_checkout,
-            "source_commit": self.source_commit,
-            "durable_receipt_root": self.durable_receipt_root,
-            "output_path": self.output_path,
-            "job_id": "profile-unit-1",
+            "source_checkout": (
+                source_checkout if source_checkout is not None else self.source_checkout
+            ),
+            "source_commit": source_commit if source_commit is not None else self.source_commit,
+            "durable_receipt_root": (
+                durable_receipt_root
+                if durable_receipt_root is not None
+                else self.durable_receipt_root
+            ),
+            "output_path": output_path if output_path is not None else self.output_path,
+            "job_id": job_id,
         }
 
 
@@ -188,7 +212,7 @@ def test_profile_requires_all_tools_in_one_frozen_checkout(
     )
     missing.unlink()
     source_commit = _commit_and_push(profile_fixture, "remove attester")
-    arguments = profile_fixture.arguments() | {"source_commit": source_commit}
+    arguments = profile_fixture.arguments(source_commit=source_commit)
     with pytest.raises(ValueError, match="required profile tool"):
         finalize_ptyche_runtime_profile(**arguments)
 
@@ -200,7 +224,7 @@ def test_profile_rejects_dirty_source_checkout(profile_fixture: ProfileFixture) 
 
 
 def test_profile_rejects_mismatched_source_commit(profile_fixture: ProfileFixture) -> None:
-    arguments = profile_fixture.arguments() | {"source_commit": "f" * 40}
+    arguments = profile_fixture.arguments(source_commit="f" * 40)
     with pytest.raises(ValueError, match="HEAD"):
         finalize_ptyche_runtime_profile(**arguments)
 
@@ -208,9 +232,9 @@ def test_profile_rejects_mismatched_source_commit(profile_fixture: ProfileFixtur
 def test_profile_rejects_unpushed_head(profile_fixture: ProfileFixture) -> None:
     source_commit = _commit_and_push(profile_fixture, "pushed baseline", allow_empty=True)
     _git(profile_fixture.source_checkout, "commit", "--allow-empty", "-m", "local only")
-    arguments = profile_fixture.arguments() | {
-        "source_commit": _git(profile_fixture.source_checkout, "rev-parse", "HEAD")
-    }
+    arguments = profile_fixture.arguments(
+        source_commit=_git(profile_fixture.source_checkout, "rev-parse", "HEAD")
+    )
     assert source_commit != arguments["source_commit"]
     with pytest.raises(ValueError, match="upstream"):
         finalize_ptyche_runtime_profile(**arguments)
@@ -219,7 +243,7 @@ def test_profile_rejects_unpushed_head(profile_fixture: ProfileFixture) -> None:
 def test_profile_rejects_git_replace_refs(profile_fixture: ProfileFixture) -> None:
     source_commit = _commit_and_push(profile_fixture, "replacement target", allow_empty=True)
     _git(profile_fixture.source_checkout, "replace", source_commit, f"{source_commit}^")
-    arguments = profile_fixture.arguments() | {"source_commit": source_commit}
+    arguments = profile_fixture.arguments(source_commit=source_commit)
     with pytest.raises(ValueError, match="replace"):
         finalize_ptyche_runtime_profile(**arguments)
 
@@ -229,7 +253,7 @@ def test_profile_rejects_source_outside_home(
 ) -> None:
     outside = tmp_path / "outside-source"
     shutil.copytree(profile_fixture.source_checkout, outside, symlinks=True)
-    arguments = profile_fixture.arguments() | {"source_checkout": outside}
+    arguments = profile_fixture.arguments(source_checkout=outside)
     with pytest.raises(ValueError, match="/home"):
         finalize_ptyche_runtime_profile(**arguments)
 
@@ -239,10 +263,10 @@ def test_profile_rejects_receipt_root_outside_lustre(
 ) -> None:
     outside = tmp_path / "outside-receipts"
     outside.mkdir()
-    arguments = profile_fixture.arguments() | {
-        "durable_receipt_root": outside,
-        "output_path": outside / "profile.json",
-    }
+    arguments = profile_fixture.arguments(
+        durable_receipt_root=outside,
+        output_path=outside / "profile.json",
+    )
     with pytest.raises(ValueError, match="durable receipt root"):
         finalize_ptyche_runtime_profile(**arguments)
 
@@ -250,9 +274,48 @@ def test_profile_rejects_receipt_root_outside_lustre(
 def test_profile_rejects_output_outside_receipt_root(
     profile_fixture: ProfileFixture, tmp_path: Path
 ) -> None:
-    arguments = profile_fixture.arguments() | {"output_path": tmp_path / "profile.json"}
+    arguments = profile_fixture.arguments(output_path=tmp_path / "profile.json")
     with pytest.raises(ValueError, match="output"):
         finalize_ptyche_runtime_profile(**arguments)
+
+
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_profile_rejects_receipt_root_rebind_before_publication_or_adoption(
+    profile_fixture: ProfileFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    existing_output: bool,
+) -> None:
+    expected_bytes = b""
+    if existing_output:
+        finalize_ptyche_runtime_profile(**profile_fixture.arguments())
+        expected_bytes = profile_fixture.output_path.read_bytes()
+
+    original_assert = profile_module._assert_held_directory
+    displaced_root = profile_fixture.durable_receipt_root.with_name("bound-receipt-root")
+    receipt_checks = 0
+
+    def rebind_after_last_check(path: Path, descriptor: int, label: str) -> None:
+        nonlocal receipt_checks
+        original_assert(path, descriptor, label)
+        if label != "durable receipt root":
+            return
+        receipt_checks += 1
+        if receipt_checks == 2:
+            profile_fixture.durable_receipt_root.rename(displaced_root)
+            profile_fixture.durable_receipt_root.mkdir()
+            if existing_output:
+                profile_fixture.output_path.write_bytes(expected_bytes)
+
+    monkeypatch.setattr(profile_module, "_assert_held_directory", rebind_after_last_check)
+    with pytest.raises(ValueError, match="durable receipt root pathname rebound"):
+        finalize_ptyche_runtime_profile(**profile_fixture.arguments())
+
+    if existing_output:
+        assert profile_fixture.output_path.read_bytes() == expected_bytes
+        assert (displaced_root / profile_fixture.output_path.name).read_bytes() == expected_bytes
+    else:
+        assert not profile_fixture.output_path.exists()
+        assert not (displaced_root / profile_fixture.output_path.name).exists()
 
 
 def test_profile_rejects_source_checkout_path_rebind(
@@ -304,6 +367,38 @@ def test_profile_rejects_tool_path_rebind_during_hash(
     monkeypatch.setattr(profile_module, "_POST_TOOL_OPEN_HOOK", rebind)
     with pytest.raises(ValueError, match="changed while hashing"):
         finalize_ptyche_runtime_profile(**profile_fixture.arguments())
+
+
+def test_profile_rejects_tool_growth_beyond_streaming_limit(
+    profile_fixture: ProfileFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = (
+        profile_fixture.source_checkout
+        / "tools/launcher/common/specdec/q30t_runtime_archive_receipt.py"
+    )
+
+    def grow(opened_path: Path) -> None:
+        if opened_path == tool:
+            with tool.open("ab") as stream:
+                stream.truncate(profile_module._MAX_TOOL_BYTES + 1)
+
+    monkeypatch.setattr(profile_module, "_POST_TOOL_OPEN_HOOK", grow)
+    with pytest.raises(ValueError, match="exceeds size limit"):
+        finalize_ptyche_runtime_profile(**profile_fixture.arguments())
+
+
+def test_profile_tool_hashing_has_bounded_streaming_memory(tmp_path: Path) -> None:
+    tool = tmp_path / "large-tool.py"
+    with tool.open("wb") as stream:
+        stream.truncate(8 * 1024 * 1024)
+
+    tracemalloc.start()
+    try:
+        profile_module._stable_tool_identity(tool)
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak_bytes < 4 * 1024 * 1024
 
 
 def test_profile_adopts_only_exact_existing_output(profile_fixture: ProfileFixture) -> None:

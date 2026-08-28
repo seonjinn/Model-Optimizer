@@ -17,8 +17,6 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from common.specdec.qwen4b_b_atomic import atomic_publish_bytes
-
 __all__ = [
     "Q30TRuntimeClusterProfile",
     "finalize_ptyche_runtime_profile",
@@ -71,6 +69,10 @@ def _no_op_path_hook(_: Path) -> None:
 
 _POST_SOURCE_AUTHENTICATION_HOOK = _no_op_hook
 _POST_TOOL_OPEN_HOOK = _no_op_path_hook
+
+
+class _ProfileOutputExistsError(FileExistsError):
+    pass
 
 
 def _canonical_json(value: object) -> bytes:
@@ -380,14 +382,6 @@ def _authenticate_git_state(source_checkout: Path, held_source_fd: int, source_c
         raise ValueError("source checkout HEAD must equal its live pushed upstream")
 
 
-def _git_blob_oid(size: int, blocks: list[bytes]) -> str:
-    digest = hashlib.sha1(usedforsecurity=False)
-    digest.update(f"blob {size}\0".encode())
-    for block in blocks:
-        digest.update(block)
-    return digest.hexdigest()
-
-
 def _stable_tool_identity(path: Path) -> tuple[str, str, bool]:
     parent_flags = (
         os.O_RDONLY
@@ -419,12 +413,15 @@ def _stable_tool_identity(path: Path) -> tuple[str, str, bool]:
             raise ValueError(f"required profile tool is not a stable single-link file: {path}")
         _POST_TOOL_OPEN_HOOK(path)
         content_digest = hashlib.sha256()
-        blocks: list[bytes] = []
+        git_digest = hashlib.sha1(usedforsecurity=False)
+        git_digest.update(f"blob {opened_before.st_size}\0".encode())
         size = 0
         while block := os.read(descriptor, _READ_BLOCK_BYTES):
             size += len(block)
+            if size > _MAX_TOOL_BYTES:
+                raise ValueError(f"required profile tool exceeds size limit: {path}")
             content_digest.update(block)
-            blocks.append(block)
+            git_digest.update(block)
         opened_after = os.fstat(descriptor)
         named_after = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         parent_after = os.fstat(parent_fd)
@@ -439,7 +436,7 @@ def _stable_tool_identity(path: Path) -> tuple[str, str, bool]:
             raise ValueError(f"required profile tool changed while hashing: {path}")
         return (
             content_digest.hexdigest(),
-            _git_blob_oid(size, blocks),
+            git_digest.hexdigest(),
             bool(opened_before.st_mode & 0o111),
         )
     except OSError as error:
@@ -494,28 +491,18 @@ def _authenticated_tool_sha256(
     return content_sha256
 
 
-def _stable_single_link_bytes(path: Path, maximum_bytes: int) -> tuple[bytes, str]:
-    parent_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0)
-    )
+def _stable_single_link_bytes_at(
+    parent_fd: int, name: str, maximum_bytes: int
+) -> tuple[bytes, str]:
     file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        parent_fd = os.open(path.parent, parent_flags)
-    except OSError as error:
-        raise ValueError("profile directory is not a readable no-follow directory") from error
     descriptor: int | None = None
     try:
         parent_before = os.fstat(parent_fd)
-        absolute_parent_before = os.stat(path.parent, follow_symlinks=False)
-        named_before = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        descriptor = os.open(path.name, file_flags, dir_fd=parent_fd)
+        named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(name, file_flags, dir_fd=parent_fd)
         opened_before = os.fstat(descriptor)
         if (
-            _directory_identity(parent_before) != _directory_identity(absolute_parent_before)
-            or _full_identity(named_before) != _full_identity(opened_before)
+            _full_identity(named_before) != _full_identity(opened_before)
             or not stat.S_ISREG(opened_before.st_mode)
             or opened_before.st_nlink != 1
             or opened_before.st_size > maximum_bytes
@@ -529,15 +516,13 @@ def _stable_single_link_bytes(path: Path, maximum_bytes: int) -> tuple[bytes, st
             if len(retained) > maximum_bytes:
                 raise ValueError("profile is too large")
         opened_after = os.fstat(descriptor)
-        named_after = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         parent_after = os.fstat(parent_fd)
-        absolute_parent_after = os.stat(path.parent, follow_symlinks=False)
         if (
             len(retained) != opened_before.st_size
             or _full_identity(opened_before) != _full_identity(opened_after)
             or _full_identity(opened_after) != _full_identity(named_after)
             or _directory_identity(parent_before) != _directory_identity(parent_after)
-            or _directory_identity(parent_after) != _directory_identity(absolute_parent_after)
         ):
             raise ValueError("profile changed while reading")
         return bytes(retained), digest.hexdigest()
@@ -546,6 +531,15 @@ def _stable_single_link_bytes(path: Path, maximum_bytes: int) -> tuple[bytes, st
     finally:
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _stable_single_link_bytes(path: Path, maximum_bytes: int) -> tuple[bytes, str]:
+    parent_fd = _open_held_directory(path.parent, "profile directory")
+    try:
+        result = _stable_single_link_bytes_at(parent_fd, path.name, maximum_bytes)
+        _assert_held_directory(path.parent, parent_fd, "profile directory")
+        return result
+    finally:
         os.close(parent_fd)
 
 
@@ -613,15 +607,98 @@ def _new_profile(
     return Q30TRuntimeClusterProfile.from_dict(body)
 
 
-def _adopt_exact_profile(path: Path, expected_bytes: bytes) -> Q30TRuntimeClusterProfile:
+def _adopt_exact_profile_at(
+    receipt_root: Path,
+    receipt_root_fd: int,
+    output_name: str,
+    expected_bytes: bytes,
+) -> Q30TRuntimeClusterProfile:
+    _assert_held_directory(receipt_root, receipt_root_fd, "durable receipt root")
     try:
-        observed_bytes, _ = _stable_single_link_bytes(path, _MAX_PROFILE_BYTES)
+        observed_bytes, _ = _stable_single_link_bytes_at(
+            receipt_root_fd, output_name, _MAX_PROFILE_BYTES
+        )
         observed = _parse_profile_bytes(observed_bytes)
     except ValueError as error:
         raise ValueError("foreign profile output already exists") from error
     if observed_bytes != expected_bytes:
         raise ValueError("foreign profile output already exists")
+    _assert_held_directory(receipt_root, receipt_root_fd, "durable receipt root")
     return observed
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written < 1:
+            raise OSError("profile publication write stalled")
+        view = view[written:]
+
+
+def _publish_profile_bytes_at(
+    *,
+    receipt_root: Path,
+    receipt_root_fd: int,
+    output_name: str,
+    payload: bytes,
+    job_id: str,
+) -> None:
+    _assert_held_directory(receipt_root, receipt_root_fd, "durable receipt root")
+    try:
+        os.stat(output_name, dir_fd=receipt_root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise _ProfileOutputExistsError(output_name)
+
+    partial_name = f".{output_name}.partial-{job_id}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    descriptor = os.open(partial_name, flags, 0o600, dir_fd=receipt_root_fd)
+    try:
+        partial_before = os.fstat(descriptor)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        partial_after = os.fstat(descriptor)
+        if (
+            _full_identity(partial_before)[:4] != _full_identity(partial_after)[:4]
+            or partial_after.st_size != len(payload)
+            or partial_after.st_nlink != 1
+        ):
+            raise ValueError("profile partial changed while writing")
+    finally:
+        os.close(descriptor)
+
+    reread, reread_sha256 = _stable_single_link_bytes_at(
+        receipt_root_fd, partial_name, _MAX_PROFILE_BYTES
+    )
+    if reread != payload or reread_sha256 != hashlib.sha256(payload).hexdigest():
+        raise ValueError("profile partial differs from canonical payload")
+    _assert_held_directory(receipt_root, receipt_root_fd, "durable receipt root")
+    try:
+        os.link(
+            partial_name,
+            output_name,
+            src_dir_fd=receipt_root_fd,
+            dst_dir_fd=receipt_root_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError as error:
+        raise _ProfileOutputExistsError(output_name) from error
+    os.unlink(partial_name, dir_fd=receipt_root_fd)
+    installed, installed_sha256 = _stable_single_link_bytes_at(
+        receipt_root_fd, output_name, _MAX_PROFILE_BYTES
+    )
+    if installed != payload or installed_sha256 != hashlib.sha256(payload).hexdigest():
+        raise ValueError("published profile differs from canonical payload")
+    os.fsync(receipt_root_fd)
+    _assert_held_directory(receipt_root, receipt_root_fd, "durable receipt root")
 
 
 def finalize_ptyche_runtime_profile(
@@ -666,12 +743,24 @@ def finalize_ptyche_runtime_profile(
         except FileNotFoundError:
             pass
         else:
-            return _adopt_exact_profile(output_path, payload)
+            return _adopt_exact_profile_at(
+                durable_receipt_root, receipt_root_fd, output_path.name, payload
+            )
         try:
-            atomic_publish_bytes(output_path, payload, job_id=job_id)
-        except FileExistsError:
-            return _adopt_exact_profile(output_path, payload)
-        published = load_ptyche_runtime_profile(output_path, hashlib.sha256(payload).hexdigest())
+            _publish_profile_bytes_at(
+                receipt_root=durable_receipt_root,
+                receipt_root_fd=receipt_root_fd,
+                output_name=output_path.name,
+                payload=payload,
+                job_id=job_id,
+            )
+        except _ProfileOutputExistsError:
+            return _adopt_exact_profile_at(
+                durable_receipt_root, receipt_root_fd, output_path.name, payload
+            )
+        published = _adopt_exact_profile_at(
+            durable_receipt_root, receipt_root_fd, output_path.name, payload
+        )
         if published != profile:
             raise ValueError("published profile differs from authenticated profile")
         return published
