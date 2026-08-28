@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +14,8 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -46,6 +49,7 @@ def _post_hash_hook() -> None:
 
 
 _POST_HASH_HOOK: Callable[[], None] = _post_hash_hook
+_PRE_EXTRACT_HOOK: Callable[[], None] = _post_hash_hook
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -237,8 +241,16 @@ def produce_runtime_archive_tree_receipt(
         raise ValueError("runtime archive output cannot be inside the extraction root")
 
     archive_fd, archive_parent_fd, archive_before = _open_stable_regular(archive_path)
+    snapshot_fd: int | None = None
+    extraction_parent_fd: int | None = None
+    extraction_fd: int | None = None
     try:
-        archive_size, archive_sha256 = _hash_open_regular(archive_fd, archive_path, archive_before)
+        snapshot_fd, archive_size, archive_sha256 = _snapshot_open_regular(
+            archive_fd,
+            archive_path,
+            archive_before,
+            private_parent=extraction_root.parent,
+        )
         _require_named_file_stable(
             archive_path, archive_fd, archive_parent_fd, archive_before, "hashing"
         )
@@ -249,7 +261,7 @@ def produce_runtime_archive_tree_receipt(
         if producer_size <= 0 or observed_producer_sha256 != producer_sha256:
             raise ValueError("runtime archive producer SHA-256 mismatch")
 
-        _preflight_archive(archive_fd)
+        _preflight_archive(snapshot_fd)
         _require_named_file_stable(
             archive_path,
             archive_fd,
@@ -257,8 +269,25 @@ def produce_runtime_archive_tree_receipt(
             archive_before,
             "preflighting",
         )
-        extraction_root.mkdir(mode=0o700, parents=False, exist_ok=False)
-        _extract_archive(archive_fd, extraction_root)
+        extraction_parent_fd, extraction_fd, extraction_before = _create_extraction_root(
+            extraction_root
+        )
+        _PRE_EXTRACT_HOOK()
+        _require_extraction_root_stable(
+            extraction_root,
+            extraction_fd,
+            extraction_parent_fd,
+            extraction_before,
+            "before extracting",
+        )
+        _extract_archive(snapshot_fd, extraction_fd)
+        _require_extraction_root_stable(
+            extraction_root,
+            extraction_fd,
+            extraction_parent_fd,
+            extraction_before,
+            "after extracting",
+        )
         _require_named_file_stable(
             archive_path,
             archive_fd,
@@ -266,11 +295,31 @@ def produce_runtime_archive_tree_receipt(
             archive_before,
             "extracting",
         )
+        _require_extraction_root_stable(
+            extraction_root,
+            extraction_fd,
+            extraction_parent_fd,
+            extraction_before,
+            "before identity",
+        )
+        identity = runtime_tree_identity(extraction_root)
+        _require_extraction_root_stable(
+            extraction_root,
+            extraction_fd,
+            extraction_parent_fd,
+            extraction_before,
+            "after identity",
+        )
     finally:
+        if extraction_fd is not None:
+            os.close(extraction_fd)
+        if extraction_parent_fd is not None:
+            os.close(extraction_parent_fd)
+        if snapshot_fd is not None:
+            os.close(snapshot_fd)
         os.close(archive_fd)
         os.close(archive_parent_fd)
 
-    identity = runtime_tree_identity(extraction_root)
     sentinels = tuple(entry for entry in identity.entries if entry.path in _SENTINEL_PATHS)
     sentinel_paths = tuple(entry.path for entry in sentinels)
     if not _REQUIRED_SENTINEL_PATHS.issubset(sentinel_paths):
@@ -421,7 +470,9 @@ def _open_absolute_directory(path: Path, flags: int) -> int:
             named = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
             child = os.open(component, flags, dir_fd=descriptor)
             opened = os.fstat(child)
-            if not stat.S_ISDIR(named.st_mode) or _file_identity(named) != _file_identity(opened):
+            if not stat.S_ISDIR(named.st_mode) or _directory_identity(named) != _directory_identity(
+                opened
+            ):
                 os.close(child)
                 raise ValueError(f"runtime archive input directory changed: {path}")
             os.close(descriptor)
@@ -432,18 +483,164 @@ def _open_absolute_directory(path: Path, flags: int) -> int:
         raise
 
 
+def _create_extraction_root(path: Path) -> tuple[int, int, os.stat_result]:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | _nofollow_flag()
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_fd = _open_absolute_directory(path.parent, directory_flags)
+    try:
+        os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(path.name, directory_flags, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        absolute = os.stat(path, follow_symlinks=False)
+        if (
+            _directory_identity(named) != _directory_identity(opened)
+            or _directory_identity(opened) != _directory_identity(absolute)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            os.close(descriptor)
+            raise ValueError("runtime archive extraction root changed while opening")
+        return parent_fd, descriptor, opened
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _directory_identity(status: os.stat_result) -> tuple[int, int, int]:
+    return status.st_dev, status.st_ino, stat.S_IFMT(status.st_mode)
+
+
+def _require_extraction_root_stable(
+    path: Path,
+    descriptor: int,
+    parent_fd: int,
+    expected: os.stat_result,
+    phase: str,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        absolute = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"runtime archive extraction root changed {phase}") from error
+    expected_identity = _directory_identity(expected)
+    if (
+        _directory_identity(opened) != expected_identity
+        or _directory_identity(named) != expected_identity
+        or _directory_identity(absolute) != expected_identity
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        raise ValueError(f"runtime archive extraction root changed {phase}")
+
+
 def _hash_open_regular(descriptor: int, path: Path, before: os.stat_result) -> tuple[int, str]:
     os.lseek(descriptor, 0, os.SEEK_SET)
     digest = hashlib.sha256()
-    size = 0
-    while block := os.read(descriptor, _READ_BLOCK_BYTES):
+    remaining = before.st_size
+    while remaining:
+        block = os.read(descriptor, min(_READ_BLOCK_BYTES, remaining))
+        if not block:
+            raise ValueError(f"runtime archive input changed while hashing: {path}")
         digest.update(block)
-        size += len(block)
+        remaining -= len(block)
+    if os.read(descriptor, 1):
+        raise ValueError(f"runtime archive input changed while hashing: {path}")
     _POST_HASH_HOOK()
     after = os.fstat(descriptor)
-    if _file_identity(before) != _file_identity(after) or size != before.st_size:
+    if _file_identity(before) != _file_identity(after):
         raise ValueError(f"runtime archive input changed while hashing: {path}")
-    return size, digest.hexdigest()
+    return before.st_size, digest.hexdigest()
+
+
+def _snapshot_open_regular(
+    source_fd: int,
+    source_path: Path,
+    source_before: os.stat_result,
+    *,
+    private_parent: Path,
+) -> tuple[int, int, str]:
+    snapshot_fd = _new_snapshot_descriptor(private_parent)
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        remaining = source_before.st_size
+        while remaining:
+            block = os.read(source_fd, min(_READ_BLOCK_BYTES, remaining))
+            if not block:
+                raise ValueError(f"runtime archive input changed while hashing: {source_path}")
+            _write_all(snapshot_fd, block)
+            digest.update(block)
+            remaining -= len(block)
+        if os.read(source_fd, 1):
+            raise ValueError(f"runtime archive input changed while hashing: {source_path}")
+        _POST_HASH_HOOK()
+        source_after = os.fstat(source_fd)
+        if _file_identity(source_before) != _file_identity(source_after):
+            raise ValueError(f"runtime archive input changed while hashing: {source_path}")
+        os.fsync(snapshot_fd)
+        snapshot_fd = _make_snapshot_immutable(snapshot_fd, private_parent)
+        snapshot = os.fstat(snapshot_fd)
+        if not stat.S_ISREG(snapshot.st_mode) or snapshot.st_size != source_before.st_size:
+            raise ValueError("runtime archive private snapshot is invalid")
+        os.lseek(snapshot_fd, 0, os.SEEK_SET)
+        return snapshot_fd, source_before.st_size, digest.hexdigest()
+    except BaseException:
+        os.close(snapshot_fd)
+        raise
+
+
+def _new_snapshot_descriptor(private_parent: Path) -> int:
+    memfd_create = getattr(os, "memfd_create", None)
+    allow_sealing = getattr(os, "MFD_ALLOW_SEALING", 0)
+    if sys.platform == "linux" and callable(memfd_create) and allow_sealing:
+        return memfd_create(
+            "q30t-runtime-archive",
+            getattr(os, "MFD_CLOEXEC", 0) | allow_sealing,
+        )
+    private_directory = Path(tempfile.mkdtemp(prefix=".q30t-runtime-snapshot-", dir=private_parent))
+    private_directory.chmod(0o700)
+    return os.open(
+        private_directory / "archive.tar.zst",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | _nofollow_flag() | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+
+
+def _make_snapshot_immutable(descriptor: int, private_parent: Path) -> int:
+    if sys.platform == "linux" and hasattr(fcntl, "F_ADD_SEALS"):
+        seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seals)
+        if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) != seals:
+            raise ValueError("runtime archive private snapshot sealing failed")
+        return descriptor
+    status = os.fstat(descriptor)
+    os.fchmod(descriptor, 0o400)
+    snapshot_path = Path(_descriptor_path(descriptor)).resolve()
+    readonly = os.open(snapshot_path, os.O_RDONLY | _nofollow_flag() | getattr(os, "O_CLOEXEC", 0))
+    opened = os.fstat(readonly)
+    if (status.st_dev, status.st_ino, status.st_size) != (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+    ):
+        os.close(readonly)
+        raise ValueError(f"runtime archive private snapshot changed under {private_parent}")
+    os.close(descriptor)
+    return readonly
+
+
+def _write_all(descriptor: int, block: bytes) -> None:
+    view = memoryview(block)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("runtime archive private snapshot write made no progress")
+        view = view[written:]
 
 
 def _require_named_file_stable(
@@ -523,15 +720,17 @@ def _preflight_archive(descriptor: int) -> None:
             raise RuntimeError("zstd preflight pipe is unavailable")
         with process.stdout, tarfile.open(fileobj=process.stdout, mode="r|") as archive:
             for member in archive:
-                canonical = _canonical_member_path(member.name, is_directory=member.isdir())
+                canonical = _canonical_member_path(
+                    member.name, is_directory=member.type == tarfile.DIRTYPE
+                )
                 if canonical is None:
                     continue
                 if canonical in seen:
                     raise ValueError(f"duplicate archive member path: {canonical}")
                 seen.add(canonical)
-                if member.isdir() or member.isreg():
+                if member.type in {tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE}:
                     continue
-                if member.issym():
+                if member.type == tarfile.SYMTYPE:
                     _require_safe_link_target(canonical, member.linkname)
                     continue
                 raise ValueError(f"unsupported archive member: {canonical}")
@@ -556,7 +755,7 @@ def _canonical_member_path(name: str, *, is_directory: bool) -> str | None:
         name.encode("utf-8")
     except UnicodeEncodeError as error:
         raise ValueError("unsafe archive member path is not UTF-8") from error
-    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+    if _contains_unicode_control(name):
         raise ValueError(f"unsafe archive member path: {name!r}")
     if name == ".":
         if is_directory:
@@ -580,11 +779,7 @@ def _require_safe_link_target(member_path: str, link_target: str) -> None:
     except UnicodeEncodeError as error:
         raise ValueError("unsafe archive link target is not UTF-8") from error
     target = PurePosixPath(link_target)
-    if (
-        not link_target
-        or target.is_absolute()
-        or any(ord(character) < 32 or ord(character) == 127 for character in link_target)
-    ):
+    if not link_target or target.is_absolute() or _contains_unicode_control(link_target):
         raise ValueError(f"unsafe archive link target: {link_target!r}")
     resolved = list(PurePosixPath(member_path).parent.parts)
     for component in target.parts:
@@ -598,8 +793,12 @@ def _require_safe_link_target(member_path: str, link_target: str) -> None:
         resolved.append(component)
 
 
-def _extract_archive(descriptor: int, extraction_root: Path) -> None:
-    os.lseek(descriptor, 0, os.SEEK_SET)
+def _contains_unicode_control(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _extract_archive(archive_fd: int, extraction_fd: int) -> None:
+    os.lseek(archive_fd, 0, os.SEEK_SET)
     subprocess.run(
         (
             "/usr/bin/tar",
@@ -608,13 +807,14 @@ def _extract_archive(descriptor: int, extraction_root: Path) -> None:
             "--no-same-owner",
             "--no-same-permissions",
             "--file",
-            _descriptor_path(descriptor),
+            _descriptor_path(archive_fd),
             "--directory",
-            str(extraction_root),
+            ".",
         ),
         check=True,
         env=_tool_environment(),
-        pass_fds=(descriptor,),
+        pass_fds=(archive_fd, extraction_fd),
+        preexec_fn=lambda: os.fchdir(extraction_fd),
     )
 
 
@@ -640,16 +840,20 @@ def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obj
 def _stable_single_link_bytes(path: Path, *, maximum_bytes: int) -> tuple[str, bytes]:
     descriptor, parent_fd, before = _open_stable_regular(path)
     try:
+        if before.st_size > maximum_bytes:
+            raise ValueError("runtime archive receipt is too large")
         retained = bytearray()
         digest = hashlib.sha256()
-        while block := os.read(
-            descriptor,
-            min(_READ_BLOCK_BYTES, maximum_bytes - len(retained) + 1),
-        ):
-            if len(retained) + len(block) > maximum_bytes:
-                raise ValueError("runtime archive receipt is too large")
+        remaining = before.st_size
+        while remaining:
+            block = os.read(descriptor, min(_READ_BLOCK_BYTES, remaining))
+            if not block:
+                raise ValueError("runtime archive receipt changed while reading")
             retained.extend(block)
             digest.update(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise ValueError("runtime archive receipt changed while reading")
         after = os.fstat(descriptor)
         _require_named_file_stable(path, descriptor, parent_fd, before, "reading")
         if _file_identity(before) != _file_identity(after) or len(retained) != before.st_size:
@@ -675,7 +879,7 @@ def _publish_or_adopt(path: Path, payload: bytes, *, job_id: str) -> None:
         return
     try:
         atomic_publish_bytes(path, payload, job_id=job_id)
-    except Exception:
+    except FileExistsError:
         if not os.path.lexists(path):
             raise
         _adopt_exact(path, payload)

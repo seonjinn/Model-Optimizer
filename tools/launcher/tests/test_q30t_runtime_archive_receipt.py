@@ -9,9 +9,11 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +27,106 @@ from common.specdec.q30t_runtime_identity import runtime_tree_identity
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+_APPROVED_ARCHIVE = (
+    "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/assets/"
+    "q235-training-prereqs-vllm0271-v1/runtime/"
+    "modelopt-vllm-0.27.1-py312-aarch64-symlinks.tar.zst"
+)
+_APPROVED_ARCHIVE_SHA256 = "4a20aee61f290c48bed22a84b4a0ae0cbdc54e3e3910854d253188c8854f5dc9"
+_RUNNER = Path(__file__).parents[1] / "common/specdec/run_q30t_runtime_archive_receipt.sbatch"
+
+
+@dataclass(frozen=True)
+class RunnerHarness:
+    """Controlled non-Linux tool boundary for behavioral sbatch tests."""
+
+    environment: dict[str, str]
+    arguments: tuple[str, ...]
+    capture_path: Path
+    tools: dict[str, Path]
+
+
+def _write_executable(path: Path, body: str) -> None:
+    """Create one explicit test executable without PATH lookup."""
+    path.write_text(f"#!/bin/bash\nset -euo pipefail\n{body}\n")
+    path.chmod(0o700)
+
+
+def _runner_harness(tmp_path: Path) -> RunnerHarness:
+    """Build explicit fake tools and exact valid runner arguments."""
+    tool_root = tmp_path / "tools"
+    tool_root.mkdir()
+    capture_path = tmp_path / "env-arguments.txt"
+    output_parent = tmp_path / "receipts"
+    output_parent.mkdir()
+    source_checkout = tmp_path / "source"
+    source_checkout.mkdir()
+    tools = {
+        name: tool_root / name
+        for name in (
+            "bash",
+            "env",
+            "python3.12",
+            "tar",
+            "zstd",
+            "dirname",
+            "mkdir",
+        )
+    }
+    for name in ("bash", "python3.12", "tar", "zstd"):
+        _write_executable(tools[name], "exit 0")
+    _write_executable(tools["dirname"], f"echo {shlex.quote(str(output_parent))}")
+    _write_executable(tools["mkdir"], "exit 0")
+    _write_executable(
+        tools["env"],
+        "capture="
+        + shlex.quote(str(capture_path))
+        + '\n: > "$capture"\nfor argument in "$@"; do printf \'%s\\n\' "$argument" >> "$capture"; done',
+    )
+    environment = {
+        "OSTYPE": "darwin-test",
+        "Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES": "non-linux-test",
+        "Q30T_TEST_BASH": str(tools["bash"]),
+        "Q30T_TEST_ENV": str(tools["env"]),
+        "Q30T_TEST_PYTHON": str(tools["python3.12"]),
+        "Q30T_TEST_TAR": str(tools["tar"]),
+        "Q30T_TEST_ZSTD": str(tools["zstd"]),
+        "Q30T_TEST_DIRNAME": str(tools["dirname"]),
+        "Q30T_TEST_MKDIR": str(tools["mkdir"]),
+        "SLURM_EXPORT_ENV": "NONE",
+        "SLURM_JOB_ID": "12345",
+        "SLURM_NNODES": "1",
+        "USER": "runner-test",
+    }
+    arguments = (
+        _APPROVED_ARCHIVE,
+        _APPROVED_ARCHIVE_SHA256,
+        str(source_checkout),
+        "2" * 40,
+        "3" * 64,
+        str(output_parent / "receipt.json"),
+        str(output_parent),
+    )
+    return RunnerHarness(environment, arguments, capture_path, tools)
+
+
+def _run_runner(
+    harness: RunnerHarness,
+    *,
+    environment_updates: Mapping[str, str] | None = None,
+    arguments: tuple[str, ...] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Execute the real sbatch artifact through privileged Bash."""
+    environment = harness.environment | dict(environment_updates or {})
+    return subprocess.run(
+        ("/bin/bash", "-p", str(_RUNNER), *(arguments or harness.arguments)),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
 
 
 def file_sha256(path: Path) -> str:
@@ -165,6 +267,85 @@ def test_archive_receipt_rejects_rebound_archive(
         produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
 
 
+def test_archive_extraction_uses_private_snapshot_after_source_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation after preflight cannot make tar consume mutable source bytes."""
+    archive = make_runtime_archive(
+        tmp_path,
+        {"bin/python": b"python", "pyvenv.cfg": b"home=x\n"},
+    )
+    replacement = make_runtime_archive(
+        tmp_path,
+        {"bin/python": b"attacker", "pyvenv.cfg": b"home=attacker\n"},
+    )
+    arguments = exact_arguments(tmp_path, archive)
+
+    monkeypatch.setattr(
+        module,
+        "_PRE_EXTRACT_HOOK",
+        lambda: archive.write_bytes(replacement.read_bytes()),
+    )
+
+    with pytest.raises(ValueError, match="changed while extracting"):
+        produce_runtime_archive_tree_receipt(**arguments)
+    assert (tmp_path / "runtime/bin/python").read_bytes() == b"python"
+
+
+def test_archive_extraction_rejects_root_rebind_before_tar_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tar never follows a replacement extraction-root pathname."""
+    archive = make_runtime_archive(
+        tmp_path,
+        {"bin/python": b"python", "pyvenv.cfg": b"home=x\n"},
+    )
+    extraction_root = tmp_path / "runtime"
+    detached_root = tmp_path / "detached-runtime"
+    foreign_root = tmp_path / "foreign-runtime"
+    foreign_root.mkdir()
+
+    def rebind_root() -> None:
+        extraction_root.rename(detached_root)
+        extraction_root.symlink_to(foreign_root, target_is_directory=True)
+
+    monkeypatch.setattr(module, "_PRE_EXTRACT_HOOK", rebind_root)
+
+    with pytest.raises(ValueError, match="extraction root changed before extracting"):
+        produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
+    assert tuple(foreign_root.iterdir()) == ()
+    assert tuple(detached_root.iterdir()) == ()
+
+
+def test_archive_tar_remains_bound_when_root_rebinds_after_precheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-check pathname replacement cannot redirect tar side effects."""
+    archive = make_runtime_archive(
+        tmp_path,
+        {"bin/python": b"python", "pyvenv.cfg": b"home=x\n"},
+    )
+    extraction_root = tmp_path / "runtime"
+    detached_root = tmp_path / "detached-runtime"
+    foreign_root = tmp_path / "foreign-runtime"
+    foreign_root.mkdir()
+    real_run = subprocess.run
+
+    def rebind_at_tar(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        command = args[0]
+        if isinstance(command, tuple) and command[0] == "/usr/bin/tar":
+            extraction_root.rename(detached_root)
+            extraction_root.symlink_to(foreign_root, target_is_directory=True)
+        return real_run(*args, **kwargs)  # type: ignore[arg-type, return-value]
+
+    monkeypatch.setattr(module.subprocess, "run", rebind_at_tar)
+
+    with pytest.raises(ValueError, match="extraction root changed after extracting"):
+        produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
+    assert tuple(foreign_root.iterdir()) == ()
+    assert (detached_root / "bin/python").read_bytes() == b"python"
+
+
 def test_archive_receipt_rejects_changed_producer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -189,6 +370,25 @@ def test_archive_receipt_rejects_changed_producer(
         produce_runtime_archive_tree_receipt(
             **exact_arguments(tmp_path, archive, producer=producer)
         )
+
+
+def test_stable_hash_reads_exact_initial_size_then_probes_growth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stable hashing never reads beyond the initial size except one probe byte."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"abc")
+    requested_sizes: list[int] = []
+    real_read = os.read
+
+    def tracked_read(descriptor: int, size: int) -> bytes:
+        requested_sizes.append(size)
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(module.os, "read", tracked_read)
+
+    assert module.stable_regular_file_sha256(source) == (3, hashlib.sha256(b"abc").hexdigest())
+    assert requested_sizes == [3, 1]
 
 
 @pytest.mark.parametrize("input_name", ["archive", "producer"])
@@ -256,6 +456,64 @@ def test_archive_receipt_adopts_only_exact_existing_bytes(tmp_path: Path) -> Non
 
     assert second == first
     assert (tmp_path / "receipt.json").read_bytes() == original
+
+
+def test_archive_receipt_propagates_atomic_durability_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exact destination cannot conceal a publisher durability failure."""
+    archive = make_runtime_archive(
+        tmp_path,
+        {"bin/python": b"python", "pyvenv.cfg": b"home=x\n"},
+    )
+
+    def fail_after_install(destination: Path, payload: bytes, *, job_id: str) -> None:
+        del job_id
+        destination.write_bytes(payload)
+        raise RuntimeError("simulated fsync failure")
+
+    monkeypatch.setattr(module, "atomic_publish_bytes", fail_after_install)
+
+    with pytest.raises(RuntimeError, match="simulated fsync failure"):
+        produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
+
+
+def test_archive_parent_content_churn_does_not_look_like_path_rebind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stable directory identity ignores ordinary concurrent content changes."""
+    archive = make_runtime_archive(
+        tmp_path,
+        {"bin/python": b"python", "pyvenv.cfg": b"home=x\n"},
+    )
+    real_open = os.open
+    churned = False
+
+    def open_with_content_churn(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal churned
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if not churned and path == tmp_path.name and dir_fd is not None:
+            marker = real_open(
+                "concurrent-entry",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=descriptor,
+            )
+            os.close(marker)
+            churned = True
+        return descriptor
+
+    monkeypatch.setattr(module.os, "open", open_with_content_churn)
+
+    produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
+
+    assert churned
 
 
 def _materialized_receipt(tmp_path: Path) -> tuple[Path, dict[str, Any]]:
@@ -388,9 +646,41 @@ def test_archive_preflight_rejects_escaping_symlink(tmp_path: Path) -> None:
     assert not (tmp_path / "runtime").exists()
 
 
-@pytest.mark.parametrize("member_type", [tarfile.CHRTYPE, tarfile.FIFOTYPE, tarfile.LNKTYPE])
+def test_archive_preflight_rejects_c1_control_in_member_path(tmp_path: Path) -> None:
+    """C1 control characters cannot enter extracted member names."""
+    member = tarfile.TarInfo("./bin/\x85python")
+    archive = make_custom_archive(tmp_path, (member,))
+
+    with pytest.raises(ValueError, match="unsafe archive member path"):
+        produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
+    assert not (tmp_path / "runtime").exists()
+
+
+def test_archive_preflight_rejects_c1_control_in_link_target(tmp_path: Path) -> None:
+    """C1 control characters cannot enter symlink targets."""
+    link = tarfile.TarInfo("./bin/python")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "python\x85target"
+    config = tarfile.TarInfo("./pyvenv.cfg")
+    archive = make_custom_archive(tmp_path, (link, config))
+
+    with pytest.raises(ValueError, match="unsafe archive link target"):
+        produce_runtime_archive_tree_receipt(**exact_arguments(tmp_path, archive))
+    assert not (tmp_path / "runtime").exists()
+
+
+@pytest.mark.parametrize(
+    "member_type",
+    [
+        tarfile.CHRTYPE,
+        tarfile.FIFOTYPE,
+        tarfile.LNKTYPE,
+        tarfile.CONTTYPE,
+        tarfile.GNUTYPE_SPARSE,
+    ],
+)
 def test_archive_preflight_rejects_unsafe_member_types(tmp_path: Path, member_type: bytes) -> None:
-    """Devices, FIFOs, and hardlinks never reach GNU tar extraction."""
+    """Non-ordinary files never reach GNU tar extraction."""
     member = tarfile.TarInfo("./unsafe")
     member.type = member_type
     if member_type == tarfile.LNKTYPE:
@@ -404,14 +694,122 @@ def test_archive_preflight_rejects_unsafe_member_types(tmp_path: Path, member_ty
 
 def test_sbatch_is_one_node_cpu_only_and_uses_exact_runtime_root() -> None:
     """The Slurm producer preserves the sterile CPU-only runtime contract."""
-    script = (
-        Path(__file__).parents[1] / "common/specdec/run_q30t_runtime_archive_receipt.sbatch"
-    ).read_text()
+    script = _RUNNER.read_text()
 
     assert "#SBATCH --nodes=1\n" in script
     assert "#SBATCH --export=NONE\n" in script
     assert "#SBATCH --gpus" not in script
     assert 'scratch_root="/raid/scratch/$USER/q30t-runtime-archive-$SLURM_JOB_ID"' in script
     assert '--extraction-root "$scratch_root/runtime"' in script
-    assert "env -i PATH=/usr/bin:/bin" in script
-    assert "/usr/bin/python3.12 -m common.specdec.q30t_runtime_archive_receipt produce" in script
+
+
+def test_sbatch_executes_with_authenticated_test_tools_and_sterile_env(tmp_path: Path) -> None:
+    """The runner reaches Python only through explicit validated tools and env -i."""
+    harness = _runner_harness(tmp_path)
+
+    result = _run_runner(harness, environment_updates={"PATH": str(tmp_path / "attacker")})
+
+    assert result.returncode == 0, result.stderr
+    captured = harness.capture_path.read_text().splitlines()
+    assert captured[:4] == [
+        "-i",
+        "PATH=/usr/bin:/bin",
+        f"PYTHONPATH={harness.arguments[2]}/tools/launcher",
+        str(harness.tools["python3.12"]),
+    ]
+    assert "common.specdec.q30t_runtime_archive_receipt" in captured
+
+
+def test_sbatch_behaviorally_rejects_wrong_arity(tmp_path: Path) -> None:
+    """The real runner rejects any positional shape other than seven."""
+    harness = _runner_harness(tmp_path)
+
+    result = _run_runner(harness, arguments=harness.arguments[:-1])
+
+    assert result.returncode == 2
+    assert "usage:" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("argument_index", "replacement"),
+    [(0, "/lustre/foreign.tar.zst"), (1, "0" * 64)],
+)
+def test_sbatch_behaviorally_rejects_wrong_fixed_archive_identity(
+    tmp_path: Path, argument_index: int, replacement: str
+) -> None:
+    """The production archive path and SHA cannot be substituted."""
+    harness = _runner_harness(tmp_path)
+    arguments = list(harness.arguments)
+    arguments[argument_index] = replacement
+
+    result = _run_runner(harness, arguments=tuple(arguments))
+
+    assert result.returncode == 2
+    assert "runtime archive identity is not approved" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [("SLURM_JOB_GPUS", "0"), ("SLURM_GPUS_ON_NODE", "1"), ("SLURM_TRES_PER_NODE", "gpu:1")],
+)
+def test_sbatch_behaviorally_rejects_gpu_environment(tmp_path: Path, name: str, value: str) -> None:
+    """GPU variables and GPU TRES fail the CPU-only allocation boundary."""
+    harness = _runner_harness(tmp_path)
+
+    result = _run_runner(harness, environment_updates={name: value})
+
+    assert result.returncode == 2
+    assert "requires a CPU-only allocation" in result.stderr
+
+
+def test_sbatch_behaviorally_rejects_output_parent_mismatch(tmp_path: Path) -> None:
+    """The seventh argument must be the exact output pathname parent."""
+    harness = _runner_harness(tmp_path)
+    arguments = (*harness.arguments[:-1], str(tmp_path / "foreign-parent"))
+
+    result = _run_runner(harness, arguments=arguments)
+
+    assert result.returncode == 2
+    assert "receipt destination is invalid" in result.stderr
+
+
+def test_sbatch_behaviorally_rejects_prohibited_python_environment(tmp_path: Path) -> None:
+    """Python environment injection is rejected before any tool executes."""
+    harness = _runner_harness(tmp_path)
+
+    result = _run_runner(harness, environment_updates={"PYTHONPATH": "/attacker"})
+
+    assert result.returncode == 2
+    assert "prohibited exported environment variable: PYTHONPATH" in result.stderr
+    assert not harness.capture_path.exists()
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["bash", "env", "python3.12", "tar", "zstd", "dirname", "mkdir"],
+)
+def test_sbatch_behaviorally_rejects_symlink_tool_substitution(
+    tmp_path: Path, tool_name: str
+) -> None:
+    """Even test-mode explicit tools must be regular, never symlink substitutions."""
+    harness = _runner_harness(tmp_path)
+    tool = harness.tools[tool_name]
+    tool.unlink()
+    tool.symlink_to("/bin/true")
+
+    result = _run_runner(harness)
+
+    assert result.returncode == 2
+    assert "approved test executable is unavailable" in result.stderr
+    assert not harness.capture_path.exists()
+
+
+def test_sbatch_behaviorally_rejects_relative_tool_substitution(tmp_path: Path) -> None:
+    """A relative executable override is rejected before invocation."""
+    harness = _runner_harness(tmp_path)
+
+    result = _run_runner(harness, environment_updates={"Q30T_TEST_TAR": "attacker-tar"})
+
+    assert result.returncode == 2
+    assert "test executable configuration is invalid" in result.stderr
+    assert not harness.capture_path.exists()
