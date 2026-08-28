@@ -22,7 +22,7 @@ from typing import Any, BinaryIO, overload
 
 try:
     from common.specdec.q30t_tokenizer_receipt import (  # pyright: ignore[reportMissingImports]
-        verify_q30t_tokenizer_receipt,
+        load_q30t_tokenizer_receipt,
     )
     from common.specdec.q30t_tree_digest import (  # pyright: ignore[reportMissingImports]
         canonical_tree_sha256,
@@ -35,9 +35,7 @@ try:
     )
 except ModuleNotFoundError:
     try:
-        from tools.launcher.common.specdec.q30t_tokenizer_receipt import (
-            verify_q30t_tokenizer_receipt,
-        )
+        from tools.launcher.common.specdec.q30t_tokenizer_receipt import load_q30t_tokenizer_receipt
         from tools.launcher.common.specdec.q30t_tree_digest import (
             canonical_tree_sha256,
             descriptor_stable_tree_entries,
@@ -51,7 +49,7 @@ except ModuleNotFoundError:
         Q30_DIRECTORY_COMPLETION_MARKER = ".q30-publication-incomplete"
         atomic_publish_directory = None
         authenticate_directory_completion = None
-        verify_q30t_tokenizer_receipt = None
+        load_q30t_tokenizer_receipt = None
         canonical_tree_sha256 = None
         descriptor_stable_tree_entries = None
 
@@ -116,7 +114,6 @@ APPROVED_ROW_SCHEMA_SHA256S: frozenset[str] = frozenset()
 APPROVED_SOURCE_INVENTORY_FILE_SHA256 = ""
 APPROVED_HISTORICAL_RECEIPT_FILE_SHA256 = ""
 APPROVED_HELD_OUT_RECEIPT_FILE_SHA256S: dict[str, str] = {}
-APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S: frozenset[str] = frozenset()
 Q30T_TOKENIZER_REPOSITORY = "Qwen/Qwen3-30B-A3B-Thinking-2507"
 _Q30T_TOKENIZER_ASSET_NAMES = frozenset(
     {
@@ -723,13 +720,39 @@ def _q30t_snapshot_tree_sha256(root: Path) -> str:
         raise ComplementError(f"tokenizer snapshot tree evidence is invalid: {error}") from error
 
 
-def _verify_q30t_tokenizer_receipt(raw: bytes) -> None:
-    if verify_q30t_tokenizer_receipt is None:
-        raise ComplementError("Q30 tokenizer receipt verifier is unavailable")
-    try:
-        verify_q30t_tokenizer_receipt(raw)
-    except ValueError as error:
-        raise ComplementError("Q30 tokenizer receipt evidence does not reconcile") from error
+def _tokenizer_trust_from_q30_payload(
+    payload: dict[str, object], file_sha256: str
+) -> TokenizerTrust:
+    def text(name: str) -> str:
+        value = payload[name]
+        if not isinstance(value, str) or not value:
+            raise ComplementError(f"Q30 tokenizer {name} is invalid")
+        return value
+
+    def digest(name: str, length: int) -> str:
+        value = text(name)
+        if not _is_lower_hex(value, length):
+            raise ComplementError(f"Q30 tokenizer {name} is invalid")
+        return value
+
+    def integer(name: str) -> int:
+        value = payload[name]
+        if type(value) is not int or value < 0:
+            raise ComplementError(f"Q30 tokenizer {name} is invalid")
+        return value
+
+    return TokenizerTrust(
+        file_sha256=file_sha256,
+        receipt_sha256=digest("receipt_sha256", 64),
+        repository=text("repository"),
+        revision=digest("revision", 40),
+        snapshot_path=Path(text("snapshot_path")),
+        snapshot_tree_sha256=digest("snapshot_tree_sha256", 64),
+        chat_template_sha256=digest("chat_template_sha256", 64),
+        training_chat_template_sha256=digest("training_chat_template_sha256", 64),
+        im_start_token_id=integer("im_start_token_id"),
+        im_end_token_id=integer("im_end_token_id"),
+    )
 
 
 def load_tokenizer_trust(
@@ -741,7 +764,14 @@ def load_tokenizer_trust(
     """Authenticate the target-bound tokenizer/template trust receipt."""
     if not _is_lower_hex(expected_sha256, 64):
         raise ComplementError("tokenizer trust caller SHA-256 is invalid")
-    is_q30t = policy.tokenizer_trust_schema == "qwen3-30ba3b-thinking-tokenizer-trust-v1"
+    if policy.tokenizer_trust_schema == "qwen3-30ba3b-thinking-tokenizer-trust-v1":
+        if load_q30t_tokenizer_receipt is None:
+            raise ComplementError("Q30 tokenizer loader is unavailable")
+        try:
+            payload = load_q30t_tokenizer_receipt(path, expected_sha256=expected_sha256)
+        except ValueError as error:
+            raise ComplementError(f"Q30 tokenizer trust is invalid: {error}") from error
+        return _tokenizer_trust_from_q30_payload(payload, expected_sha256)
     raw = _stable_regular_bytes(path, max_bytes=_MAX_TOKENIZER_RECEIPT_BYTES)
     if sha256(raw).hexdigest() != expected_sha256:
         raise ComplementError("tokenizer trust caller SHA-256 mismatch")
@@ -770,8 +800,6 @@ def load_tokenizer_trust(
         or payload["revision"] != policy.tokenizer_revision
     ):
         raise ComplementError("target tokenizer identity is invalid")
-    if is_q30t and expected_sha256 not in APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S:
-        raise ComplementError("reviewed Q30 tokenizer receipt is unavailable")
     digest_fields = (
         payload["snapshot_tree_sha256"],
         payload["chat_template_sha256"],
@@ -779,19 +807,15 @@ def load_tokenizer_trust(
     )
     snapshot = Path(payload["snapshot_path"])
     body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
-    snapshot_tree_sha256 = (
-        _q30t_snapshot_tree_sha256(snapshot) if is_q30t else _snapshot_tree_sha256(snapshot)
-    )
+    snapshot_tree_sha256 = _snapshot_tree_sha256(snapshot)
     if (
         any(not _is_lower_hex(value, 64) for value in digest_fields)
         or payload["receipt_sha256"] != sha256(_canonical_json(body)).hexdigest()
         or snapshot_tree_sha256 != payload["snapshot_tree_sha256"]
-        or (not is_q30t and payload["im_start_token_id"] != 151_644)
-        or (not is_q30t and payload["im_end_token_id"] != 151_645)
+        or payload["im_start_token_id"] != 151_644
+        or payload["im_end_token_id"] != 151_645
     ):
         raise ComplementError("tokenizer trust evidence does not reconcile")
-    if is_q30t:
-        _verify_q30t_tokenizer_receipt(raw)
     return TokenizerTrust(
         file_sha256=expected_sha256,
         receipt_sha256=payload["receipt_sha256"],

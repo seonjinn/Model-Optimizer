@@ -185,6 +185,40 @@ def _write_tokenizer_trust(path: Path, snapshot: Path) -> tuple[Path, str]:
     return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _approved_q30_policy(module):
+    policy = module.Q4_TARGET_POLICY
+    return module.TargetTokenizerPolicy(
+        schema_version=policy.schema_version,
+        scientific_identity="ptv2-ptv3-complement-700k-qwen3-30ba3b-thinking-v1",
+        target_repository="Qwen/Qwen3-30B-A3B-Thinking-2507",
+        target_revision="a" * 40,
+        tokenizer_repository="Qwen/Qwen3-30B-A3B-Thinking-2507",
+        tokenizer_revision="a" * 40,
+        tokenizer_trust_schema="qwen3-30ba3b-thinking-tokenizer-trust-v1",
+        training_sequence_length=policy.training_sequence_length,
+        quota_config_path=policy.quota_config_path,
+        quota_config_sha256=policy.quota_config_sha256,
+        source_requirements_path=policy.source_requirements_path,
+        source_requirements_sha256=policy.source_requirements_sha256,
+        file_sha256="b" * 64,
+    )
+
+
+def _q30_tokenizer_payload(tmp_path: Path) -> dict[str, object]:
+    return {
+        "schema_version": "qwen3-30ba3b-thinking-tokenizer-trust-v1",
+        "repository": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+        "revision": "a" * 40,
+        "snapshot_path": str(tmp_path / "snapshot"),
+        "snapshot_tree_sha256": "1" * 64,
+        "chat_template_sha256": "2" * 64,
+        "training_chat_template_sha256": "3" * 64,
+        "im_start_token_id": 151644,
+        "im_end_token_id": 151645,
+        "receipt_sha256": "4" * 64,
+    }
+
+
 def _toy_verifier_roots(
     module,
     monkeypatch,
@@ -1137,6 +1171,103 @@ def test_tokenizer_trust_reuses_the_caller_pinned_official_qwen_snapshot(tmp_pat
     assert trust.snapshot_path == snapshot
     assert trust.im_start_token_id == 151644
     assert trust.im_end_token_id == 151645
+
+
+def test_q30_builder_delegates_to_controller_owned_tokenizer_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    receipt_path = tmp_path / "tokenizer.json"
+    receipt_path.write_bytes(b"controller-owned\n")
+    expected_sha256 = "5ba642c455e60b67eca295dce92dd7da47292fdba66c5f9d269669c14cafc509"
+    calls: list[tuple[Path, str]] = []
+
+    def approved_loader(path: Path, *, expected_sha256: str) -> dict[str, object]:
+        calls.append((path, expected_sha256))
+        return _q30_tokenizer_payload(tmp_path)
+
+    monkeypatch.setattr(module, "load_q30t_tokenizer_receipt", approved_loader)
+    trust = module.load_tokenizer_trust(
+        receipt_path,
+        expected_sha256=expected_sha256,
+        policy=_approved_q30_policy(module),
+    )
+
+    assert calls == [(receipt_path, expected_sha256)]
+    assert trust.file_sha256 == expected_sha256
+
+
+def test_q30_builder_translates_loader_rejection_without_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    calls = 0
+
+    def rejected_loader(path: Path, *, expected_sha256: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        raise ValueError("Q30 tokenizer receipt is not approved")
+
+    monkeypatch.setattr(module, "load_q30t_tokenizer_receipt", rejected_loader)
+    with pytest.raises(module.ComplementError, match="not approved"):
+        module.load_tokenizer_trust(
+            tmp_path / "receipt.json",
+            expected_sha256="5ba642c455e60b67eca295dce92dd7da47292fdba66c5f9d269669c14cafc509",
+            policy=_approved_q30_policy(module),
+        )
+
+    assert calls == 1
+
+
+def test_q30_builder_rejects_an_unavailable_controller_loader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "load_q30t_tokenizer_receipt", None)
+
+    with pytest.raises(module.ComplementError, match="Q30 tokenizer loader is unavailable"):
+        module.load_tokenizer_trust(
+            tmp_path / "receipt.json",
+            expected_sha256="5ba642c455e60b67eca295dce92dd7da47292fdba66c5f9d269669c14cafc509",
+            policy=_approved_q30_policy(module),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("receipt_sha256", "A" * 64),
+        ("repository", ""),
+        ("revision", 17),
+        ("snapshot_path", Path("snapshot")),
+        ("snapshot_tree_sha256", "1" * 63),
+        ("chat_template_sha256", None),
+        ("training_chat_template_sha256", b"3" * 64),
+        ("im_start_token_id", True),
+        ("im_end_token_id", -1),
+    ],
+)
+def test_q30_builder_rejects_malformed_controller_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    module = _load_module()
+    payload = _q30_tokenizer_payload(tmp_path)
+    payload[field] = value
+    monkeypatch.setattr(
+        module,
+        "load_q30t_tokenizer_receipt",
+        lambda _path, *, expected_sha256: payload,
+    )
+
+    with pytest.raises(module.ComplementError, match=rf"Q30 tokenizer {field} is invalid"):
+        module.load_tokenizer_trust(
+            tmp_path / "receipt.json",
+            expected_sha256="5ba642c455e60b67eca295dce92dd7da47292fdba66c5f9d269669c14cafc509",
+            policy=_approved_q30_policy(module),
+        )
 
 
 def test_production_selection_spools_selected_conversations_to_raid_backed_sqlite(
