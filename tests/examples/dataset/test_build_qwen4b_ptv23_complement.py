@@ -6,12 +6,16 @@
 from __future__ import annotations
 
 import ast
+import ctypes
+import errno
 import hashlib
 import importlib.util
 import inspect
 import json
+import os
 import subprocess
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -164,7 +168,9 @@ def _toy_verifier_roots(
     monkeypatch.setattr(module, "_require_external_approval_roots", lambda: None)
     monkeypatch.setattr(module, "_authenticate_provenance_roots", lambda *_args: None)
     monkeypatch.setattr(
-        module, "load_complement_config", lambda _path, **_kwargs: {"quotas": module.APPROVED_QUOTAS}
+        module,
+        "load_complement_config",
+        lambda _path, **_kwargs: {"quotas": module.APPROVED_QUOTAS},
     )
     monkeypatch.setattr(module, "reconcile_source_requirements", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(module, "_category_rows", lambda _inventory: rows_by_category)
@@ -806,10 +812,10 @@ def test_verifier_streams_data_instead_of_materializing_whole_file(
     )
     original = module._stable_regular_bytes
 
-    def reject_data_materialization(path: Path) -> bytes:
+    def reject_data_materialization(path: Path, *, max_bytes: int = 512 * 1024 * 1024) -> bytes:
         if path.name == "DATA.jsonl":
             raise AssertionError("DATA.jsonl was materialized")
-        return original(path)
+        return original(path, max_bytes=max_bytes)
 
     monkeypatch.setattr(module, "_stable_regular_bytes", reject_data_materialization)
 
@@ -829,6 +835,93 @@ def test_verifier_streams_data_instead_of_materializing_whole_file(
         expected_runtime_sha256="8" * 64,
         expected_source_commit="9" * 40,
     )
+
+
+def test_verifier_rejects_bundle_root_swap_during_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verification remains bound to one held bundle root for manifest, capacity, and data."""
+    module = _load_module()
+    monkeypatch.setattr(module, "APPROVED_QUOTAS", {"stem": 1})
+    monkeypatch.setattr(module, "REQUIRED_HELD_OUT_RECEIPT_NAMES", frozenset())
+    rows = {"stem": [_row("stem", "one", 0)]}
+    selection = module.select_continuation_rows(
+        rows,
+        quotas={"stem": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+        capacity_receipt_path=tmp_path / "capacity.json",
+    )
+    historical_path, historical_sha256 = _write_historical_receipt(tmp_path / "historical.json")
+    historical = module.load_historical_exclusion(
+        historical_path, expected_sha256=historical_sha256, expected_occurrence_count=3
+    )
+    held_out = module.load_held_out_union([], required_names=frozenset())
+    completion = module.publish_selection_bundle(
+        selection,
+        output_root=tmp_path / "bundle",
+        scratch_root=tmp_path / "scratch",
+        quotas={"stem": 1},
+        config_file_sha256=hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+        source_inventory_file_sha256="6" * 64,
+        historical=historical,
+        held_out=held_out,
+        tokenizer_trust_file_sha256="7" * 64,
+        runtime_sha256="8" * 64,
+        source_commit="9" * 40,
+        enforce_production_paths=False,
+    )
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    for child in completion.output_root.iterdir():
+        (replacement / child.name).write_bytes(child.read_bytes())
+    displaced = tmp_path / "displaced"
+    verifier_roots = _toy_verifier_roots(module, monkeypatch, tmp_path, rows, historical, held_out)
+    original_select = module.select_continuation_rows
+    swapped = False
+
+    def select_then_swap(*args, **kwargs):
+        nonlocal swapped
+        replay = original_select(*args, **kwargs)
+        if not swapped:
+            swapped = True
+            completion.output_root.rename(displaced)
+            replacement.rename(completion.output_root)
+        return replay
+
+    monkeypatch.setattr(module, "select_continuation_rows", select_then_swap)
+
+    with pytest.raises(module.ComplementError, match=r"bundle|root|identity|changed"):
+        module.verify_selection_bundle(
+            completion.output_root,
+            expected_manifest_file_sha256=completion.manifest_file_sha256,
+            tokenizer=_Tokenizer(),
+            **verifier_roots,
+            expected_runtime_sha256="8" * 64,
+            expected_source_commit="9" * 40,
+        )
+
+
+def test_verifier_bundle_reader_requires_exact_nonblocking_single_link_tree() -> None:
+    """FIFO, hardlink, and extra-name inputs fail before any bundle payload is consumed."""
+    source = MODULE_PATH.read_text()
+    reader = source[
+        source.index("def _held_selection_bundle") : source.index("def verify_selection_bundle")
+    ]
+    verifier = source[
+        source.index("def _verify_selection_bundle_with_replay_root") : source.index(
+            "def _parse_args"
+        )
+    ]
+
+    assert "O_NONBLOCK" in reader
+    assert "st_nlink != 1" in reader
+    assert "frozenset(os.listdir(" in reader
+    assert "_held_selection_bundle(output_root)" in verifier
+    assert "data_path.is_file()" not in verifier
 
 
 def test_selection_does_not_advance_source_after_quota_is_full() -> None:
@@ -1013,8 +1106,19 @@ def test_authenticated_builder_readers_use_one_nofollow_descriptor() -> None:
     for helper in (stable_bytes, stable_evidence):
         assert "os.open" in helper
         assert "O_NOFOLLOW" in helper
+        assert "O_NONBLOCK" in helper
         assert ".read_bytes()" not in helper
         assert "path.open(" not in helper
+
+
+def test_stable_regular_bytes_rejects_oversized_retained_input(tmp_path: Path) -> None:
+    """Metadata readers bound retained bytes before allocating an artifact in memory."""
+    module = _load_module()
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b"123456789")
+
+    with pytest.raises(module.ComplementError, match="too large"):
+        module._stable_regular_bytes(oversized, max_bytes=8)
 
 
 def test_build_fails_on_unresolved_approval_roots_before_selection() -> None:
@@ -1041,6 +1145,329 @@ def test_publication_rehashes_copied_partial_before_atomic_rename() -> None:
     assert "publication partial changed while copying" in publication
 
 
+def test_bundle_publication_survives_lustre_renameat2_einval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The production dataset bundle uses the shared Lustre-safe publication primitive."""
+
+    class UnsupportedRename:
+        argtypes: object = None
+        restype: object = None
+
+        def __call__(self, *_args: object) -> int:
+            ctypes.set_errno(errno.EINVAL)
+            return -1
+
+    class UnsupportedLibrary:
+        renameat2 = UnsupportedRename()
+        renamex_np = UnsupportedRename()
+
+    module = _load_module()
+    partial = tmp_path / ".bundle.partial"
+    partial.mkdir()
+    (partial / "DATA.jsonl").write_bytes(b"data\n")
+    destination = tmp_path / "bundle"
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: UnsupportedLibrary())
+
+    module._rename_noreplace(partial, destination)
+
+    assert (destination / "DATA.jsonl").read_bytes() == b"data\n"
+
+
+def test_exact_dataset_retry_authenticates_the_durable_completion_marker(
+    tmp_path: Path,
+) -> None:
+    """A final bundle is adoptable only with the stable exact completed marker state."""
+    module = _load_module()
+    partial = tmp_path / ".bundle.partial"
+    partial.mkdir()
+    data_raw = b'{"row":1}\n'
+    data_sha256 = hashlib.sha256(data_raw).hexdigest()
+    manifest = {"data": {"path": "DATA.jsonl", "bytes": len(data_raw), "sha256": data_sha256}}
+    manifest_raw = _canonical(manifest) + b"\n"
+    (partial / "DATA.jsonl").write_bytes(data_raw)
+    (partial / "MANIFEST.json").write_bytes(manifest_raw)
+    root = tmp_path / "bundle"
+
+    module._rename_noreplace(partial, root)
+
+    assert module._published_bundle_matches(
+        root,
+        manifest_raw,
+        data_sha256,
+        "",
+        require_completion_marker=True,
+    )
+    (root / module.Q30_DIRECTORY_COMPLETION_MARKER).write_bytes(b"foreign\n")
+    assert not module._published_bundle_matches(
+        root,
+        manifest_raw,
+        data_sha256,
+        "",
+        require_completion_marker=True,
+    )
+
+
+@pytest.mark.parametrize("name", ["DATA.jsonl", "MANIFEST.json", "CAPACITY.json"])
+def test_exact_dataset_retry_rejects_multiply_linked_bundle_files(
+    tmp_path: Path, name: str
+) -> None:
+    """Exact-byte retry adoption cannot authenticate a multiply-linked durable file."""
+    module = _load_module()
+    root = tmp_path / "bundle"
+    root.mkdir()
+    data_raw = b'{"row":1}\n'
+    manifest_raw = b'{"manifest":1}\n'
+    capacity_raw = b'{"capacity":1}\n'
+    (root / "DATA.jsonl").write_bytes(data_raw)
+    (root / "MANIFEST.json").write_bytes(manifest_raw)
+    (root / "CAPACITY.json").write_bytes(capacity_raw)
+    os.link(root / name, tmp_path / f"linked-{name}")
+
+    assert not module._published_bundle_matches(
+        root,
+        manifest_raw,
+        hashlib.sha256(data_raw).hexdigest(),
+        hashlib.sha256(capacity_raw).hexdigest(),
+    )
+
+
+def test_exact_dataset_retry_reauthenticates_after_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-byte bundle root replacement after parent fsync cannot be adopted."""
+    module = _load_module()
+    root = tmp_path / "bundle"
+    root.mkdir()
+    data_raw = b'{"row":1}\n'
+    manifest_raw = b'{"manifest":1}\n'
+    (root / "DATA.jsonl").write_bytes(data_raw)
+    (root / "MANIFEST.json").write_bytes(manifest_raw)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "DATA.jsonl").write_bytes(data_raw)
+    (replacement / "MANIFEST.json").write_bytes(manifest_raw)
+    displaced = tmp_path / "displaced"
+    parent_identity = (root.parent.stat().st_dev, root.parent.stat().st_ino)
+    original_fsync = module.os.fsync
+    swapped = False
+
+    def fsync_then_swap(descriptor: int) -> None:
+        nonlocal swapped
+        original_fsync(descriptor)
+        status = os.fstat(descriptor)
+        if (status.st_dev, status.st_ino) == parent_identity and not swapped:
+            swapped = True
+            root.rename(displaced)
+            replacement.rename(root)
+
+    monkeypatch.setattr(module.os, "fsync", fsync_then_swap)
+
+    assert not module._published_bundle_matches(
+        root,
+        manifest_raw,
+        hashlib.sha256(data_raw).hexdigest(),
+        "",
+    )
+
+
+def test_exact_dataset_retry_rejects_declared_size_before_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A foreign DATA size is rejected from fstat before its payload can be streamed."""
+    module = _load_module()
+    root = tmp_path / "bundle"
+    root.mkdir()
+    data_raw = b'{"row":1}\n'
+    data = root / "DATA.jsonl"
+    data.write_bytes(data_raw)
+    manifest = {
+        "data": {
+            "path": "DATA.jsonl",
+            "bytes": len(data_raw) + 1,
+            "sha256": hashlib.sha256(data_raw).hexdigest(),
+        },
+        "capacity": None,
+    }
+    manifest_raw = _canonical(manifest) + b"\n"
+    (root / "MANIFEST.json").write_bytes(manifest_raw)
+    data_identity = (data.stat().st_dev, data.stat().st_ino)
+    original_fdopen = module.os.fdopen
+
+    def reject_data_hash(descriptor: int, *args, **kwargs):
+        status = os.fstat(descriptor)
+        if (status.st_dev, status.st_ino) == data_identity:
+            raise AssertionError("DATA was streamed before declared-size rejection")
+        return original_fdopen(descriptor, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "fdopen", reject_data_hash)
+
+    assert not module._published_bundle_matches(
+        root,
+        manifest_raw,
+        hashlib.sha256(data_raw).hexdigest(),
+        "",
+    )
+
+
+def test_completion_receipt_adopts_an_exact_deterministic_retry(tmp_path: Path) -> None:
+    """A completed receipt is reusable only as the same durable inode and exact bytes."""
+    module = _load_module()
+    completion = module.ComplementCompletion(
+        output_root=tmp_path / "bundle",
+        row_count=700_000,
+        manifest_file_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        scratch_root=tmp_path / "scratch",
+    )
+    path = tmp_path / "receipts/COMPLETION.json"
+
+    first = module._write_completion_receipt(
+        path, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+    )
+    before = path.stat()
+    expected = path.read_bytes()
+    second = module._write_completion_receipt(
+        path, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+    )
+
+    assert second == first
+    assert path.read_bytes() == expected
+    assert (path.stat().st_dev, path.stat().st_ino) == (before.st_dev, before.st_ino)
+
+
+def test_completion_receipt_retry_reauthenticates_after_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-byte pathname replacement during retry durability cannot be adopted."""
+    module = _load_module()
+    completion = module.ComplementCompletion(
+        output_root=tmp_path / "bundle",
+        row_count=700_000,
+        manifest_file_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        scratch_root=tmp_path / "scratch",
+    )
+    path = tmp_path / "receipts/COMPLETION.json"
+    module._write_completion_receipt(
+        path, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+    )
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(path.read_bytes())
+    displaced = tmp_path / "displaced.json"
+    original_fsync = module.os.fsync
+    parent_identity = (path.parent.stat().st_dev, path.parent.stat().st_ino)
+    swap_enabled = True
+
+    def fsync_then_swap(descriptor: int) -> None:
+        nonlocal swap_enabled
+        original_fsync(descriptor)
+        status = os.fstat(descriptor)
+        if swap_enabled and (status.st_dev, status.st_ino) == parent_identity:
+            swap_enabled = False
+            path.rename(displaced)
+            replacement.rename(path)
+
+    monkeypatch.setattr(module.os, "fsync", fsync_then_swap)
+
+    with pytest.raises(module.ComplementError, match=r"changed|rebound"):
+        module._write_completion_receipt(
+            path, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+        )
+
+
+def test_completion_receipt_retry_rejects_replacement_parent_with_same_inode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durability and final rebind use one held parent even if the receipt inode is moved."""
+    module = _load_module()
+    completion = module.ComplementCompletion(
+        output_root=tmp_path / "bundle",
+        row_count=700_000,
+        manifest_file_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        scratch_root=tmp_path / "scratch",
+    )
+    path = tmp_path / "receipts/COMPLETION.json"
+    module._write_completion_receipt(
+        path, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+    )
+    displaced_parent = tmp_path / "displaced-receipts"
+    original_fsync = module.os.fsync
+    parent_identity = (path.parent.stat().st_dev, path.parent.stat().st_ino)
+    swapped = False
+
+    def fsync_then_replace_parent(descriptor: int) -> None:
+        nonlocal swapped
+        original_fsync(descriptor)
+        status = os.fstat(descriptor)
+        if not swapped and (status.st_dev, status.st_ino) == parent_identity:
+            swapped = True
+            path.parent.rename(displaced_parent)
+            path.parent.mkdir()
+            (displaced_parent / path.name).rename(path)
+
+    monkeypatch.setattr(module.os, "fsync", fsync_then_replace_parent)
+
+    with pytest.raises(module.ComplementError, match=r"parent|changed|rebound|durability"):
+        module._write_completion_receipt(
+            path, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+        )
+
+
+def test_completion_receipt_durability_uses_one_held_parent_descriptor() -> None:
+    """One adoption owns file fsync, parent fsync, and the final absolute parent rebind."""
+    source = MODULE_PATH.read_text()
+    adoption = source[
+        source.index("def _adopt_exact_completion_receipt") : source.index(
+            "def _write_completion_receipt"
+        )
+    ]
+    writer = source[
+        source.index("def _write_completion_receipt") : source.index("def _load_completion_receipt")
+    ]
+
+    assert "os.fsync(parent_fd)" in adoption
+    assert "os.stat(path.parent, follow_symlinks=False)" in adoption
+    assert writer.count("_adopt_exact_completion_receipt") == 1
+    assert "_fsync_directory(path.parent)" not in writer
+
+
+def test_completion_receipt_retry_rejects_hardlinks_and_never_overwrites(
+    tmp_path: Path,
+) -> None:
+    """Retry adoption fails closed on linked or conflicting names without replacing them."""
+    module = _load_module()
+    completion = module.ComplementCompletion(
+        output_root=tmp_path / "bundle",
+        row_count=700_000,
+        manifest_file_sha256="a" * 64,
+        manifest_sha256="b" * 64,
+        scratch_root=tmp_path / "scratch",
+    )
+    linked = tmp_path / "linked/COMPLETION.json"
+    module._write_completion_receipt(
+        linked, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+    )
+    linked_bytes = linked.read_bytes()
+    os.link(linked, tmp_path / "receipt-hardlink.json")
+
+    with pytest.raises(module.ComplementError, match="single-link"):
+        module._write_completion_receipt(
+            linked, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+        )
+    assert linked.read_bytes() == linked_bytes
+
+    conflicting = tmp_path / "conflicting/COMPLETION.json"
+    conflicting.parent.mkdir()
+    conflicting.write_bytes(b"foreign\n")
+    with pytest.raises(module.ComplementError, match=r"differs|changed"):
+        module._write_completion_receipt(
+            conflicting, completion, runtime_sha256="c" * 64, source_commit="d" * 40
+        )
+    assert conflicting.read_bytes() == b"foreign\n"
+
+
 def test_publication_reauthenticates_the_installed_destination(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1065,7 +1492,11 @@ def test_publication_reauthenticates_the_installed_destination(
     )
     held_out = module.load_held_out_union([], required_names=frozenset())
 
-    def install_foreign_bundle(_source: Path, destination: Path) -> None:
+    def install_foreign_bundle(
+        _source: Path,
+        destination: Path,
+        **_kwargs: object,
+    ) -> None:
         destination.mkdir()
         (destination / "DATA.jsonl").write_bytes(b"foreign\n")
         (destination / "MANIFEST.json").write_bytes(b"{}\n")
@@ -1096,6 +1527,285 @@ def test_tokenizer_is_loaded_only_from_a_fresh_verified_snapshot_stage() -> None
 
     assert "_stage_tokenizer_snapshot" in loader
     assert "staged_snapshot" in loader
+
+
+def test_tokenizer_stage_failure_never_deletes_a_reused_foreign_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-UID replacement of private scratch is preserved on staging failure."""
+    module = _load_module()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    trust = module.TokenizerTrust(
+        file_sha256="a" * 64,
+        receipt_sha256="b" * 64,
+        repository=module.Q30T_TOKENIZER_REPOSITORY,
+        revision="c" * 40,
+        snapshot_path=snapshot,
+        snapshot_tree_sha256="d" * 64,
+        chat_template_sha256="e" * 64,
+        training_chat_template_sha256="f" * 64,
+        im_start_token_id=1,
+        im_end_token_id=2,
+    )
+    foreign_marker = tmp_path / "foreign-marker"
+
+    def replace_stage(*_args: object, copy_root: Path, **_kwargs: object) -> None:
+        stage_root = copy_root.parent
+        displaced = tmp_path / "displaced-stage"
+        stage_root.rename(displaced)
+        stage_root.mkdir()
+        marker = stage_root / "foreign"
+        marker.write_bytes(b"preserve-me\n")
+        foreign_marker.write_text(str(marker))
+        raise ValueError("injected staging failure")
+
+    monkeypatch.setattr(module, "descriptor_stable_tree_entries", replace_stage)
+    monkeypatch.setattr(module, "canonical_tree_sha256", lambda _entries: "d" * 64)
+
+    with pytest.raises(module.ComplementError, match="staging failed"):
+        module._stage_tokenizer_snapshot(trust, tmp_path / "scratch")
+
+    marker = Path(foreign_marker.read_text())
+    assert marker.read_bytes() == b"preserve-me\n"
+
+
+def test_tokenizer_stage_failure_never_unlinks_a_replaced_child_after_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Private scratch retention avoids the irreducible stat-to-unlink child race."""
+    module = _load_module()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    trust = module.TokenizerTrust(
+        file_sha256="a" * 64,
+        receipt_sha256="b" * 64,
+        repository=module.Q30T_TOKENIZER_REPOSITORY,
+        revision="c" * 40,
+        snapshot_path=snapshot,
+        snapshot_tree_sha256="d" * 64,
+        chat_template_sha256="e" * 64,
+        training_chat_template_sha256="f" * 64,
+        im_start_token_id=1,
+        im_end_token_id=2,
+    )
+    staged_snapshot: Path | None = None
+    real_stat = module.os.stat
+    real_open = module.os.open
+    real_rename = module.os.rename
+    victim_stats = 0
+    attacked = False
+
+    def fail_after_child(*_args: object, copy_root: Path, **_kwargs: object) -> None:
+        nonlocal staged_snapshot
+        staged_snapshot = copy_root
+        (copy_root / "victim").write_bytes(b"owned\n")
+        raise ValueError("injected staging failure")
+
+    def replace_child_after_stat(
+        path: str | bytes | Path,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal victim_stats, attacked
+        status = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if path == "victim" and dir_fd is not None:
+            victim_stats += 1
+            if victim_stats == 2:
+                attacked = True
+                real_rename("victim", "victim-displaced", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                descriptor = real_open(
+                    "victim",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    os.write(descriptor, b"foreign\n")
+                finally:
+                    os.close(descriptor)
+        return status
+
+    monkeypatch.setattr(module, "descriptor_stable_tree_entries", fail_after_child)
+    monkeypatch.setattr(module, "canonical_tree_sha256", lambda _entries: "d" * 64)
+    monkeypatch.setattr(module.os, "stat", replace_child_after_stat)
+
+    with pytest.raises(module.ComplementError, match="staging failed"):
+        module._stage_tokenizer_snapshot(trust, tmp_path / "scratch")
+
+    assert not attacked
+    assert staged_snapshot is not None
+    assert (staged_snapshot / "victim").read_bytes() == b"owned\n"
+
+
+def test_tokenizer_stage_failure_never_rmdirs_a_replaced_root_after_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Private scratch retention avoids the irreducible terminal stat-to-rmdir race."""
+    module = _load_module()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    trust = module.TokenizerTrust(
+        file_sha256="a" * 64,
+        receipt_sha256="b" * 64,
+        repository=module.Q30T_TOKENIZER_REPOSITORY,
+        revision="c" * 40,
+        snapshot_path=snapshot,
+        snapshot_tree_sha256="d" * 64,
+        chat_template_sha256="e" * 64,
+        training_chat_template_sha256="f" * 64,
+        im_start_token_id=1,
+        im_end_token_id=2,
+    )
+    stage_root: Path | None = None
+    real_stat = module.os.stat
+    real_rename = module.os.rename
+    real_mkdir = module.os.mkdir
+    attacked = False
+
+    def fail_with_empty_stage(*_args: object, copy_root: Path, **_kwargs: object) -> None:
+        nonlocal stage_root
+        stage_root = copy_root.parent
+        raise ValueError("injected staging failure")
+
+    def replace_root_after_stat(
+        path: str | bytes | Path,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal attacked
+        status = real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+        if (
+            not attacked
+            and stage_root is not None
+            and path == stage_root.name
+            and dir_fd is not None
+        ):
+            attacked = True
+            real_rename(
+                stage_root.name,
+                "stage-root-displaced",
+                src_dir_fd=dir_fd,
+                dst_dir_fd=dir_fd,
+            )
+            real_mkdir(stage_root.name, 0o700, dir_fd=dir_fd)
+        return status
+
+    monkeypatch.setattr(module, "descriptor_stable_tree_entries", fail_with_empty_stage)
+    monkeypatch.setattr(module, "canonical_tree_sha256", lambda _entries: "d" * 64)
+    monkeypatch.setattr(module.os, "stat", replace_root_after_stat)
+
+    with pytest.raises(module.ComplementError, match="staging failed"):
+        module._stage_tokenizer_snapshot(trust, tmp_path / "scratch")
+
+    assert not attacked
+    assert stage_root is not None
+    assert stage_root.is_dir()
+
+
+def test_tokenizer_stage_retains_its_bound_root_when_snapshot_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scheduler scratch lifecycle owns a stage retained after any early failure."""
+    module = _load_module()
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    trust = module.TokenizerTrust(
+        file_sha256="a" * 64,
+        receipt_sha256="b" * 64,
+        repository=module.Q30T_TOKENIZER_REPOSITORY,
+        revision="c" * 40,
+        snapshot_path=snapshot,
+        snapshot_tree_sha256="d" * 64,
+        chat_template_sha256="e" * 64,
+        training_chat_template_sha256="f" * 64,
+        im_start_token_id=1,
+        im_end_token_id=2,
+    )
+    real_mkdir = module.Path.mkdir
+
+    def fail_snapshot(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name == "snapshot" and path.parent.name.startswith("qwen-tokenizer-"):
+            raise OSError("injected snapshot mkdir failure")
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "mkdir", fail_snapshot)
+    scratch = tmp_path / "scratch"
+
+    with pytest.raises(OSError, match="injected snapshot mkdir failure"):
+        module._stage_tokenizer_snapshot(trust, scratch)
+
+    retained = list(scratch.glob("qwen-tokenizer-*"))
+    assert len(retained) == 1
+    assert retained[0].is_dir()
+
+
+def test_bundle_publication_never_follows_a_replaced_partial_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publication cannot truncate a foreign target through a substituted symlink."""
+    module = _load_module()
+    selection = module.select_continuation_rows(
+        {"stem": [_row("stem", "one", 0)]},
+        quotas={"stem": 1},
+        prior_prompt_uuids=set(),
+        held_out_prompt_uuids=set(),
+        tokenizer=_Tokenizer(),
+        training_sequence_length=8,
+        replay_categories=frozenset(),
+    )
+    historical_path, historical_file_sha256 = _write_historical_receipt(
+        tmp_path / "historical.json"
+    )
+    historical = module.load_historical_exclusion(
+        historical_path,
+        expected_sha256=historical_file_sha256,
+        expected_occurrence_count=3,
+    )
+    held_out = module.load_held_out_union([], required_names=frozenset())
+    foreign = tmp_path / "foreign-target"
+    foreign.write_bytes(b"preserve-me\n")
+    original_open = module.os.open
+    attacked = False
+
+    def replace_partial(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal attacked
+        if not attacked and path == "DATA.jsonl" and dir_fd is not None:
+            attacked = True
+            partial = next(tmp_path.glob(".bundle.partial-*"))
+            partial.rename(tmp_path / "displaced-partial")
+            partial.mkdir()
+            (partial / "DATA.jsonl").symlink_to(foreign)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(module.os, "open", replace_partial)
+
+    with suppress(module.ComplementError):
+        module.publish_selection_bundle(
+            selection,
+            output_root=tmp_path / "bundle",
+            scratch_root=tmp_path / "scratch",
+            quotas={"stem": 1},
+            config_file_sha256=hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest(),
+            source_inventory_file_sha256="6" * 64,
+            historical=historical,
+            held_out=held_out,
+            tokenizer_trust_file_sha256="7" * 64,
+            runtime_sha256="8" * 64,
+            source_commit="9" * 40,
+            enforce_production_paths=False,
+        )
+
+    assert attacked
+    assert foreign.read_bytes() == b"preserve-me\n"
 
 
 def test_builder_stable_readers_require_regular_descriptors() -> None:
@@ -1136,10 +1846,23 @@ def test_physical_row_count_uses_a_nofollow_regular_descriptor(tmp_path: Path) -
     ]
 
     assert "os.open" in counter
+    assert "O_NONBLOCK" in counter
     assert "stat.S_ISREG" in counter
     assert "path.open" not in counter
     with pytest.raises(module.ComplementError, match="regular file"):
         module._physical_row_count(nonregular, "jsonl")
+
+
+def test_authenticated_source_stream_uses_nonblocking_single_link_descriptor() -> None:
+    """Source iteration rejects special and multiply-linked inputs before any stream read."""
+    source = MODULE_PATH.read_text()
+    reader = source[
+        source.index("def _authenticated_source_stream") : source.index("def _iter_source_file")
+    ]
+
+    assert "O_NONBLOCK" in reader
+    assert "stat.S_ISREG" in reader
+    assert "st_nlink != 1" in reader
 
 
 def test_replay_workspace_uses_context_managed_cleanup() -> None:

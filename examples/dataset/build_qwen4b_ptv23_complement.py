@@ -8,36 +8,59 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sqlite3
 import stat
-import sys
 import tempfile
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, overload
 
 try:
     from common.specdec.q30t_tokenizer_receipt import (  # pyright: ignore[reportMissingImports]
         verify_q30t_tokenizer_receipt,
     )
+    from common.specdec.q30t_tree_digest import (  # pyright: ignore[reportMissingImports]
+        canonical_tree_sha256,
+        descriptor_stable_tree_entries,
+    )
+    from common.specdec.qwen4b_b_atomic import (  # pyright: ignore[reportMissingImports]
+        Q30_DIRECTORY_COMPLETION_MARKER,
+        atomic_publish_directory,
+        authenticate_directory_completion,
+    )
 except ModuleNotFoundError:
     try:
         from tools.launcher.common.specdec.q30t_tokenizer_receipt import (
             verify_q30t_tokenizer_receipt,
         )
+        from tools.launcher.common.specdec.q30t_tree_digest import (
+            canonical_tree_sha256,
+            descriptor_stable_tree_entries,
+        )
+        from tools.launcher.common.specdec.qwen4b_b_atomic import (
+            Q30_DIRECTORY_COMPLETION_MARKER,
+            atomic_publish_directory,
+            authenticate_directory_completion,
+        )
     except ModuleNotFoundError:
+        Q30_DIRECTORY_COMPLETION_MARKER = ".q30-publication-incomplete"
+        atomic_publish_directory = None
+        authenticate_directory_completion = None
         verify_q30t_tokenizer_receipt = None
+        canonical_tree_sha256 = None
+        descriptor_stable_tree_entries = None
 
 from ptv23_complement_target_policy import (
     ComplementError,
     TargetTokenizerPolicy,
     load_target_policy,
+    require_approved_target_policy,
+    source_requirements_contract_is_compatible,
 )
 from trajectory_schema import TrajectoryValidationError, validate_trajectory
 
@@ -84,6 +107,7 @@ APPROVED_QUOTAS = {
     "ptv3_interactive_agentic_swe": 19_000,
     "ptv3_general_tool_trajectories": 81_000,
 }
+APPROVED_QUOTA_CATEGORIES = tuple(APPROVED_QUOTAS)
 REQUIRED_HELD_OUT_RECEIPT_NAMES = frozenset({"speed", "math", "code", "swe", "tool"})
 APPROVED_PTV3_SWE_SOURCE_PINS: tuple[tuple[str, str, str], ...] = ()
 APPROVED_ROW_SCHEMA_SHA256S: frozenset[str] = frozenset()
@@ -91,6 +115,30 @@ APPROVED_SOURCE_INVENTORY_FILE_SHA256 = ""
 APPROVED_HISTORICAL_RECEIPT_FILE_SHA256 = ""
 APPROVED_HELD_OUT_RECEIPT_FILE_SHA256S: dict[str, str] = {}
 APPROVED_Q30T_TOKENIZER_RECEIPT_FILE_SHA256S: frozenset[str] = frozenset()
+Q30T_TOKENIZER_REPOSITORY = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+_Q30T_TOKENIZER_ASSET_NAMES = frozenset(
+    {
+        "added_tokens.json",
+        "chat_template.jinja",
+        "config.json",
+        "merges.txt",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "vocab.json",
+    }
+)
+_MAX_CONFIG_BYTES = 1 * 1024 * 1024
+_MAX_SOURCE_REQUIREMENTS_BYTES = 4 * 1024 * 1024
+_MAX_TOKENIZER_RECEIPT_BYTES = 4 * 1024 * 1024
+_MAX_COMPLETION_RECEIPT_BYTES = 4 * 1024 * 1024
+_MAX_CAPACITY_RECEIPT_BYTES = 16 * 1024 * 1024
+_MAX_BUNDLE_MANIFEST_BYTES = 16 * 1024 * 1024
+_MAX_SOURCE_INVENTORY_BYTES = 64 * 1024 * 1024
+_MAX_HELD_OUT_RECEIPT_BYTES = 256 * 1024 * 1024
+_MAX_HISTORICAL_RECEIPT_BYTES = 512 * 1024 * 1024
+_MAX_TOKENIZER_ASSET_BYTES = 512 * 1024 * 1024
 
 
 def _require_external_approval_roots() -> None:
@@ -287,35 +335,58 @@ def _is_lower_hex(value: object, length: int) -> bool:
     )
 
 
-def _stable_regular_bytes(path: Path) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _stable_regular_bytes(path: Path, *, max_bytes: int = _MAX_HISTORICAL_RECEIPT_BYTES) -> bytes:
+    if max_bytes < 0:
+        raise ValueError("authenticated input retention limit is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
         raise ComplementError(f"authenticated input is unreadable: {path}") from error
-    with os.fdopen(descriptor, "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise ComplementError(f"authenticated input is not a regular file: {path}")
-        raw = stream.read()
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        os.close(descriptor)
+        raise ComplementError(f"authenticated input is not a single-link regular file: {path}")
+    if before.st_size > max_bytes:
+        os.close(descriptor)
+        raise ComplementError(f"authenticated input is too large to retain: {path}")
+    try:
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
+        raw = stream.read(max_bytes + 1)
         after = os.fstat(stream.fileno())
     before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    if before_identity != after_identity or len(raw) != before.st_size:
+    if len(raw) > max_bytes:
+        raise ComplementError(f"authenticated input is too large to retain: {path}")
+    if before_identity != after_identity or after.st_nlink != 1 or len(raw) != before.st_size:
         raise ComplementError(f"authenticated input changed while reading: {path}")
     return raw
 
 
-def _stable_regular_evidence(path: Path) -> tuple[int, str]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _stable_regular_evidence(path: Path, *, expected_bytes: int | None = None) -> tuple[int, str]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
         raise ComplementError(f"authenticated input is unreadable: {path}") from error
-    with os.fdopen(descriptor, "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise ComplementError(f"authenticated input is not a regular file: {path}")
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or (expected_bytes is not None and before.st_size != expected_bytes)
+    ):
+        os.close(descriptor)
+        raise ComplementError(f"authenticated input is not a single-link regular file: {path}")
+    try:
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
         digest = sha256()
         size = 0
         while block := stream.read(8 * 1024 * 1024):
@@ -327,22 +398,35 @@ def _stable_regular_evidence(path: Path) -> tuple[int, str]:
         before.st_ino,
         before.st_size,
         before.st_mtime_ns,
-    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or size != before.st_size:
+    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or (
+        after.st_nlink != 1 or size != before.st_size
+    ):
         raise ComplementError(f"authenticated input changed while hashing: {path}")
     return size, digest.hexdigest()
 
 
-def _physical_row_count(path: Path, source_format: str) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _physical_row_count(
+    path: Path, source_format: str, *, expected_bytes: int | None = None
+) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
         raise ComplementError("source row-count input cannot be opened no-follow") from error
     before = os.fstat(descriptor)
-    if not stat.S_ISREG(before.st_mode):
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or (expected_bytes is not None and before.st_size != expected_bytes)
+    ):
         os.close(descriptor)
-        raise ComplementError("source row-count input must be a regular file")
-    with os.fdopen(descriptor, "rb") as stream:
+        raise ComplementError("source row-count input must be a single-link regular file")
+    try:
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
         if source_format == "jsonl":
             count = 0
             final = b""
@@ -359,11 +443,21 @@ def _physical_row_count(path: Path, source_format: str) -> int:
         else:
             raise ComplementError("source row format is unsupported")
         after = os.fstat(stream.fileno())
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
+    if (
+        before.st_nlink != 1
+        or after.st_nlink != 1
+        or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
     ):
         raise ComplementError("source row-count input changed while reading")
     return row_count
@@ -378,7 +472,7 @@ def load_source_inventory(
     """Authenticate exact source repositories, revisions, files, schema, and order."""
     if not _is_lower_hex(expected_sha256, 64):
         raise ComplementError("source inventory caller SHA-256 is invalid")
-    raw = _stable_regular_bytes(path)
+    raw = _stable_regular_bytes(path, max_bytes=_MAX_SOURCE_INVENTORY_BYTES)
     if sha256(raw).hexdigest() != expected_sha256:
         raise ComplementError("source inventory caller SHA-256 mismatch")
     try:
@@ -465,10 +559,15 @@ def load_source_inventory(
                 or occurrence in occurrences
             ):
                 raise ComplementError("source inventory file pin is invalid")
-            actual_bytes, actual_sha256 = _stable_regular_evidence(Path(file_path))
+            actual_bytes, actual_sha256 = _stable_regular_evidence(
+                Path(file_path), expected_bytes=expected_bytes
+            )
             if actual_bytes != expected_bytes or actual_sha256 != expected_file_sha256:
                 raise ComplementError("source physical file identity mismatch")
-            if _physical_row_count(Path(file_path), source_format) != row_count:
+            if (
+                _physical_row_count(Path(file_path), source_format, expected_bytes=expected_bytes)
+                != row_count
+            ):
                 raise ComplementError("source physical row count mismatch")
             occurrences.add(occurrence)
             parsed_files.append(
@@ -505,7 +604,7 @@ def load_historical_exclusion(
     """Authenticate the exact historical PTV2 occurrence stream and UUID exclusion."""
     if not _is_lower_hex(expected_sha256, 64):
         raise ComplementError("historical receipt caller SHA-256 is invalid")
-    raw = _stable_regular_bytes(path)
+    raw = _stable_regular_bytes(path, max_bytes=_MAX_HISTORICAL_RECEIPT_BYTES)
     if sha256(raw).hexdigest() != expected_sha256:
         raise ComplementError("historical receipt caller SHA-256 mismatch")
     try:
@@ -592,7 +691,7 @@ def load_held_out_union(
     for _, path, expected_sha256 in normalized:
         if not _is_lower_hex(expected_sha256, 64):
             raise ComplementError("held-out receipt caller SHA-256 is invalid")
-        raw = _stable_regular_bytes(path)
+        raw = _stable_regular_bytes(path, max_bytes=_MAX_HELD_OUT_RECEIPT_BYTES)
         if sha256(raw).hexdigest() != expected_sha256:
             raise ComplementError("held-out receipt caller SHA-256 mismatch")
         try:
@@ -642,11 +741,26 @@ def _snapshot_tree_sha256(root: Path) -> str:
             raise ComplementError("tokenizer snapshot cannot contain symlinks")
         if path.is_file():
             entries.append(
-                [path.relative_to(root).as_posix(), sha256(_stable_regular_bytes(path)).hexdigest()]
+                [
+                    path.relative_to(root).as_posix(),
+                    sha256(
+                        _stable_regular_bytes(path, max_bytes=_MAX_TOKENIZER_ASSET_BYTES)
+                    ).hexdigest(),
+                ]
             )
     if not entries:
         raise ComplementError("tokenizer snapshot is empty")
     return sha256(_canonical_json(entries)).hexdigest()
+
+
+def _q30t_snapshot_tree_sha256(root: Path) -> str:
+    if canonical_tree_sha256 is None or descriptor_stable_tree_entries is None:
+        raise ComplementError("Q30 tokenizer tree digest is unavailable")
+    try:
+        entries = descriptor_stable_tree_entries(root, require_single_link=True)
+        return canonical_tree_sha256(entries)
+    except ValueError as error:
+        raise ComplementError(f"tokenizer snapshot tree evidence is invalid: {error}") from error
 
 
 def _verify_q30t_tokenizer_receipt(raw: bytes) -> None:
@@ -668,7 +782,7 @@ def load_tokenizer_trust(
     if not _is_lower_hex(expected_sha256, 64):
         raise ComplementError("tokenizer trust caller SHA-256 is invalid")
     is_q30t = policy.tokenizer_trust_schema == "qwen3-30ba3b-thinking-tokenizer-trust-v1"
-    raw = _stable_regular_bytes(path)
+    raw = _stable_regular_bytes(path, max_bytes=_MAX_TOKENIZER_RECEIPT_BYTES)
     if sha256(raw).hexdigest() != expected_sha256:
         raise ComplementError("tokenizer trust caller SHA-256 mismatch")
     try:
@@ -705,10 +819,13 @@ def load_tokenizer_trust(
     )
     snapshot = Path(payload["snapshot_path"])
     body = {key: value for key, value in payload.items() if key != "receipt_sha256"}
+    snapshot_tree_sha256 = (
+        _q30t_snapshot_tree_sha256(snapshot) if is_q30t else _snapshot_tree_sha256(snapshot)
+    )
     if (
         any(not _is_lower_hex(value, 64) for value in digest_fields)
         or payload["receipt_sha256"] != sha256(_canonical_json(body)).hexdigest()
-        or _snapshot_tree_sha256(snapshot) != payload["snapshot_tree_sha256"]
+        or snapshot_tree_sha256 != payload["snapshot_tree_sha256"]
         or (not is_q30t and payload["im_start_token_id"] != 151_644)
         or (not is_q30t and payload["im_end_token_id"] != 151_645)
     ):
@@ -757,96 +874,148 @@ def _qwen_training_chat_template(official_template: str) -> str:
     )
 
 
-def _stage_tokenizer_snapshot(trust: TokenizerTrust, scratch_root: Path) -> Path:
+def _tokenizer_trust_tree_sha256(trust: TokenizerTrust, snapshot: Path) -> str:
+    if trust.repository == Q30T_TOKENIZER_REPOSITORY:
+        return _q30t_snapshot_tree_sha256(snapshot)
+    return _snapshot_tree_sha256(snapshot)
+
+
+def _is_q30t_tokenizer_asset(path: str) -> bool:
+    return PurePosixPath(path).name in _Q30T_TOKENIZER_ASSET_NAMES
+
+
+@dataclass(frozen=True)
+class _PrivateTreeBinding:
+    parent_identity: tuple[int, int]
+    root_identity: tuple[int, int]
+
+
+def _directory_identity(status: os.stat_result) -> tuple[int, int]:
+    return status.st_dev, status.st_ino
+
+
+def _stage_tokenizer_snapshot(
+    trust: TokenizerTrust,
+    scratch_root: Path,
+) -> Path:
     scratch_root.mkdir(parents=True, exist_ok=True)
     stage_root = Path(tempfile.mkdtemp(prefix="qwen-tokenizer-", dir=scratch_root))
     staged_snapshot = stage_root / "snapshot"
     staged_snapshot.mkdir()
-    try:
-        before = os.lstat(trust.snapshot_path)
-        if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
-            raise ComplementError("tokenizer snapshot must be a no-follow directory")
-        for source in sorted(trust.snapshot_path.rglob("*")):
-            relative = source.relative_to(trust.snapshot_path)
-            if source.is_symlink():
-                raise ComplementError("tokenizer snapshot cannot contain symlinks")
-            if source.is_dir():
-                (staged_snapshot / relative).mkdir()
-            elif source.is_file():
-                raw = _stable_regular_bytes(source)
-                destination = staged_snapshot / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                _write_durable(destination, raw)
-            else:
-                raise ComplementError("tokenizer snapshot contains a non-regular entry")
-        after = os.lstat(trust.snapshot_path)
-        if (
-            before.st_dev,
-            before.st_ino,
-            before.st_mtime_ns,
-        ) != (after.st_dev, after.st_ino, after.st_mtime_ns) or (
-            _snapshot_tree_sha256(staged_snapshot) != trust.snapshot_tree_sha256
-        ):
+    if trust.repository == Q30T_TOKENIZER_REPOSITORY:
+        if canonical_tree_sha256 is None or descriptor_stable_tree_entries is None:
+            raise ComplementError("Q30 tokenizer tree staging is unavailable")
+        try:
+            entries = descriptor_stable_tree_entries(
+                trust.snapshot_path,
+                require_single_link=True,
+                copy_root=staged_snapshot,
+                copy_predicate=_is_q30t_tokenizer_asset,
+            )
+        except ValueError as error:
+            raise ComplementError(f"tokenizer snapshot staging failed: {error}") from error
+        if canonical_tree_sha256(entries) != trust.snapshot_tree_sha256:
             raise ComplementError("tokenizer snapshot changed while staging")
+        if (
+            not (staged_snapshot / "tokenizer.json").is_file()
+            or not (staged_snapshot / "tokenizer_config.json").is_file()
+        ):
+            raise ComplementError("authenticated Q30 tokenizer assets are incomplete")
         return staged_snapshot
-    except BaseException:
-        shutil.rmtree(stage_root, ignore_errors=True)
-        raise
+    before = os.lstat(trust.snapshot_path)
+    if not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise ComplementError("tokenizer snapshot must be a no-follow directory")
+    for source in sorted(trust.snapshot_path.rglob("*")):
+        relative = source.relative_to(trust.snapshot_path)
+        if source.is_symlink():
+            raise ComplementError("tokenizer snapshot cannot contain symlinks")
+        if source.is_dir():
+            (staged_snapshot / relative).mkdir()
+        elif source.is_file():
+            raw = _stable_regular_bytes(source, max_bytes=_MAX_TOKENIZER_ASSET_BYTES)
+            destination = staged_snapshot / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _write_durable(destination, raw)
+        else:
+            raise ComplementError("tokenizer snapshot contains a non-regular entry")
+    after = os.lstat(trust.snapshot_path)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_mtime_ns,
+    ) != (after.st_dev, after.st_ino, after.st_mtime_ns) or (
+        _tokenizer_trust_tree_sha256(trust, staged_snapshot) != trust.snapshot_tree_sha256
+    ):
+        raise ComplementError("tokenizer snapshot changed while staging")
+    return staged_snapshot
 
 
 def _load_qwen_tokenizer(trust: TokenizerTrust, scratch_root: Path) -> Any:
     staged_snapshot = _stage_tokenizer_snapshot(trust, scratch_root)
+    staged_tree_before = _tokenizer_trust_tree_sha256(trust, staged_snapshot)
     try:
-        try:
-            from transformers import AutoTokenizer  # pyright: ignore[reportMissingImports]
+        from transformers import AutoTokenizer  # pyright: ignore[reportMissingImports]
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                staged_snapshot,
-                local_files_only=True,
-                trust_remote_code=False,
-            )
-            official_template = tokenizer.chat_template
-            if not isinstance(official_template, str):
-                raise ComplementError("pinned Qwen3 tokenizer has no chat template")
-            training_template = _qwen_training_chat_template(official_template)
-            identities = (
-                sha256(official_template.encode()).hexdigest(),
-                sha256(training_template.encode()).hexdigest(),
-                tokenizer.convert_tokens_to_ids("<|im_start|>"),
-                tokenizer.convert_tokens_to_ids("<|im_end|>"),
-                tokenizer.eos_token_id,
-            )
-        except ComplementError:
-            raise
-        except Exception as error:
-            raise ComplementError("unable to load authenticated Qwen3-4B tokenizer") from error
-        if identities != (
-            trust.chat_template_sha256,
-            trust.training_chat_template_sha256,
-            trust.im_start_token_id,
-            trust.im_end_token_id,
-            trust.im_end_token_id,
-        ):
-            raise ComplementError("authenticated tokenizer violates the Qwen3-4B contract")
-        if _snapshot_tree_sha256(staged_snapshot) != trust.snapshot_tree_sha256:
-            raise ComplementError("staged tokenizer changed while loading")
-        setattr(tokenizer, "_continuation_training_chat_template", training_template)
-        return tokenizer
-    finally:
-        shutil.rmtree(staged_snapshot.parent, ignore_errors=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            staged_snapshot,
+            local_files_only=True,
+            trust_remote_code=False,
+        )
+        official_template = tokenizer.chat_template
+        if not isinstance(official_template, str):
+            raise ComplementError("pinned Qwen3 tokenizer has no chat template")
+        training_template = _qwen_training_chat_template(official_template)
+        identities = (
+            sha256(official_template.encode()).hexdigest(),
+            sha256(training_template.encode()).hexdigest(),
+            tokenizer.convert_tokens_to_ids("<|im_start|>"),
+            tokenizer.convert_tokens_to_ids("<|im_end|>"),
+            tokenizer.eos_token_id,
+        )
+    except ComplementError:
+        raise
+    except Exception as error:
+        raise ComplementError("unable to load authenticated Qwen3-4B tokenizer") from error
+    if identities != (
+        trust.chat_template_sha256,
+        trust.training_chat_template_sha256,
+        trust.im_start_token_id,
+        trust.im_end_token_id,
+        trust.im_end_token_id,
+    ):
+        raise ComplementError("authenticated tokenizer violates the Qwen3-4B contract")
+    staged_tree_after = _tokenizer_trust_tree_sha256(trust, staged_snapshot)
+    if trust.repository == Q30T_TOKENIZER_REPOSITORY:
+        staged_tree_matches = staged_tree_after == staged_tree_before
+    else:
+        staged_tree_matches = staged_tree_after == trust.snapshot_tree_sha256
+    if not staged_tree_matches:
+        raise ComplementError("staged tokenizer changed while loading")
+    setattr(tokenizer, "_continuation_training_chat_template", training_template)
+    return tokenizer
 
 
 @contextmanager
 def _authenticated_source_stream(file: InventoryFile) -> Iterator[BinaryIO]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(file.path, flags)
     except OSError as error:
         raise ComplementError(
             f"source file cannot be opened no-follow: {file.logical_path}"
         ) from error
-    with os.fdopen(descriptor, "rb") as stream:
-        before = os.fstat(stream.fileno())
+    before = os.fstat(descriptor)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size != file.bytes:
+        os.close(descriptor)
+        raise ComplementError(
+            f"source file is not the expected single-link regular file: {file.logical_path}"
+        )
+    try:
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with stream:
 
         def evidence() -> tuple[int, str]:
             stream.seek(0)
@@ -876,7 +1045,12 @@ def _authenticated_source_stream(file: InventoryFile) -> Iterator[BinaryIO]:
                 after.st_size,
                 after.st_mtime_ns,
             )
-            if identity_before != identity_after or evidence() != (file.bytes, file.sha256):
+            if (
+                before.st_nlink != 1
+                or after.st_nlink != 1
+                or identity_before != identity_after
+                or evidence() != (file.bytes, file.sha256)
+            ):
                 raise ComplementError(f"source file changed during iteration: {file.logical_path}")
 
 
@@ -939,11 +1113,16 @@ def _iter_source_file(source: InventorySource, file: InventoryFile) -> Iterable[
         )
 
 
-def _category_rows(inventory: SourceInventory) -> dict[str, Iterable[Mapping[str, object]]]:
+def _category_rows(
+    inventory: SourceInventory,
+    *,
+    quotas: Mapping[str, int] | None = None,
+) -> dict[str, Iterable[Mapping[str, object]]]:
+    quotas = APPROVED_QUOTAS if quotas is None else quotas
     grouped: dict[str, list[InventorySource]] = {}
     for source in inventory.sources:
         grouped.setdefault(source.category, []).append(source)
-    if tuple(grouped) != tuple(APPROVED_QUOTAS):
+    if tuple(grouped) != tuple(quotas):
         raise ComplementError("source inventory category order does not match approved quotas")
 
     def rows(sources: list[InventorySource]) -> Iterable[Mapping[str, object]]:
@@ -954,6 +1133,15 @@ def _category_rows(inventory: SourceInventory) -> dict[str, Iterable[Mapping[str
     return {category: rows(sources) for category, sources in grouped.items()}
 
 
+def _category_rows_for_quotas(
+    inventory: SourceInventory,
+    quotas: Mapping[str, int],
+) -> dict[str, Iterable[Mapping[str, object]]]:
+    if quotas == APPROVED_QUOTAS:
+        return _category_rows(inventory)
+    return _category_rows(inventory, quotas=quotas)
+
+
 def reconcile_source_requirements(
     path: Path,
     *,
@@ -962,8 +1150,11 @@ def reconcile_source_requirements(
     policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> None:
     """Resolve every checked source requirement against authenticated live evidence."""
-    raw = _stable_regular_bytes(path)
-    if sha256(raw).hexdigest() != policy.source_requirements_sha256:
+    config = load_complement_config(path.with_name(policy.quota_config_path), policy=policy)
+    quotas: Mapping[str, int] = config["quotas"]
+    raw = _stable_regular_bytes(path, max_bytes=_MAX_SOURCE_REQUIREMENTS_BYTES)
+    source_requirements_sha256 = sha256(raw).hexdigest()
+    if source_requirements_sha256 != policy.source_requirements_sha256:
         raise ComplementError("approved source requirements identity does not match")
     try:
         requirements: Any = json.loads(raw)
@@ -979,7 +1170,11 @@ def reconcile_source_requirements(
             "blocking_external_pins",
         }
         or requirements["schema_version"] != "ptv2-ptv3-complement-source-requirements-v1"
-        or requirements["scientific_identity"] != policy.scientific_identity
+        or not source_requirements_contract_is_compatible(
+            policy,
+            observed_sha256=source_requirements_sha256,
+            embedded_scientific_identity=requirements["scientific_identity"],
+        )
         or not isinstance(requirements["known_pinned_sources"], list)
         or not isinstance(requirements["blocking_external_pins"], list)
     ):
@@ -1027,9 +1222,7 @@ def reconcile_source_requirements(
     grouped: dict[str, list[InventorySource]] = {}
     for source in inventory.sources:
         grouped.setdefault(source.category, []).append(source)
-    ptv2_categories = tuple(
-        category for category in APPROVED_QUOTAS if category.startswith("ptv2_")
-    )
+    ptv2_categories = tuple(category for category in quotas if category.startswith("ptv2_"))
     if any(
         category not in grouped
         or any(source.revision != PTV2_REVISION for source in grouped[category])
@@ -1046,7 +1239,9 @@ def reconcile_source_requirements(
         source.row_schema_sha256 not in APPROVED_ROW_SCHEMA_SHA256S for source in inventory.sources
     ):
         raise ComplementError("source row schema blocker is unresolved")
-    capacity_raw = _stable_regular_bytes(capacity_receipt_path)
+    capacity_raw = _stable_regular_bytes(
+        capacity_receipt_path, max_bytes=_MAX_CAPACITY_RECEIPT_BYTES
+    )
     try:
         capacity: Any = json.loads(capacity_raw)
     except json.JSONDecodeError as error:
@@ -1057,7 +1252,7 @@ def reconcile_source_requirements(
             "required": quota,
             "selected": quota,
         }
-        for category, quota in APPROVED_QUOTAS.items()
+        for category, quota in quotas.items()
     ]
     if (
         not isinstance(capacity, dict)
@@ -1372,50 +1567,416 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _rename_noreplace(source: Path, destination: Path) -> None:
-    import ctypes
+def _rename_noreplace(
+    source: Path,
+    destination: Path,
+    *,
+    binding: _PrivateTreeBinding | None = None,
+) -> None:
+    if atomic_publish_directory is None:
+        raise ComplementError("shared no-replace publication primitive is unavailable")
+    kwargs: dict[str, tuple[int, int]] = {}
+    if binding is not None:
+        kwargs = {
+            "expected_directory_identity": binding.root_identity,
+            "expected_parent_identity": binding.parent_identity,
+        }
+    atomic_publish_directory(source, destination, **kwargs)
 
-    libc = ctypes.CDLL(None, use_errno=True)
-    if sys.platform.startswith("linux"):
-        result = libc.renameat2(
-            -100,
-            os.fsencode(source),
-            -100,
-            os.fsencode(destination),
-            1,
+
+def _capture_directory_binding(root: Path) -> _PrivateTreeBinding:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    parent_fd = os.open(root.parent, directory_flags)
+    try:
+        parent = os.fstat(parent_fd)
+        absolute_parent = os.stat(root.parent, follow_symlinks=False)
+        named = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        root_fd = os.open(root.name, directory_flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(root_fd)
+            absolute = os.stat(root, follow_symlinks=False)
+            if (
+                _directory_identity(parent) != _directory_identity(absolute_parent)
+                or _directory_identity(named) != _directory_identity(opened)
+                or _directory_identity(absolute) != _directory_identity(opened)
+                or not stat.S_ISDIR(opened.st_mode)
+            ):
+                raise ComplementError("publication directory binding changed while opening")
+            return _PrivateTreeBinding(
+                parent_identity=_directory_identity(parent),
+                root_identity=_directory_identity(opened),
+            )
+        finally:
+            os.close(root_fd)
+    except OSError as error:
+        raise ComplementError("publication directory binding is unavailable") from error
+    finally:
+        os.close(parent_fd)
+
+
+def _copy_regular_file_at(source: Path, destination_fd: int, destination_name: str) -> None:
+    read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    source_fd = os.open(source, read_flags)
+    destination_child: int | None = None
+    try:
+        source_before = os.fstat(source_fd)
+        source_identity = (
+            source_before.st_dev,
+            source_before.st_ino,
+            source_before.st_size,
+            source_before.st_mtime_ns,
+            source_before.st_ctime_ns,
         )
-    elif sys.platform == "darwin":
-        result = libc.renamex_np(os.fsencode(source), os.fsencode(destination), 0x00000004)
-    else:
-        raise ComplementError("atomic no-replace publication is unsupported on this platform")
-    if result != 0:
-        error = ctypes.get_errno()
-        if error in {17, 39}:
-            raise FileExistsError(error, os.strerror(error), str(destination))
-        raise OSError(error, os.strerror(error), str(destination))
+        if not stat.S_ISREG(source_before.st_mode) or source_before.st_nlink != 1:
+            raise ComplementError("publication source is not a single-link regular file")
+        destination_child = os.open(
+            destination_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+            dir_fd=destination_fd,
+        )
+        destination_before = os.fstat(destination_child)
+        destination_identity = _directory_identity(destination_before)
+        while block := os.read(source_fd, 1024 * 1024):
+            view = memoryview(block)
+            while view:
+                written = os.write(destination_child, view)
+                if written < 1:
+                    raise ComplementError("publication child copy stalled")
+                view = view[written:]
+        os.fsync(destination_child)
+        source_after = os.fstat(source_fd)
+        source_rebound = os.stat(source, follow_symlinks=False)
+        destination_after = os.fstat(destination_child)
+        destination_rebound = os.stat(
+            destination_name,
+            dir_fd=destination_fd,
+            follow_symlinks=False,
+        )
+        if (
+            (
+                source_after.st_dev,
+                source_after.st_ino,
+                source_after.st_size,
+                source_after.st_mtime_ns,
+                source_after.st_ctime_ns,
+            )
+            != source_identity
+            or (
+                source_rebound.st_dev,
+                source_rebound.st_ino,
+                source_rebound.st_size,
+                source_rebound.st_mtime_ns,
+                source_rebound.st_ctime_ns,
+            )
+            != source_identity
+            or _directory_identity(destination_after) != destination_identity
+            or _directory_identity(destination_rebound) != destination_identity
+            or destination_after.st_nlink != 1
+            or destination_after.st_size != source_before.st_size
+        ):
+            raise ComplementError("publication child changed while copying")
+    except OSError as error:
+        raise ComplementError("publication child cannot be created exclusively") from error
+    finally:
+        if destination_child is not None:
+            os.close(destination_child)
+        os.close(source_fd)
+
+
+def _populate_partial_bundle(
+    partial: Path,
+    sources: Mapping[str, Path],
+) -> _PrivateTreeBinding:
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        parent_fd = os.open(partial.parent, directory_flags)
+    except OSError as error:
+        raise ComplementError("publication parent cannot be opened") from error
+    root_fd: int | None = None
+    try:
+        parent_before = os.fstat(parent_fd)
+        absolute_parent = os.stat(partial.parent, follow_symlinks=False)
+        if _directory_identity(parent_before) != _directory_identity(absolute_parent):
+            raise ComplementError("publication parent changed while opening")
+        try:
+            os.mkdir(partial.name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            raise ComplementError("publication partial collision is foreign") from None
+        named = os.stat(partial.name, dir_fd=parent_fd, follow_symlinks=False)
+        root_fd = os.open(partial.name, directory_flags, dir_fd=parent_fd)
+        root_before = os.fstat(root_fd)
+        if (
+            _directory_identity(named) != _directory_identity(root_before)
+            or not stat.S_ISDIR(root_before.st_mode)
+            or os.listdir(root_fd)
+        ):
+            raise ComplementError("publication partial changed after creation")
+        for destination_name, source in sources.items():
+            _copy_regular_file_at(source, root_fd, destination_name)
+        os.fsync(root_fd)
+        root_after = os.fstat(root_fd)
+        rebound_root = os.stat(partial.name, dir_fd=parent_fd, follow_symlinks=False)
+        parent_after = os.fstat(parent_fd)
+        absolute_parent_after = os.stat(partial.parent, follow_symlinks=False)
+        if (
+            _directory_identity(root_after) != _directory_identity(root_before)
+            or _directory_identity(rebound_root) != _directory_identity(root_before)
+            or _directory_identity(parent_after) != _directory_identity(parent_before)
+            or _directory_identity(absolute_parent_after) != _directory_identity(parent_before)
+            or frozenset(os.listdir(root_fd)) != frozenset(sources)
+        ):
+            raise ComplementError("publication partial changed while populating")
+        os.fsync(parent_fd)
+        return _PrivateTreeBinding(
+            parent_identity=_directory_identity(parent_before),
+            root_identity=_directory_identity(root_before),
+        )
+    except OSError as error:
+        raise ComplementError("publication partial changed while populating") from error
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _directory_completion_identity(directory_fd: int) -> tuple[int, int, int, int, int]:
+    if authenticate_directory_completion is None:
+        raise ComplementError("shared directory completion authenticator is unavailable")
+    try:
+        return authenticate_directory_completion(directory_fd)
+    except (OSError, RuntimeError) as error:
+        raise ComplementError("directory completion marker is invalid") from error
 
 
 def _published_bundle_matches(
-    root: Path, manifest_raw: bytes, data_sha256: str, capacity_sha256: str
+    root: Path,
+    manifest_raw: bytes,
+    data_sha256: str,
+    capacity_sha256: str,
+    *,
+    require_completion_marker: bool = False,
+    expected_binding: _PrivateTreeBinding | None = None,
 ) -> bool:
-    try:
-        expected_names = ["DATA.jsonl", "MANIFEST.json"]
-        capacity_matches = True
-        if capacity_sha256:
-            expected_names.append("CAPACITY.json")
-            capacity_matches = (
-                sha256(_stable_regular_bytes(root / "CAPACITY.json")).hexdigest() == capacity_sha256
-            )
+    def identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
         return (
-            not root.is_symlink()
-            and root.is_dir()
-            and _stable_regular_bytes(root / "MANIFEST.json") == manifest_raw
-            and _stable_regular_evidence(root / "DATA.jsonl")[1] == data_sha256
-            and capacity_matches
-            and tuple(sorted(item.name for item in root.iterdir())) == tuple(sorted(expected_names))
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
         )
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    expected_sha256s = {"DATA.jsonl": data_sha256}
+    try:
+        manifest_payload: Any = json.loads(manifest_raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(manifest_payload, dict):
+        return False
+    data_descriptor = manifest_payload.get("data")
+    if (
+        not isinstance(data_descriptor, dict)
+        or data_descriptor.get("path") != "DATA.jsonl"
+        or type(data_descriptor.get("bytes")) is not int
+        or data_descriptor["bytes"] < 0
+        or data_descriptor.get("sha256") != data_sha256
+    ):
+        return False
+    expected_sizes = {
+        "DATA.jsonl": data_descriptor["bytes"],
+        "MANIFEST.json": len(manifest_raw),
+    }
+    if capacity_sha256:
+        capacity_descriptor = manifest_payload.get("capacity")
+        if (
+            not isinstance(capacity_descriptor, dict)
+            or capacity_descriptor.get("path") != "CAPACITY.json"
+            or type(capacity_descriptor.get("bytes")) is not int
+            or capacity_descriptor["bytes"] < 0
+            or capacity_descriptor.get("sha256") != capacity_sha256
+        ):
+            return False
+        expected_sha256s["CAPACITY.json"] = capacity_sha256
+        expected_sizes["CAPACITY.json"] = capacity_descriptor["bytes"]
+    expected_names = frozenset({"MANIFEST.json", *expected_sha256s})
+    enumerated_names = expected_names | (
+        {Q30_DIRECTORY_COMPLETION_MARKER} if require_completion_marker else set()
+    )
+    if len(manifest_raw) > _MAX_BUNDLE_MANIFEST_BYTES:
+        return False
+    try:
+        parent_fd = os.open(root.parent, directory_flags)
+    except OSError:
+        return False
+    try:
+        parent_before = os.fstat(parent_fd)
+        named_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        root_fd = os.open(root.name, directory_flags, dir_fd=parent_fd)
+        try:
+            root_before = os.fstat(root_fd)
+            absolute_root = os.stat(root, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(root_before.st_mode)
+                or (
+                    expected_binding is not None
+                    and (
+                        _directory_identity(parent_before) != expected_binding.parent_identity
+                        or _directory_identity(root_before) != expected_binding.root_identity
+                    )
+                )
+                or identity(named_root) != identity(root_before)
+                or identity(absolute_root) != identity(root_before)
+                or frozenset(os.listdir(root_fd)) != enumerated_names
+            ):
+                return False
+            if require_completion_marker:
+                marker_identity = _directory_completion_identity(root_fd)
+            else:
+                marker_identity = None
+            file_identities: dict[str, tuple[int, int, int, int, int]] = {}
+            for name in sorted(expected_names):
+                named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                descriptor = os.open(name, flags, dir_fd=root_fd)
+                try:
+                    before = os.fstat(descriptor)
+                    file_identity = identity(before)
+                    if (
+                        identity(named) != file_identity
+                        or not stat.S_ISREG(before.st_mode)
+                        or before.st_nlink != 1
+                        or before.st_size != expected_sizes[name]
+                    ):
+                        return False
+                    if name == "MANIFEST.json":
+                        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                            retained = stream.read(_MAX_BUNDLE_MANIFEST_BYTES + 1)
+                        matches = retained == manifest_raw
+                    else:
+                        digest = sha256()
+                        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                            while block := stream.read(8 * 1024 * 1024):
+                                digest.update(block)
+                        matches = digest.hexdigest() == expected_sha256s[name]
+                    after = os.fstat(descriptor)
+                    rebound = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                    if (
+                        not matches
+                        or identity(after) != file_identity
+                        or identity(rebound) != file_identity
+                        or after.st_nlink != 1
+                    ):
+                        return False
+                    os.fsync(descriptor)
+                    durable = os.fstat(descriptor)
+                    if identity(durable) != file_identity or durable.st_nlink != 1:
+                        return False
+                    file_identities[name] = file_identity
+                finally:
+                    os.close(descriptor)
+            if frozenset(os.listdir(root_fd)) != enumerated_names:
+                return False
+            root_after = os.fstat(root_fd)
+            rebound_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+            if identity(root_after) != identity(root_before) or identity(rebound_root) != identity(
+                root_before
+            ):
+                return False
+            os.fsync(root_fd)
+            if (
+                marker_identity is not None
+                and _directory_completion_identity(root_fd) != marker_identity
+            ):
+                return False
+        finally:
+            os.close(root_fd)
+        parent_after = os.fstat(parent_fd)
+        if identity(parent_after) != identity(parent_before):
+            return False
+        os.fsync(parent_fd)
+        final_parent = os.fstat(parent_fd)
+        absolute_parent = os.stat(root.parent, follow_symlinks=False)
+        final_named_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        final_root_fd = os.open(root.name, directory_flags, dir_fd=parent_fd)
+        try:
+            final_root = os.fstat(final_root_fd)
+            final_absolute_root = os.stat(root, follow_symlinks=False)
+            if (
+                identity(final_parent) != identity(parent_before)
+                or identity(absolute_parent) != identity(parent_before)
+                or identity(final_named_root) != identity(root_before)
+                or identity(final_root) != identity(root_before)
+                or identity(final_absolute_root) != identity(root_before)
+                or frozenset(os.listdir(final_root_fd)) != enumerated_names
+            ):
+                return False
+            for name, expected_identity in file_identities.items():
+                final_named = os.stat(name, dir_fd=final_root_fd, follow_symlinks=False)
+                final_descriptor = os.open(name, flags, dir_fd=final_root_fd)
+                try:
+                    final_opened = os.fstat(final_descriptor)
+                    final_absolute = os.stat(root / name, follow_symlinks=False)
+                    if (
+                        identity(final_named) != expected_identity
+                        or identity(final_opened) != expected_identity
+                        or identity(final_absolute) != expected_identity
+                        or final_opened.st_nlink != 1
+                        or final_absolute.st_nlink != 1
+                    ):
+                        return False
+                finally:
+                    os.close(final_descriptor)
+            if marker_identity is not None:
+                final_marker = _directory_completion_identity(final_root_fd)
+                absolute_marker = os.stat(
+                    root / Q30_DIRECTORY_COMPLETION_MARKER,
+                    follow_symlinks=False,
+                )
+                if (
+                    final_marker != marker_identity
+                    or identity(absolute_marker) != marker_identity
+                    or absolute_marker.st_nlink != 1
+                ):
+                    return False
+            if frozenset(os.listdir(final_root_fd)) != enumerated_names:
+                return False
+            last_parent = os.fstat(parent_fd)
+            last_named_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+            last_absolute_root = os.stat(root, follow_symlinks=False)
+            if (
+                identity(last_parent) != identity(parent_before)
+                or identity(last_named_root) != identity(root_before)
+                or identity(last_absolute_root) != identity(root_before)
+            ):
+                return False
+            if (
+                marker_identity is not None
+                and _directory_completion_identity(final_root_fd) != marker_identity
+            ):
+                return False
+        finally:
+            os.close(final_root_fd)
+        return True
     except (ComplementError, OSError):
         return False
+    finally:
+        os.close(parent_fd)
 
 
 def publish_selection_bundle(
@@ -1499,7 +2060,9 @@ def publish_selection_bundle(
     data_sha256 = data_hash.hexdigest()
     capacity_raw = b""
     if selection.capacity_receipt_path is not None:
-        capacity_raw = _stable_regular_bytes(selection.capacity_receipt_path)
+        capacity_raw = _stable_regular_bytes(
+            selection.capacity_receipt_path, max_bytes=_MAX_CAPACITY_RECEIPT_BYTES
+        )
         if sha256(capacity_raw).hexdigest() != selection.capacity_receipt_file_sha256:
             raise ComplementError("capacity receipt changed before publication")
         _write_durable(scratch / "CAPACITY.json", capacity_raw)
@@ -1558,39 +2121,51 @@ def publish_selection_bundle(
     _fsync_directory(scratch)
     manifest_file_sha256 = sha256(manifest_raw).hexdigest()
     partial = output_root.with_name(f".{output_root.name}.partial-{manifest_file_sha256[:16]}")
-    if partial.exists():
+    partial_sources = {
+        "DATA.jsonl": data_path,
+        "MANIFEST.json": scratch / "MANIFEST.json",
+    }
+    if capacity_raw:
+        partial_sources["CAPACITY.json"] = scratch / "CAPACITY.json"
+    if os.path.lexists(partial):
+        partial_binding = _capture_directory_binding(partial)
         if not _published_bundle_matches(
-            partial, manifest_raw, data_sha256, selection.capacity_receipt_file_sha256
+            partial,
+            manifest_raw,
+            data_sha256,
+            selection.capacity_receipt_file_sha256,
+            expected_binding=partial_binding,
         ):
             raise ComplementError("publication partial collision is foreign")
     else:
-        partial.mkdir(mode=0o700)
-        shutil.copyfile(data_path, partial / "DATA.jsonl")
-        shutil.copyfile(scratch / "MANIFEST.json", partial / "MANIFEST.json")
-        if capacity_raw:
-            shutil.copyfile(scratch / "CAPACITY.json", partial / "CAPACITY.json")
-        for child in partial.iterdir():
-            with child.open("rb") as stream:
-                os.fsync(stream.fileno())
-        _fsync_directory(partial)
+        partial_binding = _populate_partial_bundle(partial, partial_sources)
         if not _published_bundle_matches(
-            partial, manifest_raw, data_sha256, selection.capacity_receipt_file_sha256
+            partial,
+            manifest_raw,
+            data_sha256,
+            selection.capacity_receipt_file_sha256,
+            expected_binding=partial_binding,
         ):
             raise ComplementError("publication partial changed while copying")
     if output_root.exists():
         if not _published_bundle_matches(
-            output_root, manifest_raw, data_sha256, selection.capacity_receipt_file_sha256
+            output_root,
+            manifest_raw,
+            data_sha256,
+            selection.capacity_receipt_file_sha256,
+            require_completion_marker=True,
         ):
             raise ComplementError("publication destination collision is foreign")
     else:
         try:
-            _rename_noreplace(partial, output_root)
+            _rename_noreplace(partial, output_root, binding=partial_binding)
         except FileExistsError:
             if not _published_bundle_matches(
                 output_root,
                 manifest_raw,
                 data_sha256,
                 selection.capacity_receipt_file_sha256,
+                require_completion_marker=True,
             ):
                 raise ComplementError("publication destination collision is foreign") from None
     if not _published_bundle_matches(
@@ -1598,9 +2173,9 @@ def publish_selection_bundle(
         manifest_raw,
         data_sha256,
         selection.capacity_receipt_file_sha256,
+        require_completion_marker=True,
     ):
         raise ComplementError("publication destination changed after install")
-    _fsync_directory(output_root.parent)
     return ComplementCompletion(
         output_root=output_root,
         row_count=len(selection.rows),
@@ -1608,6 +2183,148 @@ def publish_selection_bundle(
         manifest_sha256=manifest_identity,
         scratch_root=scratch,
     )
+
+
+@dataclass(frozen=True)
+class _HeldSelectionBundle:
+    root: Path
+    parent_fd: int
+    root_fd: int
+    parent_status: os.stat_result
+    root_status: os.stat_result
+    descriptors: dict[str, int]
+    statuses: dict[str, os.stat_result]
+
+
+def _bundle_identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
+
+
+@contextmanager
+def _held_selection_bundle(root: Path) -> Iterator[_HeldSelectionBundle]:
+    required_names = frozenset({"DATA.jsonl", "MANIFEST.json"})
+    allowed_name_sets = frozenset(
+        {
+            required_names | {Q30_DIRECTORY_COMPLETION_MARKER},
+            required_names | {"CAPACITY.json", Q30_DIRECTORY_COMPLETION_MARKER},
+        }
+    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    parent_fd: int | None = None
+    root_fd: int | None = None
+    descriptors: dict[str, int] = {}
+    try:
+        parent_fd = os.open(root.parent, directory_flags)
+        parent_status = os.fstat(parent_fd)
+        absolute_parent = os.stat(root.parent, follow_symlinks=False)
+        named_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        root_fd = os.open(root.name, directory_flags, dir_fd=parent_fd)
+        root_status = os.fstat(root_fd)
+        absolute_root = os.stat(root, follow_symlinks=False)
+        expected_names = frozenset(os.listdir(root_fd))
+        if (
+            _bundle_identity(absolute_parent) != _bundle_identity(parent_status)
+            or not stat.S_ISDIR(root_status.st_mode)
+            or _bundle_identity(named_root) != _bundle_identity(root_status)
+            or _bundle_identity(absolute_root) != _bundle_identity(root_status)
+            or expected_names not in allowed_name_sets
+        ):
+            raise ComplementError("bundle root identity or exact enumeration is invalid")
+        marker_identity = _directory_completion_identity(root_fd)
+        statuses: dict[str, os.stat_result] = {}
+        for name in sorted(expected_names - {Q30_DIRECTORY_COMPLETION_MARKER}):
+            named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            descriptor = os.open(name, flags, dir_fd=root_fd)
+            descriptors[name] = descriptor
+            opened = os.fstat(descriptor)
+            if (
+                _bundle_identity(named) != _bundle_identity(opened)
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+            ):
+                raise ComplementError(f"bundle entry is not a single-link regular file: {name}")
+            statuses[name] = opened
+        bundle = _HeldSelectionBundle(
+            root,
+            parent_fd,
+            root_fd,
+            parent_status,
+            root_status,
+            descriptors,
+            statuses,
+        )
+        yield bundle
+        if frozenset(os.listdir(root_fd)) != expected_names:
+            raise ComplementError("bundle root enumeration changed during verification")
+        if _directory_completion_identity(root_fd) != marker_identity:
+            raise ComplementError("bundle completion marker changed during verification")
+        final_parent = os.fstat(parent_fd)
+        final_absolute_parent = os.stat(root.parent, follow_symlinks=False)
+        final_root = os.fstat(root_fd)
+        final_named_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+        final_absolute_root = os.stat(root, follow_symlinks=False)
+        if (
+            _bundle_identity(final_parent) != _bundle_identity(parent_status)
+            or _bundle_identity(final_absolute_parent) != _bundle_identity(parent_status)
+            or _bundle_identity(final_root) != _bundle_identity(root_status)
+            or _bundle_identity(final_named_root) != _bundle_identity(root_status)
+            or _bundle_identity(final_absolute_root) != _bundle_identity(root_status)
+        ):
+            raise ComplementError("bundle root changed or rebound during verification")
+        for name, descriptor in descriptors.items():
+            final_opened = os.fstat(descriptor)
+            final_named = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            final_absolute = os.stat(root / name, follow_symlinks=False)
+            expected = statuses[name]
+            if (
+                _bundle_identity(final_opened) != _bundle_identity(expected)
+                or _bundle_identity(final_named) != _bundle_identity(expected)
+                or _bundle_identity(final_absolute) != _bundle_identity(expected)
+                or final_opened.st_nlink != 1
+                or final_absolute.st_nlink != 1
+            ):
+                raise ComplementError(f"bundle entry changed or rebound: {name}")
+        absolute_marker = os.stat(
+            root / Q30_DIRECTORY_COMPLETION_MARKER,
+            follow_symlinks=False,
+        )
+        if (
+            _directory_completion_identity(root_fd) != marker_identity
+            or _bundle_identity(absolute_marker) != marker_identity
+            or absolute_marker.st_nlink != 1
+        ):
+            raise ComplementError("bundle completion marker changed or rebound")
+        if frozenset(os.listdir(root_fd)) != expected_names:
+            raise ComplementError("bundle root final enumeration changed")
+    except OSError as error:
+        raise ComplementError("bundle root or entry cannot be authenticated no-follow") from error
+    finally:
+        for descriptor in descriptors.values():
+            os.close(descriptor)
+        if root_fd is not None:
+            os.close(root_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+
+
+def _held_bundle_bytes(bundle: _HeldSelectionBundle, name: str, *, max_bytes: int) -> bytes:
+    descriptor = bundle.descriptors[name]
+    before = os.fstat(descriptor)
+    if before.st_size > max_bytes:
+        raise ComplementError(f"bundle entry is too large to retain: {name}")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    with os.fdopen(descriptor, "rb", closefd=False) as stream:
+        raw = stream.read(max_bytes + 1)
+    after = os.fstat(descriptor)
+    if (
+        len(raw) > max_bytes
+        or _bundle_identity(before) != _bundle_identity(after)
+        or after.st_nlink != 1
+        or len(raw) != before.st_size
+    ):
+        raise ComplementError(f"bundle entry changed or exceeded its retention bound: {name}")
+    return raw
 
 
 def verify_selection_bundle(
@@ -1659,23 +2376,57 @@ def _verify_selection_bundle_with_replay_root(
     expected_source_commit: str,
     policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> dict[str, Any]:
+    with _held_selection_bundle(output_root) as bundle:
+        return _verify_selection_bundle_from_held_root(
+            output_root,
+            bundle=bundle,
+            expected_manifest_file_sha256=expected_manifest_file_sha256,
+            tokenizer=tokenizer,
+            config_path=config_path,
+            inventory=inventory,
+            historical=historical,
+            held_out=held_out,
+            tokenizer_trust_file_sha256=tokenizer_trust_file_sha256,
+            replay_root=replay_root,
+            expected_runtime_sha256=expected_runtime_sha256,
+            expected_source_commit=expected_source_commit,
+            policy=policy,
+        )
+
+
+def _verify_selection_bundle_from_held_root(
+    output_root: Path,
+    *,
+    bundle: _HeldSelectionBundle,
+    expected_manifest_file_sha256: str,
+    tokenizer: Any,
+    config_path: Path,
+    inventory: SourceInventory,
+    historical: HistoricalExclusion,
+    held_out: HeldOutUnion,
+    tokenizer_trust_file_sha256: str,
+    replay_root: Path,
+    expected_runtime_sha256: str,
+    expected_source_commit: str,
+    policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
+) -> dict[str, Any]:
     """Replay one caller-pinned installed bundle through schema, UUID, and token gates."""
     if (
         not _is_lower_hex(expected_manifest_file_sha256, 64)
         or not _is_lower_hex(tokenizer_trust_file_sha256, 64)
         or not _is_lower_hex(expected_runtime_sha256, 64)
         or not _is_lower_hex(expected_source_commit, 40)
-        or output_root.is_symlink()
-        or not output_root.is_dir()
     ):
         raise ComplementError("verification trust identity is invalid")
-    manifest_raw = _stable_regular_bytes(output_root / "MANIFEST.json")
+    manifest_raw = _held_bundle_bytes(bundle, "MANIFEST.json", max_bytes=_MAX_BUNDLE_MANIFEST_BYTES)
     if sha256(manifest_raw).hexdigest() != expected_manifest_file_sha256:
         raise ComplementError("manifest caller SHA-256 mismatch")
     try:
         manifest: Any = json.loads(manifest_raw)
     except json.JSONDecodeError as error:
         raise ComplementError("manifest JSON is invalid") from error
+    config = load_complement_config(config_path, policy=policy)
+    approved_quotas: Mapping[str, int] = config["quotas"]
     expected_manifest_keys = {
         "schema_version",
         "scientific_identity",
@@ -1701,18 +2452,15 @@ def _verify_selection_bundle_with_replay_root(
         or set(manifest) != expected_manifest_keys
         or manifest.get("schema_version") != "ptv2-ptv3-complement-bundle-v1"
         or manifest.get("scientific_identity") != policy.scientific_identity
-        or manifest.get("quotas") != APPROVED_QUOTAS
-        or manifest.get("category_counts") != APPROVED_QUOTAS
-        or manifest.get("row_count") != sum(APPROVED_QUOTAS.values())
+        or manifest.get("quotas") != approved_quotas
+        or manifest.get("category_counts") != approved_quotas
+        or manifest.get("row_count") != sum(approved_quotas.values())
     ):
         raise ComplementError("manifest schema, canonical bytes, or approved quotas are invalid")
     _require_external_approval_roots()
     manifest_body = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
     if manifest.get("manifest_sha256") != sha256(_canonical_json(manifest_body)).hexdigest():
         raise ComplementError("manifest identity does not reconcile")
-    config = load_complement_config(config_path, policy=policy)
-    if config["quotas"] != APPROVED_QUOTAS:
-        raise ComplementError("verification config quotas are invalid")
     _authenticate_provenance_roots(inventory, historical, held_out)
     trust = manifest.get("trust")
     if (
@@ -1726,7 +2474,8 @@ def _verify_selection_bundle_with_replay_root(
             "runtime_sha256",
             "source_commit",
         }
-        or trust.get("config_file_sha256") != sha256(_stable_regular_bytes(config_path)).hexdigest()
+        or trust.get("config_file_sha256")
+        != sha256(_stable_regular_bytes(config_path, max_bytes=_MAX_CONFIG_BYTES)).hexdigest()
         or trust.get("source_inventory_file_sha256") != inventory.file_sha256
         or trust.get("tokenizer_trust_file_sha256") != tokenizer_trust_file_sha256
         or trust.get("target_policy_file_sha256") != policy.file_sha256
@@ -1773,17 +2522,26 @@ def _verify_selection_bundle_with_replay_root(
         not isinstance(data_descriptor, dict)
         or set(data_descriptor) != {"path", "bytes", "sha256"}
         or data_descriptor.get("path") != "DATA.jsonl"
+        or type(data_descriptor.get("bytes")) is not int
+        or data_descriptor["bytes"] < 0
+        or not _is_lower_hex(data_descriptor.get("sha256"), 64)
     ):
         raise ComplementError("manifest data descriptor is invalid")
     capacity = manifest.get("capacity")
     if (
         not isinstance(capacity, dict)
         or capacity.get("path") != "CAPACITY.json"
+        or type(capacity.get("bytes")) is not int
+        or capacity["bytes"] < 0
         or capacity.get("sha256") != manifest.get("capacity_receipt_file_sha256")
     ):
         raise ComplementError("capacity descriptor is invalid")
     capacity_path = output_root / "CAPACITY.json"
-    capacity_raw = _stable_regular_bytes(capacity_path)
+    if bundle.statuses["CAPACITY.json"].st_size != capacity["bytes"]:
+        raise ComplementError("capacity receipt declared size does not reconcile")
+    capacity_raw = _held_bundle_bytes(
+        bundle, "CAPACITY.json", max_bytes=_MAX_CAPACITY_RECEIPT_BYTES
+    )
     if (
         capacity.get("bytes") != len(capacity_raw)
         or capacity.get("sha256") != sha256(capacity_raw).hexdigest()
@@ -1797,8 +2555,8 @@ def _verify_selection_bundle_with_replay_root(
     )
     replay_capacity_path = replay_root / "CAPACITY.json"
     replay = select_continuation_rows(
-        _category_rows(inventory),
-        quotas=APPROVED_QUOTAS,
+        _category_rows_for_quotas(inventory, approved_quotas),
+        quotas=approved_quotas,
         prior_prompt_uuids=set(historical.prompt_uuids),
         held_out_prompt_uuids=set(held_out.prompt_uuids),
         tokenizer=tokenizer,
@@ -1812,7 +2570,8 @@ def _verify_selection_bundle_with_replay_root(
     )
     if (
         replay.exclusions != manifest.get("exclusions")
-        or _stable_regular_bytes(replay_capacity_path) != capacity_raw
+        or _stable_regular_bytes(replay_capacity_path, max_bytes=_MAX_CAPACITY_RECEIPT_BYTES)
+        != capacity_raw
     ):
         raise ComplementError("selection replay capacity or exclusions do not reconcile")
     replay_rows = iter(replay.rows)
@@ -1825,18 +2584,16 @@ def _verify_selection_bundle_with_replay_root(
     data_digest = sha256()
     data_bytes = 0
     row_count = 0
-    data_path = output_root / "DATA.jsonl"
-    if data_path.is_symlink() or not data_path.is_file():
+    descriptor = bundle.descriptors["DATA.jsonl"]
+    before = os.fstat(descriptor)
+    if (
+        _bundle_identity(before) != _bundle_identity(bundle.statuses["DATA.jsonl"])
+        or before.st_nlink != 1
+        or data_descriptor["bytes"] != before.st_size
+    ):
         raise ComplementError("data identity does not reconcile")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(data_path, flags)
-    except OSError as error:
-        raise ComplementError("data identity does not reconcile") from error
-    with os.fdopen(descriptor, "rb") as stream:
-        before = os.fstat(stream.fileno())
-        if data_descriptor.get("bytes") != before.st_size:
-            raise ComplementError("data identity does not reconcile")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    with os.fdopen(descriptor, "rb", closefd=False) as stream:
         for index, raw_line in enumerate(stream):
             data_digest.update(raw_line)
             data_bytes += len(raw_line)
@@ -1946,8 +2703,8 @@ def _verify_selection_bundle_with_replay_root(
     else:
         raise ComplementError("selection replay contains rows absent from data")
     if (
-        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        _bundle_identity(before) != _bundle_identity(after)
+        or after.st_nlink != 1
         or data_descriptor.get("bytes") != data_bytes
         or data_descriptor.get("sha256") != data_digest.hexdigest()
     ):
@@ -1957,7 +2714,7 @@ def _verify_selection_bundle_with_replay_root(
     token_evidence_sha256.update(b"]")
     if (
         row_count != manifest.get("row_count")
-        or tuple(category_order) != tuple(APPROVED_QUOTAS)
+        or tuple(category_order) != tuple(approved_quotas)
         or dict(counts) != manifest.get("category_counts")
         or dict(counts) != manifest.get("quotas")
         or manifest.get("duplicate_uuid_multiplicity") != {}
@@ -2045,6 +2802,101 @@ def _completion_payload(
     return body | {"receipt_sha256": sha256(_canonical_json(body)).hexdigest()}
 
 
+def _completion_receipt_identity(status: os.stat_result) -> tuple[int, int, int, int, int]:
+    return status.st_dev, status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
+
+
+def _adopt_exact_completion_receipt(
+    path: Path,
+    expected: bytes,
+    *,
+    required_identity: tuple[int, int, int, int, int] | None = None,
+) -> tuple[int, int, int, int, int]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    try:
+        parent_fd = os.open(path.parent, directory_flags)
+    except OSError as error:
+        raise ComplementError("completion receipt parent cannot be authenticated") from error
+    descriptor: int | None = None
+    try:
+        parent_before = os.fstat(parent_fd)
+        try:
+            named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            raise ComplementError("completion receipt cannot be adopted no-follow") from error
+        before = os.fstat(descriptor)
+        identity = _completion_receipt_identity(before)
+        if (
+            _completion_receipt_identity(named) != identity
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or (required_identity is not None and identity != required_identity)
+        ):
+            raise ComplementError("completion receipt identity changed or is not single-link")
+        retained = bytearray()
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while block := stream.read(1024 * 1024):
+                retained.extend(block)
+                if len(retained) > len(expected):
+                    break
+        after = os.fstat(descriptor)
+        rebound = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _completion_receipt_identity(after) != identity
+            or _completion_receipt_identity(rebound) != identity
+            or after.st_nlink != 1
+            or bytes(retained) != expected
+        ):
+            raise ComplementError("completion receipt changed, rebound, or differs during adoption")
+        os.fsync(descriptor)
+        durable = os.fstat(descriptor)
+        rebound_after_fsync = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        absolute = os.stat(path, follow_symlinks=False)
+        parent_after_file_fsync = os.fstat(parent_fd)
+        if (
+            _completion_receipt_identity(durable) != identity
+            or _completion_receipt_identity(rebound_after_fsync) != identity
+            or _completion_receipt_identity(absolute) != identity
+            or durable.st_nlink != 1
+            or _completion_receipt_identity(parent_before)
+            != _completion_receipt_identity(parent_after_file_fsync)
+        ):
+            raise ComplementError("completion receipt changed or rebound after durability")
+        os.fsync(parent_fd)
+        final_parent = os.fstat(parent_fd)
+        final_absolute_parent = os.stat(path.parent, follow_symlinks=False)
+        final_named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        final_descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            final_opened = os.fstat(final_descriptor)
+            final_absolute = os.stat(path, follow_symlinks=False)
+            if (
+                _completion_receipt_identity(final_parent)
+                != _completion_receipt_identity(parent_before)
+                or _completion_receipt_identity(final_absolute_parent)
+                != _completion_receipt_identity(parent_before)
+                or _completion_receipt_identity(final_named) != identity
+                or _completion_receipt_identity(final_opened) != identity
+                or _completion_receipt_identity(final_absolute) != identity
+                or final_opened.st_nlink != 1
+                or final_absolute.st_nlink != 1
+            ):
+                raise ComplementError(
+                    "completion receipt parent or file changed after parent durability"
+                )
+        finally:
+            os.close(final_descriptor)
+        return identity
+    except OSError as error:
+        raise ComplementError("completion receipt durability authentication failed") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def _write_completion_receipt(
     path: Path,
     completion: ComplementCompletion,
@@ -2058,8 +2910,10 @@ def _write_completion_receipt(
     )
     raw = _canonical_json(payload) + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_durable(path, raw)
-    _fsync_directory(path.parent)
+    if not os.path.lexists(path):
+        with suppress(FileExistsError):
+            _write_durable(path, raw)
+    _adopt_exact_completion_receipt(path, raw)
     return sha256(raw).hexdigest()
 
 
@@ -2072,7 +2926,7 @@ def _load_completion_receipt(
     source_commit: str,
     policy: TargetTokenizerPolicy = Q4_TARGET_POLICY,
 ) -> dict[str, Any]:
-    raw = _stable_regular_bytes(path)
+    raw = _stable_regular_bytes(path, max_bytes=_MAX_COMPLETION_RECEIPT_BYTES)
     if sha256(raw).hexdigest() != expected_sha256:
         raise ComplementError("completion receipt caller SHA-256 mismatch")
     try:
@@ -2136,7 +2990,7 @@ def main(argv: list[str] | None = None) -> int:
         args.scratch_root.mkdir(parents=True, exist_ok=True)
         selection_scratch = Path(tempfile.mkdtemp(prefix="ptv23-selection-", dir=args.scratch_root))
         selection = select_continuation_rows(
-            _category_rows(inventory),
+            _category_rows_for_quotas(inventory, config["quotas"]),
             quotas=config["quotas"],
             prior_prompt_uuids=set(historical.prompt_uuids),
             held_out_prompt_uuids=set(held_out.prompt_uuids),
@@ -2163,7 +3017,9 @@ def main(argv: list[str] | None = None) -> int:
             output_root=args.output_root,
             scratch_root=args.scratch_root,
             quotas=config["quotas"],
-            config_file_sha256=sha256(_stable_regular_bytes(args.config)).hexdigest(),
+            config_file_sha256=sha256(
+                _stable_regular_bytes(args.config, max_bytes=_MAX_CONFIG_BYTES)
+            ).hexdigest(),
             source_inventory_file_sha256=inventory.file_sha256,
             historical=historical,
             held_out=held_out,
@@ -2230,11 +3086,15 @@ def load_complement_config(
     path: Path, *, policy: TargetTokenizerPolicy = Q4_TARGET_POLICY
 ) -> dict[str, Any]:
     """Load the immutable quota and source policy bound to one target policy."""
+    require_approved_target_policy(policy)
     try:
-        raw = _stable_regular_bytes(path)
+        raw = _stable_regular_bytes(path, max_bytes=_MAX_CONFIG_BYTES)
         payload: Any = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise ComplementError("approved continuation policy is unreadable") from error
+    if sha256(raw).hexdigest() != policy.quota_config_sha256:
+        raise ComplementError("approved continuation policy does not match")
+    quotas = payload.get("quotas") if isinstance(payload, dict) else None
     expected = {
         "schema_version": SCHEMA_VERSION,
         "scientific_identity": policy.scientific_identity,
@@ -2249,14 +3109,27 @@ def load_complement_config(
             "path": policy.source_requirements_path,
             "sha256": policy.source_requirements_sha256,
         },
-        "quotas": APPROVED_QUOTAS,
+        "quotas": quotas,
     }
-    if sha256(raw).hexdigest() != policy.quota_config_sha256 or payload != expected:
+    if (
+        payload != expected
+        or not isinstance(quotas, dict)
+        or set(quotas) != set(APPROVED_QUOTA_CATEGORIES)
+        or any(type(value) is not int or value < 1 for value in quotas.values())
+        or sum(quotas.values()) != 700_000
+    ):
         raise ComplementError("approved continuation policy does not match")
     requirements = path.parent / policy.source_requirements_path
-    if sha256(_stable_regular_bytes(requirements)).hexdigest() != policy.source_requirements_sha256:
+    if (
+        sha256(
+            _stable_regular_bytes(requirements, max_bytes=_MAX_SOURCE_REQUIREMENTS_BYTES)
+        ).hexdigest()
+        != policy.source_requirements_sha256
+    ):
         raise ComplementError("approved source requirements identity does not match")
-    return expected
+    return expected | {
+        "quotas": {category: quotas[category] for category in APPROVED_QUOTA_CATEGORIES}
+    }
 
 
 if __name__ == "__main__":
