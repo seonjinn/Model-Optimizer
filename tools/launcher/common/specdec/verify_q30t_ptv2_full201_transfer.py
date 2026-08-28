@@ -8,17 +8,14 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import ctypes
-import errno
 import fcntl
 import hashlib
 import json
 import os
-import platform
 import signal
 import stat
 import sys
 import threading
-import uuid
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -73,6 +70,7 @@ _DATA_NAME = "data"
 _READ_BLOCK_BYTES = 8 * 1024 * 1024
 _MAX_JSON_BYTES = 64 * 1024 * 1024
 _SHA256_LENGTH = 64
+_RECEIPT_MODE = 0o440
 _F_SETLEASE = getattr(fcntl, "F_SETLEASE", None)
 _F_GETLEASE = getattr(fcntl, "F_GETLEASE", None)
 _F_RDLCK = getattr(fcntl, "F_RDLCK", None)
@@ -205,6 +203,16 @@ def _identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
 
 def _object_identity(metadata: os.stat_result) -> tuple[int, int]:
     return metadata.st_dev, metadata.st_ino
+
+
+def _is_exact_receipt_metadata(metadata: os.stat_result, *, payload_size: int) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink == 1
+        and metadata.st_size == payload_size
+        and stat.S_IMODE(metadata.st_mode) == _RECEIPT_MODE
+    )
 
 
 def _is_lower_sha256(value: object) -> bool:
@@ -385,8 +393,8 @@ def _require_published_receipt_binding(
             descriptor, output.name, output, retain=True
         )
         if (
-            _object_identity(rebound) != _object_identity(receipt_expected)
-            or rebound.st_nlink != 1
+            _identity(rebound) != _identity(receipt_expected)
+            or not _is_exact_receipt_metadata(rebound, payload_size=len(payload))
             or size != len(payload)
             or digest != hashlib.sha256(payload).hexdigest()
             or reread != payload
@@ -425,46 +433,6 @@ def _require_published_receipt_binding(
             os.close(rebound_parent_fd)
     finally:
         os.close(descriptor)
-
-
-def _rename_no_replace_at(parent_fd: int, source: str, destination: str) -> None:
-    library = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source)
-    destination_bytes = os.fsencode(destination)
-    system = platform.system()
-    try:
-        if system == "Linux":
-            rename = library.renameat2
-            rename.argtypes = [
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            ]
-            rename.restype = ctypes.c_int
-            result = rename(parent_fd, source_bytes, parent_fd, destination_bytes, 1)
-        elif system == "Darwin":
-            rename = library.renameatx_np
-            rename.argtypes = [
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_int,
-                ctypes.c_char_p,
-                ctypes.c_uint,
-            ]
-            rename.restype = ctypes.c_int
-            result = rename(parent_fd, source_bytes, parent_fd, destination_bytes, 0x00000004)
-        else:
-            raise OSError(errno.ENOSYS, f"atomic no-replace rename is unsupported on {system}")
-    except AttributeError as error:
-        raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable") from error
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise FileExistsError(error_number, os.strerror(error_number), destination)
-    raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _read_regular_at(
@@ -829,77 +797,62 @@ def _verify_tree(
 
 def _publish_no_clobber(output: Path, payload: bytes, lease_guard: _ReadLeaseGuard) -> None:
     parent_fd, parent_expected = _open_private_output_parent(output)
-    try:
-        os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    except OSError as error:
-        os.close(parent_fd)
-        raise TransferVerificationError("verification receipt path is unavailable") from error
-    else:
-        os.close(parent_fd)
-        raise TransferVerificationError("verification receipt already exists")
-    temporary = f".{output.name}.partial-{os.getpid()}-{uuid.uuid4().hex}"
     installed = False
     created: os.stat_result | None = None
     published: os.stat_result | None = None
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-            0o440,
-            dir_fd=parent_fd,
-        )
+        lease_guard.require_no_break()
         try:
+            descriptor = os.open(
+                output.name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o000,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError as error:
+            raise TransferVerificationError("verification receipt already exists") from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size != 0:
+                raise TransferVerificationError(
+                    "verification receipt reservation identity mismatch"
+                )
             offset = 0
             while offset < len(payload):
                 offset += os.write(descriptor, payload[offset:])
             os.fsync(descriptor)
+            os.fchmod(descriptor, _RECEIPT_MODE)
+            os.fsync(descriptor)
             created = os.fstat(descriptor)
         finally:
             os.close(descriptor)
-        size, digest, reread, rebound = _read_regular_at(
-            parent_fd, temporary, output.parent / temporary, retain=True
-        )
-        if (
-            created is None
-            or _identity(rebound) != _identity(created)
-            or size != len(payload)
-            or digest != hashlib.sha256(payload).hexdigest()
-            or reread != payload
-        ):
-            raise TransferVerificationError(
-                "verification receipt temporary identity or durable reread mismatch"
-            )
-        lease_guard.require_no_break()
-        try:
-            _rename_no_replace_at(parent_fd, temporary, output.name)
-        except FileExistsError as error:
-            raise TransferVerificationError("verification receipt already exists") from error
         installed = True
         output_size, output_digest, output_reread, output_expected = _read_regular_at(
             parent_fd, output.name, output, retain=True
         )
         published = output_expected
         if (
-            _object_identity(output_expected) != _object_identity(created)
+            created is None
+            or not _is_exact_receipt_metadata(created, payload_size=len(payload))
+            or _identity(output_expected) != _identity(created)
+            or not _is_exact_receipt_metadata(output_expected, payload_size=len(payload))
             or output_size != len(payload)
             or output_digest != hashlib.sha256(payload).hexdigest()
             or output_reread != payload
         ):
             raise TransferVerificationError("published verification receipt identity mismatch")
-        os.fsync(parent_fd)
+        try:
+            os.fsync(parent_fd)
+        except OSError as error:
+            raise TransferVerificationError("verification receipt parent fsync failed") from error
     except OSError as error:
         raise TransferVerificationError("verification receipt publication failed") from error
     finally:
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        os.close(parent_fd)
     if not installed or published is None:
         raise TransferVerificationError("verification receipt was not installed")
     _require_published_receipt_binding(
@@ -914,7 +867,7 @@ def _publish_no_clobber(output: Path, payload: bytes, lease_guard: _ReadLeaseGua
 def verify_and_publish_q30t_ptv2_full201_transfer(
     *, source_root: Path, output: Path, workers: int
 ) -> bytes:
-    """Rehash the approved transfer and atomically publish its canonical receipt."""
+    """Rehash the approved transfer and exclusively publish its canonical receipt."""
     with _ReadLeaseGuard() as lease_guard:
         receipt = _canonical_json(
             _verify_tree(source_root, workers=workers, lease_guard=lease_guard)

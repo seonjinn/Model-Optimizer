@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -229,14 +230,235 @@ def test_verifier_is_no_clobber(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert output.read_bytes() == b"preserve\n"
 
 
-def test_publication_rechecks_source_leases_immediately_before_atomic_install(
+def test_publication_uses_a_lustre_compatible_exclusive_destination_reservation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A lease break detected after receipt staging must prevent the atomic install."""
+    """Publication does not depend on unsupported RENAME_NOREPLACE filesystem flags."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    real_open = module.os.open
+    reservation_flags: int | None = None
+
+    def observe_destination_reservation(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal reservation_flags
+        if path == output.name and flags & module.os.O_CREAT:
+            reservation_flags = flags
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(module.os, "open", observe_destination_reservation)
+
+    receipt = module.verify_and_publish_q30t_ptv2_full201_transfer(
+        source_root=source_root, output=output, workers=2
+    )
+
+    assert reservation_flags is not None
+    assert reservation_flags & module.os.O_CREAT
+    assert reservation_flags & module.os.O_EXCL
+    assert output.read_bytes() == receipt
+    assert not list(output.parent.glob(f".{output.name}.partial-*"))
+
+
+def test_publication_ignores_and_preserves_an_exact_prior_partial(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed rename-era partial neither blocks nor gets deleted by a safe retry."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    output.parent.mkdir(mode=0o700)
+    prior_partial = output.parent / ".VERIFY.json.partial-1489510-aa0d726b74da4ba1aa7b2534ffb310cd"
+    prior_bytes = b"exact prior canonical receipt bytes\n"
+    prior_partial.write_bytes(prior_bytes)
+
+    receipt = module.verify_and_publish_q30t_ptv2_full201_transfer(
+        source_root=source_root, output=output, workers=2
+    )
+
+    assert output.read_bytes() == receipt
+    assert prior_partial.read_bytes() == prior_bytes
+
+
+def test_destination_stays_unreadable_until_payload_and_mode_are_durable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A consumer cannot open the reserved completion path while its payload is incomplete."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    real_fsync = module.os.fsync
+    durable_modes: list[int] = []
+
+    def observe_destination_fsync(descriptor: int) -> None:
+        if output.exists():
+            descriptor_status = module.os.fstat(descriptor)
+            output_status = module.os.stat(output, follow_symlinks=False)
+            if (descriptor_status.st_dev, descriptor_status.st_ino) == (
+                output_status.st_dev,
+                output_status.st_ino,
+            ):
+                durable_modes.append(stat.S_IMODE(descriptor_status.st_mode))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(module.os, "fsync", observe_destination_fsync)
+
+    module.verify_and_publish_q30t_ptv2_full201_transfer(
+        source_root=source_root, output=output, workers=2
+    )
+
+    assert durable_modes == [0o000, 0o440]
+    assert stat.S_IMODE(output.stat().st_mode) == 0o440
+
+
+def test_publication_rejects_a_mode_change_after_the_0440_fsync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A chmod race cannot become the authenticated final receipt identity."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    real_fsync = module.os.fsync
+    changed = False
+
+    def chmod_after_0440_fsync(descriptor: int) -> None:
+        nonlocal changed
+        real_fsync(descriptor)
+        if changed or not output.exists():
+            return
+        descriptor_status = module.os.fstat(descriptor)
+        output_status = module.os.stat(output, follow_symlinks=False)
+        if (descriptor_status.st_dev, descriptor_status.st_ino) == (
+            output_status.st_dev,
+            output_status.st_ino,
+        ) and stat.S_IMODE(descriptor_status.st_mode) == 0o440:
+            module.os.fchmod(descriptor, 0o660)
+            changed = True
+
+    monkeypatch.setattr(module.os, "fsync", chmod_after_0440_fsync)
+
+    with pytest.raises(module.TransferVerificationError, match=r"receipt.*(identity|mode|changed)"):
+        module.verify_and_publish_q30t_ptv2_full201_transfer(
+            source_root=source_root, output=output, workers=2
+        )
+
+    assert changed
+    assert stat.S_IMODE(output.stat().st_mode) == 0o660
+
+
+def test_already_exists_is_not_masked_by_a_parent_fsync_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cleanup durability failure cannot replace the primary no-clobber collision."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    output.parent.mkdir(mode=0o700)
+    output.write_bytes(b"preserve\n")
+    real_fsync = module.os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(module.os.fstat(descriptor).st_mode):
+            raise OSError(errno.EIO, "injected parent fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(module.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(module.TransferVerificationError, match="already exists"):
+        module.verify_and_publish_q30t_ptv2_full201_transfer(
+            source_root=source_root, output=output, workers=2
+        )
+
+    assert output.read_bytes() == b"preserve\n"
+
+
+def test_success_path_fsyncs_the_held_parent_once_before_final_rebinding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Publication has one durability barrier before its independent final binding check."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    real_fsync = module.os.fsync
+    real_final_binding = module._require_published_receipt_binding
+    entered_final_binding = False
+    publication_parent_fsyncs = 0
+
+    def observe_parent_fsync(descriptor: int) -> None:
+        nonlocal publication_parent_fsyncs
+        if output.parent.exists():
+            descriptor_status = module.os.fstat(descriptor)
+            parent_status = module.os.stat(output.parent, follow_symlinks=False)
+            if (
+                not entered_final_binding
+                and stat.S_ISDIR(descriptor_status.st_mode)
+                and (descriptor_status.st_dev, descriptor_status.st_ino)
+                == (parent_status.st_dev, parent_status.st_ino)
+            ):
+                publication_parent_fsyncs += 1
+        real_fsync(descriptor)
+
+    def mark_final_binding(**kwargs: object) -> None:
+        nonlocal entered_final_binding
+        entered_final_binding = True
+        real_final_binding(**kwargs)
+
+    monkeypatch.setattr(module.os, "fsync", observe_parent_fsync)
+    monkeypatch.setattr(module, "_require_published_receipt_binding", mark_final_binding)
+
+    module.verify_and_publish_q30t_ptv2_full201_transfer(
+        source_root=source_root, output=output, workers=2
+    )
+
+    assert publication_parent_fsyncs == 1
+
+
+def test_exclusive_publication_rejects_a_same_uid_destination_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A destination rebound after its durable write is preserved but never authenticated."""
+    module = _load_module()
+    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
+    moved_receipt = output.with_name("reserved-receipt-moved.json")
+    foreign = b"foreign replacement\n"
+    real_fsync = module.os.fsync
+    swapped = False
+
+    def swap_after_destination_fsync(descriptor: int) -> None:
+        nonlocal swapped
+        real_fsync(descriptor)
+        if swapped or not output.exists():
+            return
+        descriptor_status = module.os.fstat(descriptor)
+        output_status = module.os.stat(output, follow_symlinks=False)
+        if (descriptor_status.st_dev, descriptor_status.st_ino) != (
+            output_status.st_dev,
+            output_status.st_ino,
+        ):
+            return
+        output.rename(moved_receipt)
+        output.write_bytes(foreign)
+        swapped = True
+
+    monkeypatch.setattr(module.os, "fsync", swap_after_destination_fsync)
+
+    with pytest.raises(module.TransferVerificationError, match=r"receipt.*(changed|identity)"):
+        module.verify_and_publish_q30t_ptv2_full201_transfer(
+            source_root=source_root, output=output, workers=2
+        )
+
+    assert swapped
+    assert output.read_bytes() == foreign
+    assert moved_receipt.is_file()
+
+
+def test_publication_rechecks_source_leases_immediately_before_destination_reservation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A lease break detected before the exclusive destination open prevents publication."""
     module = _load_module()
     source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
     real_require = module._ReadLeaseGuard.require_no_break
-    real_rename = module._rename_no_replace_at
+    real_open = module.os.open
     checks = 0
 
     def count_lease_check(guard: object) -> None:
@@ -244,12 +466,19 @@ def test_publication_rechecks_source_leases_immediately_before_atomic_install(
         checks += 1
         real_require(guard)
 
-    def require_last_check_before_install(parent_fd: int, source: str, destination: str) -> None:
-        assert checks == 3
-        real_rename(parent_fd, source, destination)
+    def require_last_check_before_reservation(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == output.name and flags & module.os.O_EXCL:
+            assert checks == 3
+        return real_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(module._ReadLeaseGuard, "require_no_break", count_lease_check)
-    monkeypatch.setattr(module, "_rename_no_replace_at", require_last_check_before_install)
+    monkeypatch.setattr(module.os, "open", require_last_check_before_reservation)
 
     module.verify_and_publish_q30t_ptv2_full201_transfer(
         source_root=source_root, output=output, workers=2
@@ -291,40 +520,7 @@ def test_publication_reports_a_late_lease_break_after_final_receipt_rebinding(
     assert json.loads(output.read_bytes())["observed_complete_at_verification"] is True
 
 
-def test_publication_preserves_a_foreign_replacement_of_its_temporary_name(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Cleanup cannot unlink a same-UID file that replaced the verifier's temporary inode."""
-    module = _load_module()
-    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
-    real_fsync = module.os.fsync
-    replacements: list[Path] = []
-
-    def replace_after_durable_write(descriptor: int) -> None:
-        real_fsync(descriptor)
-        if replacements or not output.parent.exists():
-            return
-        temporary_files = list(output.parent.glob(f".{output.name}.partial-*"))
-        if not temporary_files:
-            return
-        temporary = temporary_files[0]
-        temporary.rename(output.parent / "owned-temporary-moved")
-        temporary.write_bytes(b"foreign replacement\n")
-        replacements.append(temporary)
-
-    monkeypatch.setattr(module.os, "fsync", replace_after_durable_write)
-
-    with pytest.raises(module.TransferVerificationError, match=r"temporary|reread"):
-        module.verify_and_publish_q30t_ptv2_full201_transfer(
-            source_root=source_root, output=output, workers=2
-        )
-
-    assert len(replacements) == 1
-    assert replacements[0].read_bytes() == b"foreign replacement\n"
-    assert not output.exists()
-
-
-def test_publication_consumes_the_temporary_inode_without_a_second_link(
+def test_publication_exposes_only_one_link_without_a_temporary_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The installed receipt is never exposed as a second link needing pathname cleanup."""
@@ -373,18 +569,26 @@ def test_publication_rebinds_the_output_parent_after_installation(
     moved_parent = output.parent.with_name("installed-output-parent-moved")
     replacement = output.parent.with_name("foreign-output-parent")
     replacement.mkdir(mode=0o700)
-    real_rename = module._rename_no_replace_at
+    real_fsync = module.os.fsync
     swapped = False
 
-    def swap_after_install(parent_fd: int, source: str, destination: str) -> None:
+    def swap_after_install(descriptor: int) -> None:
         nonlocal swapped
-        real_rename(parent_fd, source, destination)
-        if not swapped:
-            output.parent.rename(moved_parent)
-            replacement.rename(output.parent)
-            swapped = True
+        real_fsync(descriptor)
+        if swapped or not output.exists():
+            return
+        descriptor_status = module.os.fstat(descriptor)
+        output_status = module.os.stat(output, follow_symlinks=False)
+        if (descriptor_status.st_dev, descriptor_status.st_ino) != (
+            output_status.st_dev,
+            output_status.st_ino,
+        ):
+            return
+        output.parent.rename(moved_parent)
+        replacement.rename(output.parent)
+        swapped = True
 
-    monkeypatch.setattr(module, "_rename_no_replace_at", swap_after_install)
+    monkeypatch.setattr(module.os, "fsync", swap_after_install)
 
     with pytest.raises(module.TransferVerificationError, match="receipt parent changed"):
         module.verify_and_publish_q30t_ptv2_full201_transfer(
@@ -443,81 +647,6 @@ def test_publication_rebinds_the_output_parent_after_receipt_reread(
 
     assert not output.exists()
     assert (moved_parent / output.name).is_file()
-
-
-def test_publication_never_deletes_a_replacement_created_at_unlink_time(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Publication cannot use stat-then-unlink cleanup on a rebindable temporary name."""
-    module = _load_module()
-    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
-    real_unlink = module.os.unlink
-    replacements: list[Path] = []
-
-    def replace_at_unlink(
-        name: str | bytes,
-        *,
-        dir_fd: int | None = None,
-    ) -> None:
-        if (
-            dir_fd is not None
-            and isinstance(name, str)
-            and name.startswith(f".{output.name}.partial-")
-            and not replacements
-        ):
-            moved_name = f"owned-{name}"
-            module.os.rename(name, moved_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-            descriptor = module.os.open(
-                name,
-                module.os.O_WRONLY | module.os.O_CREAT | module.os.O_EXCL,
-                0o600,
-                dir_fd=dir_fd,
-            )
-            try:
-                module.os.write(descriptor, b"foreign replacement\n")
-            finally:
-                module.os.close(descriptor)
-            replacements.append(output.parent / name)
-        real_unlink(name, dir_fd=dir_fd)
-
-    monkeypatch.setattr(module.os, "unlink", replace_at_unlink)
-
-    module.verify_and_publish_q30t_ptv2_full201_transfer(
-        source_root=source_root, output=output, workers=2
-    )
-
-    assert not replacements or replacements[0].read_bytes() == b"foreign replacement\n"
-
-
-def test_publication_rebinds_the_receipt_file_after_atomic_install(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The final receipt path must still name the inode and bytes installed by the verifier."""
-    module = _load_module()
-    source_root, output, _ = _fixture(module, monkeypatch, tmp_path)
-    moved_receipt = output.with_name("installed-receipt-moved.json")
-    real_rename = module._rename_no_replace_at
-    swapped = False
-
-    def swap_after_install(parent_fd: int, source: str, destination: str) -> None:
-        nonlocal swapped
-        real_rename(parent_fd, source, destination)
-        if not swapped:
-            output.rename(moved_receipt)
-            output.write_bytes(b"foreign receipt\n")
-            swapped = True
-
-    monkeypatch.setattr(module, "_rename_no_replace_at", swap_after_install)
-
-    with pytest.raises(
-        module.TransferVerificationError, match=r"published (verification )?receipt"
-    ):
-        module.verify_and_publish_q30t_ptv2_full201_transfer(
-            source_root=source_root, output=output, workers=2
-        )
-
-    assert output.read_bytes() == b"foreign receipt\n"
-    assert moved_receipt.is_file()
 
 
 @pytest.mark.parametrize("fault", ["tamper", "extra", "symlink", "directory"])
