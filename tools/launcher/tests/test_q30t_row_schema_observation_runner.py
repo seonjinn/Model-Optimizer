@@ -47,6 +47,50 @@ def _scratch_allocator_test_source(scratch_root: Path) -> str:
     return source
 
 
+def _run_current_materialization_segment(
+    tmp_path: Path, scratch_root: Path
+) -> subprocess.CompletedProcess[str]:
+    materializer = _runner_embedded_python("Q30T_BLOB_MATERIALIZER")
+    fake_git = tmp_path / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "for last do :; done\n"
+        'case "$last" in\n'
+        "  *\\^\\{commit\\}) exit 0 ;;\n"
+        "  *observe_q30t*) printf observer-bytes ;;\n"
+        "  *stage_subset*) printf plan-bytes ;;\n"
+        "  *qwen4b_b_atomic*) printf atomic-bytes ;;\n"
+        "esac\n"
+    )
+    fake_git.chmod(0o700)
+    source = tmp_path / "source"
+    source.mkdir()
+    descriptor = os.open(scratch_root, os.O_RDONLY)
+    try:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-",
+                str(descriptor),
+                str(fake_git),
+                str(source),
+                "a" * 40,
+                "examples/dataset/observe_q30t_ptv23_row_schemas.py",
+                "examples/dataset/qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json",
+                "tools/launcher/common/specdec/qwen4b_b_atomic.py",
+            ],
+            input=materializer,
+            text=True,
+            capture_output=True,
+            pass_fds=(descriptor,),
+            check=False,
+        )
+    finally:
+        os.close(descriptor)
+
+
 def _load_observer_test_support() -> ModuleType:
     path = ROOT.parent / "tests/examples/dataset/test_observe_q30t_ptv23_row_schemas.py"
     spec = importlib.util.spec_from_file_location("q30t_observer_test_support", path)
@@ -127,6 +171,73 @@ def test_scratch_allocator_falls_back_when_slurm_tmpdir_is_absent(tmp_path: Path
     assert re.fullmatch(r"q30t-row-schema-75209087-[0-9a-f]{32}", path.name)
     assert path.stat().st_mode & 0o777 == 0o700
     assert (path.stat().st_dev, path.stat().st_ino) == (int(device), int(inode))
+
+
+def test_materialization_never_truncates_through_a_descendant_symlink(tmp_path: Path) -> None:
+    """An attacker-created examples symlink cannot redirect blob writes to foreign data."""
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir(mode=0o700)
+    foreign = tmp_path / "foreign-dir"
+    (foreign / "dataset").mkdir(parents=True)
+    foreign_observer = foreign / "dataset" / "observe_q30t_ptv23_row_schemas.py"
+    foreign_observer.write_bytes(b"foreign-data-must-survive")
+    foreign_identity = (foreign_observer.stat().st_dev, foreign_observer.stat().st_ino)
+    (scratch_root / "examples").symlink_to(foreign, target_is_directory=True)
+
+    result = _run_current_materialization_segment(tmp_path, scratch_root)
+
+    assert result.returncode != 0
+    assert foreign_observer.read_bytes() == b"foreign-data-must-survive"
+    assert (foreign_observer.stat().st_dev, foreign_observer.stat().st_ino) == foreign_identity
+
+
+def test_materialization_never_truncates_an_existing_hardlink(tmp_path: Path) -> None:
+    """Exclusive final creation rejects a hostile hardlink without changing its target."""
+    scratch_root = tmp_path / "scratch"
+    target_parent = scratch_root / "examples" / "dataset"
+    target_parent.mkdir(parents=True, mode=0o700)
+    foreign = tmp_path / "foreign.keep"
+    foreign.write_bytes(b"foreign-hardlink-data")
+    target = target_parent / "observe_q30t_ptv23_row_schemas.py"
+    os.link(foreign, target)
+    identity = (foreign.stat().st_dev, foreign.stat().st_ino, foreign.stat().st_nlink)
+
+    result = _run_current_materialization_segment(tmp_path, scratch_root)
+
+    assert result.returncode != 0
+    assert foreign.read_bytes() == b"foreign-hardlink-data"
+    assert target.read_bytes() == b"foreign-hardlink-data"
+    assert (foreign.stat().st_dev, foreign.stat().st_ino, foreign.stat().st_nlink) == identity
+
+
+def test_materialization_creates_exact_read_only_single_link_blobs(tmp_path: Path) -> None:
+    """The held-root materializer publishes complete authenticated blobs exclusively."""
+    scratch_root = tmp_path / "scratch"
+    scratch_root.mkdir(mode=0o700)
+
+    result = _run_current_materialization_segment(tmp_path, scratch_root)
+
+    assert result.returncode == 0, result.stderr
+    values = result.stdout.strip().split("\t")
+    assert len(values) == 12
+    expected = (b"observer-bytes", b"plan-bytes", b"atomic-bytes")
+    paths = (
+        scratch_root / "examples/dataset/observe_q30t_ptv23_row_schemas.py",
+        scratch_root / "examples/dataset/qwen3_30ba3b_thinking_ptv3_stage_subset_v1.json",
+        scratch_root / "tools/launcher/common/specdec/qwen4b_b_atomic.py",
+    )
+    for ordinal, (path, content) in enumerate(zip(paths, expected, strict=True)):
+        metadata = path.stat()
+        offset = ordinal * 4
+        assert path.read_bytes() == content
+        assert metadata.st_mode & 0o777 == 0o400
+        assert metadata.st_nlink == 1
+        assert values[offset : offset + 4] == [
+            str(metadata.st_dev),
+            str(metadata.st_ino),
+            str(len(content)),
+            hashlib.sha256(content).hexdigest(),
+        ]
 
 
 def test_scratch_allocator_preserves_safe_slurm_tmpdir_path(tmp_path: Path) -> None:
@@ -476,6 +587,55 @@ def test_immutable_bootstrap_executes_held_bytes_after_path_rebind(tmp_path: Pat
         capture_output=True,
         check=False,
     )
+
+    assert result.returncode == 0, result.stderr
+    assert trusted_marker.exists()
+    assert not substituted_marker.exists()
+
+
+def test_immutable_bootstrap_executes_adopted_descriptor_after_name_rebind(
+    tmp_path: Path,
+) -> None:
+    """Production's fd:N interface never reopens a rebound scratch pathname."""
+    bootstrap = _runner_embedded_python("Q30T_IMMUTABLE_BOOTSTRAP")
+    primitives = bootstrap.split(
+        "observer_path, observer_sha256, atomic_path, atomic_sha256 = sys.argv[1:5]", 1
+    )[0]
+    trusted_marker = tmp_path / "trusted-code-ran"
+    substituted_marker = tmp_path / "substituted-code-ran"
+    observer = tmp_path / "observer.py"
+    trusted = f"from pathlib import Path\nPath({str(trusted_marker)!r}).touch()\n".encode()
+    observer.write_bytes(trusted)
+    observer.chmod(0o400)
+    descriptor = os.open(observer, os.O_RDONLY)
+    moved = tmp_path / "observer-held.py"
+    observer.rename(moved)
+    observer.write_text(f"from pathlib import Path\nPath({str(substituted_marker)!r}).touch()\n")
+    exercise = (
+        primitives
+        + "\nreference, expected = sys.argv[1:3]\n"
+        + "descriptor, authenticated = open_blob(reference, expected, 'observer')\n"
+        + "try:\n    exec(compile(authenticated, f'/proc/self/fd/{descriptor}', 'exec'), {})\n"
+        + "finally:\n    os.close(descriptor)\n"
+    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-",
+                f"fd:{descriptor}",
+                hashlib.sha256(trusted).hexdigest(),
+            ],
+            input=exercise,
+            text=True,
+            capture_output=True,
+            pass_fds=(descriptor,),
+            check=False,
+        )
+    finally:
+        os.close(descriptor)
 
     assert result.returncode == 0, result.stderr
     assert trusted_marker.exists()

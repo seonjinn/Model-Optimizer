@@ -38,12 +38,10 @@ readonly receipt_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-dr
     && ( -z "${SLURM_GPUS_ON_NODE:-}" || "${SLURM_GPUS_ON_NODE:-}" == 0 ) ]] \
     || fail "observation requires a CPU-only allocation"
 
-readonly approved_chmod="/usr/bin/chmod"
 readonly approved_git="/usr/bin/git"
 readonly approved_id="/usr/bin/id"
 readonly approved_mkdir="/usr/bin/mkdir"
 readonly approved_python="/usr/bin/python3.12"
-readonly approved_sha256sum="/usr/bin/sha256sum"
 readonly approved_env="/usr/bin/env"
 [[ "$-" == *p* ]] || fail "privileged Bash mode is required"
 for name in $(compgen -e); do
@@ -56,8 +54,8 @@ unset PATH
 PATH=/usr/bin:/bin
 export PATH
 
-"$approved_python" -I -S - /bin/bash "$approved_env" "$approved_chmod" "$approved_git" \
-    "$approved_id" "$approved_mkdir" "$approved_python" "$approved_sha256sum" <<'PY'
+"$approved_python" -I -S - /bin/bash "$approved_env" "$approved_git" \
+    "$approved_id" "$approved_mkdir" "$approved_python" <<'PY'
 # Q30T_TOOL_AUTHENTICATOR
 import os
 import stat
@@ -354,45 +352,247 @@ readonly atomic_path="tools/launcher/common/specdec/qwen4b_b_atomic.py"
 readonly observer="$scratch_root/$observer_path"
 readonly ptv3_plan="$scratch_root/$ptv3_plan_path"
 readonly atomic="$scratch_root/$atomic_path"
-"$approved_mkdir" -p -- "${observer%/*}" "${atomic%/*}"
+materialized_record="$(/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    "$approved_python" -I -S - "$scratch_fd" "$approved_git" "$source_path" \
+    "$source_commit" "$observer_path" "$ptv3_plan_path" "$atomic_path" <<'PY'
+# Q30T_BLOB_MATERIALIZER
+import hashlib
+import os
+import stat
+import subprocess
+import sys
 
-# git cat-file binds both executable and plan bytes to the reviewed commit object.
-/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
-    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
-    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
-    cat-file -e "$source_commit^{commit}"
-/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
-    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
-    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
-    cat-file blob "$source_commit:$observer_path" >"$observer"
-/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
-    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
-    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
-    cat-file blob "$source_commit:$ptv3_plan_path" >"$ptv3_plan"
-/usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
-    GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
-    -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
-    cat-file blob "$source_commit:$atomic_path" >"$atomic"
-"$approved_chmod" 0400 "$observer" "$ptv3_plan" "$atomic"
-observer_sha256="$(
-    /usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
-        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
-        -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
-        cat-file blob "$source_commit:$observer_path" \
-        | /usr/bin/env -i LC_ALL=C "$approved_sha256sum"
+root_fd = int(sys.argv[1])
+git, source, commit = sys.argv[2:5]
+paths = sys.argv[5:8]
+limits = (8 * 1024 * 1024, 8 * 1024 * 1024, 8 * 1024 * 1024)
+open_directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+open_output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK
+git_environment = {
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+}
+git_prefix = [
+    git,
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-C",
+    source,
+]
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def require_private_directory(descriptor, label):
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail(f"{label} is not an exact-owner mode-0700 directory")
+    return metadata
+
+
+def open_parent(relative):
+    if os.path.isabs(relative) or os.path.normpath(relative) != relative:
+        fail("materialized blob path is not normalized and relative")
+    components = relative.split("/")
+    if len(components) < 2 or any(not value or value in (".", "..") for value in components):
+        fail("materialized blob path has unsafe components")
+    parent = os.dup(root_fd)
+    require_private_directory(parent, "materialization root")
+    try:
+        for component in components[:-1]:
+            try:
+                os.mkdir(component, 0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = os.open(component, open_directory_flags, dir_fd=parent)
+            metadata = require_private_directory(child, "materialization directory")
+            named = os.stat(component, dir_fd=parent, follow_symlinks=False)
+            if (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino):
+                os.close(child)
+                fail("materialization directory namespace changed")
+            os.close(parent)
+            parent = child
+        return parent, components[-1]
+    except BaseException:
+        os.close(parent)
+        raise
+
+
+def write_all(descriptor, data):
+    offset = 0
+    while offset < len(data):
+        written = os.write(descriptor, data[offset:])
+        if written <= 0:
+            fail("materialized blob write made no progress")
+        offset += written
+
+
+def materialize(relative, maximum_bytes):
+    parent, name = open_parent(relative)
+    descriptor = None
+    process = None
+    try:
+        descriptor = os.open(name, open_output_flags, 0o400, dir_fd=parent)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o400
+            or opened.st_nlink != 1
+        ):
+            fail("new materialized blob has unsafe metadata")
+        process = subprocess.Popen(
+            [*git_prefix, "cat-file", "blob", f"{commit}:{relative}"],
+            env=git_environment,
+            stdout=subprocess.PIPE,
+        )
+        if process.stdout is None:
+            fail("Git blob stream is unavailable")
+        digest = hashlib.sha256()
+        counted = 0
+        while True:
+            block = process.stdout.read(1024 * 1024)
+            if not block:
+                break
+            if len(block) > maximum_bytes - counted:
+                process.kill()
+                fail("materialized blob exceeds its byte bound")
+            write_all(descriptor, block)
+            digest.update(block)
+            counted += len(block)
+        process.stdout.close()
+        if process.wait() != 0:
+            fail("Git failed while streaming a reviewed blob")
+        os.fsync(descriptor)
+        os.fsync(parent)
+        after = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+            or (after.st_dev, after.st_ino) != (named.st_dev, named.st_ino)
+            or after.st_size != counted
+            or after.st_nlink != 1
+            or stat.S_IMODE(after.st_mode) != 0o400
+        ):
+            fail("materialized blob changed before durable publication")
+        return after.st_dev, after.st_ino, counted, digest.hexdigest()
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+if subprocess.run(
+    [*git_prefix, "cat-file", "-e", f"{commit}^{{commit}}"],
+    env=git_environment,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+).returncode != 0:
+    fail("reviewed Git commit object is unavailable")
+records = [materialize(path, limit) for path, limit in zip(paths, limits, strict=True)]
+print("\t".join(str(value) for record in records for value in record), flush=True)
+PY
 )"
-observer_sha256="${observer_sha256%% *}"
-atomic_sha256="$(
-    /usr/bin/env -i LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null \
-        GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 "$approved_git" \
-        -c core.attributesFile=/dev/null -c core.hooksPath=/dev/null -C "$source_path" \
-        cat-file blob "$source_commit:$atomic_path" \
-        | /usr/bin/env -i LC_ALL=C "$approved_sha256sum"
-)"
-atomic_sha256="${atomic_sha256%% *}"
-readonly observer_sha256 atomic_sha256
-[[ "$observer_sha256" =~ ^[0-9a-f]{64}$ && "$atomic_sha256" =~ ^[0-9a-f]{64}$ ]] \
-    || fail "materialized executable SHA-256 capture failed"
+readonly materialized_record
+IFS=$'\t' read -r observer_device observer_inode observer_size observer_sha256 \
+    ptv3_plan_device ptv3_plan_inode ptv3_plan_size observed_ptv3_plan_sha256 \
+    atomic_device atomic_inode atomic_size atomic_sha256 materialized_extra <<<"$materialized_record"
+readonly observer_device observer_inode observer_size observer_sha256 \
+    ptv3_plan_device ptv3_plan_inode ptv3_plan_size observed_ptv3_plan_sha256 \
+    atomic_device atomic_inode atomic_size atomic_sha256 materialized_extra
+[[ "$observer_device" =~ ^[0-9]+$ && "$observer_inode" =~ ^[0-9]+$ \
+    && "$observer_size" =~ ^[0-9]+$ && "$observer_sha256" =~ ^[0-9a-f]{64}$ \
+    && "$ptv3_plan_device" =~ ^[0-9]+$ && "$ptv3_plan_inode" =~ ^[0-9]+$ \
+    && "$ptv3_plan_size" =~ ^[0-9]+$ && "$observed_ptv3_plan_sha256" =~ ^[0-9a-f]{64}$ \
+    && "$atomic_device" =~ ^[0-9]+$ && "$atomic_inode" =~ ^[0-9]+$ \
+    && "$atomic_size" =~ ^[0-9]+$ && "$atomic_sha256" =~ ^[0-9a-f]{64}$ \
+    && -z "$materialized_extra" ]] || fail "materialized blob identity capture failed"
+
+exec 10<"$observer" || fail "materialized observer adoption failed"
+exec 11<"$ptv3_plan" || fail "materialized PTV3 plan adoption failed"
+exec 12<"$atomic" || fail "materialized atomic dependency adoption failed"
+/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    "$approved_python" -I -S - "$scratch_fd" \
+    "$observer_path" 10 "$observer_device" "$observer_inode" "$observer_size" "$observer_sha256" \
+    "$ptv3_plan_path" 11 "$ptv3_plan_device" "$ptv3_plan_inode" "$ptv3_plan_size" "$observed_ptv3_plan_sha256" \
+    "$atomic_path" 12 "$atomic_device" "$atomic_inode" "$atomic_size" "$atomic_sha256" <<'PY'
+# Q30T_BLOB_ADOPTER
+import hashlib
+import os
+import stat
+import sys
+
+root_fd = int(sys.argv[1])
+arguments = sys.argv[2:]
+if len(arguments) != 18:
+    raise SystemExit("materialized blob adoption arguments are invalid")
+
+
+def identity(metadata):
+    return metadata.st_dev, metadata.st_ino
+
+
+for offset in range(0, len(arguments), 6):
+    relative, fd_text, device, inode, size, expected_sha256 = arguments[offset : offset + 6]
+    descriptor = int(fd_text)
+    expected_identity = int(device), int(inode)
+    expected_size = int(size)
+    components = relative.split("/")
+    parent = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+            os.close(parent)
+            parent = child
+        opened = os.fstat(descriptor)
+        named = os.stat(components[-1], dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o400
+            or opened.st_nlink != 1
+            or opened.st_size != expected_size
+            or identity(opened) != expected_identity
+            or identity(named) != expected_identity
+        ):
+            raise SystemExit("materialized blob changed before descriptor adoption")
+        digest = hashlib.sha256()
+        counted = 0
+        while counted < expected_size:
+            block = os.pread(descriptor, min(1024 * 1024, expected_size - counted), counted)
+            if not block:
+                raise SystemExit("materialized blob shrank during descriptor adoption")
+            digest.update(block)
+            counted += len(block)
+        if os.pread(descriptor, 1, expected_size):
+            raise SystemExit("materialized blob grew during descriptor adoption")
+        after = os.fstat(descriptor)
+        rebound = os.stat(components[-1], dir_fd=parent, follow_symlinks=False)
+        if identity(after) != expected_identity or identity(rebound) != expected_identity:
+            raise SystemExit("materialized blob rebound during descriptor adoption")
+        if digest.hexdigest() != expected_sha256:
+            raise SystemExit("materialized blob SHA-256 mismatch during descriptor adoption")
+    finally:
+        os.close(parent)
+PY
 
 readonly ptv2_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/assets/q30t-ptv2-full201-source-v1"
 readonly ptv2_plan="$ptv2_root/SOURCE_PLAN.json"
@@ -403,9 +603,7 @@ readonly ptv3_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-draft
 readonly ptv3_plan_sha256="752090878ed2c5fce47683b2939f9d857be5549311b158476fce33bb79f52eac"
 readonly ptv3_completion="$ptv3_root/completion.json"
 
-observed_ptv3_plan_sha256="$(/usr/bin/env -i LC_ALL=C \
-    "$approved_sha256sum" "$ptv3_plan")"
-[[ "${observed_ptv3_plan_sha256%% *}" == "$ptv3_plan_sha256" ]] \
+[[ "$observed_ptv3_plan_sha256" == "$ptv3_plan_sha256" ]] \
     || fail "immutable PTV3 plan blob SHA-256 mismatch"
 ptv3_completion_sha256="$(/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
     PYTHONSAFEPATH=1 "$approved_python" -I -S - "$ptv3_completion" <<'PY'
@@ -467,7 +665,7 @@ readonly ptv3_completion_sha256
 
 "$approved_mkdir" -p -- "$receipt_root/row-schema"
 /usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    "$approved_python" -I -S - "$observer" "$observer_sha256" "$atomic" "$atomic_sha256" \
+    "$approved_python" -I -S - "fd:10" "$observer_sha256" "fd:12" "$atomic_sha256" \
     --ptv2-plan "$ptv2_plan" \
     --ptv2-plan-sha256 "$ptv2_plan_sha256" \
     --ptv2-completion "$ptv2_completion" \
@@ -505,10 +703,19 @@ def identity(value):
 def open_blob(path, expected_sha256, label):
     if len(expected_sha256) != 64 or any(character not in "0123456789abcdef" for character in expected_sha256):
         raise SystemExit(f"{label} blob SHA-256 is invalid")
-    before = os.stat(path, follow_symlinks=False)
+    held_descriptor = path.startswith("fd:")
+    if held_descriptor:
+        try:
+            descriptor = os.dup(int(path.removeprefix("fd:")))
+        except (OSError, ValueError):
+            raise SystemExit(f"{label} held descriptor is invalid") from None
+        before = os.fstat(descriptor)
+    else:
+        before = os.stat(path, follow_symlinks=False)
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > MAX_BLOB_BYTES:
         raise SystemExit(f"{label} blob is not a bounded single-link regular file")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not held_descriptor:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     opened = os.fstat(descriptor)
     if identity(before) != identity(opened):
         os.close(descriptor)
@@ -528,7 +735,7 @@ def open_blob(path, expected_sha256, label):
         os.close(descriptor)
         raise SystemExit(f"{label} blob grew while reading")
     after = os.fstat(descriptor)
-    rebound = os.stat(path, follow_symlinks=False)
+    rebound = after if held_descriptor else os.stat(path, follow_symlinks=False)
     if identity(before) != identity(after) or identity(after) != identity(rebound):
         os.close(descriptor)
         raise SystemExit(f"{label} blob changed while reading")
