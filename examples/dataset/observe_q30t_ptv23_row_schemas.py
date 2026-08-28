@@ -13,6 +13,7 @@ import json
 import os
 import stat
 import sys
+import sysconfig
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -32,6 +33,7 @@ _PTV3_MANIFEST_NAME = "MANIFEST.json"
 _PTV3_COMPLETION_NAME = "completion.json"
 _MAX_RUNTIME_FILES = 4096
 _MAX_RUNTIME_BYTES = 1024 * 1024 * 1024
+_MAX_PYTHON_EXECUTABLE_BYTES = 1024 * 1024 * 1024
 
 
 class ObservationError(RuntimeError):
@@ -108,6 +110,42 @@ def _approved_executable(path: Path) -> Path:
     raise ObservationError("Python executable symlink chain is too deep")
 
 
+def _approved_regular_file_sha256(path: Path, label: str, maximum_bytes: int) -> tuple[int, str]:
+    named = os.stat(path, follow_symlinks=False)
+    _require_root_owned_nonwritable(named, label)
+    if not stat.S_ISREG(named.st_mode) or named.st_nlink != 1 or named.st_size > maximum_bytes:
+        raise ObservationError(f"{label} is not a bounded single-link regular file")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if _identity(opened) != _identity(named):
+            raise ObservationError(f"{label} changed while opening")
+        digest = hashlib.sha256()
+        size = 0
+        while size < named.st_size:
+            block = os.read(descriptor, min(_READ_BLOCK_BYTES, named.st_size - size))
+            if not block:
+                raise ObservationError(f"{label} shrank while hashing")
+            digest.update(block)
+            size += len(block)
+        if os.read(descriptor, 1):
+            raise ObservationError(f"{label} grew while hashing")
+        after = os.fstat(descriptor)
+        rebound = os.stat(path, follow_symlinks=False)
+    finally:
+        os.close(descriptor)
+    if (
+        size != named.st_size
+        or _identity(named) != _identity(after)
+        or _identity(after) != _identity(rebound)
+    ):
+        raise ObservationError(f"{label} changed while hashing")
+    return size, digest.hexdigest()
+
+
 def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
     root_before = os.stat(root, follow_symlinks=False)
     _require_root_owned_nonwritable(root_before, "PyArrow package root")
@@ -144,7 +182,17 @@ def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
                 opened = os.fstat(descriptor)
                 if _identity(opened) != _identity(named):
                     raise ObservationError("PyArrow package file changed while opening")
-                size, file_sha256, _ = _read_descriptor(descriptor, retain=False)
+                file_digest = hashlib.sha256()
+                size = 0
+                while size < named.st_size:
+                    block = os.read(descriptor, min(_READ_BLOCK_BYTES, named.st_size - size))
+                    if not block:
+                        raise ObservationError("PyArrow package file shrank while hashing")
+                    file_digest.update(block)
+                    size += len(block)
+                if os.read(descriptor, 1):
+                    raise ObservationError("PyArrow package file grew while hashing")
+                file_sha256 = file_digest.hexdigest()
                 after = os.fstat(descriptor)
             finally:
                 os.close(descriptor)
@@ -165,7 +213,40 @@ def _pyarrow_tree_inventory(root: Path) -> tuple[int, int, str]:
 
 def _authenticate_runtime() -> dict[str, object]:
     """Authenticate the concrete Python/PyArrow runtime before importing PyArrow."""
+    if any(name == "pyarrow" or name.startswith("pyarrow.") for name in sys.modules):
+        raise ObservationError("PyArrow is already loaded before runtime authentication")
+    if sys.flags.isolated != 1 or sys.flags.no_site != 1:
+        raise ObservationError("runtime authentication requires Python -I -S")
     python_target = _approved_executable(Path(sys.executable))
+    try:
+        target_metadata = os.stat(python_target, follow_symlinks=False)
+        running_metadata = os.stat("/proc/self/exe")
+    except OSError as error:
+        raise ObservationError("running Python executable identity is unavailable") from error
+    if (target_metadata.st_dev, target_metadata.st_ino) != (
+        running_metadata.st_dev,
+        running_metadata.st_ino,
+    ):
+        raise ObservationError("running Python differs from the approved executable")
+    python_size, python_sha256 = _approved_regular_file_sha256(
+        python_target, "Python executable", _MAX_PYTHON_EXECUTABLE_BYTES
+    )
+    site_candidates = {
+        Path(value)
+        for key in ("purelib", "platlib")
+        if (value := sysconfig.get_paths().get(key)) is not None
+    }
+    package_parents = [path for path in sorted(site_candidates) if (path / "pyarrow").is_dir()]
+    if len(package_parents) != 1:
+        raise ObservationError("approved PyArrow site-package location is not unique")
+    package_parent = package_parents[0]
+    parent_metadata = os.stat(package_parent, follow_symlinks=False)
+    _require_root_owned_nonwritable(parent_metadata, "PyArrow site-package parent")
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise ObservationError("PyArrow site-package parent is not a directory")
+    root = package_parent / "pyarrow"
+    inventory = _pyarrow_tree_inventory(root)
+    sys.path.insert(0, str(package_parent))
     spec = importlib.util.find_spec("pyarrow")
     if spec is None or spec.origin is None or spec.submodule_search_locations is None:
         raise ObservationError("an approved PyArrow package is unavailable")
@@ -173,10 +254,8 @@ def _authenticate_runtime() -> dict[str, object]:
     roots = tuple(Path(value) for value in spec.submodule_search_locations)
     if len(roots) != 1 or not origin.is_absolute() or not roots[0].is_absolute():
         raise ObservationError("PyArrow package origin is not uniquely absolute")
-    root = roots[0]
-    if origin.parent != root:
+    if roots[0] != root or origin.parent != root:
         raise ObservationError("PyArrow origin is outside its package root")
-    inventory = _pyarrow_tree_inventory(root)
     pyarrow = importlib.import_module("pyarrow")
     version = getattr(pyarrow, "__version__", None)
     imported_origin = Path(getattr(pyarrow, "__file__", ""))
@@ -186,6 +265,8 @@ def _authenticate_runtime() -> dict[str, object]:
         raise ObservationError("PyArrow package changed across import")
     return {
         "python_executable": str(python_target),
+        "python_executable_bytes": python_size,
+        "python_executable_sha256": python_sha256,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "pyarrow_version": version,
         "pyarrow_origin": str(origin),
@@ -201,6 +282,22 @@ def _require_imported_runtime(runtime: Mapping[str, object]) -> None:
         raise ObservationError("observed PyArrow runtime changed")
     if Path(getattr(pyarrow, "__file__", "")) != Path(cast("str", runtime["pyarrow_origin"])):
         raise ObservationError("observed PyArrow origin changed")
+    python_target = Path(cast("str", runtime["python_executable"]))
+    python_evidence = _approved_regular_file_sha256(
+        python_target, "Python executable", _MAX_PYTHON_EXECUTABLE_BYTES
+    )
+    if python_evidence != (
+        runtime["python_executable_bytes"],
+        runtime["python_executable_sha256"],
+    ):
+        raise ObservationError("Python executable changed while observing")
+    pyarrow_root = Path(cast("str", runtime["pyarrow_origin"])).parent
+    if _pyarrow_tree_inventory(pyarrow_root) != (
+        runtime["pyarrow_tree_file_count"],
+        runtime["pyarrow_tree_bytes"],
+        runtime["pyarrow_tree_sha256"],
+    ):
+        raise ObservationError("PyArrow package changed while observing")
 
 
 def _canonical_json(value: object, *, newline: bool = True) -> bytes:
@@ -1039,8 +1136,6 @@ def observe_stage_schemas(inputs: StageInputs) -> bytes:
     finally:
         stage.close()
     _require_imported_runtime(runtime)
-    if _authenticate_runtime() != runtime:
-        raise ObservationError("Python/PyArrow runtime changed while observing")
     payload: dict[str, object] = {
         "schema_version": _SCHEMA_VERSION,
         "runtime": runtime,

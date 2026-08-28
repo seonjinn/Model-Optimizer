@@ -138,7 +138,7 @@ observed_ptv3_plan_sha256="$(/usr/bin/env -i LC_ALL=C \
 [[ "${observed_ptv3_plan_sha256%% *}" == "$ptv3_plan_sha256" ]] \
     || fail "immutable PTV3 plan blob SHA-256 mismatch"
 ptv3_completion_sha256="$(/usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONSAFEPATH=1 "$approved_python" -I - "$ptv3_completion" <<'PY'
+    PYTHONSAFEPATH=1 "$approved_python" -I -S - "$ptv3_completion" <<'PY'
 # Q30T_COMPLETION_BINDER
 import hashlib
 import os
@@ -197,7 +197,7 @@ readonly ptv3_completion_sha256
 
 "$approved_mkdir" -p -- "$receipt_root/row-schema"
 /usr/bin/env -i LC_ALL=C PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    "$approved_python" -I -c \
+    "$approved_python" -I -S -c \
     'import runpy,sys; root=sys.argv.pop(1); script=sys.argv.pop(1); sys.path.insert(0,root); sys.argv[0]=script; runpy.run_path(script,run_name="__main__")' \
     "$scratch_root" "$observer" \
     --ptv2-plan "$ptv2_plan" \

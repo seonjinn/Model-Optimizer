@@ -46,34 +46,13 @@ done
 
 [[ "$source_path" == /* && "$source_path" != *"/../"* && "$source_path" != *"/./"* \
     && -d "$source_path" && ! -L "$source_path" ]] || fail "source path is unsafe"
-receipt_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/q30t-ptv23-complement-700k-v1"
-approved_git="/usr/bin/git"
-approved_sbatch="/usr/bin/sbatch"
-approved_ssh="/usr/bin/ssh"
-approved_env="/usr/bin/env"
-approved_python="/usr/bin/python3.12"
-approved_fetch_url="ssh://git@gitlab-master.nvidia.com:12051/sna/modelopt.git"
-test_executables=0
-if [[ -n "${Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES:-}" \
-    || -n "${Q30T_TEST_PYTHON:-}" || -n "${Q30T_TEST_GIT:-}" \
-    || -n "${Q30T_TEST_SBATCH:-}" || -n "${Q30T_TEST_SSH:-}" ]]; then
-    [[ "$OSTYPE" != linux* \
-        && "${Q30T_TEST_ALLOW_SYSTEM_EXECUTABLES:-}" == non-linux-test \
-        && "${Q30T_TEST_PYTHON:-}" == /* && "${Q30T_TEST_GIT:-}" == /* \
-        && "${Q30T_TEST_SBATCH:-}" == /* && "${Q30T_TEST_SSH:-}" == /* \
-        && "${Q30T_TEST_RECEIPT_ROOT:-}" == /* \
-        && "${Q30T_TEST_FETCH_URL:-}" == /* ]] \
-        || fail "system executable test override is forbidden"
-    approved_python="$Q30T_TEST_PYTHON"
-    approved_git="$Q30T_TEST_GIT"
-    approved_sbatch="$Q30T_TEST_SBATCH"
-    approved_ssh="$Q30T_TEST_SSH"
-    receipt_root="$Q30T_TEST_RECEIPT_ROOT"
-    approved_fetch_url="$Q30T_TEST_FETCH_URL"
-    test_executables=1
-fi
-readonly receipt_root approved_git approved_sbatch approved_ssh approved_env approved_python
-readonly approved_fetch_url test_executables
+readonly receipt_root="/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/receipts/q30t-ptv23-complement-700k-v1"
+readonly approved_git="/usr/bin/git"
+readonly approved_sbatch="/usr/bin/sbatch"
+readonly approved_ssh="/usr/bin/ssh"
+readonly approved_env="/usr/bin/env"
+readonly approved_python="/usr/bin/python3.12"
+readonly approved_fetch_url="ssh://git@gitlab-master.nvidia.com:12051/sna/modelopt.git"
 [[ "$output" =~ ^${receipt_root}/row-schema/observation-[ab]\.json$ ]] \
     || fail "output is not an approved row-schema observation path"
 [[ "$slurm_output" =~ ^${receipt_root}/logs/row-schema-[ab]-%j\.out$ ]] \
@@ -89,27 +68,21 @@ done
 unset PATH
 PATH=/usr/bin:/bin
 export PATH
-authenticator_arguments=(/bin/bash "$approved_env" "$approved_python" \
-    "$approved_git" "$approved_sbatch" "$approved_ssh")
-((test_executables)) && authenticator_arguments=(--test-owner "${authenticator_arguments[@]}")
-"$approved_python" -I -S - "${authenticator_arguments[@]}" <<'PY'
+"$approved_python" -I -S - /bin/bash "$approved_env" "$approved_python" \
+    "$approved_git" "$approved_sbatch" "$approved_ssh" <<'PY'
 # Q30T_TOOL_AUTHENTICATOR
 import os
 import stat
 import sys
 
-arguments = sys.argv[1:]
-test_owner = arguments[:1] == ["--test-owner"]
-if test_owner:
-    arguments = arguments[1:]
-required_uids = {0, os.getuid()} if test_owner else {0}
-for value in arguments:
+approved_uids = {0}
+for value in sys.argv[1:]:
     path = value
     if not os.path.isabs(path):
         raise SystemExit("approved executable path is not absolute")
     for _ in range(16):
         metadata = os.lstat(path)
-        if metadata.st_uid not in required_uids or stat.S_IMODE(metadata.st_mode) & 0o022:
+        if metadata.st_uid not in approved_uids or stat.S_IMODE(metadata.st_mode) & 0o022:
             raise SystemExit(f"approved executable is not root-owned or is writable: {value}")
         if not stat.S_ISLNK(metadata.st_mode):
             if not stat.S_ISREG(metadata.st_mode) or not os.access(path, os.X_OK):
@@ -119,7 +92,7 @@ for value in arguments:
         path = os.path.normpath(target if os.path.isabs(target) else os.path.join(os.path.dirname(path), target))
     else:
         raise SystemExit(f"approved executable symlink chain is too deep: {value}")
-if not test_owner and sys.version_info < (3, 12):
+if sys.version_info < (3, 12):
     raise SystemExit("approved Python must be Python 3.12 or newer")
 PY
 

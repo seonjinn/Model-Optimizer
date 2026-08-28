@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
 _TEST_RUNTIME = {
     "python_executable": "/usr/bin/python3.12",
+    "python_executable_bytes": 123456,
+    "python_executable_sha256": "b" * 64,
     "python_version": "3.12.0",
     "pyarrow_version": "test-pyarrow",
     "pyarrow_origin": "/usr/lib/python3.12/site-packages/pyarrow/__init__.py",
@@ -509,14 +511,37 @@ def test_observation_binds_the_authenticated_python_and_pyarrow_runtime(tmp_path
 
 
 def test_runtime_authentication_fails_closed_on_a_user_owned_python(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     python = tmp_path / "python3.12"
     python.write_bytes(b"not an approved interpreter")
     python.chmod(0o755)
-    monkeypatch.setattr(observer_module.sys, "executable", str(python))
-
     with pytest.raises(ObservationError, match="root-owned"):
+        observer_module._approved_executable(python)
+
+
+def test_runtime_authentication_requires_isolated_no_site_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in tuple(observer_module.sys.modules):
+        if name == "pyarrow" or name.startswith("pyarrow."):
+            monkeypatch.delitem(observer_module.sys.modules, name)
+
+    with pytest.raises(ObservationError, match=r"-I -S"):
+        _REAL_AUTHENTICATE_RUNTIME()
+
+
+def test_runtime_authentication_rejects_preloaded_pyarrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        observer_module,
+        "_approved_executable",
+        lambda path: observer_module.Path("/usr/bin/python3.12"),
+    )
+    monkeypatch.setitem(observer_module.sys.modules, "pyarrow", object())
+
+    with pytest.raises(ObservationError, match="already loaded"):
         _REAL_AUTHENTICATE_RUNTIME()
 
 
