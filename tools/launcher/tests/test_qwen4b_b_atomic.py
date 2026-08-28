@@ -59,10 +59,25 @@ def test_file_fallback_rejects_same_size_source_mutation_after_reread(
         publication.ctypes, "CDLL", lambda *_args, **_kwargs: _UnsupportedRenameLibrary()
     )
 
-    def mutate_before_copy(source: Path, target: Path, *, expected_sha256: str) -> tuple[int, int]:
+    def mutate_before_copy(
+        source: Path,
+        target: Path,
+        *,
+        expected_sha256: str,
+        expected_source_identity: tuple[int, int],
+        expected_parent_identity: tuple[int, int],
+        parent_fd: int,
+    ) -> tuple[int, int]:
         assert source == partial
         source.write_bytes(b"forged!!\n")
-        return original_copy(source, target, expected_sha256=expected_sha256)
+        return original_copy(
+            source,
+            target,
+            expected_sha256=expected_sha256,
+            expected_source_identity=expected_source_identity,
+            expected_parent_identity=expected_parent_identity,
+            parent_fd=parent_fd,
+        )
 
     monkeypatch.setattr(publication, "_copy_file_with_exclusive_destination", mutate_before_copy)
 
@@ -84,21 +99,65 @@ def test_file_fallback_rejects_parent_replacement_at_final_durability(
     monkeypatch.setattr(
         publication.ctypes, "CDLL", lambda *_args, **_kwargs: _UnsupportedRenameLibrary()
     )
-    real_fsync_directory = publication._fsync_directory
+    expected_parent = parent.stat()
+    expected_parent_identity = (expected_parent.st_dev, expected_parent.st_ino)
+    real_fsync = publication.os.fsync
+    attacked = False
 
-    def replace_parent(path: Path) -> None:
-        parent.rename(moved_parent)
-        parent.mkdir()
-        (parent / destination.name).write_bytes(b"foreign\n")
-        real_fsync_directory(path)
+    def replace_parent(descriptor: int) -> None:
+        nonlocal attacked
+        real_fsync(descriptor)
+        status = publication.os.fstat(descriptor)
+        if not attacked and (status.st_dev, status.st_ino) == expected_parent_identity:
+            attacked = True
+            parent.rename(moved_parent)
+            parent.mkdir()
+            (parent / destination.name).write_bytes(b"foreign\n")
 
-    monkeypatch.setattr(publication, "_fsync_directory", replace_parent)
+    monkeypatch.setattr(publication.os, "fsync", replace_parent)
 
     with pytest.raises(publication.Task10PublicationError, match=r"parent|rebound"):
         publication.atomic_publish_bytes(destination, b"receipt\n", job_id="replacement")
 
+    assert attacked
     assert destination.read_bytes() == b"foreign\n"
     assert (moved_parent / destination.name).read_bytes() == b"receipt\n"
+
+
+def test_file_publication_parent_swap_before_partial_create_never_mutates_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Partial creation remains under one held authenticated parent after a pathname swap."""
+    parent = tmp_path / "publication"
+    parent.mkdir()
+    destination = parent / "receipt.json"
+    partial = parent / ".receipt.json.partial-parent-swap"
+    displaced = tmp_path / "publication-displaced"
+    real_open = publication.os.open
+    attacked = False
+
+    def replace_parent_before_partial_create(
+        path: str | bytes | Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal attacked
+        if not attacked and (path == partial or (path == partial.name and dir_fd is not None)):
+            attacked = True
+            parent.rename(displaced)
+            parent.mkdir()
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(publication.os, "open", replace_parent_before_partial_create)
+
+    with pytest.raises(publication.Task10PublicationError, match=r"parent|rebound"):
+        publication.atomic_publish_bytes(destination, b"receipt\n", job_id="parent-swap")
+
+    assert attacked
+    assert not partial.exists()
+    assert not destination.exists()
 
 
 def test_directory_publication_survives_lustre_renameat2_einval(
@@ -122,6 +181,105 @@ def test_directory_publication_survives_lustre_renameat2_einval(
     assert (partial / "MANIFEST.json").read_bytes() == b"manifest\n"
     assert (destination / "MANIFEST.json").read_bytes() == b"manifest\n"
     assert (destination / "nested" / "DATA.jsonl").read_bytes() == b"data\n"
+
+
+def test_directory_publication_rejects_a_caller_bound_partial_replacement(tmp_path: Path) -> None:
+    """A caller-bound partial inode cannot be silently redefined before publication."""
+    partial = tmp_path / ".bundle.partial"
+    partial.mkdir()
+    (partial / "MANIFEST.json").write_bytes(b"trusted\n")
+    expected = partial.stat()
+    displaced = tmp_path / "displaced-partial"
+    partial.rename(displaced)
+    partial.mkdir()
+    (partial / "MANIFEST.json").write_bytes(b"foreign\n")
+    destination = tmp_path / "bundle"
+
+    with pytest.raises(publication.Task10PublicationError, match=r"partial.*identity"):
+        publication.atomic_publish_directory(
+            partial,
+            destination,
+            expected_directory_identity=(expected.st_dev, expected.st_ino),
+        )
+
+    assert not destination.exists()
+    assert (partial / "MANIFEST.json").read_bytes() == b"foreign\n"
+
+
+def test_directory_publication_rejects_a_caller_bound_parent_replacement(tmp_path: Path) -> None:
+    """A caller-bound parent inode rejects publication through a replacement pathname."""
+    parent = tmp_path / "publication"
+    parent.mkdir()
+    expected_parent = parent.stat()
+    displaced = tmp_path / "displaced-publication"
+    parent.rename(displaced)
+    parent.mkdir()
+    partial = parent / ".bundle.partial"
+    partial.mkdir()
+    (partial / "MANIFEST.json").write_bytes(b"foreign\n")
+    partial_status = partial.stat()
+    destination = parent / "bundle"
+
+    with pytest.raises(publication.Task10PublicationError, match=r"parent.*identity"):
+        publication.atomic_publish_directory(
+            partial,
+            destination,
+            expected_directory_identity=(partial_status.st_dev, partial_status.st_ino),
+            expected_parent_identity=(expected_parent.st_dev, expected_parent.st_ino),
+        )
+
+    assert not destination.exists()
+    assert (partial / "MANIFEST.json").read_bytes() == b"foreign\n"
+
+
+def test_directory_publication_rejects_parent_swap_before_any_reservation_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller-bound parent is rechecked inside the reservation boundary before mkdir."""
+    parent = tmp_path / "publication"
+    parent.mkdir()
+    partial = parent / ".bundle.partial"
+    partial.mkdir()
+    (partial / "MANIFEST.json").write_bytes(b"trusted\n")
+    destination = parent / "bundle"
+    expected_parent = parent.stat()
+    expected_partial = partial.stat()
+    displaced = tmp_path / "publication-displaced"
+    original_reservation = publication._rename_directory_with_reservation
+    attacked = False
+
+    def replace_parent_before_reservation(
+        source: Path,
+        target: Path,
+        **kwargs: object,
+    ) -> tuple[int, int]:
+        nonlocal attacked
+        attacked = True
+        parent.rename(displaced)
+        parent.mkdir()
+        (displaced / source.name).rename(parent / source.name)
+        return original_reservation(source, target, **kwargs)
+
+    monkeypatch.setattr(
+        publication,
+        "_rename_directory_with_reservation",
+        replace_parent_before_reservation,
+    )
+
+    with pytest.raises(
+        publication.Task10PublicationError,
+        match=r"parent.*(?:changed|rebound)|identity",
+    ):
+        publication.atomic_publish_directory(
+            partial,
+            destination,
+            expected_directory_identity=(expected_partial.st_dev, expected_partial.st_ino),
+            expected_parent_identity=(expected_parent.st_dev, expected_parent.st_ino),
+        )
+
+    assert attacked
+    assert not destination.exists()
+    assert not (destination / publication.Q30_DIRECTORY_COMPLETION_MARKER).exists()
 
 
 def test_directory_fallback_rejects_same_size_source_mutation_after_fsync(
@@ -383,10 +541,11 @@ def test_file_fallback_never_unlinks_a_replaced_partial(
 
     monkeypatch.setattr(publication.os, "stat", replace_after_source_stat)
 
-    publication.atomic_publish_bytes(destination, b"receipt\n", job_id="replacement")
+    with pytest.raises(publication.Task10PublicationError, match=r"changed|rebound|stable"):
+        publication.atomic_publish_bytes(destination, b"receipt\n", job_id="replacement")
 
     assert replacement_identity is not None
     status = partial.stat()
     assert (status.st_dev, status.st_ino) == replacement_identity
     assert partial.read_bytes() == b"foreign\n"
-    assert destination.read_bytes() == b"receipt\n"
+    assert not destination.exists()

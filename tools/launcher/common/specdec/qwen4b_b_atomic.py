@@ -131,17 +131,37 @@ def atomic_publish_bytes(destination: Path, payload: bytes, *, job_id: str) -> N
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", job_id) is None:
         raise ValueError("Task10 publication job_id is unsafe")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    parent_identity = _observe(destination.parent).identity
-    if parent_identity is None:
-        raise Task10PublicationError("Task10 publication parent is unavailable")
-    if os.path.lexists(destination):
-        raise FileExistsError(f"immutable Task10 artifact already exists: {destination}")
     partial = destination.with_name(f".{destination.name}.partial-{job_id}")
     phase = "partial_setup"
     expected: tuple[int, int] | None = None
+    parent_fd: int | None = None
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(partial, flags, 0o600)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        parent_fd = os.open(destination.parent, directory_flags)
+        parent_status = os.fstat(parent_fd)
+        absolute_parent = os.stat(destination.parent, follow_symlinks=False)
+        parent_identity = (parent_status.st_dev, parent_status.st_ino)
+        if (absolute_parent.st_dev, absolute_parent.st_ino) != parent_identity:
+            raise Task10PublicationError("Task10 publication parent changed while opening")
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"immutable Task10 artifact already exists: {destination}")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(partial.name, flags, 0o600, dir_fd=parent_fd)
         metadata = os.fstat(descriptor)
         expected = (metadata.st_dev, metadata.st_ino)
         with os.fdopen(descriptor, "wb") as stream:
@@ -149,26 +169,49 @@ def atomic_publish_bytes(destination: Path, payload: bytes, *, job_id: str) -> N
             stream.flush()
             os.fsync(stream.fileno())
         phase = "reread"
-        if _reread_created_file(partial, expected) != payload:
+        if _reread_created_file_at(parent_fd, partial.name, expected) != payload:
             raise Task10PublicationError("Task10 partial reread identity mismatch")
         phase = "rename"
         installed_identity = _rename_no_replace(
             partial,
             destination,
             expected_file_sha256=sha256(payload).hexdigest(),
+            expected_file_identity=expected,
+            expected_parent_identity=parent_identity,
+            parent_fd=parent_fd,
         )
-        if _observe(destination).identity != installed_identity:
+        installed_status = os.stat(
+            destination.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (installed_status.st_dev, installed_status.st_ino) != installed_identity:
             raise Task10PublicationError("Task10 destination inode differs from its partial")
-        if _reread_created_file(destination, installed_identity) != payload:
+        if _reread_created_file_at(parent_fd, destination.name, installed_identity) != payload:
             raise Task10PublicationError("Task10 destination content differs from its partial")
         phase = "parent_fsync"
-        _fsync_directory(destination.parent)
-        final_status = os.stat(destination, follow_symlinks=False)
+        os.fsync(parent_fd)
+        final_parent = os.fstat(parent_fd)
+        final_named = os.stat(
+            destination.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        try:
+            final_absolute_parent = os.stat(destination.parent, follow_symlinks=False)
+            final_absolute = os.stat(destination, follow_symlinks=False)
+        except OSError as error:
+            raise Task10PublicationError(
+                "Task10 publication parent or destination rebound after durability"
+            ) from error
         if (
-            _observe(destination.parent).identity != parent_identity
-            or (final_status.st_dev, final_status.st_ino) != installed_identity
-            or not stat.S_ISREG(final_status.st_mode)
-            or final_status.st_nlink != 1
+            (final_parent.st_dev, final_parent.st_ino) != parent_identity
+            or (final_absolute_parent.st_dev, final_absolute_parent.st_ino) != parent_identity
+            or (final_named.st_dev, final_named.st_ino) != installed_identity
+            or (final_absolute.st_dev, final_absolute.st_ino) != installed_identity
+            or not stat.S_ISREG(final_named.st_mode)
+            or final_named.st_nlink != 1
+            or final_absolute.st_nlink != 1
         ):
             raise Task10PublicationError(
                 "Task10 publication parent or destination rebound after durability"
@@ -187,20 +230,42 @@ def atomic_publish_bytes(destination: Path, payload: bytes, *, job_id: str) -> N
             ),
         )
         raise
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
-def atomic_publish_directory(partial: Path, destination: Path) -> None:
+def atomic_publish_directory(
+    partial: Path,
+    destination: Path,
+    *,
+    expected_directory_identity: tuple[int, int] | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
+) -> None:
     """Publish a fully fsynced sibling directory without replacement."""
-    expected = _observe(partial).identity
-    parent_identity = _observe(destination.parent).identity
-    phase = "directory_fsync"
+    observed_partial_identity = _observe(partial).identity
+    observed_parent_identity = _observe(destination.parent).identity
+    expected = expected_directory_identity or observed_partial_identity
+    parent_identity = expected_parent_identity or observed_parent_identity
+    phase = "caller_binding"
     try:
+        if (
+            expected_directory_identity is not None
+            and observed_partial_identity != expected_directory_identity
+        ):
+            raise Task10PublicationError("Task10 partial identity differs from caller binding")
+        if (
+            expected_parent_identity is not None
+            and observed_parent_identity != expected_parent_identity
+        ):
+            raise Task10PublicationError("Task10 parent identity differs from caller binding")
         if (
             expected is None
             or parent_identity is None
             or partial.parent.resolve() != destination.parent.resolve()
         ):
             raise Task10PublicationError("Task10 partial must be a present sibling directory")
+        phase = "directory_fsync"
         _fsync_tree(partial)
         if _observe(partial).identity != expected:
             raise Task10PublicationError("Task10 partial inode changed before rename")
@@ -213,6 +278,7 @@ def atomic_publish_directory(partial: Path, destination: Path) -> None:
             destination,
             expected_directory_sha256=expected_tree_sha256,
             expected_directory_identity=expected,
+            expected_parent_identity=parent_identity,
         )
         if _observe(destination).identity != installed_identity:
             raise Task10PublicationError("Task10 destination inode differs from its partial")
@@ -263,8 +329,16 @@ def atomic_publish_directory(partial: Path, destination: Path) -> None:
         raise
 
 
-def _reread_created_file(path: Path, expected: tuple[int, int]) -> bytes:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+def _reread_created_file_at(
+    parent_fd: int,
+    name: str,
+    expected: tuple[int, int],
+) -> bytes:
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=parent_fd,
+    )
     try:
         before = os.fstat(descriptor)
         if (before.st_dev, before.st_ino) != expected or not stat.S_ISREG(before.st_mode):
@@ -274,7 +348,13 @@ def _reread_created_file(path: Path, expected: tuple[int, int]) -> bytes:
             after = os.fstat(stream.fileno())
     except BaseException:
         raise
-    if (after.st_dev, after.st_ino) != expected or _observe(path).identity != expected:
+    rebound = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        (after.st_dev, after.st_ino) != expected
+        or (rebound.st_dev, rebound.st_ino) != expected
+        or after.st_nlink != 1
+        or rebound.st_nlink != 1
+    ):
         raise Task10PublicationError("Task10 partial inode changed during reread")
     return payload
 
@@ -414,10 +494,15 @@ def _directory_content_sha256_at(directory_fd: int) -> str:
     return digest.hexdigest()
 
 
-def _native_rename_no_replace(source: Path, destination: Path) -> None:
+def _native_rename_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    parent_fd: int | None = None,
+) -> None:
     library = ctypes.CDLL(None, use_errno=True)
-    source_bytes = os.fsencode(source)
-    destination_bytes = os.fsencode(destination)
+    source_bytes = os.fsencode(source.name if parent_fd is not None else source)
+    destination_bytes = os.fsencode(destination.name if parent_fd is not None else destination)
     if platform.system() == "Linux":
         try:
             rename = library.renameat2
@@ -431,12 +516,28 @@ def _native_rename_no_replace(source: Path, destination: Path) -> None:
             ctypes.c_uint,
         ]
         rename.restype = ctypes.c_int
-        result = rename(-100, source_bytes, -100, destination_bytes, 1)
+        directory_fd = -100 if parent_fd is None else parent_fd
+        result = rename(directory_fd, source_bytes, directory_fd, destination_bytes, 1)
     elif platform.system() == "Darwin":
-        rename = library.renamex_np
-        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        rename.restype = ctypes.c_int
-        result = rename(source_bytes, destination_bytes, 0x00000004)
+        if parent_fd is None:
+            rename = library.renamex_np
+            rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            result = rename(source_bytes, destination_bytes, 0x00000004)
+        else:
+            try:
+                rename = library.renameatx_np
+            except AttributeError as error:
+                raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable") from error
+            rename.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename.restype = ctypes.c_int
+            result = rename(parent_fd, source_bytes, parent_fd, destination_bytes, 0x00000004)
     else:
         raise OSError(
             errno.ENOSYS, f"atomic no-replace rename is unsupported on {platform.system()}"
@@ -462,19 +563,27 @@ def _copy_file_with_exclusive_destination(
     destination: Path,
     *,
     expected_sha256: str,
+    expected_source_identity: tuple[int, int] | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
+    parent_fd: int | None = None,
 ) -> tuple[int, int]:
     """Copy a sibling partial into an exclusively created final pathname."""
     if source.parent.absolute() != destination.parent.absolute():
         raise Task10PublicationError("Task10 partial must be a destination sibling")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
-    parent_fd = os.open(source.parent, directory_flags)
+    owns_parent_fd = parent_fd is None
+    if parent_fd is None:
+        parent_fd = os.open(source.parent, directory_flags)
     source_fd: int | None = None
     destination_fd: int | None = None
     try:
         parent_before = os.fstat(parent_fd)
         absolute_parent = os.stat(source.parent, follow_symlinks=False)
-        if (parent_before.st_dev, parent_before.st_ino) != (
+        parent_identity = (parent_before.st_dev, parent_before.st_ino)
+        if (
+            expected_parent_identity is not None and parent_identity != expected_parent_identity
+        ) or parent_identity != (
             absolute_parent.st_dev,
             absolute_parent.st_ino,
         ):
@@ -492,6 +601,9 @@ def _copy_file_with_exclusive_destination(
         )
         if (
             (source_named.st_dev, source_named.st_ino) != source_identity
+            or (
+                expected_source_identity is not None and source_identity != expected_source_identity
+            )
             or not stat.S_ISREG(source_before.st_mode)
             or source_before.st_nlink != 1
         ):
@@ -578,7 +690,8 @@ def _copy_file_with_exclusive_destination(
             os.close(destination_fd)
         if source_fd is not None:
             os.close(source_fd)
-        os.close(parent_fd)
+        if owns_parent_fd:
+            os.close(parent_fd)
 
 
 def _copy_directory_at(source_fd: int, destination_fd: int, *, root: bool = False) -> None:
@@ -767,6 +880,7 @@ def _rename_directory_with_reservation(
     *,
     expected_sha256: str,
     expected_source_identity: tuple[int, int],
+    expected_parent_identity: tuple[int, int],
 ) -> tuple[int, int]:
     """Claim an absent sibling directory before a portable held-parent rename."""
     if source.parent.absolute() != destination.parent.absolute():
@@ -779,6 +893,13 @@ def _rename_directory_with_reservation(
     try:
         parent_before = os.fstat(parent_fd)
         absolute_parent = os.stat(source.parent, follow_symlinks=False)
+        if (parent_before.st_dev, parent_before.st_ino) != expected_parent_identity or (
+            absolute_parent.st_dev,
+            absolute_parent.st_ino,
+        ) != expected_parent_identity:
+            raise Task10PublicationError(
+                "Task10 directory reservation parent identity changed before publication"
+            )
         source_named = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
         source_fd = os.open(source.name, directory_flags, dir_fd=parent_fd)
         source_opened = os.fstat(source_fd)
@@ -913,23 +1034,41 @@ def _rename_no_replace(
     destination: Path,
     *,
     expected_file_sha256: str | None = None,
+    expected_file_identity: tuple[int, int] | None = None,
     expected_directory_sha256: str | None = None,
     expected_directory_identity: tuple[int, int] | None = None,
+    expected_parent_identity: tuple[int, int] | None = None,
+    parent_fd: int | None = None,
 ) -> tuple[int, int]:
-    source_identity = _observe(source).identity
-    if source_identity is None:
-        raise Task10PublicationError("Task10 partial is unavailable before publication")
     try:
-        source_status = os.stat(source, follow_symlinks=False)
+        if parent_fd is None:
+            source_status = os.stat(source, follow_symlinks=False)
+        else:
+            opened_parent = os.fstat(parent_fd)
+            absolute_parent = os.stat(source.parent, follow_symlinks=False)
+            if (
+                expected_parent_identity is None
+                or (opened_parent.st_dev, opened_parent.st_ino) != expected_parent_identity
+                or (absolute_parent.st_dev, absolute_parent.st_ino) != expected_parent_identity
+            ):
+                raise Task10PublicationError(
+                    "Task10 file publication parent identity changed before publication"
+                )
+            source_status = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+    except Task10PublicationError:
+        raise
     except OSError as error:
         raise Task10PublicationError(
             "Task10 partial cannot be inspected for publication"
         ) from error
+    source_identity = (source_status.st_dev, source_status.st_ino)
     if stat.S_ISDIR(source_status.st_mode):
         if (
             expected_file_sha256 is not None
+            or expected_file_identity is not None
             or expected_directory_sha256 is None
             or expected_directory_identity is None
+            or expected_parent_identity is None
             or source_identity != expected_directory_identity
         ):
             raise Task10PublicationError("Task10 directory cannot use a file content identity")
@@ -938,27 +1077,25 @@ def _rename_no_replace(
             destination,
             expected_sha256=expected_directory_sha256,
             expected_source_identity=expected_directory_identity,
+            expected_parent_identity=expected_parent_identity,
         )
-    try:
-        _native_rename_no_replace(source, destination)
-        return source_identity
-    except OSError as error:
-        if error.errno == errno.EEXIST:
-            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
-        if not _unsupported_no_replace_error(error):
-            raise Task10PublicationError(
-                f"atomic no-replace rename failed: {os.strerror(error.errno or errno.EIO)}"
-            ) from error
     if stat.S_ISREG(source_status.st_mode):
         if (
             expected_file_sha256 is None
+            or expected_file_identity is None
+            or source_identity != expected_file_identity
             or expected_directory_sha256 is not None
             or expected_directory_identity is not None
+            or expected_parent_identity is None
+            or parent_fd is None
         ):
             raise Task10PublicationError("Task10 file fallback requires a content identity")
         return _copy_file_with_exclusive_destination(
             source,
             destination,
             expected_sha256=expected_file_sha256,
+            expected_source_identity=expected_file_identity,
+            expected_parent_identity=expected_parent_identity,
+            parent_fd=parent_fd,
         )
     raise Task10PublicationError("Task10 partial has an unsupported fallback type")
