@@ -122,15 +122,52 @@ The physical PTV2 inventory is rooted at revision
 STEM, Chat/instruction, and DE/JA/ES/FR/IT multilingual data, and PTV2 carries
 that domain in the split name rather than in a row field.
 
-No staged copy exists yet. A survey on 2026-08-28 found no PTV2 or PTV3 data
-under `/lustre` on OCI-HSG and no Hugging Face dataset cache, and the Lustre
-paths that appear in repo configs are unwritten destinations rather than
-existing stores. Corpus acquisition is therefore unstarted work on the critical
-path, not a precondition already satisfied. It is also gated: every PTV2
-per-file SHA-256 in the current inventory is null and marked
-`gated-redacted-require-bootstrap`, and the file inventory, row-schema digests,
-and per-category capacity receipts are declared blocking external pins. The
-staging gate below must close before any training run is scheduled.
+A staged PTV2 copy exists on OCI-HSG at
+`/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/haoguo/Nemotron-Post-Training-Dataset-v2`:
+42 GB, a `README.md` and a flat `data/` directory of 202 Parquet shards. It is
+absent on AWS-CMH-03, OCI-AGA, Lyris, and Ptyche. An earlier survey recorded in
+this spec claimed no staged copy existed anywhere. That survey was scoped to
+`users/sna` and bounded at depth 4, so it could not reach a depth-6 path under
+another user's directory. Its conclusion was wrong and is retracted.
+
+The staged `README.md` carries the upstream `dataset_info` block, so per-split
+row counts are now measured from the artifact rather than asserted from a
+generator docstring:
+
+| Split | Rows | Bytes | Shards |
+|---|---:|---:|---:|
+| `stem` | 355,000 | 807,639,463 | 2 |
+| `chat` | 627,720 | 5,971,361,114 | 12 |
+| `math` | 239,467 | 507,431,890 | 2 |
+| `code` | 175,000 | 980,267,419 | 2 |
+| `multilingual_ja` | 975,202 | 18,014,250,907 | 37 |
+| `multilingual_de` | 1,015,314 | 18,891,078,015 | 38 |
+| `multilingual_it` | 1,016,503 | 18,724,137,501 | 38 |
+| `multilingual_es` | 935,704 | 16,273,052,735 | 33 |
+| `multilingual_fr` | 1,001,504 | 18,231,554,197 | 37 |
+
+Repository totals are `download_size` 44,423,886,661 and `dataset_size`
+98,400,773,241. The four English domains this study admits sum to 1,397,187
+rows and 3.7 GB on disk, confirming to the digit the ~1.40M figure previously
+carried only as an assertion. The multilingual splits hold 38 of the 42 staged
+GB and are not admitted, so the corpus this study actually moves is small
+enough that staging cost is not a scheduling factor.
+
+A prior inventory pass reported a label conflict: a 257,813-row bucket labelled
+`multilingual_de` in one config and `stem` in another. That conflict is
+withdrawn. It was an artifact of measuring 26 of 201 shards. `stem` and
+`multilingual_de` are distinct splits of 355,000 and 1,015,314 rows and neither
+equals 257,813. One stray `multilingual-00000-of-00001.parquet` (768 KB) sits
+in `data/` with no matching entry in the `configs` block and is ignored.
+
+Acquisition is not a blocker. `https://huggingface.co` answers HTTP 200 from
+the login nodes of all five clusters, so any split absent from a cluster is
+fetched directly at the pinned revision and filtered to the admitted domains.
+Gating governs provenance, not access: every PTV2 per-file SHA-256 in the
+current inventory is null and marked `gated-redacted-require-bootstrap`, so the
+file inventory, row-schema digests, and per-category capacity receipts remain
+blocking pins that must be materialised from the staged or downloaded shards
+before a training run is scheduled.
 
 PTV3 is not a single repository. There is no `nvidia/Nemotron-Post-Training-
 Dataset-v3`; PTV3 is a collection of separately versioned repositories, each
@@ -165,6 +202,41 @@ record the exact revision, configuration, split, every physical relative path,
 file size, SHA-256, row count, row-schema digest, license expression, and
 approved-use classification. Adding or changing a source creates a new corpus
 policy identity.
+
+### Staging topology
+
+The corpus is staged to Lustre on every cluster that will run training. Write
+access is not uniform. Measured on 2026-08-28:
+
+| Cluster | Staging root | Writable | Space used / quota | Inodes used / soft limit |
+|---|---|---|---:|---:|
+| OCI-HSG | `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna` | yes | 101.4 T / 323.7 T | 25,672,851 / 52,428,800 |
+| Lyris | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | yes | 49.0 T / 250 T | 24,494,708 / 26,214,400 |
+| Ptyche | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | yes | 74.0 T / 250 T | 2,304,907 / 26,214,400 |
+| AWS-CMH-03 | none | no | n/a | n/a |
+| OCI-AGA | none | no | n/a | n/a |
+
+On AWS-CMH-03 and OCI-AGA the `users` directory of every `coreai_*` project is
+root-owned and not group-writable (`drwxr-xr-x root:root` and
+`drwxr-sr-x root:joc` respectively), and a direct `mkdir` is denied. The only
+group this account holds on those clusters is the generic `coreai`, not a
+per-project group, so the existing per-user directories there were provisioned
+administratively. Staging on those two clusters is blocked pending provisioning
+rather than work this study can perform itself.
+
+Lyris and Ptyche expose the same path but are different filesystems (`lfs5` and
+`lfs4`), so each requires its own copy.
+
+Two consequences follow. First, GB300 training runs on the Lyris `gb300`
+partition rather than on AWS-CMH-03, because Lyris is the only GB300 site where
+this account can write a corpus. This supersedes the earlier preference for
+AWS-CMH-03 on FairShare grounds: a higher share is worthless without a place to
+put the data. Second, Lyris sits at 93.4 percent of its soft inode limit, with
+about 1.7 M inodes of headroom. Shard and checkpoint layout on Lyris must be
+inode-frugal, favouring few large shards over many small ones and pruning
+superseded checkpoint directories as milestones are exported. Ptyche, at 9
+percent of the same limit, carries no such constraint. Free capacity exceeds
+200 T everywhere, so space is never the binding constraint; inodes are.
 
 ## Held-out and contamination policy
 
@@ -611,6 +683,57 @@ alone. Rebalancing the eight-to-eight split is out of scope, because it would
 change the performance identity of the run; the calibration numbers instead
 size `SERVE_MAX_NUM_SEQS` and the dataloader worker count so both halves stay
 busy at the fixed topology.
+
+### Shared-filesystem and scheduler conduct
+
+MARS clusters are shared, and the cluster team publishes conduct rules whose
+violation degrades the filesystem or the scheduler for every other user. These
+are hard constraints on this study's scripts, not advice.
+
+Storage placement. `/home` holds scripts, source, git checkouts, and configs
+only, never datasets or job output. Node-local `/raid/scratch/$SLURM_JOB_ID`
+holds builds, caches, databases, lock files, and temporary logs, and nothing
+that must outlive the job. Lustre holds container images, datasets,
+checkpoints, and large results, and never code, builds, databases, caches, or
+large populations of small files. Lustre is provisioned for a few large files
+read in parallel and degrades under metadata-heavy access, which is the reason
+the Hugging Face cache, the Triton and TorchInductor caches, W&B state, and any
+SQLite file stay node-local. A database moved to a node is copied whole,
+including its `-wal` and `-shm` companions.
+
+Layout. No directory exceeds roughly 25,000 entries; output fans out into
+subdirectories or aggregates into fewer, larger files. Directory depth stays at
+or below 12, and anything deeper sets metadata striping explicitly with
+`lfs mkdir -c -1`. Deletion is incremental rather than a single sweeping
+removal, which would pressure the metadata target. Shared inputs are staged to
+node-local storage rather than read simultaneously by every rank.
+
+Search. Filesystem scans are scoped to this account's own directories.
+Unbounded `find` over shared trees is prohibited, particularly from a login
+node. An earlier survey recorded in this spec derived its conclusion from a
+depth-bounded scan that nonetheless traversed another portfolio's tree; that
+practice is retired, and the conclusion it produced was in fact wrong.
+
+Scheduler. Job status is never polled in a tight loop. Queries use
+`squeue --me` or `squeue -j <jobid>`, one query per poll rather than one per
+job, with at least 60 seconds between polls. Unfiltered `squeue` and
+`scontrol show jobs` are prohibited outright, because each forces the
+controller to assemble every job on the cluster. For the chunked resume chain,
+whose whole point is to run unattended for a day or more, the server-side
+watcher pattern is preferred over client-side polling: it reduces the
+controller's request rate to one read per check and survives client
+disconnection.
+
+Logging. Large runs write per-rank or per-node log files rather than funnelling
+all output through a single `srun` stream. At this study's scale, 16 to 64
+nodes of 4 GPUs each, a single per-job log would not yet be a bottleneck, but
+per-rank logs remain the default because they also make the producer-consumer
+split legible: serve replicas and trainer ranks write separate streams.
+
+These rules interact with the inode headroom measured on Lyris. Per-rank
+logging and frequent checkpointing both create files, so on Lyris the logging
+cadence and the checkpoint retention depth are the two knobs held down, and
+superseded checkpoints are pruned incrementally as milestones are exported.
 
 ## Evaluation
 
