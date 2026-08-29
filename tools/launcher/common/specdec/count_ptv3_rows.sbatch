@@ -63,7 +63,7 @@ mkdir -p "$STUDY_ROOT/receipts"
 # Which repos to count. Staging finishes at different times on different
 # clusters, so the caller extends this as repos verify complete rather than
 # editing the file: REPOS="<space-separated names>".
-REPOS="${REPOS:-Nemotron-SFT-Math-v4 Nemotron-RL-Math-v2 Nemotron-SFT-SWE-v3 Nemotron-SFT-SWE-v3.5 Nemotron-SFT-SWE-v2}"
+REPOS="${REPOS:-Nemotron-SFT-Math-v4 Nemotron-RL-Math-v2 Nemotron-SFT-SWE-v3 Nemotron-SFT-SWE-v3.5 Nemotron-SFT-SWE-v2 Nemotron-SWE-v1}"
 repo_args=()
 for repo in $REPOS; do
     repo_args+=(--repo "$repo")
