@@ -40,7 +40,7 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
   <div class="stat"><div class="n">5 / 5</div><div class="l">clusters staged</div></div>
   <div class="stat"><div class="n">3</div><div class="l">arms</div></div>
   <div class="stat"><div class="n">3.12&times;</div><div class="l">train step speedup</div></div>
-  <div class="stat"><div class="n">120</div><div class="l">unit tests green</div></div>
+  <div class="stat"><div class="n">255</div><div class="l">unit tests green</div></div>
   <div class="stat"><div class="n">0</div><div class="l">training runs launched</div></div>
 </div>
 
@@ -55,15 +55,19 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <tr><td>OCI-AGA enabled as a submission target</td><td>account <code>nemotron_sw_post</code>, FairShare 0.2486, 429 idle nodes, <code>batch</code> 4 h / <code>batch_long</code> 7 d</td></tr>
 <tr><td>ModelOpt checkouts on both GB300 clusters</td><td>AWS-CMH-03 and OCI-AGA at <code>~/modelopt</code>, upstream <code>main</code></td></tr>
 <tr><td>MARS shared-cluster conduct rules encoded into the spec</td><td>storage placement, &lt;25 K files/dir, no unfiltered <code>squeue</code>, &ge;60 s polling</td></tr>
+<tr><td>PR #2027 cherry-picked (drafter PTQ, DSPARK harness support)</td><td><code>quantize_drafter.py</code> +378, FP8 / NVFP4 recipes, <code>PASSTHROUGH_ENGINE_ARGS</code>, <code>enforce_eager</code> passthrough</td></tr>
+<tr><td>specdec_bench serves all three arms, with a pre-flight architecture guard</td><td><code>DFLASH2</code> added to <code>--speculative_algorithm</code>; <code>_assert_draft_architecture</code> rejects a mismatched drafter before serving. 8 new tests</td></tr>
+<tr><td>DFlash2 added to the pinned horizon matrix</td><td><code>_HORIZONS[("dflash2", 8)] = 7</code>, <code>[("dflash2", 16)] = 15</code>. 81 launcher tests green</td></tr>
+<tr><td>Export <code>--trust_remote_code</code> question settled</td><td>No <code>auto_map</code> and no <code>register_for_auto_class</code> anywhere in the speculative plugins &mdash; the flag governs loading the base, not the drafter. Not needed for stock Qwen3</td></tr>
 </table>
 
 <h2>Next</h2>
 <table>
 <tr><th>Item</th><th>State</th><th>Blocks</th></tr>
-<tr><td>Probe job 611308 &mdash; settle whether OCI-AGA is GB200 or GB300</td><td><span class="b pend">queued</span></td><td>GB300 serving sweep</td></tr>
-<tr><td>Stage PTV3 on all five clusters; measure authoritative row counts</td><td><span class="b wip">in progress</span></td><td>corpus composition</td></tr>
-<tr><td>Patch specdec_bench: add <code>DSPARK</code> / <code>DFLASH2</code> to <code>--speculative_algorithm</code></td><td><span class="b pend">not started</span></td><td>any three-arm throughput number</td></tr>
-<tr><td>Decide on PR #2027 (<code>quantize_drafter.py</code>, calibration-free FP8/NVFP4 drafter PTQ)</td><td><span class="b pend">evaluating</span></td><td>NVFP4 reference comparison</td></tr>
+<tr><td>Probe job 611352 &mdash; settle whether OCI-AGA is GB200 or GB300</td><td><span class="b pend">queued</span></td><td>GB300 serving sweep</td></tr>
+<tr><td>Finish PTV3 staging (10 pinned repos, ~70 G) on all five clusters</td><td><span class="b wip">in progress</span></td><td>corpus composition</td></tr>
+<tr><td>Measure authoritative PTV3 row counts per repo and per domain</td><td><span class="b pend">not started</span></td><td>the one variable this study controls</td></tr>
+<tr><td>Pin a vLLM nightly at or after 2026-08-21 (DFlash2 support, vllm#52816)</td><td><span class="b pend">not started</span></td><td>DFlash2 serving numbers</td></tr>
 <tr><td>Lyris inode cleanup (93.4 % of soft limit)</td><td><span class="b blocked">user-owned</span></td><td>Lyris as a checkpoint target</td></tr>
 <tr><td>Spec user-review gate, then implementation plan</td><td><span class="b wip">awaiting review</span></td><td>launch</td></tr>
 </table>
@@ -102,4 +106,13 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 
 <li><span class="t">Idle GPUs can get the job killed by the scheduler.</span>
 <span class="w">In the producer-consumer topology (vLLM serve nodes plus DDP trainer nodes), a stalled serve leaves trainer GPUs idle and risks auto-termination of a 16-node job. Node counts must be sized so both halves stay busy.</span></li>
+
+<li><span class="t">DFlash2 is served as <code>method: "dflash"</code>, so a wrong drafter produces a plausible number instead of an error.</span>
+<span class="w">vLLM picks the V2 speculator from the draft checkpoint's <code>architectures</code> (<code>DFlash2DraftModel</code>), not from the method string (vllm#52816). A DFLASH2 run pointed at a DFlash checkpoint starts cleanly, benchmarks DFlash, and reports it as DFlash2. Only a pre-flight check on the checkpoint can catch it &mdash; hence <code>_assert_draft_architecture</code>.</span></li>
+
+<li><span class="t">Check upstream before writing the patch, not after.</span>
+<span class="w">Wrote and committed a DSPARK branch for specdec_bench, then found PR #2027 had already merged a better one two days earlier (<code>num_speculative_tokens</code> default 7, plus <code>draft_sample_method</code>). Reset the commit and cherry-picked #2027 instead. A one-minute <code>gh pr list</code> would have saved the whole detour.</span></li>
+
+<li><span class="t">A cluster QOS can enforce a <em>minimum</em> allocation, not just a maximum.</span>
+<span class="w">A 1-GPU probe on OCI-AGA was rejected with <code>QOSMinGRES</code>; 4 GPUs is the floor. Node generation is also invisible from the scheduler &mdash; <code>Gres=gpu:4</code>, <code>RealMemory=942080</code>, and the feature list are identical on GB200 and GB300, so HBM can only be read from inside a GPU job.</span></li>
 </ol>
