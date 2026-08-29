@@ -209,7 +209,7 @@ revision.
 | Repository | Revision | Rows | Bytes | Source of count |
 |---|---|---:|---:|---|
 | `Nemotron-SFT-Math-v4` | `84d42ad0` | 545,431 | 5.5 G | datasets-server |
-| `Nemotron-RL-Math-v2` | `804418c1` | 7,732 | 0.05 G | datasets-server |
+| `Nemotron-RL-Math-v2` | `804418c1` | 7,732 | 0.007 G | datasets-server |
 | `Nemotron-SFT-SWE-v3` | `3f73de64` | 237,970 | 11.7 G | datasets-server |
 | `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 0.3 G | datasets-server |
 | `Nemotron-SWE-v1` | `0fe17a96` | 24,875 (floor) | 11.1 G | partial conversion |
