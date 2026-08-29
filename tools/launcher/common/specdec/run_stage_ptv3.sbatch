@@ -57,7 +57,15 @@ done
 echo "stager: $stager"
 echo "study root: $STUDY_ROOT"
 
-mkdir -p "$STUDY_ROOT/ptv3_data"
+# PTv2 stages through the same job with STAGE_MANIFEST set, and it must not
+# land in the PTv3 tree: the verifier and the row counter both treat a repo
+# directory's parent as one pinned collection.
+DEST_SUBDIR="${STAGE_DEST_SUBDIR:-ptv3_data}"
+case "$DEST_SUBDIR" in
+    */*|.|..|"") echo "STAGE_DEST_SUBDIR must be a single directory name, got: $DEST_SUBDIR" >&2; exit 2 ;;
+esac
+echo "dest: $STUDY_ROOT/$DEST_SUBDIR"
+mkdir -p "$STUDY_ROOT/$DEST_SUBDIR"
 
 # The token goes over a pipe on stdin. Passing it in argv would expose it to
 # every user on the node, since /proc here is mounted without hidepid.
@@ -65,8 +73,9 @@ mkdir -p "$STUDY_ROOT/ptv3_data"
 # below is the point of the job, and a partial stage is the case where it is
 # most worth reading.
 status=0
-printf '%s\n' "$HF_TOKEN" | bash "$stager" "$STUDY_ROOT/ptv3_data" || status=$?
+printf '%s\n' "$HF_TOKEN" | bash "$stager" "$STUDY_ROOT/$DEST_SUBDIR" || status=$?
 
 echo "stager exit: $status"
-cat "$STUDY_ROOT/stage_ptv3_status.txt" 2>/dev/null || true
+# The stager writes its summary inside the directory it staged into.
+cat "$STUDY_ROOT/$DEST_SUBDIR/stage_ptv3_status.txt" 2>/dev/null || true
 exit "$status"
