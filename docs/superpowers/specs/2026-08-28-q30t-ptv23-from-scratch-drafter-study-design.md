@@ -116,9 +116,27 @@ collision with different canonical prompt bytes is a hard error.
 
 ### PTV2
 
-The physical PTV2 inventory is rooted at the staged OCI-HSG copy associated
-with revision `5c89e01dd720ae0f4058445ed49c5fb68a03c76e`. Eligible domains are
-Math, Code, STEM, Chat/instruction, and DE/JA/ES/FR/IT multilingual data.
+The physical PTV2 inventory is rooted at revision
+`5c89e01dd720ae0f4058445ed49c5fb68a03c76e` of
+`nvidia/Nemotron-Post-Training-Dataset-v2`. Eligible domains are Math, Code,
+STEM, Chat/instruction, and DE/JA/ES/FR/IT multilingual data, and PTV2 carries
+that domain in the split name rather than in a row field.
+
+No staged copy exists yet. A survey on 2026-08-28 found no PTV2 or PTV3 data
+under `/lustre` on OCI-HSG and no Hugging Face dataset cache, and the Lustre
+paths that appear in repo configs are unwritten destinations rather than
+existing stores. Corpus acquisition is therefore unstarted work on the critical
+path, not a precondition already satisfied. It is also gated: every PTV2
+per-file SHA-256 in the current inventory is null and marked
+`gated-redacted-require-bootstrap`, and the file inventory, row-schema digests,
+and per-category capacity receipts are declared blocking external pins. The
+staging gate below must close before any training run is scheduled.
+
+PTV3 is not a single repository. There is no `nvidia/Nemotron-Post-Training-
+Dataset-v3`; PTV3 is a collection of separately versioned repositories, each
+pinned individually, and domain is carried by repository identity rather than
+by a row field. Any lane, category, or pool label applied to PTV3 rows is
+assigned by this study's configs and is not inherent to the source.
 
 PTV2 source completions are used only by `H-native`. `H-synth` and `M-synth`
 strip the response being regenerated. The source license, generator, category,
@@ -406,24 +424,52 @@ is an actual identity at initialization; a test must compare the shared
 backbone numerically without manually mutating the module. The selector remains
 fresh and deterministic under the experiment seed.
 
-The source commit must contain the reviewed equivalents of ModelOpt DFlash2 PR
-2216, training-speed PR 2279, Qwen3 DSpark example PR 2164, and the merged
-same-architecture warm-start support from PR 2149. As of 2026-08-28 only PR
-2149 is merged; 2216, 2279, and 2164 are open. The study therefore runs from a
-composite branch rather than upstream main, and the immutable source receipt
-records the exact commit of that branch together with the four PR head commits
-it integrates, so a later reader can tell which upstream review state the
-results correspond to. This from-scratch study does not set
-`dflash_init_checkpoint`.
+The study runs from a composite branch assembled by cherry-pick, not from
+upstream main. As of 2026-08-28 ModelOpt DFlash2 PR 2216, training-speed PR
+2279, and Qwen3 DSpark example PR 2164 are all open, and each is required: 2216
+supplies the DFlash2 architecture, 2279 the training speedup that makes the
+one-to-two-day budget reachable, and 2164 the Qwen3 DSpark launcher this study
+adapts to Q30.
+
+PR 2149 is merged but is not required here. Its three features do not apply:
+warm start is unused because this is a from-scratch study that does not set
+`dflash_init_checkpoint`, and causal sliding-window attention and attention
+sink are inapplicable because Qwen3-30B-A3B sets `sliding_window` to null. It
+is cherry-picked only if its streaming-dataset and export deltas apply cleanly,
+and its absence does not block the study.
+
+The immutable source receipt records the composite branch commit together with
+the head commit of every cherry-picked PR, so a later reader can tell which
+upstream review state the results correspond to. Because the branch is
+assembled rather than merged, the receipt also records the cherry-pick order
+and any conflict resolution, and a rebuild of the branch from the same inputs
+must reproduce the same tree hash.
 
 ## Distributed execution
 
-Source audit and target generation prefer OCI-HSG because the staged PTV2 copy
-is local there. Training may run on OCI-HSG, Ptyche, Lyris, AWS-CMH-03, or
-OCI-AGA only after that cluster has an independently approved immutable
-runtime and passes the same one-node, two-node, and sixteen-node platform
-sequence. Evaluation is confined to the GB200 runtime identity regardless of
-where training ran, for the reason given under Evaluation.
+Training may run on OCI-HSG, Ptyche, Lyris, AWS-CMH-03, or OCI-AGA only after
+that cluster has an independently approved immutable runtime and passes the
+same one-node, two-node, and sixteen-node platform sequence. Evaluation is
+confined to the GB200 runtime identity regardless of where training ran, for
+the reason given under Evaluation.
+
+Because no cluster holds a staged corpus copy, staging location is a free
+choice and cluster preference follows throughput and queue access instead.
+AWS-CMH-03 is preferred for training on two independent grounds. Its
+`nemotron_sw_post` FairShare is the highest measured at 0.915, and its GB300
+HBM leaves materially more room for the target's KV cache: after roughly 30 GiB
+of weights per GPU at tensor parallel size 2, GB200 has about 136 GiB for KV at
+0.9 utilization against about 217 GiB on GB300. Since the streaming pipeline is
+generation-bound, that KV headroom converts into concurrent sequences on the
+half that sets wall clock. OCI-HSG with `nemotron_n3_post` at FairShare 0.769
+is the GB200 alternative and is where evaluation runs regardless.
+
+Runs are distributed across clusters to finish the wave inside the time budget.
+The training cluster is recorded per run. Training hardware is not treated as a
+confound for trained quality, since global batch size, data order, and seed are
+identical; if an arm ranking turns out to be close enough that this matters,
+the deciding pair is re-run on a single cluster before the ranking is
+reported.
 
 The proven Q30 streaming shape uses 16 GB200 nodes, eight target-serving nodes,
 eight trainer nodes, four GPUs per node, 32 trainer ranks, and target tensor
@@ -580,12 +626,14 @@ proposed-token horizon is held fixed for an arm across every checkpoint,
 corpus view, and target, but it is not equal between arms, because it is
 architecture-intrinsic at `B - 1` for DFlash and DFlash2 and `B` for DSpark.
 
-Runtime identity is not relaxed. Training may run on the GB300 clusters, whose
-FairShare is often better, but every throughput and latency number that enters
-a comparison is measured on the GB200 runtime identity. Throughput measured on
-GB300 is not comparable to throughput measured on GB200 and is never
-substituted for it; a GB300 measurement may be reported only as a separately
-labeled secondary observation.
+Runtime identity is not relaxed for measurement, but it is deliberately free
+for training. Every throughput and latency number that enters a comparison is
+measured on the GB200 runtime identity, because the historical drafters this
+study compares against were measured there. A GB300 measurement is never
+substituted for a GB200 one and may appear only as a separately labeled
+secondary observation. Where a run was trained does not constrain this, since
+training hardware is not a confound for trained quality when the global batch
+size, data order, and seed are identical.
 
 ### Milestones
 
