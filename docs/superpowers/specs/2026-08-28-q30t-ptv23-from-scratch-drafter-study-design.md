@@ -954,18 +954,30 @@ So the harness change is: add a `DSPARK` choice mapping to
 `DFlash2DraftModel`. Both must land before any three-arm comparison is run;
 until they do, DSpark and DFlash2 have no measured throughput.
 
-Serving DFlash2 also pins the image. PR #52816 merged at
-`b389ac29465b33f9e9c534df221ea3c129e9793f` on 2026-08-21T05:27Z, and vLLM
-nightly tags are stamped with the build commit, not the push date - the tag
-pushed on 2026-08-21 was built from a commit two behind the merge. The first
-nightly that contains it is
-`vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013`
-(`sha256:95bed119f39e2414973cf7224df31c9a3ed213566138722346d7bd360edf842b`),
-verified by the presence of `vllm/model_executor/models/qwen3_dflash2.py`
-rather than by ancestry alone. No stable release carries it: v0.28.0 branched
-from `53e211d2` on 2026-08-17, four days before the merge. Docker Hub retains
-nightlies for roughly ten days, so this image must be mirrored to an internal
-registry before it is pruned; a digest pin does not survive blob deletion.
+Serving DFlash2 also pins the image, and the pin is a **stable release, not a
+nightly**. vLLM v0.28.0 (released 2026-08-26) contains full DFlash2 support,
+verified at the tag rather than inferred from branch ancestry:
+`vllm/model_executor/models/qwen3_dflash2.py` is present at 290 lines defining
+`DFlashGroupedConv`, `CandidateSelector`, and `DFlash2Qwen3ForCausalLM`;
+`registry.py` maps `"DFlash2DraftModel"` to it; and
+`v1/worker/gpu/spec_decode/__init__.py` carries the architecture-based
+dispatch. All three arms' export names resolve at that tag -
+`DFlashDraftModel`, `Qwen3DSparkModel`, and `DFlash2DraftModel` are all
+registered.
+
+The pin is `vllm/vllm-openai:v0.28.0`
+(`sha256:61fc8a896b0a4fbbbdc063bc4b0dbc25ce98e02b5050c24aeb7830ac02039b14`), a
+manifest list whose arm64 entry is
+`sha256:2a7cde230b59f3ce6cab33dd245ba6bee41aa87b38c9fe84f966ff24016813ce` -
+identical to the standalone `v0.28.0-aarch64` tag, which is the one that
+matters because every compute node in this study is Grace and the readiness
+probe asserts `uname -m == aarch64`.
+
+Using the release rather than a nightly also removes a retention risk. Docker
+Hub keeps `nightly-<sha>` tags for roughly ten days, so a nightly pin would
+have needed mirroring to an internal registry before its blobs were pruned; a
+digest pin does not survive blob deletion. Release tags carry no such
+deadline.
 
 Two harness properties shape the sweep cost. The runner constructs its engine
 in process through `AsyncLLM.from_engine_args` and cannot attach to an
