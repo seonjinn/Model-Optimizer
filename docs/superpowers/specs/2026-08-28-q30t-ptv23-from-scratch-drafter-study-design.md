@@ -408,8 +408,13 @@ fresh and deterministic under the experiment seed.
 
 The source commit must contain the reviewed equivalents of ModelOpt DFlash2 PR
 2216, training-speed PR 2279, Qwen3 DSpark example PR 2164, and the merged
-same-architecture warm-start support from PR 2149. This from-scratch study
-does not set `dflash_init_checkpoint`.
+same-architecture warm-start support from PR 2149. As of 2026-08-28 only PR
+2149 is merged; 2216, 2279, and 2164 are open. The study therefore runs from a
+composite branch rather than upstream main, and the immutable source receipt
+records the exact commit of that branch together with the four PR head commits
+it integrates, so a later reader can tell which upstream review state the
+results correspond to. This from-scratch study does not set
+`dflash_init_checkpoint`.
 
 ## Distributed execution
 
@@ -615,6 +620,32 @@ harness, which already folds in the proposal horizon and the verifier cost.
 `Joint_Acceptance_Rate[k]` is reported alongside it because it is indexed by
 position and so remains comparable; raw `Average_AL` is reported per arm but
 never used to rank arms against each other.
+
+### Harness prerequisites
+
+The evaluation harness does not yet support two of the three arms, and this is
+a prerequisite rather than an assumption. `examples/specdec_bench/run.py`
+exposes `--speculative_algorithm` with choices `EAGLE3`, `EAGLE`,
+`DRAFT_TARGET`, `NGRAM`, `MTP`, `DFLASH`, and `NONE`, and
+`specdec_bench/models/vllm.py` maps only `DFLASH` onto a vLLM
+`{"method": "dflash"}` speculative config. No branch emits `dspark` or
+`dflash2`. vLLM itself accepts `method: "dspark"`, which the Qwen3-8B
+walkthrough exercises directly, so the gap is in the harness rather than the
+serving engine. Adding the two choices and their method mappings is a small,
+reviewed change that must land before any three-arm comparison is run;
+until it does, DSpark and DFlash2 have no measured throughput.
+
+Two harness properties shape the sweep cost. The runner constructs its engine
+in process through `AsyncLLM.from_engine_args` and cannot attach to an
+already-running vLLM server, so every concurrency point pays a full engine
+startup and the sweep cannot piggyback on a live rollout server. And
+`--block_size` is the DFlash-family spelling of the proposal horizon, passed
+through as the speculative token count under the relation
+`block_size = draft_length + 1`; `--concurrency` defaults to 1. The relevant
+flags for this study are `--speculative_algorithm`, `--model_dir`,
+`--draft_model_dir`, `--block_size`, `--concurrency`, `--num_requests`,
+`--dataset` with `--dataset_path`, `--tp_size`, `--trust_remote_code`, and
+`--save_dir`.
 
 ### Concurrency profile
 
