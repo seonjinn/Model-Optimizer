@@ -215,10 +215,10 @@ revision.
 | `Nemotron-SWE-v1` | `0fe17a96` | **51,029** | 11.1 G | **staged shards** |
 | `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | **staged shards, matches index** |
 | `Nemotron-SFT-SWE-v2` | `bd151f3f` | 256,254 | 18.1 G | **staged shards, counter validated** |
-| `Nemotron-Agentic-v1` | `650d5909` | unmeasured | 5.8 G | bytes from HF tree |
-| `Nemotron-SFT-Agentic-v2` | `7c804833` | unmeasured | 21.9 G | bytes from HF tree |
-| `Nemotron-RL-Lightning-Training-Blend` | `262eb58c` | unmeasured | 3.9 G | bytes from HF tree |
-| **Total** | | | **124.8 G** | |
+| `Nemotron-Agentic-v1` | `650d5909` | **335,122** | 5.8 G | **staged shards** |
+| `Nemotron-SFT-Agentic-v2` | `7c804833` | **991,900** | 21.9 G | **staged shards** |
+| `Nemotron-RL-Lightning-Training-Blend` | `262eb58c` | **92,684** | 3.9 G | **staged shards** |
+| **Total** | | **3,088,344** | **124.8 G** | |
 
 `Open-SWE-Traces` splits across three configs: `v1.0` 151,219, `v1.1` 360,335,
 `v1.2` 53,553. At 46.5 G it is a third of the corpus on its own, and it is the
@@ -253,38 +253,37 @@ in-flight `.part` files it happily counts. Two entries moved far enough to
 matter: `Nemotron-SWE-v1` is 11.1 G rather than the 1.4 G the datasets-server
 reported, consistent with its conversion being partial, and
 `Nemotron-SFT-SWE-v3.5` is 0.3 G rather than 1.2 G. **Bytes are not rows.** The
-three repositories the datasets-server never converted still have no row count
--- `Nemotron-Agentic-v1`, `Nemotron-SFT-Agentic-v2` and
-`Nemotron-RL-Lightning-Training-Blend`, none of them staged yet -- so the
-composition constraint below is unchanged: the blend stays unpinned until every
-row count is read from the staged shards.
+three repositories the datasets-server never converted have since been staged
+and counted directly -- `Nemotron-Agentic-v1` at 335,122,
+`Nemotron-SFT-Agentic-v2` at 991,900 and
+`Nemotron-RL-Lightning-Training-Blend` at 92,684 -- which closes the last of
+the unmeasured rows.
 
-Two caveats bind the composition step. Four repositories return zero for both
-row count and byte count, which means the datasets-server has not converted
-them, not that they are empty; their counts must be read from the staged shards
-directly. One of the four, `Nemotron-SFT-SWE-v2`, is now measured; the other
-three are counted as their staging completes.
+One caveat shaped the composition step. Four repositories returned zero for
+both row count and byte count, which meant the datasets-server had not
+converted them, not that they were empty; their counts had to be read from the
+staged shards directly. All four are now measured, and between them they carry
+1,675,960 rows -- 54% of the corpus. An endpoint zero taken at face value would
+have discarded more than half the training data.
 
-Five repositories are now counted from the staged bytes rather than taken from
-the index: `Nemotron-SFT-Math-v4` (545,431), `Nemotron-SFT-SWE-v3` (237,970),
-`Nemotron-RL-Math-v2` (7,732), `Nemotron-SFT-SWE-v3.5` (5,115) and
-`Nemotron-SFT-SWE-v2` (256,254). The first four reproduce the indexed total
-exactly, and they span both storage formats -- two parquet, two JSONL -- so the
-footer path and the newline path are each validated against an independent
-reference rather than against each other. The fifth is the repository the index
-called empty.
+All ten repositories are now counted from the staged bytes rather than taken
+from the index, in a single 96-worker pass reading 124.75 G in 23 seconds. Five
+of them have an index to check against -- `Nemotron-SFT-Math-v4` (545,431),
+`Nemotron-SFT-SWE-v3` (237,970), `Nemotron-RL-Math-v2` (7,732),
+`Nemotron-SFT-SWE-v3.5` (5,115) and `Open-SWE-Traces` (565,107) -- and the
+counter reproduces all five exactly across both storage formats, so the parquet
+footer path and the JSONL newline path are each validated against an
+independent reference rather than against each other. The counter withholds
+every result if any of the five disagrees, which is what makes the other five
+numbers usable.
 
 Staging completeness is judged against the pinned revision tree -- every file
 the SHA lists, present at its published size -- and not against the stager's
 own status file, which a restarted run truncates and which drifts from disk.
-Progress differs by cluster, so the check is run per site. Six repositories
-pass byte-exact on OCI-HSG, the furthest along: `Nemotron-SFT-Math-v4`,
-`Nemotron-RL-Math-v2`, `Nemotron-SFT-SWE-v3`, `Nemotron-SFT-SWE-v3.5`,
-`Nemotron-SFT-SWE-v2` and `Nemotron-SWE-v1` (11,141,247,963 bytes across 3
-files). The first five also pass on AWS, where `Nemotron-SWE-v1` is still
-downloading. `Open-SWE-Traces` is 93 files short of its 234 on OCI-HSG
-(27.1 G of 46.5 G); `Nemotron-Agentic-v1`, `Nemotron-SFT-Agentic-v2` and
-`Nemotron-RL-Lightning-Training-Blend` have not started anywhere.
+Progress differs by cluster, so the check is run per site. OCI-HSG now passes
+byte-exact on all ten repositories, 124.75 G, and is the site the counts were
+read from. Lyris and AWS-CMH are within 2 G of the same total and finishing;
+Ptyche and OCI-AGA trail.
 
 `Nemotron-SWE-v1` now being complete is what makes its count obtainable, and
 the measurement settles it at **51,029 rows**. The indexed 24,875 described the
@@ -297,9 +296,9 @@ All five previously measured repositories reproduce their AWS totals exactly on
 OCI-HSG. Two clusters, independently staged from the same pinned revisions,
 counted by the same reader, agreeing to the row -- which tests the staging as
 much as the counter. **No composition ratio may be
-computed from an unmeasured or floor row count.** Until every entry above is a
-measured total read from the pinned staged files, the blend is unpinned and no
-training run is schedulable.
+computed from an unmeasured or floor row count.** That gate is now satisfied:
+every entry above is a measured total read from the pinned staged files, so the
+blend is pinnable at **3,088,344 rows** and training is schedulable.
 
 Four further repositories are deliberately deferred as too large and too
 general for a Math/SWE-targeted drafter: `Nemotron-Math-v2` (190.52 G),
