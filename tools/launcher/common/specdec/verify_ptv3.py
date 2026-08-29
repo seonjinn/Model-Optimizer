@@ -13,7 +13,11 @@ from pathlib import Path
 
 ROOT = Path(sys.argv[1])
 TOKEN = os.environ["HF_TOKEN"]
-MANIFEST = {
+
+# Overridable in the same shape the stager takes, so the two cannot be pointed
+# at different revision sets by accident: whichever manifest staged a tree is
+# the one that verifies it.
+DEFAULT_MANIFEST = {
     "Nemotron-SFT-Math-v4": "84d42ad0",
     "Nemotron-RL-Math-v2": "804418c1",
     "Nemotron-SFT-SWE-v3": "3f73de64",
@@ -25,6 +29,19 @@ MANIFEST = {
     "Nemotron-SFT-Agentic-v2": "7c804833",
     "Nemotron-RL-Lightning-Training-Blend": "262eb58c",
 }
+
+
+def _manifest():
+    override = os.environ.get("STAGE_MANIFEST", "").split()
+    if not override:
+        return DEFAULT_MANIFEST
+    pairs = [entry.split(":", 1) for entry in override]
+    if any(len(pair) != 2 or not pair[0] or not pair[1] for pair in pairs):
+        raise SystemExit("STAGE_MANIFEST entries must be repo:revision")
+    return dict(pairs)
+
+
+MANIFEST = _manifest()
 
 # The stager's own bookkeeping, written inside each repo directory and belonging
 # to no revision: a cached tree and a log of transfers that failed.

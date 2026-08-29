@@ -17,7 +17,12 @@
 set -uo pipefail
 DST="${1:?usage: stage_ptv3.sh <dest-dir>}"
 read -r HFTOK
-MANIFEST="
+# The PTv3 core set is the default because it is what every cluster stages.
+# PTv2 rides the same code path through an override rather than a second copy
+# of it: same size checks, same ranged fetch, same status file, one place to
+# fix. Entries are repo:revision under the nvidia namespace, whitespace
+# separated.
+MANIFEST="${STAGE_MANIFEST:-
 Nemotron-SFT-Math-v4:84d42ad0
 Nemotron-RL-Math-v2:804418c1
 Nemotron-SFT-SWE-v3:3f73de64
@@ -28,7 +33,7 @@ Open-SWE-Traces:c2114fc8
 Nemotron-Agentic-v1:650d5909
 Nemotron-SFT-Agentic-v2:7c804833
 Nemotron-RL-Lightning-Training-Blend:262eb58c
-"
+}"
 mkdir -p "$DST" || exit 1
 STATUS="$DST/stage_ptv3_status.txt"; : > "$STATUS"
 

@@ -201,3 +201,29 @@ def test_filesize_reports_a_bare_number_and_minus_one_when_absent(
         target.write_bytes(contents)
     result = _run(tmp_path, "filesize probe")
     assert result.stdout.strip() == expected
+
+
+def test_the_manifest_override_replaces_the_pinned_default(tmp_path: Path) -> None:
+    """PTv2 rides the stager through STAGE_MANIFEST rather than a second copy of it.
+
+    An override that merely *appended* would silently re-stage the 125 G PTv3
+    core every time PTv2 was asked for, so what matters is that the default is
+    gone, not just that the override is present. Both names here are repos that
+    do not exist, which resolves the same way with or without a network: the
+    tree fetch fails and the loop records TREE_FAILED, having proved it read
+    the override.
+    """
+    dest = tmp_path / "staged"
+    result = subprocess.run(
+        ["bash", str(STAGER), str(dest)],
+        input="test-token-not-a-secret\n",
+        env={**os.environ, "STAGE_MANIFEST": "not-a-repo-alpha:aaaaaaaa not-a-repo-beta:bbbbbbbb"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    status = (dest / "stage_ptv3_status.txt").read_text()
+    assert "not-a-repo-alpha sha=aaaaaaaa TREE_FAILED" in status
+    assert "not-a-repo-beta sha=bbbbbbbb TREE_FAILED" in status
+    assert "Nemotron" not in status
