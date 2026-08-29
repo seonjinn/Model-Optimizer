@@ -214,7 +214,7 @@ revision.
 | `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 0.3 G | datasets-server |
 | `Nemotron-SWE-v1` | `0fe17a96` | 24,875 (floor) | 11.1 G | partial conversion |
 | `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | datasets-server, 3 configs |
-| `Nemotron-SFT-SWE-v2` | `bd151f3f` | unmeasured | 18.1 G | bytes from HF tree |
+| `Nemotron-SFT-SWE-v2` | `bd151f3f` | 256,254 | 18.1 G | **staged shards, counter validated** |
 | `Nemotron-Agentic-v1` | `650d5909` | unmeasured | 5.8 G | bytes from HF tree |
 | `Nemotron-SFT-Agentic-v2` | `7c804833` | unmeasured | 21.9 G | bytes from HF tree |
 | `Nemotron-RL-Lightning-Training-Blend` | `262eb58c` | unmeasured | 3.9 G | bytes from HF tree |
@@ -224,20 +224,39 @@ revision.
 `v1.2` 53,553. At 46.5 G it is a third of the corpus on its own, and it is the
 only repository that nests four directory levels below its root.
 
+`Nemotron-SFT-SWE-v2` is the first of the four unconverted repositories to be
+counted from the staged bytes: **256,254 rows** across two JSONL shards. That
+number is worth pausing on. The datasets-server reported it as zero, and it is
+in fact comparable to `Nemotron-SFT-SWE-v3`'s 237,970 -- the single largest SWE
+contributor after `Open-SWE-Traces`. Had the endpoint's zero been taken as a
+count, the blend would have dropped the second-largest SWE source and nothing
+would have failed.
+
+The count comes from `count_ptv3_rows.py`, which validates itself before
+reporting: it counts the repositories the datasets-server *did* convert and
+withholds every result if its own numbers disagree. On this run it reproduced
+`Nemotron-RL-Math-v2` at 7,732 and `Nemotron-SFT-SWE-v3.5` at 5,115 exactly,
+against two different shard formats -- plain JSONL and gzipped. The guarded
+failure mode is a plausible wrong count, not a crash, so the validation is the
+part that makes the number usable.
+
 The byte column is now measured for all ten, summed from the `size` field of
 each pinned revision's recursive tree listing rather than from `du`, which
 under-reports a Lustre tree still being written. Two entries moved far enough to
 matter: `Nemotron-SWE-v1` is 11.1 G rather than the 1.4 G the datasets-server
 reported, consistent with its conversion being partial, and
 `Nemotron-SFT-SWE-v3.5` is 0.3 G rather than 1.2 G. **Bytes are not rows.** The
-four repositories the datasets-server never converted still have no row count,
-so the composition constraint below is unchanged: the blend stays unpinned until
-every row count is read from the staged shards.
+three repositories the datasets-server never converted still have no row count
+-- `Nemotron-Agentic-v1`, `Nemotron-SFT-Agentic-v2` and
+`Nemotron-RL-Lightning-Training-Blend`, none of them staged yet -- so the
+composition constraint below is unchanged: the blend stays unpinned until every
+row count is read from the staged shards.
 
 Two caveats bind the composition step. Four repositories return zero for both
 row count and byte count, which means the datasets-server has not converted
 them, not that they are empty; their counts must be read from the staged shards
-directly. `Nemotron-SWE-v1` reports 24,875 converted rows against an estimate of
+directly. One of the four, `Nemotron-SFT-SWE-v2`, is now measured; the other
+three are counted as their staging completes. `Nemotron-SWE-v1` reports 24,875 converted rows against an estimate of
 34,772, so its converted count is a floor rather than a total. **No composition
 ratio may be computed from an unmeasured or floor row count.** Until every entry
 above is a measured total read from the pinned staged files, the blend is
