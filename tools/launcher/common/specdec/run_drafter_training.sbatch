@@ -48,6 +48,28 @@ PY
 fi
 readonly WANDB_NETRC_PATH WANDB_NETRC_CONTAINER_PATH
 
+# training.report_to=wandb further down is unconditional, and the netrc branch
+# that exports WANDB_API_KEY only runs when a netrc was configured. Without one
+# the run depends on the key being inherited from the job environment, which is
+# how the clusters are actually set up -- but if it ever is not there, the
+# failure surfaces inside the container with a 16-node allocation already
+# standing, or the run trains for a day logging nowhere. Decide it here, in the
+# first seconds of the job, and say which source won. The key is never echoed;
+# only its shape is checked.
+if [[ -z "$WANDB_NETRC_CONTAINER_PATH" ]]; then
+    [[ -n "${WANDB_API_KEY:-}" ]] || {
+        echo "no wandb credential: export WANDB_API_KEY or set WANDB_NETRC_PATH" >&2
+        exit 2
+    }
+    [[ "${WANDB_API_KEY}" =~ ^[A-Za-z0-9]{40,}$ ]] || {
+        echo "WANDB_API_KEY is not shaped like a wandb key" >&2
+        exit 2
+    }
+    echo "wandb credential source: WANDB_API_KEY from the job environment"
+else
+    echo "wandb credential source: $WANDB_NETRC_PATH"
+fi
+
 mapfile -t manifest_values < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$MANIFEST_PATH" "$EXPERIMENT_INDEX" "$CLUSTER_PROFILE_PATH" "${READINESS_RECEIPT:-}" "$CLUSTER_NAME" "$SCRATCH_ROOT" <<'PY'
 import json
 import sys
@@ -300,7 +322,7 @@ else
 fi
 
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS SAVE_STEPS RUN_NAME SAMPLE_SIZE
-export SERVE_NODES CLUSTER_NAME WANDB_NETRC_CONTAINER_PATH
+export SERVE_NODES CLUSTER_NAME WANDB_NETRC_CONTAINER_PATH WANDB_API_KEY
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     export WANDB_RUN_ID="${WANDB_RUN_ID}"
     export WANDB_RESUME=allow

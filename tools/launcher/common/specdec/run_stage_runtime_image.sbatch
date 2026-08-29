@@ -117,6 +117,27 @@ if [[ -n "${EXPECTED_IMAGE_DIGEST:-}" && "$EXPECTED_IMAGE_DIGEST" != "$upstream_
     exit 2
 fi
 
+# These nodes carry a node-level pull-through registry cache in the proxy
+# variables, and it is not uniform across the partition: cpu-dm-0004 imported
+# cleanly while cpu-dm-0007 failed six curl retries on an unresolvable
+# container-cache host. The asymmetry hides well -- curl honours all_proxy for
+# every scheme, Python's urllib does not -- so the digest resolution above can
+# reach the registry directly on exactly the node where the import cannot.
+# The proxy is a cache, not an authorisation gateway, so an unreachable one is
+# a reason to go direct rather than to fail. Prefer it when it resolves.
+for proxy_var in all_proxy ALL_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY; do
+    proxy_value="${!proxy_var:-}"
+    [[ -n "$proxy_value" ]] || continue
+    proxy_host="${proxy_value#*://}"
+    proxy_host="${proxy_host%%/*}"
+    proxy_host="${proxy_host##*@}"
+    proxy_host="${proxy_host%%:*}"
+    if [[ -n "$proxy_host" ]] && ! getent hosts "$proxy_host" >/dev/null 2>&1; then
+        echo "proxy $proxy_var=$proxy_host does not resolve; importing direct"
+        unset "$proxy_var"
+    fi
+done
+
 staged="$scratch/image.sqsh"
 enroot import -o "$staged" "$IMAGE_REF"
 [[ -s "$staged" ]] || { echo "import produced no image" >&2; exit 2; }
