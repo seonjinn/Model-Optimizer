@@ -16,7 +16,11 @@
 
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=96
+# The whole node, without naming its width: data-mover nodes are 96 CPUs on
+# OCI-HSG and 90 on OCI-AGA, and --cpus-per-task=96 is a submission error
+# there rather than a smaller job. The counter sizes its pool from the
+# allocation Slurm reports.
+#SBATCH --exclusive
 #SBATCH --mem=0
 
 set -euo pipefail
@@ -91,7 +95,6 @@ done
 "$scratch/venv/bin/python" "$counter" \
     --data-root "$STUDY_ROOT/ptv3_data" \
     --output "$STUDY_ROOT/receipts/ptv3_rows_${SLURM_JOB_ID}.json" \
-    --workers 48 \
     "${repo_args[@]}" \
     --expect Nemotron-RL-Math-v2=7732 --expect Nemotron-SFT-SWE-v3.5=5115 \
     --expect Nemotron-SFT-Math-v4=545431 --expect Nemotron-SFT-SWE-v3=237970 \
