@@ -328,7 +328,11 @@ class DFlash2Module(DFlashModule):
             for name, _ in self.named_parameters()
             if "_conv." in name or name.startswith("candidate_selector.")
         }
-        missing = sorted(dflash2_names.intersection(incompatible_keys.missing_keys))
+        missing = sorted(
+            key
+            for key in incompatible_keys.missing_keys
+            if any(key == name or key.endswith(f".{name}") for name in dflash2_names)
+        )
         if missing:
             raise RuntimeError(
                 "incomplete DFlash2 checkpoint: missing DFlash2 tensors: " + ", ".join(missing)

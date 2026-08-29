@@ -339,6 +339,16 @@ class TestDFlash2CheckpointLoading:
         with pytest.raises(RuntimeError, match="incomplete DFlash2 checkpoint"):
             module.load_state_dict(state_dict, strict=False)
 
+    def test_parent_non_strict_load_rejects_a_missing_dflash2_tensor(self):
+        """Parent-model recursive loading cannot hide a missing child DFlash2 tensor."""
+        model = get_tiny_llama(num_hidden_layers=4)
+        mtsp.convert(model, [("dflash", _get_dflash2_config())])
+        state_dict = model.state_dict()
+        del state_dict["dflash_module.layers.0.attention_conv.kernel_projection.weight"]
+
+        with pytest.raises(RuntimeError, match="incomplete DFlash2 checkpoint"):
+            model.load_state_dict(state_dict, strict=False)
+
 
 class TestDFlash2Export:
     """Test the DFlash2 export format (weights + config)."""
