@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import stat
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -68,6 +69,9 @@ _MAX_MATCHER_WORK_BYTES = 1024 * 1024 * 1024
 _MAX_ATOMS_PER_CATALOG_RULE_SHAPE = 20_000_000
 _MAX_ATOM_BYTES_PER_CATALOG = 8 * 1024 * 1024 * 1024
 _SUPPORTED_FIXTURE_SHAPES = frozenset(range(8)) | {10}
+_NUMERIC_ANSWER = re.compile(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|[0-9]+/[0-9]+|[0-9]+(?:,[0-9]{3})+)(?:%|[A-Za-z]+)?"
+)
 _WHITE_SPACE = frozenset(
     chr(codepoint)
     for start, end in (
@@ -137,24 +141,14 @@ class HeldoutV2Atom:
                 raise FromScratchExclusionError("tool key/value atom requires a field key")
         elif self.field_key:
             raise FromScratchExclusionError("only a tool key/value atom may contain a field key")
-        if self.shape_id == 2 and self.domain_id != 1:
-            raise FromScratchExclusionError("answer-context atom must use the answer domain")
-        if self.shape_id in {5, 6, 7} and self.domain_id != 5:
-            raise FromScratchExclusionError("tool atom shape must use the tool domain")
-        if self.shape_id == 10 and self.domain_id != 7:
-            raise FromScratchExclusionError("raw equality atom must use the raw-record domain")
         if not isinstance(self.value, str) or not self.value:
             raise FromScratchExclusionError("held-out atom value is empty")
         normalized_value = _containment_text(self.value)
         if normalized_value != self.value:
             raise FromScratchExclusionError("held-out atom value is not pre-normalized")
-        if (
-            self.shape_id == 3
-            and sum(character not in _WHITE_SPACE for character in self.value) < 4
-        ):
-            raise FromScratchExclusionError("substring atom is too short")
-        if self.shape_id == 6 and len(self.value.split(" ")) < 2:
-            raise FromScratchExclusionError("tool-description atom is too short")
+        if _normalize_text(self.field_key) != self.field_key:
+            raise FromScratchExclusionError("held-out atom field key is not normalized")
+        _validate_full_shape_contract(self)
         if len(self.field_key.encode("utf-8")) > 65_535:
             raise FromScratchExclusionError("held-out atom field key exceeds the byte cap")
         if len(self.value.encode("utf-8")) > _MAX_SCALAR_UTF8_BYTES:
@@ -323,7 +317,7 @@ class _CandidateViews:
     prompt_uuid: str
     text: tuple[str, ...]
     structured: tuple[str, ...]
-    whole_lines: frozenset[str]
+    whole_lines: tuple[str, ...]
     key_values: Mapping[str, tuple[str, ...]]
     raw_record: str
 
@@ -666,8 +660,7 @@ def _atom_matches(atom: HeldoutV2Atom, views: _CandidateViews, budget: _MatcherB
             atom, (*views.text, *views.structured), budget, lambda view, value: value in view
         )
     if atom.shape_id == 4:
-        budget.charge("\n".join(sorted(views.whole_lines)), atom)
-        return atom.value in views.whole_lines
+        return _match_equality(atom, views.whole_lines, budget)
     if atom.shape_id == 5:
         return _match_predicate(atom, views.structured, budget, lambda view, value: value in view)
     if atom.shape_id == 6:
@@ -692,13 +685,60 @@ def _match_predicate(
     atom: HeldoutV2Atom,
     views: tuple[str, ...],
     budget: _MatcherBudget,
-    predicate: Any,
+    predicate: Callable[[str, str], bool],
 ) -> bool:
     for view in views:
         budget.charge(view, atom)
         if predicate(view, atom.value):
             return True
     return False
+
+
+def _validate_full_shape_contract(atom: HeldoutV2Atom) -> None:
+    alphanumeric_count = sum(
+        unicodedata.category(character).startswith(("L", "N")) for character in atom.value
+    )
+    non_whitespace_count = sum(character not in _WHITE_SPACE for character in atom.value)
+    numeric_answer = _NUMERIC_ANSWER.fullmatch(atom.value) is not None
+    allowed = False
+    if atom.shape_id == 0:
+        allowed = atom.domain_id in range(7)
+    elif atom.shape_id == 1:
+        allowed = (
+            atom.domain_id in {0, 6} and alphanumeric_count >= 2
+        ) or (
+            atom.domain_id == 1
+            and alphanumeric_count >= 2
+            and not numeric_answer
+        )
+    elif atom.shape_id == 2:
+        allowed = atom.domain_id == 1 and (numeric_answer or alphanumeric_count < 2)
+    elif atom.shape_id == 3:
+        allowed = atom.domain_id in {2, 3, 4} and non_whitespace_count >= 4
+    elif atom.shape_id == 4:
+        allowed = (
+            atom.domain_id in {2, 3, 4} and non_whitespace_count < 4
+        ) or (atom.domain_id == 6 and alphanumeric_count < 2)
+    elif atom.shape_id == 5:
+        allowed = atom.domain_id == 5 and _is_canonical_structured_json(atom.value)
+    elif atom.shape_id == 6:
+        allowed = atom.domain_id == 5 and len(atom.value.split(" ")) >= 2
+    elif atom.shape_id == 7:
+        allowed = atom.domain_id == 5
+    elif atom.shape_id == 10:
+        allowed = atom.domain_id == 7
+    if not allowed:
+        raise FromScratchExclusionError(
+            "held-out fixture atom violates the frozen domain/shape contract"
+        )
+
+
+def _is_canonical_structured_json(value: str) -> bool:
+    try:
+        parsed = _load_canonical_value(value.encode("utf-8"), label="held-out tool atom")
+    except FromScratchExclusionError:
+        return False
+    return isinstance(parsed, (dict, list)) and _canonical_json(parsed).decode("utf-8") == value
 
 
 def _lexical_contains(view: str, value: str) -> bool:

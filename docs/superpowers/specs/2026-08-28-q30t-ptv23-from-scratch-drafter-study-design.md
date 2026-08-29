@@ -520,21 +520,32 @@ must reproduce the same tree hash.
 ## Distributed execution
 
 Training may run on OCI-HSG, Ptyche, Lyris, AWS-CMH-03, or OCI-AGA only after
-that cluster has an independently approved immutable runtime and passes the
-same one-node, two-node, and sixteen-node platform sequence. Evaluation is
+that cluster has an independently approved immutable runtime, a writable Lustre
+staging path, and a pass on the same one-node, two-node, and sixteen-node
+platform sequence. Evaluation is
 confined to the GB200 runtime identity regardless of where training ran, for
 the reason given under Evaluation.
 
-Because no cluster holds a staged corpus copy, staging location is a free
-choice and cluster preference follows throughput and queue access instead.
-AWS-CMH-03 is preferred for training on two independent grounds. Its
-`nemotron_sw_post` FairShare is the highest measured at 0.915, and its GB300
-HBM leaves materially more room for the target's KV cache: after roughly 30 GiB
-of weights per GPU at tensor parallel size 2, GB200 has about 136 GiB for KV at
-0.9 utilization against about 217 GiB on GB300. Since the streaming pipeline is
-generation-bound, that KV headroom converts into concurrent sequences on the
-half that sets wall clock. OCI-HSG with `nemotron_n3_post` at FairShare 0.769
-is the GB200 alternative and is where evaluation runs regardless.
+Cluster preference follows write access first and throughput second, because a
+cluster with no writable corpus path cannot host training at any FairShare.
+AWS-CMH-03 holds the highest measured FairShare at 0.915 and has GB300 HBM, but
+this account cannot create a staging directory there, and the same is true of
+OCI-AGA; both are excluded as training sites until a per-user Lustre directory
+is provisioned. GB300 training therefore runs on the Lyris `gb300` partition,
+the only GB300 site with a writable corpus path, at FairShare 0.524.
+
+The GB300 case is still worth taking on its own terms. After roughly 30 GiB of
+weights per GPU at tensor parallel size 2, GB200 has about 136 GiB for KV at
+0.9 utilization against about 217 GiB on GB300, and since the streaming
+pipeline is generation-bound that KV headroom converts into concurrent
+sequences on the half that sets wall clock.
+
+OCI-HSG with `nemotron_n3_post` at FairShare 0.769 is the primary GB200 site:
+it already holds the staged PTV2 copy, has the largest inode headroom of the
+three writable clusters, and is where evaluation runs regardless. Ptyche is the
+third writable site, GB200 at FairShare 0.233, and is the most inode-rich by a
+wide margin, which makes it the overflow target when Lyris inode pressure
+rather than queue position is the binding concern.
 
 Runs are distributed across clusters to finish the wave inside the time budget.
 The training cluster is recorded per run. Training hardware is not treated as a
