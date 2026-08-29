@@ -431,7 +431,15 @@ PY
 import sys
 from pathlib import Path
 
-import accelerate, datasets, modelopt, wandb
+import accelerate, datasets, wandb
+import modelopt
+
+# modelopt/__init__.py is two lines, so `import modelopt` only proves the
+# distribution metadata resolves. The trainer and the serve side both reach
+# modelopt.torch, whose closure pulls omegaconf, pulp and scipy -- none of
+# which the container carries. Import what the run imports, or the preflight
+# passes and the job dies minutes later on a missing third-party module.
+import modelopt.torch.speculative
 
 source = Path(sys.argv[1]).resolve()
 origin = Path(modelopt.__file__).resolve()

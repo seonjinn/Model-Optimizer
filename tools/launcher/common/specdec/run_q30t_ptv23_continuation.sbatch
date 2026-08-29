@@ -543,6 +543,8 @@ PY
     local imported
     imported="$(PYTHONPATH="$local_root/source" "$local_root/runtime/bin/python" - <<'PY'
 import modelopt
+import modelopt.torch.speculative
+
 print(modelopt.__file__)
 PY
 )"
