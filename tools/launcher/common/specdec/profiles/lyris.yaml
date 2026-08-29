@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: lyris
-modelopt_commit: e3febcbe1319f018eea81fa4d42e2e36cb54494e
+modelopt_commit: 82b91603a95a4913724675b9360ad073395e2122
 ssh_host: login-lyris
 account: coreai_dlalgo_llm
 partition: gb200

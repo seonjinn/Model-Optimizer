@@ -23,7 +23,7 @@ from common.specdec.cluster_profile import (
 
 _LAUNCHER_DIR = Path(__file__).resolve().parents[1]
 PROFILES = _LAUNCHER_DIR / "common/specdec/profiles"
-_MODELOPT_PIN = "e3febcbe1319f018eea81fa4d42e2e36cb54494e"
+_MODELOPT_PIN = "82b91603a95a4913724675b9360ad073395e2122"
 _PROBE = _LAUNCHER_DIR / "common/specdec/probe_cluster_profile.sh"
 _BASH = shutil.which("bash")
 
