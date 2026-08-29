@@ -161,6 +161,7 @@ export VIRTUAL_ENV="$MODELOPT_RUNTIME"
 export PATH="$VIRTUAL_ENV/bin:$PATH"
 export PYTHONPATH="$node_root/source${PYTHONPATH:+:$PYTHONPATH}"
 "$MODELOPT_RUNTIME/bin/python" - "$node_root/source" <<'PY'
+import importlib
 import sys
 from pathlib import Path
 
@@ -170,5 +171,61 @@ source = Path(sys.argv[1]).resolve()
 origin = Path(modelopt.__file__).resolve()
 if not origin.is_relative_to(source):
     raise RuntimeError(f"modelopt imported outside staged source: {origin}")
+# The archive carries its own vLLM and transformers but no torch, and its venv
+# precedes the container's site-packages, so the stack that actually serves is
+# the archive's Python bound to the image's libtorch. Nothing anywhere pins
+# that pair. Report which side each import resolved to rather than assuming a
+# matching image was mounted.
+runtime = Path(sys.executable).resolve().parent.parent
+
+
+def _side(module) -> str:
+    location = getattr(module, "__file__", None)
+    if location and Path(location).resolve().is_relative_to(runtime):
+        return "archive"
+    return "image"
+
+
+import torch
+import transformers
+import vllm
+
+for name, module in (("torch", torch), ("transformers", transformers), ("vllm", vllm)):
+    print(f"probe: {name} {module.__version__} from {_side(module)}")
+
+# vLLM's compiled extensions name libtorch by unversioned soname, so they bind
+# to whatever torch the image ships. A C++ ABI break surfaces here, at import,
+# as an undefined symbol -- which is the whole reason this probe exists. Other
+# load failures are reported but not fatal: several .so files in the tree are
+# opened through ctypes and are not importable as modules at all.
+undefined = []
+for library in sorted(Path(vllm.__file__).parent.glob("*.so")):
+    name = library.name.split(".")[0]
+    try:
+        importlib.import_module(f"vllm.{name}")
+    except Exception as error:
+        detail = f"{type(error).__name__}: {error}"
+        if "undefined symbol" in str(error):
+            undefined.append(f"{name}: {detail}")
+            print(f"probe: vllm.{name} ABI FAILURE {detail}")
+        else:
+            print(f"probe: vllm.{name} not importable ({detail})")
+    else:
+        print(f"probe: vllm.{name} ok")
+
+# The served architecture registry comes from whichever vLLM is on the path, so
+# verifying that the image registers the three arms says nothing about what the
+# server will accept. Check the one that actually runs.
+from vllm.model_executor.models.registry import ModelRegistry
+
+architectures = sorted(ModelRegistry.get_supported_archs())
+drafts = [name for name in architectures if "DFlash" in name or "DSpark" in name]
+print(f"probe: draft architectures {drafts}")
+wanted = {"DFlashDraftModel", "DFlash2DraftModel", "Qwen3DSparkModel"}
+missing = sorted(wanted.difference(architectures))
+if missing:
+    raise RuntimeError(f"serving vLLM does not register: {missing}")
+if undefined:
+    raise RuntimeError("vLLM extensions failed against the image torch: " + "; ".join(undefined))
 PY
 echo "relocatable runtime probe passed: $MODELOPT_RUNTIME"
