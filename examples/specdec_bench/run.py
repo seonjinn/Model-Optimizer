@@ -369,7 +369,7 @@ if __name__ == "__main__":
         required=False,
         default=None,
         help=(
-            "DFlash block size (num_speculative_tokens). Use instead of --draft_length "
+            "DFlash block size B. Use instead of --draft_length "
             "for DFLASH/DFLASH2/DSPARK. DFlash and DFlash2 accept K = B - 1 tokens "
             "per block; DSpark accepts K = B."
         ),

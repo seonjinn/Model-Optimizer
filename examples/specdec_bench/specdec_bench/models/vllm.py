@@ -41,6 +41,33 @@ DRAFT_ARCHITECTURES = {
 }
 
 
+# ``--block_size`` is B, the DFlash-family block width, but vLLM's
+# ``num_speculative_tokens`` is K, the count actually proposed per block, and
+# the relation between them differs by family. DFlash and DFlash2 predict
+# positions 1..B-1 of each block, so K = B - 1 -- which is why the walkthrough
+# serves a ``dflash_block_size=8`` checkpoint with ``num_speculative_tokens: 7``
+# (examples/speculative_decoding/doc/dflash.md). DSpark's Markov head emits the
+# final position too, so K = B. Forwarding B unconverted made the DFlash arms
+# propose one token more than they were trained to emit, and made their
+# acceptance length incomparable with DSpark's measured at the same B.
+DRAFT_TOKEN_OFFSET = {"DFLASH": -1, "DFLASH2": -1, "DSPARK": 0}
+DEFAULT_BLOCK_SIZE = 8
+
+
+def _draft_tokens(algorithm, kwargs):
+    """Convert the requested block size into vLLM's proposed-token count."""
+    # ``run.py`` always passes this key, carrying None when --block_size is
+    # unset, so ``kwargs.get(key, default)`` returns None rather than the
+    # default and hands vLLM a null horizon.
+    block_size = kwargs.get("speculative_num_draft_tokens") or DEFAULT_BLOCK_SIZE
+    tokens = block_size + DRAFT_TOKEN_OFFSET[algorithm]
+    if tokens < 1:
+        raise ValueError(
+            f"{algorithm} with block size {block_size} would propose {tokens} tokens."
+        )
+    return tokens
+
+
 def _assert_draft_architecture(draft_model_dir, expected, algorithm):
     """Fail before serving if the drafter is not the architecture ``algorithm`` asks for."""
     if not draft_model_dir:
@@ -156,13 +183,11 @@ class VLLMModel(Model):
                 kwargs.get("draft_model_dir"), DRAFT_ARCHITECTURES[algorithm], algorithm
             )
             # Both variants are served as "dflash"; the drafter's architectures
-            # pick the speculator. DFlash2's default horizon is K = B - 1 = 7.
+            # pick the speculator.
             specdec = {
                 "method": "dflash",
                 "model": kwargs.get("draft_model_dir"),
-                "num_speculative_tokens": kwargs.get(
-                    "speculative_num_draft_tokens", 7 if algorithm == "DFLASH2" else 8
-                ),
+                "num_speculative_tokens": _draft_tokens(algorithm, kwargs),
             }
         elif kwargs.get("speculative_algorithm") == "DSPARK":
             _assert_draft_architecture(
@@ -171,7 +196,7 @@ class VLLMModel(Model):
             specdec = {
                 "method": "dspark",
                 "model": kwargs.get("draft_model_dir"),
-                "num_speculative_tokens": kwargs.get("speculative_num_draft_tokens", 7),
+                "num_speculative_tokens": _draft_tokens("DSPARK", kwargs),
                 "draft_sample_method": kwargs.get("draft_sample_method", "greedy"),
             }
         elif kwargs.get("speculative_algorithm") == "NONE":
