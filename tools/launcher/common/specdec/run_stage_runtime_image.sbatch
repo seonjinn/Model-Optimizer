@@ -28,6 +28,16 @@ done
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || { echo "invalid Slurm job identity" >&2; exit 2; }
 [[ "$DEST_ROOT" == /lustre/* ]] || { echo "container images belong on Lustre" >&2; exit 2; }
 [[ "$IMAGE_TAG" =~ ^[0-9a-zA-Z._-]+$ ]] || { echo "malformed image tag" >&2; exit 2; }
+# enroot needs a URI scheme and rejects a bare name with "Invalid argument",
+# while the digest lookup below already strips docker:// -- so the scheme was
+# required in one place and optional-looking in the other. Normalise here so
+# both consume the same value and a bare repo:tag cannot fail at the import
+# after the digest has already been resolved.
+[[ "$IMAGE_REF" == *"://"* ]] || IMAGE_REF="docker://$IMAGE_REF"
+
+# The login node is x86_64 on at least one cluster while its compute nodes are
+# aarch64 Grace. enroot resolves a multi-arch manifest against the host, so an
+# import run in the wrong place stages an image the GPUs cannot execute.
 [[ "$(uname -m)" == aarch64 ]] || { echo "image staging must run on an aarch64 node" >&2; exit 2; }
 command -v enroot >/dev/null || { echo "enroot is absent" >&2; exit 2; }
 command -v unsquashfs >/dev/null || { echo "unsquashfs is absent" >&2; exit 2; }
