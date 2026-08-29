@@ -1,0 +1,14 @@
+{
+  "source_path": "/home/sna/modelopt-q30t-design",
+  "source_sha": "82b91603a95a4913724675b9360ad073395e2122",
+  "image_path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/containers/vllm_openai_v0271_aarch64_20260813_2688476.sqsh",
+  "image_sha256": "e7be53f2754097c88f7c801da92f6d94794ec4d78d9df937fcd315a6994297f0",
+  "runtime_archive_path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec/dflash2-oci/assets/dflash2-pr52816-b389ac2-compiled-runtime-0b7448f06/modelopt-vllm-0.27.1-pr52816-b389ac2-compiled-cudagraph-v6-py312-aarch64.tar.zst",
+  "runtime_archive_sha256": "faa8cba601ae807134f7a40b2a5a537822eff1dcc95b0070f540581e90c447b7",
+  "dataset_path": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/datasets/nemotron-post-training-v2-compatible-1p3m/data",
+  "output_root": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/sd2",
+  "targets": {
+    "q30-base": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/models/Qwen3-30B-A3B-ad44e777",
+    "q30-thinking": "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/models/Qwen3-30B-A3B-Thinking-2507-144afc2f"
+  }
+}
