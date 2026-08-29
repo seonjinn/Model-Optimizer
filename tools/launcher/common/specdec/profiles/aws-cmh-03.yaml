@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: aws-cmh-03
+modelopt_commit: e3febcbe1319f018eea81fa4d42e2e36cb54494e
+ssh_host: aws-cmh-03
+account: nemotron_sw_post
+partition: batch
+fallback_partition: null
+durable_root: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_modelopt/sna/specdec_ptv23
+scratch_candidates:
+  - $SLURM_TMPDIR
+  - /raid/scratch
+  - /tmp
+training_nodes: 16
+training_segment: 16
+evaluation_nodes: 1
+evaluation_segment: 1
+gpus_per_node: 4
+explicit_gpu_flag: true
+walltime: "03:55:00"

@@ -347,3 +347,27 @@ def test_validate_scratch_root_accepts_resolved_slurm_tmpdir(
     profile = load_cluster_profile(PROFILES / "lyris.yaml")
 
     validate_scratch_root(profile, Path("/private/slurm-tmp/job-123/modelopt-drafter"))
+
+
+def test_aws_cmh_03_profile_requests_gpus_explicitly() -> None:
+    """AWS rejects a batch job with no GPU specification, unlike Ptyche and Lyris."""
+    profile = load_cluster_profile(PROFILES / "aws-cmh-03.yaml")
+
+    assert profile.account == "nemotron_sw_post"
+    assert profile.partition == "batch"
+    assert profile.fallback_partition is None
+    assert profile.explicit_gpu_flag is True
+    assert scheduler_gpu_args(profile) == ("--gpus-per-node=4",)
+    assert "--gpus-per-node=4" in render_probe_sbatch(profile)
+
+
+def test_aws_cmh_03_profile_fits_a_single_nvl72_domain() -> None:
+    """Sixteen four-GPU nodes stay inside one NVL72 block and divide evenly."""
+    profile = load_cluster_profile(PROFILES / "aws-cmh-03.yaml")
+
+    assert profile.training_nodes == 16
+    assert profile.training_segment == 16
+    assert profile.training_nodes % profile.training_segment == 0
+    assert profile.walltime == "03:55:00"
+    assert profile.durable_root.is_absolute()
+    assert str(profile.durable_root).startswith("/lustre/")

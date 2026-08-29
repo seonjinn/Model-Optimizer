@@ -264,7 +264,7 @@ access is not uniform. Measured on 2026-08-28:
 | OCI-HSG | `.../coreai_dlalgo_nemorl/users/sna` | 222 T / 323.7 T | 25,672,851 / 52,428,800 | 18/18, 3.6 G |
 | Ptyche | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | 176 T / 250 T | 2,304,907 / 26,214,400 | 18/18, 3.7 G |
 | Lyris | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | 201 T / 250 T | 24,494,708 / 26,214,400 | 18/18, 3.7 G |
-| AWS-CMH-03 | `.../coreai_dlalgo_modelopt/sna` | 8.8 T / 323.7 T | (shared project quota) | 18/18, 3.5 G |
+| AWS-CMH-03 | `.../coreai_dlalgo_modelopt/sna` | 8.8 P / 18 P (51% used) | 176 / 52,428,800 | 18/18, 3.5 G |
 | OCI-AGA | `.../coreai_dlalgo_modelopt/sna` | 82 T / 100 T | (shared, 52,428,800) | 18/18, 3.7 G |
 
 An earlier survey concluded that AWS-CMH-03 and OCI-AGA were unwritable and
@@ -281,22 +281,43 @@ All five clusters are distinct filesystems, so each requires its own copy. At
 staging is complete everywhere as of 2026-08-28 at pinned revision
 `5c89e01dd720ae0f4058445ed49c5fb68a03c76e`.
 
-Two storage cautions survive. Lyris sits at 93.4 percent of its soft inode
-limit with about 1.7 M inodes of headroom, and AWS-CMH-03 is at 97 percent of
-capacity with 8.8 T free. Neither can absorb a checkpoint stream. Both hold the
-corpus and can serve reads; neither is a checkpoint target without cleanup
-first. OCI-HSG, Ptyche, and OCI-AGA carry no such constraint.
+One storage caution survives. Lyris sits at 93.4 percent of its soft inode
+limit with about 1.7 M inodes of headroom; it holds the corpus and can serve
+reads, but it is not a checkpoint target without cleanup first.
+
+**The AWS-CMH-03 caution is withdrawn - it was a unit error.** An earlier pass
+recorded "8.8 T free, 97 percent of capacity" and concluded the cluster could
+not absorb a checkpoint stream. Re-measured on 2026-08-28, `df` reports 18 P
+total with **8.8 P free at 51 percent used**, and `lfs df` agrees at 8.7 P free
+across the OSTs. The figure was off by a factor of a thousand and the
+utilisation claim was inverted. The user quota is untouched at 24.7 G of a 100 T
+block limit and 176 of 52,428,800 inodes. AWS-CMH-03 has more checkpoint
+headroom than any other site in this study. OCI-HSG, Ptyche, and OCI-AGA carry
+no such constraint either.
 
 Restoring the two GB300 sites restores the cross-generation question the
-GB200-only plan had dissolved. **Training is pinned to GB200 anyway, and for a
-reason that is about comparability rather than access:** the three arms are
-compared to each other, so every arm must see the same global batch size, the
-same data order, and the same HBM ceiling. Mixing generations across arms would
-confound the only variable this study controls. GB300 capacity is used instead
-for the two things that are safe to run there, both single-arm and both
-throughput rather than quality measurements: the GB200-versus-GB300 serving
-sweep, and overflow when GB200 queue position is the binding concern and a
-whole wave can move together.
+GB200-only plan had dissolved, and on re-examination it also dissolves the
+GB200 training pin. **The binding constraint was never GB200 specifically; it
+is that generation must be constant across arms.** The three arms are compared
+only to each other, so what would confound the comparison is one arm training
+on GB200 while another trains on GB300. A wave in which all three arms train on
+the same generation satisfies the constraint whichever generation that is,
+because global batch size is asserted at 512, and data order and seed are
+pinned identically regardless of HBM.
+
+Training is therefore pinned to **one generation per wave, not to GB200**, and
+the primary training site is AWS-CMH-03 on GB300 - the site with the granted
+FairShare and the deepest queue. If a wave has to be split across sites, it
+splits across same-generation sites only; an arm is never migrated
+mid-comparison to a different generation. GB300's extra HBM does not change the
+trained artifact under a fixed global batch size, so this buys queue position
+without buying a confound.
+
+Evaluation is unaffected and remains confined to the GB200 runtime identity on
+OCI-HSG, for the reason given under Evaluation: throughput is a property of the
+serving hardware, so every reported number has to come from one generation. The
+GB200-versus-GB300 serving sweep stays a separate, deliberately
+cross-generation measurement and is never mixed into the arm ranking.
 
 The cross-generation numbers are worth taking on their own terms. After roughly
 30 GiB of weights per GPU at tensor parallel size 2, GB200 has about 136 GiB
@@ -604,12 +625,31 @@ checkpoint headroom rather than access.
 | OCI-HSG | `nemotron_n3_post` | 0.769 | GB200 | primary training, all evaluation |
 | Ptyche | `coreai_dlalgo_modelopt` | 0.233 | GB200 | second training site, most inode-rich |
 | OCI-AGA | `nemotron_sw_post` | 0.249 | unmeasured | GB300 serving sweep, overflow |
-| AWS-CMH-03 | `coreai_dlalgo_modelopt` | 0.915 | GB300 | GB300 serving sweep only, 8.8 T free |
+| AWS-CMH-03 | `nemotron_sw_post` | 0.915 | GB300 | primary training site, 3,854-node `batch` |
 | Lyris | `coreai_dlalgo_llm` | 0.524 | GB300 | corpus only, inode-exhausted |
 
-OCI-HSG is primary: highest FairShare among the GB200 sites, largest absolute
-inode headroom, holder of the only live Hugging Face token, and where
-evaluation runs regardless. Ptyche is the second training site.
+AWS-CMH-03 is the primary training site. Its `nemotron_sw_post` association
+holds `RawShares=76` against `RawShares=1` for every other account reachable
+there, which is why its FairShare is 0.915 rather than the 0.13 and 0.85 of the
+two neighbouring accounts on the same cluster - the share is granted, not
+earned down. Measured on 2026-08-28: `batch` spans 3,854 nodes at a 4 h cap,
+and `sbatch --test-only` for the full 16-node, 64-GPU training shape returned
+an immediate start. That combination - granted share, four-hour cap, and a pool
+deep enough that a 16-node request does not wait - is what the chunk-and-chain
+structure is built to exploit.
+
+Two AWS-specific submission facts were measured rather than assumed. `--segment`
+does not appear in `sbatch --help` on this Slurm build but is accepted and
+honoured: a `--segment=16` request placed all sixteen nodes on
+`nvl72d136-T[01-16]`, one NVL72 domain. And a `batch` job that omits a GPU
+request is rejected outright ("Cannot find GPU specification"), so the profile
+sets `explicit_gpu_flag: true`. Ptyche and Lyris take the opposite setting; a
+profile copied between them without changing this field fails at submission.
+
+OCI-HSG remains primary for evaluation and is the second training site: highest
+FairShare among the GB200 sites, largest absolute inode headroom, and the GB200
+runtime identity that every reported throughput number is confined to. Ptyche is
+the third training site.
 
 OCI-AGA is the newest addition and the reason overflow is credible: 429 idle
 nodes were measured on 2026-08-28 against `nemotron_sw_post`, with `batch`
@@ -890,12 +930,42 @@ a prerequisite rather than an assumption. `examples/specdec_bench/run.py`
 exposes `--speculative_algorithm` with choices `EAGLE3`, `EAGLE`,
 `DRAFT_TARGET`, `NGRAM`, `MTP`, `DFLASH`, and `NONE`, and
 `specdec_bench/models/vllm.py` maps only `DFLASH` onto a vLLM
-`{"method": "dflash"}` speculative config. No branch emits `dspark` or
-`dflash2`. vLLM itself accepts `method: "dspark"`, which the Qwen3-8B
-walkthrough exercises directly, so the gap is in the harness rather than the
-serving engine. Adding the two choices and their method mappings is a small,
-reviewed change that must land before any three-arm comparison is run;
-until it does, DSpark and DFlash2 have no measured throughput.
+`{"method": "dflash"}` speculative config. No branch emits `dspark`, and none
+selects DFlash2 at all.
+
+The two gaps are not symmetric. DSpark needs a new method string: vLLM accepts
+`method: "dspark"`, which the Qwen3-8B walkthrough exercises directly, so the
+harness only has to emit it. **DFlash2 has no method string of its own.**
+`SpeculativeMethod` in `vllm/config/speculative.py` admits `dflash` and
+`dspark` but never `dflash2`, so passing `method: "dflash2"` fails config
+validation before the engine starts. DFlash2 is reached by keeping
+`method: "dflash"` and letting the draft checkpoint select the V2 speculator:
+`vllm/v1/worker/gpu/spec_decode/__init__.py` dispatches to `DFlash2Speculator`
+when `"DFlash2DraftModel"` appears in the draft config's `architectures`, and
+falls through to `DFlashSpeculator` otherwise. This makes the export
+architecture name load-bearing rather than cosmetic - a DFlash2 checkpoint
+exported under the wrong `architectures` value serves silently as plain
+DFlash, and the arm would be measured as a duplicate of the DFlash arm rather
+than failing loudly.
+
+So the harness change is: add a `DSPARK` choice mapping to
+`{"method": "dspark"}`, and a `DFLASH2` choice mapping to
+`{"method": "dflash"}` with an assertion that the draft checkpoint declares
+`DFlash2DraftModel`. Both must land before any three-arm comparison is run;
+until they do, DSpark and DFlash2 have no measured throughput.
+
+Serving DFlash2 also pins the image. PR #52816 merged at
+`b389ac29465b33f9e9c534df221ea3c129e9793f` on 2026-08-21T05:27Z, and vLLM
+nightly tags are stamped with the build commit, not the push date - the tag
+pushed on 2026-08-21 was built from a commit two behind the merge. The first
+nightly that contains it is
+`vllm/vllm-openai:nightly-e9d1398d9edfd90fcc1cf783805240e3effec013`
+(`sha256:95bed119f39e2414973cf7224df31c9a3ed213566138722346d7bd360edf842b`),
+verified by the presence of `vllm/model_executor/models/qwen3_dflash2.py`
+rather than by ancestry alone. No stable release carries it: v0.28.0 branched
+from `53e211d2` on 2026-08-17, four days before the merge. Docker Hub retains
+nightlies for roughly ten days, so this image must be mirrored to an internal
+registry before it is pruned; a digest pin does not survive blob deletion.
 
 Two harness properties shape the sweep cost. The runner constructs its engine
 in process through `AsyncLLM.from_engine_args` and cannot attach to an

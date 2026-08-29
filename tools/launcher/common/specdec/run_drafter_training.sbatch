@@ -205,6 +205,18 @@ case "${METHOD}:${BLOCK_SIZE}" in
         LOSS_VALUE=7
         DFLASH_DPACE_ALPHA=""
         ;;
+    dflash2:8)
+        NUM_SPEC_TOKENS=7
+        LOSS_OBJECTIVE=decay
+        LOSS_VALUE=4
+        DFLASH_DPACE_ALPHA=""
+        ;;
+    dflash2:16)
+        NUM_SPEC_TOKENS=15
+        LOSS_OBJECTIVE=decay
+        LOSS_VALUE=7
+        DFLASH_DPACE_ALPHA=""
+        ;;
     *) echo "unsupported method/block size: ${METHOD}/${BLOCK_SIZE}" >&2; exit 2 ;;
 esac
 export SERVE_NODES NUM_SPEC_TOKENS

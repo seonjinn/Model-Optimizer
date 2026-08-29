@@ -1408,3 +1408,49 @@ def test_resume_chain_gates_each_cumulative_wave_on_public_acceptance() -> None:
     ):
         assert required in readme
     assert "512 / (2 * 4) = 64" not in readme
+
+
+def _dispatch_method(method: str, block_size: int) -> tuple[str, str, str, str]:
+    """Execute the runner's method dispatch in isolation and read back its choices."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+    block = re.search(
+        r'^case "\$\{METHOD\}:\$\{BLOCK_SIZE\}" in$.*?^esac$', runner, re.MULTILINE | re.DOTALL
+    )
+    assert block is not None
+    script = (
+        f"METHOD={method}\nBLOCK_SIZE={block_size}\n"
+        f"{block.group(0)}\n"
+        'printf "%s|%s|%s|%s\\n" '
+        '"$NUM_SPEC_TOKENS" "$LOSS_OBJECTIVE" "$LOSS_VALUE" "$DFLASH_DPACE_ALPHA"\n'
+    )
+    completed = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+    first, second, third, fourth = completed.stdout.strip().split("|")
+    return first, second, third, fourth
+
+
+@pytest.mark.parametrize("block_size", [8, 16])
+def test_runner_dispatches_dflash2_at_the_manifest_horizon(block_size: int) -> None:
+    """DFlash2 proposes block_size-1 tokens, the same K as DFlash and one below DSpark."""
+    tokens, objective, value, alpha = _dispatch_method("dflash2", block_size)
+
+    assert int(tokens) == speculative_tokens("dflash2", block_size)
+    assert int(tokens) == block_size - 1
+    assert objective == "decay"
+    assert value == str(4 if block_size == 8 else 7)
+    assert alpha == ""
+
+
+def test_runner_confines_the_dpace_alpha_override_to_dflash() -> None:
+    """dflash2 trains on the decay objective, so it must not inherit DFlash's dpace alpha."""
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+
+    assert 'if [[ "$METHOD" == dflash ]]; then' in runner
+    for method, block_size in (("dflash2", 8), ("dflash2", 16), ("dspark", 8), ("dspark", 16)):
+        assert _dispatch_method(method, block_size)[3] == ""
+    assert _dispatch_method("dflash", 16)[3] == "0.5"
+
+
+def test_runner_still_rejects_an_unsupported_method_block_pair() -> None:
+    """Widening the dispatch must not turn the catch-all into a silent default."""
+    with pytest.raises(subprocess.CalledProcessError):
+        _dispatch_method("dflash2", 32)
