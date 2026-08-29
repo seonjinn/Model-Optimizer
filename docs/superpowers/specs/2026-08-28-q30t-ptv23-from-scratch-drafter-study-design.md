@@ -414,9 +414,11 @@ does not set `dflash_init_checkpoint`.
 ## Distributed execution
 
 Source audit and target generation prefer OCI-HSG because the staged PTV2 copy
-is local there. Training may run on OCI-HSG, Ptyche, or Lyris only after that
-cluster has an independently approved immutable runtime and passes the same
-one-node, two-node, and sixteen-node platform sequence.
+is local there. Training may run on OCI-HSG, Ptyche, Lyris, AWS-CMH-03, or
+OCI-AGA only after that cluster has an independently approved immutable
+runtime and passes the same one-node, two-node, and sixteen-node platform
+sequence. Evaluation is confined to the GB200 runtime identity regardless of
+where training ran, for the reason given under Evaluation.
 
 The proven Q30 streaming shape uses 16 GB200 nodes, eight target-serving nodes,
 eight trainer nodes, four GPUs per node, 32 trainer ranks, and target tensor
@@ -503,8 +505,9 @@ Restart overhead per chunk covers container import, the target `vllm serve`
 load at tensor parallel size 2 across eight nodes, trainer initialization, and
 optimizer-state resume. It is budgeted at twenty minutes and measured in the
 calibration gate; at that budget a four-hour chunk yields about 3.6 hours of
-training and a five-hour chunk about 4.6 hours, so a thirty-hour run is roughly
-nine chunks on `batch` or seven on Lyris and Ptyche. Recovery checkpointing
+training and a five-hour chunk about 4.6 hours. The chunk count per run follows
+from the calibrated generation rate against the 4B-token boundary, and is
+recorded per run rather than assumed. Recovery checkpointing
 runs at `save_steps=500` with `save_total_limit=2`, sized so that at most a few
 minutes of work is lost at a chunk boundary; the permanent milestone
 checkpoints described under Evaluation are a separate, retained set.
@@ -556,21 +559,45 @@ busy at the fixed topology.
 ## Evaluation
 
 Each run is evaluated at initialization, 256M, 1B, and 4B when present. The
-same evaluator source, prompts, target, decoding settings, proposed-token
-horizon, concurrency, and GB200 runtime identity are used for every paired
-comparison.
+same evaluator source, prompts, target, decoding settings, concurrency, and
+GB200 runtime identity are used for every paired comparison.
+
+Two of those identity terms need qualifying, because the amendments below
+relax them in controlled ways. Concurrency is held equal within a paired
+comparison but is swept across comparisons, so each concurrency point is its
+own paired comparison rather than a single fixed operating point. The
+proposed-token horizon is held fixed for an arm across every checkpoint,
+corpus view, and target, but it is not equal between arms, because it is
+architecture-intrinsic at `B - 1` for DFlash and DFlash2 and `B` for DSpark.
+
+Runtime identity is not relaxed. Training may run on the GB300 clusters, whose
+FairShare is often better, but every throughput and latency number that enters
+a comparison is measured on the GB200 runtime identity. Throughput measured on
+GB300 is not comparable to throughput measured on GB200 and is never
+substituted for it; a GB300 measurement may be reported only as a separately
+labeled secondary observation.
 
 ### Milestones
 
-Milestones are defined by prompts consumed, not by optimizer step, because the
-step count is a function of the global batch size and would not line up across
-arms if that ever changed. The retained milestones are 250k, 500k, 1M, and 2M
-prompts, which at global batch size 512 fall at steps 500, 1,000, 2,000, and
-3,906. The spacing is logarithmic rather than linear because acceptance
-saturates early, so the informative comparisons are concentrated in the first
-quarter of the run. Each milestone is checkpointed permanently, exported, and
-evaluated by an independent job; the recovery checkpoints written every 500
-steps are rotated and are not milestones.
+Milestones are the 256M, 1B, and 4B assistant-loss-token boundaries already
+defined under Corpus cardinality, plus initialization. No separate step-count
+or prompt-count grid is introduced. Those boundaries are the right unit because
+the 256M schedule is a byte-identical prefix of the 1B schedule and the 1B of
+the 4B, so a single run passes through all three and every checkpoint is
+directly comparable to the same boundary in another run. A step-count grid
+would not have that property, since step count depends on global batch size.
+
+The mapping to optimizer steps is arithmetic. Each arm supervises
+`dflash_num_anchors` times `dflash_block_size`, or 4,096, positions per
+sequence, and global batch size is 512 sequences, so a step consumes about
+2.10M assistant-loss tokens. The boundaries therefore fall near step 122, 477,
+and 1,907. Wall clock is set by the serving half rather than the trainer, so
+the number of chunks a run needs is 4B divided by the calibrated aggregate
+generation rate, divided by the 3.6 or 4.6 hours of training a chunk yields.
+
+Each milestone checkpoint is retained permanently, exported, and evaluated by
+an independent job. The recovery checkpoints written every 500 steps are
+rotated under `save_total_limit=2` and are not milestones.
 
 ### Comparability of acceptance across arms
 
