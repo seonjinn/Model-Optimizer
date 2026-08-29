@@ -58,6 +58,65 @@ export ENROOT_DATA_PATH="$scratch/data"
 export ENROOT_TEMP_PATH="$scratch/tmp"
 mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_TEMP_PATH"
 
+# Resolve what the tag points at *before* importing. Each cluster squashes its
+# own image, so the resulting file digests differ by construction and cannot be
+# compared across sites. The upstream manifest digest is the thing that can:
+# it makes "every cluster imported the same vLLM" a checkable claim rather than
+# an assumption, and the arms are only comparable if it holds.
+upstream_digest="$(python3 - "$IMAGE_REF" <<'PY_DIGEST'
+import json
+import sys
+import urllib.request
+
+_ACCEPT = ",".join(
+    (
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+    )
+)
+
+
+def _get(url, headers):
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return json.load(response)
+
+
+reference = sys.argv[1]
+if reference.startswith("docker://"):
+    reference = reference[len("docker://") :]
+repository, _, tag = reference.partition(":")
+if "/" not in repository:
+    repository = "library/" + repository
+
+token = _get(
+    "https://auth.docker.io/token?service=registry.docker.io"
+    f"&scope=repository:{repository}:pull",
+    {},
+)["token"]
+index = _get(
+    f"https://registry-1.docker.io/v2/{repository}/manifests/{tag}",
+    {"Authorization": f"Bearer {token}", "Accept": _ACCEPT},
+)
+
+for manifest in index.get("manifests", []):
+    platform = manifest.get("platform", {})
+    if platform.get("architecture") == "arm64" and platform.get("os") == "linux":
+        print(manifest["digest"])
+        break
+else:
+    raise SystemExit("tag has no linux/arm64 manifest")
+PY_DIGEST
+)"
+[[ "$upstream_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    echo "could not resolve the upstream arm64 digest" >&2
+    exit 2
+}
+if [[ -n "${EXPECTED_IMAGE_DIGEST:-}" && "$EXPECTED_IMAGE_DIGEST" != "$upstream_digest" ]]; then
+    echo "tag moved: expected $EXPECTED_IMAGE_DIGEST, resolved $upstream_digest" >&2
+    exit 2
+fi
+
 staged="$scratch/image.sqsh"
 enroot import -o "$staged" "$IMAGE_REF"
 [[ -s "$staged" ]] || { echo "import produced no image" >&2; exit 2; }
@@ -106,11 +165,11 @@ mv "$dest.part" "$dest"
 chmod 0444 "$dest"
 
 receipt="$dest_dir/${name%.sqsh}.json"
-python3 - "$receipt" "$IMAGE_REF" "$IMAGE_TAG" "$dest" "$digest" <<'PY'
+python3 - "$receipt" "$IMAGE_REF" "$IMAGE_TAG" "$dest" "$digest" "$upstream_digest" <<'PY_RECEIPT'
 import json
 import sys
 
-receipt, image_ref, image_tag, image_path, image_sha256 = sys.argv[1:6]
+receipt, image_ref, image_tag, image_path, image_sha256, upstream_digest = sys.argv[1:7]
 with open(receipt, "w") as handle:
     json.dump(
         {
@@ -119,6 +178,7 @@ with open(receipt, "w") as handle:
             "image_tag": image_tag,
             "image_path": image_path,
             "image_sha256": image_sha256,
+            "upstream_digest": upstream_digest,
             "draft_architectures": [
                 "DFlashDraftModel",
                 "DFlash2DraftModel",
@@ -130,7 +190,8 @@ with open(receipt, "w") as handle:
         sort_keys=True,
     )
     handle.write("\n")
-PY
+PY_RECEIPT
 
 echo "image_path=$dest"
 echo "image_sha256=$digest"
+echo "upstream_digest=$upstream_digest"
