@@ -28,6 +28,7 @@ import time
 import weakref
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from multiprocessing import get_context
@@ -736,6 +737,86 @@ def load_tokenizer_snapshot(receipt_path: Path, expected_receipt_sha256: str) ->
     )
 
 
+def _training_chat_template(official_template: str) -> str:
+    """Return the official template with the assistant turn wrapped in a generation block.
+
+    Qwen3-30B-A3B-Thinking-2507 ships no ``{% generation %}`` marker, and
+    ``apply_chat_template(return_assistant_tokens_mask=True)`` answers a
+    template without one by logging a warning and returning an all-zero mask --
+    not by raising. Every row would then score zero assistant tokens and be
+    skipped, so a full tokenization pass over the corpus would yield an empty
+    inventory with nothing having failed.
+
+    The derivation is textual and anchored, so it refuses a template it does not
+    recognize rather than emitting one that renders differently. It must stay
+    byte-identical to the launcher's copy in
+    ``tools/launcher/common/specdec/q30t_tokenizer_receipt.py``; the tokenizer
+    receipt pins ``training_chat_template_sha256`` over this exact output, which
+    is what makes a divergence between the two copies fail loudly.
+    """
+    assistant = '    {%- elif message.role == "assistant" %}\n'
+    header = "'<|im_start|>' + message.role + '\\n' + "
+    thinking_header = "'<|im_start|>' + message.role + '\\n<think>\\n' + "
+    im_end = "        {{- '<|im_end|>\\n' }}\n"
+    tool = '    {%- elif message.role == "tool" %}'
+    boundary = im_end + tool
+    if official_template.count(assistant) != 1 or official_template.count(boundary) != 1:
+        raise ValueError("Q30 official chat template lacks approved assistant anchors")
+    before, remainder = official_template.split(assistant, 1)
+    assistant_block, after = remainder.split(boundary, 1)
+    if assistant_block.count(header) < 1 or assistant_block.count(thinking_header) > 1:
+        raise ValueError("Q30 official chat template lacks the approved assistant header")
+    assistant_block = assistant_block.replace(thinking_header, "'<think>\\n' + ", 1)
+    assistant_block = assistant_block.replace(header, "")
+    return (
+        before
+        + assistant
+        + "        {{- '<|im_start|>' + message.role + '\\n' }}\n"
+        + "        {%- generation %}\n"
+        + assistant_block
+        + im_end
+        + "        {%- endgeneration %}\n"
+        + tool
+        + after
+    )
+
+
+_MASK_PROBE_MESSAGES = (
+    {"role": "user", "content": "probe question"},
+    {"role": "assistant", "content": "probe answer"},
+)
+
+
+def _verify_masking_template(tokenizer: Any, official: str, training: str) -> None:
+    """Prove the training template masks assistant turns and changes no rendering.
+
+    Two independent ways to be wrong, so two assertions. A template that renders
+    differently would train the drafter on text the target never emits, and a
+    template that masks nothing would empty the inventory one silent skip at a
+    time. Both are cheap to rule out here and expensive to discover downstream.
+    """
+    probe = [dict(message) for message in _MASK_PROBE_MESSAGES]
+    rendered_official = tokenizer.apply_chat_template(
+        probe, tokenize=False, add_generation_prompt=False, chat_template=official
+    )
+    rendered_training = tokenizer.apply_chat_template(
+        probe, tokenize=False, add_generation_prompt=False, chat_template=training
+    )
+    if rendered_official != rendered_training:
+        raise ValueError("training chat template does not render identically to the official one")
+    encoded = tokenizer.apply_chat_template(
+        probe,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=True,
+        return_assistant_tokens_mask=True,
+        chat_template=training,
+    )
+    mask = encoded.get("assistant_masks", encoded.get("assistant_mask"))
+    if not isinstance(mask, list) or sum(mask) < 1:
+        raise ValueError("training chat template produced no assistant-token mask")
+
+
 def _load_tokenizer_from_snapshot(snapshot: TokenizerSnapshot) -> CandidateTokenizer:
     """Load only the locally authenticated serialization represented by ``snapshot``."""
     try:
@@ -754,6 +835,24 @@ def _load_tokenizer_from_snapshot(snapshot: TokenizerSnapshot) -> CandidateToken
         raise ValueError("loaded tokenizer chat template is invalid") from error
     if sha256_bytes(loaded_template) != snapshot.chat_template_sha256:
         raise ValueError("loaded tokenizer chat template identity mismatch")
+    # Swap in the masking template only after the official one has been
+    # authenticated, so the identity check above still covers what shipped.
+    # Rendering is unchanged, so the callers that tokenize without asking for a
+    # mask are unaffected, and rows keep recording the official template digest
+    # because that is what identifies the text the target sees.
+    official = getattr(tokenizer, "chat_template")
+    if not isinstance(official, str) or not official:
+        raise ValueError("loaded tokenizer chat template is invalid")
+    if "generation %}" not in official:
+        # Templates that already mark their assistant span are left alone. The
+        # rest are rewritten only if the derivation recognizes them; a template
+        # it does not recognize is not an error here, because this loader also
+        # serves callers that only need token IDs. _tokenize is where a mask is
+        # actually required, and that is where its absence is refused.
+        with suppress(ValueError):
+            training = _training_chat_template(official)
+            _verify_masking_template(tokenizer, official, training)
+            tokenizer.chat_template = training
     return tokenizer
 
 
@@ -1565,9 +1664,10 @@ def _stage_authenticated_source_once(
     staged_descriptor = os.open(staged_path, stage_flags, 0o600)
     digest = hashlib.sha256()
     try:
-        with os.fdopen(os.dup(descriptor), "rb") as source_stream, os.fdopen(
-            staged_descriptor, "wb"
-        ) as staged_stream:
+        with (
+            os.fdopen(os.dup(descriptor), "rb") as source_stream,
+            os.fdopen(staged_descriptor, "wb") as staged_stream,
+        ):
             for chunk in iter(lambda: source_stream.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
                 staged_stream.write(chunk)
@@ -1854,8 +1954,7 @@ def _raw_row_schema(path: Path) -> dict[str, Any]:
                 schema["record_json_decoded"] = type(decoded).__name__
                 if isinstance(decoded, dict):
                     schema["record_json_fields"] = {
-                        str(key): type(value).__name__
-                        for key, value in sorted(decoded.items())
+                        str(key): type(value).__name__ for key, value in sorted(decoded.items())
                     }
         return schema
     return {"row_type": "empty"}
@@ -2158,7 +2257,9 @@ def _build_candidate_inventory_parallel(
             "elapsed_seconds": round(
                 (time.monotonic_ns() - started_monotonic_ns) / 1_000_000_000, 6
             ),
-            "shards": [asdict(result) | {"spool_path": result.spool_path.name} for result in results],
+            "shards": [
+                asdict(result) | {"spool_path": result.spool_path.name} for result in results
+            ],
             "tokenization_shards": [asdict(result) for result in tokenization_results],
         }
         execution["receipt_sha256"] = sha256_bytes(canonical_json(execution))
@@ -2582,6 +2683,17 @@ def _tokenize(tokenizer: Any, row: dict[str, Any]) -> tuple[list[int], list[int]
         or any(value not in (0, 1) for value in loss_mask)
     ):
         raise ValueError("tokenizer did not return aligned IDs and assistant mask")
+    # A conversation containing an assistant turn whose mask selects nothing is
+    # the signature of a chat template with no {% generation %} marker:
+    # transformers logs a warning and returns all zeros instead of raising. The
+    # caller drops rows with no assistant tokens, so left alone this empties the
+    # whole inventory without any single step having failed. Refuse it here,
+    # where the distinction between "this row has nothing to learn from" and
+    # "this tokenizer cannot mark what to learn from" is still visible.
+    if not any(value for value in loss_mask) and any(
+        isinstance(message, Mapping) and message.get("role") == "assistant" for message in messages
+    ):
+        raise ValueError("chat template marked no assistant tokens in an assistant turn")
     return input_ids, loss_mask
 
 
