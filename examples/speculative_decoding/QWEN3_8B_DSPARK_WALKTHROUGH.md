@@ -212,7 +212,7 @@ assistant span to mask. Train over the full sequence.
 tensorboard isn't installed in the serve container.
 
 **Batch size and LR stay at the recipe defaults.** `dspark.yaml` ships
-`per_device_train_batch_size=1`, `learning_rate=6e-4`, `warmup_ratio=0.04` —
+`per_device_train_batch_size=1`, `learning_rate=6e-4`, `warmup_steps=0.04` —
 tuned for a from-scratch draft on a single GPU. The Kimi-K2.6 and MiniMax-M3
 examples override these to a larger batch and a gentle `1e-4` because they run 8
 GPUs per node and warm-start a large backbone. Don't copy those numbers to

@@ -1016,7 +1016,6 @@ def build_q30_node_local_training_command(
         _override("training.dataloader_num_workers", 0),
         _override("training.learning_rate", "0.00006"),
         _override("training.warmup_steps", 55),
-        _override("training.warmup_ratio", "0.0"),
         _override("training.lr_scheduler_type", "linear"),
         _override("training.report_to", "wandb"),
         _override("training.run_name", run_name),
