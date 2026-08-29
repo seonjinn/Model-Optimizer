@@ -208,35 +208,52 @@ policy identity.
 The corpus is staged to Lustre on every cluster that will run training. Write
 access is not uniform. Measured on 2026-08-28:
 
-| Cluster | Staging root | Writable | Space used / quota | Inodes used / soft limit |
-|---|---|---|---:|---:|
-| OCI-HSG | `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna` | yes | 101.4 T / 323.7 T | 25,672,851 / 52,428,800 |
-| Lyris | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | yes | 49.0 T / 250 T | 24,494,708 / 26,214,400 |
-| Ptyche | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | yes | 74.0 T / 250 T | 2,304,907 / 26,214,400 |
-| AWS-CMH-03 | none | no | n/a | n/a |
-| OCI-AGA | none | no | n/a | n/a |
+| Cluster | Staging root | Space free / quota | Inodes used / soft limit | PTV2 staged |
+|---|---|---:|---:|---|
+| OCI-HSG | `.../coreai_dlalgo_nemorl/users/sna` | 222 T / 323.7 T | 25,672,851 / 52,428,800 | 18/18, 3.6 G |
+| Ptyche | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | 176 T / 250 T | 2,304,907 / 26,214,400 | 18/18, 3.7 G |
+| Lyris | `/lustre/fsw/coreai_dlalgo_llm/users/sna` | 201 T / 250 T | 24,494,708 / 26,214,400 | 18/18, 3.7 G |
+| AWS-CMH-03 | `.../coreai_dlalgo_modelopt/sna` | 8.8 T / 323.7 T | (shared project quota) | 18/18, 3.5 G |
+| OCI-AGA | `.../coreai_dlalgo_modelopt/sna` | 82 T / 100 T | (shared, 52,428,800) | 18/18, 3.7 G |
 
-On AWS-CMH-03 and OCI-AGA the `users` directory of every `coreai_*` project is
-root-owned and not group-writable (`drwxr-xr-x root:root` and
-`drwxr-sr-x root:joc` respectively), and a direct `mkdir` is denied. The only
-group this account holds on those clusters is the generic `coreai`, not a
-per-project group, so the existing per-user directories there were provisioned
-administratively. Staging on those two clusters is blocked pending provisioning
-rather than work this study can perform itself.
+An earlier survey concluded that AWS-CMH-03 and OCI-AGA were unwritable and
+that this study was therefore GB200-only. That conclusion was wrong and is
+withdrawn. It rested on testing exactly one path, `<project>/users`, which is
+root-owned on both clusters (`drwxr-xr-x root:root` and `drwxr-sr-x root:joc`);
+the **project root itself** is group-writable on both, and the corpus now lives
+at `<project>/sna` there. The lesson generalises past this study: a permission
+denial on one subdirectory is evidence about that subdirectory, not about the
+tree, and the cheap follow-up is to walk up one level before concluding.
 
-Lyris and Ptyche expose the same path but are different filesystems (`lfs5` and
-`lfs4`), so each requires its own copy.
+All five clusters are distinct filesystems, so each requires its own copy. At
+3.5-3.7 G for the admitted English subset the copies are effectively free, and
+staging is complete everywhere as of 2026-08-28 at pinned revision
+`5c89e01dd720ae0f4058445ed49c5fb68a03c76e`.
 
-Two consequences follow. First, GB300 training runs on the Lyris `gb300`
-partition rather than on AWS-CMH-03, because Lyris is the only GB300 site where
-this account can write a corpus. This supersedes the earlier preference for
-AWS-CMH-03 on FairShare grounds: a higher share is worthless without a place to
-put the data. Second, Lyris sits at 93.4 percent of its soft inode limit, with
-about 1.7 M inodes of headroom. Shard and checkpoint layout on Lyris must be
-inode-frugal, favouring few large shards over many small ones and pruning
-superseded checkpoint directories as milestones are exported. Ptyche, at 9
-percent of the same limit, carries no such constraint. Free capacity exceeds
-200 T everywhere, so space is never the binding constraint; inodes are.
+Two storage cautions survive. Lyris sits at 93.4 percent of its soft inode
+limit with about 1.7 M inodes of headroom, and AWS-CMH-03 is at 97 percent of
+capacity with 8.8 T free. Neither can absorb a checkpoint stream. Both hold the
+corpus and can serve reads; neither is a checkpoint target without cleanup
+first. OCI-HSG, Ptyche, and OCI-AGA carry no such constraint.
+
+Restoring the two GB300 sites restores the cross-generation question the
+GB200-only plan had dissolved. **Training is pinned to GB200 anyway, and for a
+reason that is about comparability rather than access:** the three arms are
+compared to each other, so every arm must see the same global batch size, the
+same data order, and the same HBM ceiling. Mixing generations across arms would
+confound the only variable this study controls. GB300 capacity is used instead
+for the two things that are safe to run there, both single-arm and both
+throughput rather than quality measurements: the GB200-versus-GB300 serving
+sweep, and overflow when GB200 queue position is the binding concern and a
+whole wave can move together.
+
+The cross-generation numbers are worth taking on their own terms. After roughly
+30 GiB of weights per GPU at tensor parallel size 2, GB200 has about 136 GiB
+for KV at 0.9 utilization against about 217 GiB on GB300, and since the
+streaming pipeline is generation-bound that KV headroom converts into
+concurrent sequences on the half that sets wall clock. The low-concurrency
+tail, where RL rollout spends its time, is exactly where that headroom stops
+paying, which is why both regimes are measured.
 
 ## Held-out and contamination policy
 
@@ -528,24 +545,29 @@ the reason given under Evaluation.
 
 Cluster preference follows write access first and throughput second, because a
 cluster with no writable corpus path cannot host training at any FairShare.
-AWS-CMH-03 holds the highest measured FairShare at 0.915 and has GB300 HBM, but
-this account cannot create a staging directory there, and the same is true of
-OCI-AGA; both are excluded as training sites until a per-user Lustre directory
-is provisioned. GB300 training therefore runs on the Lyris `gb300` partition,
-the only GB300 site with a writable corpus path, at FairShare 0.524.
+All five clusters now hold the corpus, so preference follows queue position and
+checkpoint headroom rather than access.
 
-The GB300 case is still worth taking on its own terms. After roughly 30 GiB of
-weights per GPU at tensor parallel size 2, GB200 has about 136 GiB for KV at
-0.9 utilization against about 217 GiB on GB300, and since the streaming
-pipeline is generation-bound that KV headroom converts into concurrent
-sequences on the half that sets wall clock.
+| Cluster | Account | FairShare | Gen | Role |
+|---|---|---:|---|---|
+| OCI-HSG | `nemotron_n3_post` | 0.769 | GB200 | primary training, all evaluation |
+| Ptyche | `coreai_dlalgo_modelopt` | 0.233 | GB200 | second training site, most inode-rich |
+| OCI-AGA | `nemotron_sw_post` | 0.249 | unmeasured | GB300 serving sweep, overflow |
+| AWS-CMH-03 | `coreai_dlalgo_modelopt` | 0.915 | GB300 | GB300 serving sweep only, 8.8 T free |
+| Lyris | `coreai_dlalgo_llm` | 0.524 | GB300 | corpus only, inode-exhausted |
 
-OCI-HSG with `nemotron_n3_post` at FairShare 0.769 is the primary GB200 site:
-it already holds the staged PTV2 copy, has the largest inode headroom of the
-three writable clusters, and is where evaluation runs regardless. Ptyche is the
-third writable site, GB200 at FairShare 0.233, and is the most inode-rich by a
-wide margin, which makes it the overflow target when Lyris inode pressure
-rather than queue position is the binding concern.
+OCI-HSG is primary: highest FairShare among the GB200 sites, largest absolute
+inode headroom, holder of the only live Hugging Face token, and where
+evaluation runs regardless. Ptyche is the second training site.
+
+OCI-AGA is the newest addition and the reason overflow is credible: 429 idle
+nodes were measured on 2026-08-28 against `nemotron_sw_post`, with `batch`
+capped at 4 h and `batch_long` at 7 d. Only `batch` is assumed available, since
+`batch_long` requires approval this account does not hold, which makes the 4 h
+chunk-and-chain structure a hard requirement there rather than a convenience.
+Its GPU generation is inferred from node naming and **not yet measured**; a
+one-node probe is queued to settle it, and the serving sweep must not be run
+there until it reports.
 
 Runs are distributed across clusters to finish the wave inside the time budget.
 The training cluster is recorded per run. Training hardware is not treated as a
