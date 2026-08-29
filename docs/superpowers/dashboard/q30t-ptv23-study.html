@@ -33,15 +33,15 @@ ol.ins .w{display:block;color:var(--dim);font-size:12.5px;margin-top:3px}
 </style>
 
 <h1>Qwen3-30B-A3B-Thinking &mdash; PTv2+v3 from-scratch drafter study</h1>
-<div class="sub">Three arms (DFlash / DSpark / DFlash2), identical training config, corpus composition the only controlled variable.
+<div class="sub">Three methods (DFlash / DSpark / DFlash2) &times; two block sizes (8 / 16) &times; two targets (Base / Thinking) = <b>12 arms</b>, trained from scratch.
 Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; Last updated 2026-08-29</div>
 
 <div class="grid">
-  <div class="stat"><div class="n">3</div><div class="l">arms</div></div>
-  <div class="stat"><div class="n">5 / 5</div><div class="l">clusters staged</div></div>
+  <div class="stat"><div class="n">12</div><div class="l">arms in the matrix</div></div>
+  <div class="stat"><div class="n">8 / 12</div><div class="l">arms launched</div></div>
+  <div class="stat"><div class="n">1 / 4</div><div class="l">clusters run-ready</div></div>
   <div class="stat"><div class="n">3.09 M</div><div class="l">PTv3 rows measured</div></div>
   <div class="stat"><div class="n">3.12&times;</div><div class="l">train step speedup</div></div>
-  <div class="stat"><div class="n">0</div><div class="l">training runs launched</div></div>
 </div>
 
 <h2>Done</h2>
@@ -63,6 +63,12 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 
 <tr><td><b>Target and assets</b></td>
 <td>Q30-Thinking target receipt generated; all four pinned canary assets present and hash-matched on OCI-HSG. The vLLM image is a pinned stable release imported to Lustre squashfs, not a nightly.</td></tr>
+
+<tr><td><b>Matrix launched from scratch</b></td>
+<td><b>8 of the 12 Q30 arms are queued</b> on OCI-HSG, 16 nodes each, billed to <code>nemotron_n3_post</code>, self-requeuing toward <b>25,391 steps</b> with a checkpoint every 500. Every arm writes to a fresh <code>sd2/</code> root, so <b>none resumes an earlier checkpoint</b> &mdash; the comparison is method-vs-method at equal training, not at equal wall clock. The remaining four are held for Lyris rather than deepening one queue.</td></tr>
+
+<tr><td><b>Manifests are per-cluster data</b></td>
+<td>The production builder hard-codes one 32-run matrix over dflash and dspark only, billed to a fixed account &mdash; it cannot express a dflash2 arm at all. Matrix shape is now an argument and the pinned paths are a per-cluster JSON file, so <b>adding a cluster is a new file, not a code change</b>. The generator reproduces the queued manifest byte for byte.</td></tr>
 
 <tr><td><b>Canary is expressible</b></td>
 <td>Three-arm 20-step manifest builder committed: one entry per method at block size 8, everything else pinned identically, so a failure names the architecture rather than the environment.</td></tr>
@@ -99,9 +105,21 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <td><span class="b wip">reader gaps under survey</span></td>
 <td>Everything. Writer done; the reader must take the full 163-file mirror, and language reaches a row only from the shard filename</td></tr>
 
-<tr><td><b>Submit the 20-step three-arm canary</b> &mdash; 16 nodes, <code>batch</code></td>
-<td><span class="b pend">manifest ready</span></td>
-<td>Full training. Proves all three arms start on this cluster, at this commit, in this image</td></tr>
+<tr><td><b>Bring Lyris, Ptyche and OCI-AGA online</b></td>
+<td><span class="b wip">receipts in flight</span></td>
+<td>All parallelism. Each needs a readiness receipt and roughly <b>150 G of staged assets</b> &mdash; image, runtime archive, both targets, the corpus. Lyris has ~88 idle nodes and none of the assets, so staging is its critical path, not capacity</td></tr>
+
+<tr><td>Submit the last four Q30 arms (dspark b16 &times;2, dflash b8 &times;2)</td>
+<td><span class="b pend">held for Lyris</span></td>
+<td>Nothing downstream. Deliberately not queued on OCI-HSG, which is already congested</td></tr>
+
+<tr><td>Submit the Q235 twelve-arm matrix</td>
+<td><span class="b pend">opportunistic</span></td>
+<td>Nothing. Prefer the GB300 clusters for their 1.50&times; HBM</td></tr>
+
+<tr><td>The 20-step canary is now trailing the real runs</td>
+<td><span class="b pend">still queued</span></td>
+<td>Nothing any more. It was the cheap gate; the real arms reached the queue first, so the first arm to start is the gate</td></tr>
 
 <tr><td>Gate the vLLM / torch pairing with a one-node import probe</td>
 <td><span class="b wip">under investigation</span></td>
@@ -166,5 +184,8 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 
 <li><span class="t">Check upstream before writing the patch, and read what a source actually says.</span>
 <span class="w">A staging tool with sha256 verification already existed in the repo; a shell script was written instead. A delegated research result sent the study to a prunable nightly when a stable release already had the feature. <code>rows = 0</code> from the datasets-server means <i>unconverted</i>, not empty &mdash; the four repos it called empty hold millions of rows. <code>git log -- &lt;file&gt;</code> is not the file&rsquo;s history, and reading it as such reopened a settled question.</span></li>
+
+<li><span class="t">An index into the list you built is not an index into the manifest you wrote.</span>
+<span class="w"><code>write_manifest</code> canonicalizes experiment order, so the submitter&rsquo;s <code>--experiment-index</code> addressed different arms than the ones enumerated at build time. Four arms were submitted believing they were DFlash2; they were DFlash and DSpark. Nothing was corrupted &mdash; every arm belonged in the matrix &mdash; but the <i>intended</i> method went unqueued, and a silent method swap is exactly the failure this study cannot detect from its own metrics. Selection now reads the stored order back out of the written file.</span></li>
 
 </ol>
