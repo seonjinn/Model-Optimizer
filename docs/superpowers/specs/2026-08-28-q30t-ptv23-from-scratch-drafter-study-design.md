@@ -197,6 +197,45 @@ the following families:
 - Code, STEM, instruction following, structured output, and multilingual
   sources from the pinned PTV3 collection.
 
+### The pinned PTV3 core registry
+
+Ten repositories carry the PTV3 side of the corpus. Each is pinned to the
+revision that was its repository head on 2026-08-28; all ten were verified
+`pinned == head`, so the counts below describe exactly the staged revision and
+not some later one. Row counts are read from the Hugging Face datasets-server
+`/size` endpoint, which reports the converted Parquet view of the pinned
+revision.
+
+| Repository | Revision | Rows | Bytes | Source of count |
+|---|---|---:|---:|---|
+| `Nemotron-SFT-Math-v4` | `84d42ad0` | 545,431 | 5.5 G | datasets-server |
+| `Nemotron-RL-Math-v2` | `804418c1` | 7,732 | 0.05 G | datasets-server |
+| `Nemotron-SFT-SWE-v3` | `3f73de64` | 237,970 | 11.7 G | datasets-server |
+| `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 1.2 G | datasets-server |
+| `Nemotron-SWE-v1` | `0fe17a96` | 24,875 (floor) | 1.4 G | partial conversion |
+| `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | datasets-server, 3 configs |
+| `Nemotron-SFT-SWE-v2` | `bd151f3f` | unmeasured | - | not indexed |
+| `Nemotron-Agentic-v1` | `650d5909` | unmeasured | - | not indexed |
+| `Nemotron-SFT-Agentic-v2` | `7c804833` | unmeasured | - | not indexed |
+| `Nemotron-RL-Lightning-Training-Blend` | `262eb58c` | unmeasured | - | not indexed |
+
+`Open-SWE-Traces` splits across three configs: `v1.0` 151,219, `v1.1` 360,335,
+`v1.2` 53,553.
+
+Two caveats bind the composition step. Four repositories return zero for both
+row count and byte count, which means the datasets-server has not converted
+them, not that they are empty; their counts must be read from the staged shards
+directly. `Nemotron-SWE-v1` reports 24,875 converted rows against an estimate of
+34,772, so its converted count is a floor rather than a total. **No composition
+ratio may be computed from an unmeasured or floor row count.** Until every entry
+above is a measured total read from the pinned staged files, the blend is
+unpinned and no training run is schedulable.
+
+Four further repositories are deliberately deferred as too large and too
+general for a Math/SWE-targeted drafter: `Nemotron-Math-v2` (190.52 G),
+`Nemotron-SFT-Math-v3` (143.55 G), `Nemotron-Science-v2` (49.07 G), and
+`Nemotron-OpenCode-v1` (30.45 G).
+
 A repository name alone is not authority. Each admitted source manifest must
 record the exact revision, configuration, split, every physical relative path,
 file size, SHA-256, row count, row-schema digest, license expression, and
