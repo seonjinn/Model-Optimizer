@@ -81,7 +81,7 @@ def _provenance(*, source_row_index: int = 0) -> PromptProvenance:
 
 
 def _candidate(
-    content: str,
+    content: object,
     *,
     source_row_index: int = 0,
     metadata: dict[str, object] | None = None,
@@ -90,7 +90,15 @@ def _candidate(
     message: dict[str, object] = {"role": "user", "content": content}
     if metadata is not None:
         message["metadata"] = metadata
-    messages = [message]
+    return _candidate_from_messages([message], source_row_index=source_row_index, tools=tools)
+
+
+def _candidate_from_messages(
+    messages: list[dict[str, object]],
+    *,
+    source_row_index: int = 0,
+    tools: list[dict[str, object]] | None = None,
+) -> PromptCandidate:
     tool_list = tools or []
     identity = generation_prompt_identity(
         messages,
@@ -380,6 +388,59 @@ def test_typed_patch_containment_preserves_domain_digest_and_all_contributors() 
     assert protected not in repr(heldout)
 
 
+def test_message_multipart_content_emits_an_lf_joined_view() -> None:
+    atom = _atom("code", "return sorted(values)", domain_id=4, shape_id=3)
+
+    exclusion = apply_heldout_union(
+        _candidate(["return", "sorted(values)"]), _bundle(atoms=(atom,))
+    )
+
+    assert exclusion is not None
+    assert exclusion.matched_identity == atom.digest
+
+
+def test_tool_declaration_emits_an_lf_joined_view() -> None:
+    atom = _atom("code", "sorted(values) return", domain_id=4, shape_id=3)
+    tool = {
+        "type": "function",
+        "function": {"name": "return", "description": "sorted(values)"},
+    }
+
+    exclusion = apply_heldout_union(_candidate("inspect", tools=[tool]), _bundle(atoms=(atom,)))
+
+    assert exclusion is not None
+    assert exclusion.matched_identity == atom.digest
+
+
+def test_whole_conversation_emits_an_lf_joined_view() -> None:
+    atom = _atom("code", "return sorted(values)", domain_id=4, shape_id=3)
+    messages = [
+        {"role": "user", "content": "return"},
+        {"role": "assistant", "content": "sorted(values)"},
+    ]
+
+    exclusion = apply_heldout_union(_candidate_from_messages(messages), _bundle(atoms=(atom,)))
+
+    assert exclusion is not None
+    assert exclusion.matched_identity == atom.digest
+
+
+def test_complete_projection_emits_an_lf_joined_view() -> None:
+    atom = _atom("code", "user find values", domain_id=4, shape_id=3)
+    tool = {
+        "type": "function",
+        "function": {"name": "lookup", "description": "find values"},
+    }
+
+    exclusion = apply_heldout_union(
+        _candidate("inspect", tools=[tool]),
+        _bundle(atoms=(atom,)),
+    )
+
+    assert exclusion is not None
+    assert exclusion.matched_identity == atom.digest
+
+
 def test_same_value_in_different_domains_has_distinct_evidence() -> None:
     problem = _atom("math", "domain separated value", domain_id=0, shape_id=0)
     code = _atom("code", "domain separated value", domain_id=4, shape_id=0)
@@ -410,13 +471,39 @@ def test_short_code_atom_matches_only_a_complete_normalized_line() -> None:
     assert exclusion.matched_identity == atom.digest
 
 
-def test_short_numeric_answer_requires_an_authenticated_answer_context() -> None:
+@pytest.mark.parametrize(
+    "content",
+    [
+        "There are 42 items.",
+        "Final answer: 420",
+        "unanswer: 42",
+        "nonanswer is 42",
+    ],
+)
+def test_short_numeric_answer_rejects_only_a_bounded_authenticated_context(
+    content: str,
+) -> None:
     answer = _atom("math", "42", domain_id=1, shape_id=2)
     heldout = _bundle(atoms=(answer,))
 
-    assert apply_heldout_union(_candidate("There are 42 items."), heldout) is None
-    assert apply_heldout_union(_candidate("Final answer: 420"), heldout) is None
-    exclusion = apply_heldout_union(_candidate("Final answer: 42"), heldout)
+    assert apply_heldout_union(_candidate(content), heldout) is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Final answer: 42",
+        "The final answer is 42",
+        # The word carries its own left boundary here, so the guard against a
+        # glued prefix ("unanswer") must not reject an ordinary sentence.
+        "notFinal answer: 42",
+    ],
+)
+def test_short_numeric_answer_matches_an_exact_approved_context(content: str) -> None:
+    answer = _atom("math", "42", domain_id=1, shape_id=2)
+    heldout = _bundle(atoms=(answer,))
+
+    exclusion = apply_heldout_union(_candidate(content), heldout)
     assert exclusion is not None
     assert exclusion.matched_identity == answer.digest
     assert exclusion.protected_shape == 2
@@ -486,6 +573,20 @@ def test_candidate_with_65537_structured_nodes_fails_closed() -> None:
         apply_heldout_union(_large_node_candidate(65_537), _bundle())
 
 
+def test_newline_heavy_scalar_streams_line_bounds_until_the_view_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(exclusions_module, "_MAX_GENERATED_VIEW_COUNT", 32)
+    monkeypatch.setattr(exclusions_module, "_MAX_SCALAR_UTF8_BYTES", 32)
+    content = "\n" * 32
+
+    with pytest.raises(FromScratchExclusionError, match="generated view count"):
+        apply_heldout_union(_candidate(content), _bundle())
+
+    bounds = exclusions_module._iter_line_bounds(content)
+    assert iter(bounds) is bounds
+
+
 def test_matcher_work_budget_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(exclusions_module, "_MAX_MATCHER_WORK_BYTES", 8)
     atom = _atom("code", "protected", domain_id=4, shape_id=3)
@@ -510,6 +611,50 @@ def test_atom_count_and_bytes_are_bounded_before_matching(
     monkeypatch.setattr(exclusions_module, "_MAX_ATOM_BYTES_PER_CATALOG", 64)
     with pytest.raises(FromScratchExclusionError, match="atom bytes"):
         _bundle(atoms=(_atom("code", "x" * 64, domain_id=4),))
+
+
+def test_atom_cap_precedes_any_full_order_key_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(exclusions_module, "_MAX_ATOMS_PER_CATALOG_RULE_SHAPE", 0)
+
+    def reject_materialization(_atom_value: HeldoutV2Atom) -> tuple[object, ...]:
+        raise AssertionError("atom order key materialized before count cap")
+
+    monkeypatch.setattr(exclusions_module, "_atom_order_key", reject_materialization)
+    atoms = tuple(_atom(catalog, f"fixture {catalog}") for catalog in HELDOUT_V2_CATALOG_ORDER)
+
+    with pytest.raises(FromScratchExclusionError, match="atom count"):
+        HeldoutV2Bundle(
+            scientific_identity=FROZEN_SCIENTIFIC_IDENTITY,
+            receipt_sha256="c" * 64,
+            catalog_names=HELDOUT_V2_CATALOG_ORDER,
+            prompt_uuids=frozenset(),
+            exact_content_sha256s=frozenset(),
+            containment_index=atoms,
+            approval_identity_sha256="d" * 64,
+            component_order={
+                catalog: (f"fixture-{catalog}",) for catalog in HELDOUT_V2_CATALOG_ORDER
+            },
+        )
+
+
+def test_atom_index_rejects_producer_records_out_of_canonical_order() -> None:
+    atoms = tuple(_atom(catalog, f"fixture {catalog}") for catalog in HELDOUT_V2_CATALOG_ORDER)
+
+    with pytest.raises(FromScratchExclusionError, match="fixed order"):
+        HeldoutV2Bundle(
+            scientific_identity=FROZEN_SCIENTIFIC_IDENTITY,
+            receipt_sha256="c" * 64,
+            catalog_names=HELDOUT_V2_CATALOG_ORDER,
+            prompt_uuids=frozenset(),
+            exact_content_sha256s=frozenset(),
+            containment_index=(atoms[1], atoms[0], *atoms[2:]),
+            approval_identity_sha256="d" * 64,
+            component_order={
+                catalog: (f"fixture-{catalog}",) for catalog in HELDOUT_V2_CATALOG_ORDER
+            },
+        )
 
 
 def test_unicode_version_mismatch_is_fatal_before_matching(

@@ -530,10 +530,19 @@ def _candidate_views(candidate: PromptCandidate) -> _CandidateViews:
                 seen=seen_views,
             )
         normalized_key_values[key] = tuple(recorded)
+    if not isinstance(projection, dict):
+        raise FromScratchExclusionError("candidate projection is invalid")
+    _append_joined_candidate_views(
+        projection,
+        text,
+        counters=counters,
+        seen=seen_views,
+    )
     whole_lines: list[str] = []
     for value in text_values:
-        for line in value.split("\n"):
-            _preflight_containment_view(line, counters)
+        for line_start, line_end in _iter_line_bounds(value):
+            _preflight_containment_range(value, line_start, line_end, counters)
+            line = value[line_start:line_end]
             normalized_line = _containment_text(line)
             if normalized_line:
                 _append_unique_view(
@@ -644,10 +653,17 @@ def _charge_decoded_bytes(counters: _TraversalCounters, value: str) -> None:
 
 
 def _preflight_containment_view(value: str, counters: _TraversalCounters) -> None:
+    _preflight_containment_fragments((value,), counters)
+
+
+def _preflight_containment_range(
+    value: str, start: int, end: int, counters: _TraversalCounters
+) -> None:
     _start_generated_view(counters)
     output_started = False
     pending_space = False
-    for character in value:
+    for index in range(start, end):
+        character = value[index]
         if character in _WHITE_SPACE:
             if output_started:
                 pending_space = True
@@ -657,6 +673,38 @@ def _preflight_containment_view(value: str, counters: _TraversalCounters) -> Non
             pending_space = False
         _charge_generated_view_bytes(counters, len(character.encode("utf-8")))
         output_started = True
+
+
+def _iter_line_bounds(value: str) -> Iterator[tuple[int, int]]:
+    start = 0
+    while True:
+        end = value.find("\n", start)
+        if end < 0:
+            yield start, len(value)
+            return
+        yield start, end
+        start = end + 1
+
+
+def _preflight_containment_fragments(
+    fragments: tuple[str, ...], counters: _TraversalCounters
+) -> None:
+    _start_generated_view(counters)
+    output_started = False
+    pending_space = False
+    for fragment_index, fragment in enumerate(fragments):
+        if fragment_index:
+            pending_space = output_started
+        for character in fragment:
+            if character in _WHITE_SPACE:
+                if output_started:
+                    pending_space = True
+                continue
+            if pending_space:
+                _charge_generated_view_bytes(counters, 1)
+                pending_space = False
+            _charge_generated_view_bytes(counters, len(character.encode("utf-8")))
+            output_started = True
 
 
 def _preflight_json_view(
@@ -733,6 +781,104 @@ def _append_unique_view(
 ) -> None:
     if _record_view(kind, value, counters=counters, seen=seen):
         output.append(value)
+
+
+def _append_joined_candidate_views(
+    projection: dict[str, object],
+    output: list[str],
+    *,
+    counters: _TraversalCounters,
+    seen: set[tuple[str, int, str]],
+) -> None:
+    messages = projection.get("messages")
+    tools = projection.get("tools")
+    source_assistant = projection.get("source_assistant")
+    if not isinstance(messages, list) or not isinstance(tools, list):
+        raise FromScratchExclusionError("candidate joined-view projection is invalid")
+
+    message_views: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise FromScratchExclusionError("candidate joined-view message is invalid")
+        joined = _joined_containment_view(
+            tuple(_string_leaf_values(message.get("content"))), counters
+        )
+        if joined:
+            message_views.append(joined)
+            _append_unique_view(
+                output,
+                "message-joined",
+                joined,
+                counters=counters,
+                seen=seen,
+            )
+    if source_assistant is not None:
+        if not isinstance(source_assistant, dict):
+            raise FromScratchExclusionError("candidate joined-view assistant is invalid")
+        joined = _joined_containment_view(
+            tuple(_string_leaf_values(source_assistant.get("content"))), counters
+        )
+        if joined:
+            message_views.append(joined)
+            _append_unique_view(
+                output,
+                "message-joined",
+                joined,
+                counters=counters,
+                seen=seen,
+            )
+
+    for tool in tools:
+        if not isinstance(tool, dict):
+            raise FromScratchExclusionError("candidate joined-view tool is invalid")
+        joined = _joined_containment_view(tuple(_string_leaf_values(tool)), counters)
+        if joined:
+            _append_unique_view(
+                output,
+                "tool-joined",
+                joined,
+                counters=counters,
+                seen=seen,
+            )
+
+    conversation = _joined_containment_view(tuple(message_views), counters)
+    if conversation:
+        _append_unique_view(
+            output,
+            "conversation-joined",
+            conversation,
+            counters=counters,
+            seen=seen,
+        )
+    projected = _joined_containment_view(tuple(_string_leaf_values(projection)), counters)
+    if projected:
+        _append_unique_view(
+            output,
+            "projection-joined",
+            projected,
+            counters=counters,
+            seen=seen,
+        )
+
+
+def _joined_containment_view(parts: tuple[str, ...], counters: _TraversalCounters) -> str:
+    _preflight_containment_fragments(parts, counters)
+    normalized_parts = tuple(
+        normalized for part in parts if (normalized := _containment_text(part))
+    )
+    return " ".join(normalized_parts)
+
+
+def _string_leaf_values(value: object) -> Iterator[str]:
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            yield current
+        elif isinstance(current, dict):
+            pending.extend(reversed(tuple(current.values())))
+        elif isinstance(current, list):
+            pending.extend(reversed(current))
 
 
 def _atom_matches(atom: HeldoutV2Atom, views: _CandidateViews, budget: _MatcherBudget) -> bool:
@@ -859,13 +1005,23 @@ def _answer_context_contains(view: str, value: str) -> bool:
     )
     for prefix, suffix in contexts:
         template = f"{prefix}{value}{suffix}"
+        # A prefix that opens with a letter is a word ("answer", "final answer"),
+        # so it needs its own left boundary: without one, "unanswer: 42" contains
+        # "answer: 42" and the value-side check passes vacuously, since the char
+        # before the value is the prefix's own trailing space.
+        prefix_is_lexical = bool(prefix) and not _is_lexical_boundary(prefix[0])
         start = 0
         while (position := view.find(template, start)) >= 0:
             value_start = position + len(prefix)
             value_end = value_start + len(value)
+            head = view[position - 1] if position else None
             before = view[value_start - 1] if value_start else None
             after = view[value_end] if value_end < len(view) else None
-            if _is_lexical_boundary(before) and _is_lexical_boundary(after):
+            if (
+                (not prefix_is_lexical or _is_lexical_boundary(head))
+                and _is_lexical_boundary(before)
+                and _is_lexical_boundary(after)
+            ):
                 return True
             start = position + 1
     return False
@@ -924,14 +1080,14 @@ def _validate_atoms(
 ) -> tuple[tuple[HeldoutV2Atom, ...], dict[CatalogName, tuple[HeldoutV2Atom, ...]]]:
     if not isinstance(value, tuple) or any(not isinstance(atom, HeldoutV2Atom) for atom in value):
         raise FromScratchExclusionError("held-out atom index is invalid")
-    expected = tuple(sorted(value, key=_atom_sort_key))
-    if value != expected or len({_atom_sort_key(atom) for atom in value}) != len(value):
-        raise FromScratchExclusionError("held-out atoms are duplicate or not in fixed order")
     counts: dict[tuple[CatalogName, int, int], int] = {}
     byte_counts = dict.fromkeys(HELDOUT_V2_CATALOG_ORDER, 0)
     by_catalog: dict[CatalogName, list[HeldoutV2Atom]] = {
         catalog: [] for catalog in HELDOUT_V2_CATALOG_ORDER
     }
+    # Caps run before the order check: the order check materializes an order key
+    # per atom, so an over-cap index would pay for the whole index to be told it
+    # is over the cap.
     for atom in value:
         _require_component_subsequence(
             atom.contributing_component_ids, component_order[atom.catalog]
@@ -946,10 +1102,13 @@ def _validate_atoms(
         if byte_counts[atom.catalog] > _MAX_ATOM_BYTES_PER_CATALOG:
             raise FromScratchExclusionError("held-out atom bytes exceed the catalog cap")
         by_catalog[atom.catalog].append(atom)
+    expected = tuple(sorted(value, key=_atom_order_key))
+    if value != expected or len({_atom_order_key(atom) for atom in value}) != len(value):
+        raise FromScratchExclusionError("held-out atoms are duplicate or not in fixed order")
     return value, {catalog: tuple(by_catalog[catalog]) for catalog in HELDOUT_V2_CATALOG_ORDER}
 
 
-def _atom_sort_key(atom: HeldoutV2Atom) -> tuple[object, ...]:
+def _atom_order_key(atom: HeldoutV2Atom) -> tuple[object, ...]:
     return (
         HELDOUT_V2_CATALOG_ORDER.index(atom.catalog),
         atom.domain_id,
