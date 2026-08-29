@@ -82,6 +82,9 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <tr><td><b>Corpus builder can produce output</b></td>
 <td>The Q30T chat template carries no <code>{% generation %}</code> marker, and transformers answers that with an <b>all-zero mask instead of an error</b>. The builder now derives a masking template, proves it renders identically and masks non-empty, and refuses an empty mask on any turn that has an assistant message. Without this the corpus would have built <b>empty</b> after a full tokenization pass.</td></tr>
 
+<tr><td><b>The training container can finally import its own stack</b></td>
+<td>Every arm on both clusters died in under two minutes on the runtime preflight. Three gaps, found in that order. <b>modelopt</b> resolves <code>__version__</code> through <code>importlib.metadata</code>, so <code>PYTHONPATH</code> alone never sufficed; staging now writes an <code>nvidia_modelopt.egg-info/PKG-INFO</code> beside the staged source, versioned the way a real build would be (<code>git describe</code>, falling back to the project&rsquo;s declared <code>0.0.0</code> because the cluster clones carry no tags). <b>wandb</b> was in neither layer &mdash; runtime rebuilt as <b>v7</b> = v6 + wandb 0.29.0 + platformdirs 4.11.5. <b>omegaconf, pulp and scipy</b> were then missing too: the v7 gate only ran <code>import modelopt</code>, a two-line <code>__init__</code>, while the trainer and the serve side both reach <code>modelopt.torch</code>. A single one-node probe enumerated all fifteen declared dependencies at once instead of discovering them one 16-node job at a time; exactly three were absent. Runtime rebuilt as <b>v8</b> = v7 + those three (plus antlr4 4.9.3, built from sdist since omegaconf pins <code>4.9.*</code> and no wheel is published). Everything is installed <code>--no-deps</code> from an offline wheelhouse so the container&rsquo;s pydantic, protobuf, requests and urllib3 keep backing torch, vllm and transformers. Both cluster builds print <code>preflight ok</code>, and the preflight now imports <code>modelopt.torch.speculative</code> &mdash; what the run imports.</td></tr>
+
 </table>
 
 <h2>Cluster capacity for a 16-node job &mdash; measured 2026-08-28</h2>
@@ -106,12 +109,12 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <td>Everything. Writer done; the reader must take the full 163-file mirror, and language reaches a row only from the shard filename</td></tr>
 
 <tr><td><b>Bring Lyris, Ptyche and OCI-AGA online</b></td>
-<td><span class="b wip">Lyris staged, submitting</span></td>
+<td><span class="b wip">Lyris live, others saturated</span></td>
 <td>All parallelism. <b>Lyris is ready</b>: it already held both targets at the exact pinned revisions (<code>ad44e777</code>, <code>144afc2f</code>), the 1,309,377-row corpus and a valid readiness receipt; the 325 M compiled runtime archive and the 6.7 G pinned image were copied across from OCI-HSG. Ptyche and OCI-AGA remain saturated (0 and 1 idle node) and are worth less than the staging effort</td></tr>
 
-<tr><td>Submit the last four Q30 arms (dspark b16 &times;2, dflash b8 &times;2)</td>
-<td><span class="b pend">held for Lyris</span></td>
-<td>Nothing downstream. Deliberately not queued on OCI-HSG, which is already congested</td></tr>
+<tr><td><b>Resubmit the twelve Q30 arms on the v8 runtime</b></td>
+<td><span class="b wip">gate arm running on Lyris</span></td>
+<td>All results. Split by target so each arm lives on exactly one cluster: <b>Lyris takes the six Thinking arms</b> (97 idle GB200 nodes, six 16-node arms fit exactly), <b>OCI-HSG takes the six Base arms</b> (zero idle, queued). One arm goes first as the gate; the rest follow once it clears the preflight and reaches a training step</td></tr>
 
 <tr><td>Submit the Q235 twelve-arm matrix</td>
 <td><span class="b pend">opportunistic</span></td>
@@ -148,6 +151,9 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <h2>Key insights and mistakes</h2>
 <div class="sub" style="margin:0 0 10px">Consolidated. Each is a lesson that changed how the study is built, not a log entry.</div>
 <ol class="ins">
+
+<li><span class="t">A gate that imports less than the program imports is not a gate.</span>
+<span class="w">The runtime preflight ran <code>import modelopt</code> and passed. That executes a two-line <code>__init__</code>; the trainer and the vLLM serve side both reach <code>modelopt.torch</code>, whose closure pulls omegaconf, pulp and scipy. So a green preflight was followed ninety seconds later by <code>ModuleNotFoundError</code> on a 16-node job &mdash; twice, because the second round fixed only the module the first round happened to name. The fix has two parts: <b>the check now performs the real import</b> (<code>modelopt.torch.speculative</code>), and the remaining gap was closed by <b>enumerating the whole declared dependency list in one cheap probe</b> rather than letting the next expensive job name the next missing module.</span></li>
 
 <li><span class="t">A validator that cannot fail is the most expensive defect class in this study.</span>
 <span class="w">It has happened five separate ways: an all-zero assistant mask that transformers <i>warns</i> about instead of raising; a row counter that returned a silent zero on the two largest repos; a checkpoint guard shipped failing open with a test that could not tell; a stager status file calling a repo staged with 5,901 bytes on disk; a completeness check that marked all ten repos INCOMPLETE. Every one produced a number that looked right. The rule that came out of it: <b>a check has to be shown failing on a case it is meant to catch</b>, not merely shown passing.</span></li>
