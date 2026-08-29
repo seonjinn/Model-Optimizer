@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -188,6 +189,73 @@ def test_undeclared_function_and_malformed_arguments_are_rejected() -> None:
     malformed["messages"][2]["tool_calls"][0]["function"]["arguments"] = "{"
     with pytest.raises(ValueError, match="malformed arguments"):
         module.canonicalize_trajectory(malformed, source_id="trace:13")
+
+
+def test_object_and_string_arguments_emit_the_same_canonical_string_and_bytes() -> None:
+    module = _load_module()
+    as_string = _trajectory()
+    as_string["messages"][2]["tool_calls"][0]["function"]["arguments"] = (
+        '{"cmd":"pytest","timeout":10}'
+    )
+    as_object = _trajectory()
+    as_object["messages"][2]["tool_calls"][0]["function"]["arguments"] = {
+        "timeout": 10,
+        "cmd": "pytest",
+    }
+
+    string_validation = module.validate_trajectory(
+        as_string, source_id="trace:canonical", lane="generic-tool-replay"
+    )
+    object_validation = module.validate_trajectory(
+        as_object, source_id="trace:canonical", lane="generic-tool-replay"
+    )
+
+    assert object_validation.canonical_bytes == string_validation.canonical_bytes
+    assert (
+        object_validation.canonical["messages"][2]["tool_calls"][0]["function"][
+            "arguments"
+        ]
+        == '{"cmd":"pytest","timeout":10}'
+    )
+
+
+def test_already_canonical_string_arguments_preserve_legacy_replay_bytes() -> None:
+    module = _load_module()
+
+    validation = module.validate_trajectory(
+        _trajectory(), source_id="compat", lane="interactive-swe-replay"
+    )
+
+    assert len(validation.canonical_bytes) == 534
+    assert hashlib.sha256(validation.canonical_bytes).hexdigest() == (
+        "0ac3226212ee38eca58f21eb5a0f4b300a11b2ff74ff2770a19d20fdca772747"
+    )
+
+
+def test_conflicting_call_id_aliases_are_rejected_as_ambiguous() -> None:
+    module = _load_module()
+    row = _trajectory()
+    row["messages"][2]["tool_calls"][0]["tool_call_id"] = "different-call"
+
+    with pytest.raises(ValueError, match="ambiguous tool call ID"):
+        module.validate_trajectory(row, source_id="trace:ambiguous", lane="generic-tool-replay")
+
+
+def test_well_formed_tool_calls_on_non_assistant_messages_are_rejected() -> None:
+    module = _load_module()
+    row = _trajectory()
+    row["messages"][1]["tool_calls"] = [
+        {
+            "id": "hidden-call",
+            "type": "function",
+            "function": {"name": "shell", "arguments": '{"cmd":"ignored"}'},
+        }
+    ]
+
+    with pytest.raises(ValueError, match="non-assistant message"):
+        module.validate_trajectory(
+            row, source_id="trace:hidden-call", lane="generic-tool-replay"
+        )
 
 
 def test_digest_is_independent_of_input_mapping_order() -> None:

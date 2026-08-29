@@ -48,10 +48,38 @@ def _reject(reason: str, detail: str) -> NoReturn:
     raise TrajectoryValidationError(reason, detail)
 
 
+def _resolved_call_id(record: dict[str, Any], source_id: str) -> str:
+    id_value = str(record.get("id") or "")
+    tool_call_id_value = str(record.get("tool_call_id") or "")
+    if id_value and tool_call_id_value and id_value != tool_call_id_value:
+        _reject(
+            "ambiguous_tool_call_id",
+            f"{source_id}: ambiguous tool call ID aliases {id_value!r} and "
+            f"{tool_call_id_value!r}",
+        )
+    return id_value or tool_call_id_value
+
+
+def _canonical_arguments(arguments: object, source_id: str, call_id: str) -> str:
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
+    else:
+        parsed_arguments = arguments
+    if not isinstance(parsed_arguments, dict):
+        _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
+    try:
+        return canonical_json(parsed_arguments).decode("utf-8")
+    except (TypeError, ValueError):
+        _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
+
+
 def _validate_tool_call(call: Any, source_id: str, declared_functions: set[str]) -> tuple[str, str]:
     if not isinstance(call, dict):
         _reject("invalid_tool_call", f"{source_id}: assistant tool call is not a mapping")
-    call_id = str(call.get("id") or call.get("tool_call_id") or "")
+    call_id = _resolved_call_id(call, source_id)
     if not call_id:
         _reject("missing_tool_call_id", f"{source_id}: assistant tool call has no ID")
     call_type = call.get("type", "function")
@@ -69,12 +97,7 @@ def _validate_tool_call(call: Any, source_id: str, declared_functions: set[str])
     arguments = function.get("arguments", "{}")
     if not isinstance(arguments, str):
         _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
-    try:
-        parsed_arguments = json.loads(arguments)
-    except json.JSONDecodeError:
-        _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
-    if not isinstance(parsed_arguments, dict):
-        _reject("malformed_arguments", f"{source_id}: malformed arguments for {call_id}")
+    _canonical_arguments(arguments, source_id, call_id)
     return call_id, name
 
 
@@ -136,10 +159,32 @@ def _storage_normalized_trajectory(
         tools = []
     if not isinstance(tools, list):
         _reject("invalid_tool_declarations", f"{source_id}: tools must be a list")
+    normalized_messages = normalize_storage_fields(deepcopy(messages))
+    normalized_tools = normalize_storage_fields(deepcopy(tools))
+    if not isinstance(normalized_messages, list) or not all(
+        isinstance(message, dict) for message in normalized_messages
+    ):
+        raise AssertionError("normalized trajectory messages must be mappings")
+    if not isinstance(normalized_tools, list):
+        raise AssertionError("normalized trajectory tools must be a list")
+    for message in normalized_messages:
+        raw_calls = message.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            continue
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            call_id = _resolved_call_id(call, source_id)
+            function["arguments"] = _canonical_arguments(
+                function.get("arguments", "{}"), source_id, call_id or "<missing>"
+            )
     canonical_bytes = canonical_json(
         {
-            "messages": normalize_storage_fields(deepcopy(messages)),
-            "tools": normalize_storage_fields(deepcopy(tools)),
+            "messages": normalized_messages,
+            "tools": normalized_tools,
         }
     )
     payload = json.loads(canonical_bytes)
@@ -157,6 +202,11 @@ def _validate_referential_integrity(
 
     for index, message in enumerate(messages):
         role = message.get("role")
+        if role != "assistant" and calls_by_message[index]:
+            _reject(
+                "invalid_tool_calls",
+                f"{source_id}: non-assistant message {index} contains tool calls",
+            )
         if role != "tool" and pending:
             unresolved = ", ".join(sorted(pending))
             _reject(
@@ -179,7 +229,7 @@ def _validate_referential_integrity(
                 tool_call_count += 1
             continue
         if role == "tool":
-            call_id = str(message.get("tool_call_id") or message.get("id") or "")
+            call_id = _resolved_call_id(message, source_id)
             if not call_id or call_id not in pending:
                 _reject(
                     "orphan_tool_result",
