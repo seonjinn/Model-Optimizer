@@ -208,10 +208,10 @@ revision.
 
 | Repository | Revision | Rows | Bytes | Source of count |
 |---|---|---:|---:|---|
-| `Nemotron-SFT-Math-v4` | `84d42ad0` | 545,431 | 5.5 G | datasets-server |
-| `Nemotron-RL-Math-v2` | `804418c1` | 7,732 | 0.007 G | datasets-server |
-| `Nemotron-SFT-SWE-v3` | `3f73de64` | 237,970 | 11.7 G | datasets-server |
-| `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 0.3 G | datasets-server |
+| `Nemotron-SFT-Math-v4` | `84d42ad0` | 545,431 | 5.5 G | **staged shards, matches index** |
+| `Nemotron-RL-Math-v2` | `804418c1` | 7,732 | 0.007 G | **staged shards, matches index** |
+| `Nemotron-SFT-SWE-v3` | `3f73de64` | 237,970 | 11.7 G | **staged shards, matches index** |
+| `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 0.3 G | **staged shards, matches index** |
 | `Nemotron-SWE-v1` | `0fe17a96` | 24,875 (floor) | 11.1 G | partial conversion |
 | `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | datasets-server, 3 configs |
 | `Nemotron-SFT-SWE-v2` | `bd151f3f` | 256,254 | 18.1 G | **staged shards, counter validated** |
@@ -258,6 +258,15 @@ row count and byte count, which means the datasets-server has not converted
 them, not that they are empty; their counts must be read from the staged shards
 directly. One of the four, `Nemotron-SFT-SWE-v2`, is now measured; the other
 three are counted as their staging completes.
+
+Five repositories are now counted from the staged bytes rather than taken from
+the index: `Nemotron-SFT-Math-v4` (545,431), `Nemotron-SFT-SWE-v3` (237,970),
+`Nemotron-RL-Math-v2` (7,732), `Nemotron-SFT-SWE-v3.5` (5,115) and
+`Nemotron-SFT-SWE-v2` (256,254). The first four reproduce the indexed total
+exactly, and they span both storage formats -- two parquet, two JSONL -- so the
+footer path and the newline path are each validated against an independent
+reference rather than against each other. The fifth is the repository the index
+called empty.
 
 Staging completeness is judged against the pinned revision tree -- every file
 the SHA lists, present at its published size -- and not against the stager's
