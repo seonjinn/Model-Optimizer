@@ -117,7 +117,11 @@ pipeline:
       - EAGLE_CAPTURE_IDS: "[2,10,18,26,34,36]"
       - SERVE_TP: "1"
       - STREAMING_NUM_WORKERS: "4"
-      # DSpark exports a custom modeling file; export must trust remote code.
+      # --trust_remote_code on export applies to LOADING training.output_dir, not
+      # to what DSpark writes: the exporter emits config fields only, no auto_map
+      # and no modeling file. Qwen3 is a stock architecture, so the flag is a
+      # no-op here; it is required only when the BASE target ships custom
+      # modeling code (Kimi, MiniMax).
       - EXPORT_EXTRA_ARGS: "--trust_remote_code"
       - SERVE_MAX_MODEL_LEN: "4160"
       - SERVE_MAX_NUM_SEQS: "32"
