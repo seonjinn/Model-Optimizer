@@ -40,7 +40,7 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
   <div class="stat"><div class="n">5 / 5</div><div class="l">clusters staged</div></div>
   <div class="stat"><div class="n">3</div><div class="l">arms</div></div>
   <div class="stat"><div class="n">3.12&times;</div><div class="l">train step speedup</div></div>
-  <div class="stat"><div class="n">255</div><div class="l">unit tests green</div></div>
+  <div class="stat"><div class="n">297</div><div class="l">unit tests green</div></div>
   <div class="stat"><div class="n">0</div><div class="l">training runs launched</div></div>
 </div>
 
@@ -59,17 +59,39 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <tr><td>PR #2027 cherry-picked (drafter PTQ, DSPARK harness support)</td><td><code>quantize_drafter.py</code> +378, FP8 / NVFP4 recipes, <code>PASSTHROUGH_ENGINE_ARGS</code>, <code>enforce_eager</code> passthrough</td></tr>
 <tr><td>specdec_bench serves all three arms, with a pre-flight architecture guard</td><td><code>DFLASH2</code> added to <code>--speculative_algorithm</code>; <code>_assert_draft_architecture</code> rejects a mismatched drafter before serving. 8 new tests</td></tr>
 <tr><td>DFlash2 added to the pinned horizon matrix</td><td><code>_HORIZONS[("dflash2", 8)] = 7</code>, <code>[("dflash2", 16)] = 15</code>. 81 launcher tests green</td></tr>
+<tr><td>16-node capacity measured on all five clusters with <code>--test-only</code></td><td><code>batch_long</code> (7 d) is reachable on OCI-AGA, OCI-HSG and AWS-CMH-03, and starts <i>sooner</i> than <code>batch</code> on all three. See the capacity table below</td></tr>
+<tr><td>PTV3 staging past the two largest repos on all five clusters</td><td>4 / 10 repos, ~19&ndash;20 G each, <code>fail=0</code> everywhere. Shard sizes byte-identical across clusters</td></tr>
+<tr><td>Joined-view containment scan added to the exclusion filter</td><td>An atom split across a message boundary previously escaped the scan. Fixed two defects it exposed. 42 tests green</td></tr>
 <tr><td>Export <code>--trust_remote_code</code> question settled</td><td>No <code>auto_map</code> and no <code>register_for_auto_class</code> anywhere in the speculative plugins &mdash; the flag governs loading the base, not the drafter. Not needed for stock Qwen3</td></tr>
+</table>
+
+<h2>Cluster capacity for a 16-node job &mdash; measured 2026-08-28</h2>
+<div class="sub" style="margin:0 0 10px">Estimated start times from <code>sbatch --test-only -N 16</code>, which costs nothing and never enters the queue.
+Start times track the live queue and move; the partition limits and the access verdict do not.</div>
+<table>
+<tr><th>Cluster</th><th>Partition</th><th>Limit</th><th>Est. start</th><th>Wait</th></tr>
+<tr><td>Lyris</td><td><code>gb300-backfill</code></td><td>8 h</td><td>08-28 19:46</td><td><span class="b done">now</span> preemptible</td></tr>
+<tr><td>Lyris</td><td><code>gb200</code></td><td>5 h</td><td>08-28 19:53</td><td><span class="b done">now</span></td></tr>
+<tr><td><b>OCI-AGA</b></td><td><code><b>batch_long</b></code></td><td><b>7 d</b></td><td>08-28 20:05</td><td><span class="b done">now</span></td></tr>
+<tr><td>Ptyche</td><td><code>backfill</code></td><td>8 h</td><td>08-28 20:39</td><td>~1 h, preemptible</td></tr>
+<tr><td><b>OCI-HSG</b></td><td><code><b>batch_long</b></code></td><td><b>7 d</b></td><td>08-28 21:15</td><td>~1.5 h</td></tr>
+<tr><td>OCI-HSG</td><td><code>batch</code></td><td>4 h</td><td>08-29 00:00</td><td>~4 h</td></tr>
+<tr><td>OCI-AGA</td><td><code>batch</code></td><td>4 h</td><td>08-29 06:45</td><td>~11 h</td></tr>
+<tr><td>AWS-CMH-03</td><td><code>batch_long</code></td><td>7 d</td><td>08-29 07:26</td><td>~11 h</td></tr>
+<tr><td>AWS-CMH-03</td><td><code>batch</code></td><td>4 h</td><td>08-29 12:22</td><td>~16 h</td></tr>
+<tr><td>Lyris</td><td><code>gb300</code></td><td>5 h</td><td>09-01 12:55</td><td>~4 d</td></tr>
+<tr><td>Ptyche</td><td><code>batch</code></td><td>5 h</td><td>11-08 20:29</td><td><span class="b blocked">~2.5 months</span></td></tr>
 </table>
 
 <h2>Next</h2>
 <table>
 <tr><th>Item</th><th>State</th><th>Blocks</th></tr>
-<tr><td>Probe job 611352 &mdash; settle whether OCI-AGA is GB200 or GB300</td><td><span class="b pend">queued</span></td><td>GB300 serving sweep</td></tr>
+<tr><td>Probe job 611352 &mdash; settle whether OCI-AGA is GB200 or GB300</td><td><span class="b pend">queued</span></td><td>GB300 serving sweep. Lyris needs no probe: its <code>gb200</code> / <code>gb300</code> partitions are named, and GB300 nodes are <code>theia*</code></td></tr>
+<tr><td>Confirm <code>batch_long</code> has no approval gate outside Slurm</td><td><span class="b wip">--test-only passes</span></td><td>whether the run needs 4 h chunk chaining at all</td></tr>
 <tr><td>Finish PTV3 staging (10 pinned repos, ~70 G) on all five clusters</td><td><span class="b wip">in progress</span></td><td>corpus composition</td></tr>
 <tr><td>Measure the four unindexed PTV3 repos from the staged shards, and <code>Nemotron-SWE-v1</code> past its 24,875-row floor</td><td><span class="b wip">6 / 10 measured</span></td><td>the one variable this study controls</td></tr>
 <tr><td>Pin a vLLM nightly at or after 2026-08-21 (DFlash2 support, vllm#52816)</td><td><span class="b pend">not started</span></td><td>DFlash2 serving numbers</td></tr>
-<tr><td>Lyris inode cleanup (93.4 % of soft limit)</td><td><span class="b blocked">user-owned</span></td><td>Lyris as a checkpoint target</td></tr>
+<tr><td>Lyris inode cleanup &mdash; user at 92.6 % of soft limit, and the <i>project</i> is already over both block and inode quota</td><td><span class="b blocked">user-owned</span></td><td>Lyris as a checkpoint target</td></tr>
 <tr><td>Spec user-review gate, then implementation plan</td><td><span class="b wip">awaiting review</span></td><td>launch</td></tr>
 </table>
 
@@ -78,6 +100,18 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 
 <h2>Key insights and mistakes</h2>
 <ol class="ins">
+<li><span class="t"><code>sbatch --test-only</code> answers "can I, and when" for free &mdash; and it overturned the plan.</span>
+<span class="w">The design assumed <code>batch</code> only, with 4 h chunks chained by <code>--dependency=afterany</code>, because <code>batch_long</code> was believed to need approval. <code>--test-only</code> passes on <code>batch_long</code> on all three OCI/AWS clusters, and the 7-day partition starts <i>sooner</i> than the 4-hour one on every one of them. It never enters the queue, so there is no reason to guess at capacity. Caveat: it validates Slurm limits, not a social approval policy.</span></li>
+
+<li><span class="t">Lyris and Ptyche allocate whole nodes and expose no GPU gres, so GPU flags are rejected outright.</span>
+<span class="w"><code>Gres=(null)</code> on both. <code>--gpus-per-node=4</code> and <code>--gres=gpu:4</code> both fail with "Invalid generic resource specification"; you ask for <code>-N</code> and get the whole node. OCI-AGA, OCI-HSG and AWS-CMH-03 do have <code>gpu:4</code> and OCI-AGA's QOS enforces a 4-GPU minimum. One submission script cannot serve both families.</span></li>
+
+<li><span class="t">GB300 is invisible to the scheduler on every attribute except the node name.</span>
+<span class="w">On Lyris, where the partitions are labelled, a GB200 node (<code>lyris0001</code>) and a GB300 node (<code>theia0001</code>) report identical <code>RealMemory=940000</code>, identical <code>CPUTot=144</code>, and <code>Gres=(null)</code> on both. Only the hostname prefix and rack features differ. On the unlabelled clusters HBM is readable only from inside a GPU job.</span></li>
+
+<li><span class="t"><code>du -sh</code> on Lustre under-reports a directory still being written, and it nearly cost a false corruption alarm.</span>
+<span class="w">The same four-file repo reported 10 K, 52 K, 6.1 M and 6.6 M across four clusters. Listing the files showed all four shards byte-identical everywhere. Verify a staged corpus by per-file size, never by directory total.</span></li>
+
 <li><span class="t">A permission denial on one subdirectory is not evidence about the tree.</span>
 <span class="w">Tested only <code>&lt;project&gt;/users</code> on AWS-CMH-03 and OCI-AGA, found it root-owned, and wrote a spec section declaring the study GB200-only. The project root itself is group-writable on both. Walk up one level before concluding. Cost: one wrong spec section and a discarded hardware plan.</span></li>
 
