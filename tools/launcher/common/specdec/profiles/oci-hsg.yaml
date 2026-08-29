@@ -4,7 +4,7 @@
 name: oci-hsg
 modelopt_commit: b549c2d338949e90c33f60d789a42bd375c0bd7b
 ssh_host: oci-hsg-cs-001-vscode-01
-account: nemotron_sw_post
+account: nemotron_n3_post
 partition: batch
 fallback_partition:
 durable_root: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/specdec_ptv23
