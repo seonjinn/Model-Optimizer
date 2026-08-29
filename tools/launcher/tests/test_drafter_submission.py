@@ -75,12 +75,19 @@ def test_validate_topology_rejects_invalid_segments(nodes: int, segment: int, ro
 
 @pytest.mark.parametrize(
     ("method", "block_size", "expected"),
-    [("dflash", 8, 7), ("dflash", 16, 15), ("dspark", 8, 8), ("dspark", 16, 16)],
+    [
+        ("dflash", 8, 7),
+        ("dflash", 16, 15),
+        ("dflash2", 8, 7),
+        ("dflash2", 16, 15),
+        ("dspark", 8, 8),
+        ("dspark", 16, 16),
+    ],
 )
 def test_speculative_tokens_uses_the_pinned_b_k_matrix(
     method: str, block_size: int, expected: int
 ) -> None:
-    """Every public evaluator run uses the corresponding DFlash/DSpark horizon."""
+    """Every public evaluator run uses the corresponding DFlash/DFlash2/DSpark horizon."""
     assert speculative_tokens(method, block_size) == expected
 
 

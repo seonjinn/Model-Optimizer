@@ -30,7 +30,16 @@ __all__ = [
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_HORIZONS = {("dflash", 8): 7, ("dflash", 16): 15, ("dspark", 8): 8, ("dspark", 16): 16}
+# DFlash and DFlash2 accept K = B - 1 tokens per block; DSpark's shift-label
+# alignment does not exclude position 0, so it accepts K = B.
+_HORIZONS = {
+    ("dflash", 8): 7,
+    ("dflash", 16): 15,
+    ("dflash2", 8): 7,
+    ("dflash2", 16): 15,
+    ("dspark", 8): 8,
+    ("dspark", 16): 16,
+}
 _TARGET_SLURM_DEFAULTS = {
     "qwen3-30b-a3b": (
         {"nodes": 2, "segment": 2},
