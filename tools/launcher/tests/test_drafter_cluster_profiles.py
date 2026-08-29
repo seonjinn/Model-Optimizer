@@ -50,8 +50,8 @@ def test_ptyche_profile_uses_exclusive_four_gpu_nodes() -> None:
     assert profile.account == "coreai_dlalgo_llm"
     assert profile.partition == "36x2-a01r"
     assert profile.fallback_partition == "batch"
-    assert profile.training_nodes == 4
-    assert profile.training_segment == 4
+    assert profile.training_nodes == 16
+    assert profile.training_segment == 16
     assert profile.evaluation_nodes == 1
     assert profile.evaluation_segment == 1
     assert scheduler_gpu_args(profile) == ()

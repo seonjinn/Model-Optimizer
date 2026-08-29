@@ -7,8 +7,8 @@ fallback_partition:
 durable_root: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec
 scratch_candidates:
   - /raid/scratch
-training_nodes: 4
-training_segment: 4
+training_nodes: 16
+training_segment: 16
 evaluation_nodes: 1
 evaluation_segment: 1
 gpus_per_node: 4
