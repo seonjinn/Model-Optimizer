@@ -305,7 +305,17 @@ if __name__ == "__main__":
         type=str,
         required=False,
         default="EAGLE3",
-        choices=["EAGLE3", "EAGLE", "DRAFT_TARGET", "NGRAM", "MTP", "DFLASH", "DSPARK", "NONE"],
+        choices=[
+            "EAGLE3",
+            "EAGLE",
+            "DRAFT_TARGET",
+            "NGRAM",
+            "MTP",
+            "DFLASH",
+            "DFLASH2",
+            "DSPARK",
+            "NONE",
+        ],
         help="Speculative algorithm to use",
     )
     parser.add_argument("--model_dir", type=str, required=True, help="Path to the model directory")
@@ -360,7 +370,8 @@ if __name__ == "__main__":
         default=None,
         help=(
             "DFlash block size (num_speculative_tokens). Use instead of --draft_length "
-            "for DFLASH: block_size = draft_length + 1."
+            "for DFLASH/DFLASH2/DSPARK. DFlash and DFlash2 accept K = B - 1 tokens "
+            "per block; DSpark accepts K = B."
         ),
     )
     parser.add_argument(

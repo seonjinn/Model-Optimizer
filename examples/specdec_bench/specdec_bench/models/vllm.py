@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import asyncio
+import json
+import os
 import time
 
 from .base import Model
@@ -26,6 +28,36 @@ try:
 except ImportError:
     print("vllm is not installed.")
     vllm = None
+
+
+# vLLM serves DFlash2 under ``method="dflash"`` and selects the V2 speculator
+# from the draft checkpoint's ``architectures`` instead (vllm#52816). So a
+# DFLASH2 run pointed at a plain DFlash drafter starts cleanly and silently
+# benchmarks DFlash. Only the checkpoint distinguishes them.
+DRAFT_ARCHITECTURES = {
+    "DFLASH": "DFlashDraftModel",
+    "DFLASH2": "DFlash2DraftModel",
+    "DSPARK": "Qwen3DSparkModel",
+}
+
+
+def _assert_draft_architecture(draft_model_dir, expected, algorithm):
+    """Fail before serving if the drafter is not the architecture ``algorithm`` asks for."""
+    if not draft_model_dir:
+        raise ValueError(f"{algorithm} requires --draft_model_dir.")
+    config_path = os.path.join(draft_model_dir, "config.json")
+    if not os.path.isfile(config_path):
+        # A repo id, or a layout we cannot inspect locally — defer to vLLM.
+        return
+    with open(config_path) as f:
+        architectures = json.load(f).get("architectures") or []
+    if expected not in architectures:
+        raise ValueError(
+            f"{algorithm} expects a drafter whose architectures include {expected!r}, "
+            f"but {draft_model_dir} declares {architectures}. "
+            "Both DFlash and DFlash2 are served as method='dflash', so a mismatch "
+            "would run the wrong speculator and report a valid-looking number."
+        )
 
 
 # Forwarded from ``--runtime_params`` ``engine_args.<key>``; extend as needed.
@@ -118,13 +150,24 @@ class VLLMModel(Model):
                 # and let vLLM use the target model as its own draft
                 # (handled in speculative.py:562-573).
                 specdec["model"] = draft_model_dir
-        elif kwargs.get("speculative_algorithm") == "DFLASH":
+        elif kwargs.get("speculative_algorithm") in ("DFLASH", "DFLASH2"):
+            algorithm = kwargs["speculative_algorithm"]
+            _assert_draft_architecture(
+                kwargs.get("draft_model_dir"), DRAFT_ARCHITECTURES[algorithm], algorithm
+            )
+            # Both variants are served as "dflash"; the drafter's architectures
+            # pick the speculator. DFlash2's default horizon is K = B - 1 = 7.
             specdec = {
                 "method": "dflash",
                 "model": kwargs.get("draft_model_dir"),
-                "num_speculative_tokens": kwargs.get("speculative_num_draft_tokens", 8),
+                "num_speculative_tokens": kwargs.get(
+                    "speculative_num_draft_tokens", 7 if algorithm == "DFLASH2" else 8
+                ),
             }
         elif kwargs.get("speculative_algorithm") == "DSPARK":
+            _assert_draft_architecture(
+                kwargs.get("draft_model_dir"), DRAFT_ARCHITECTURES["DSPARK"], "DSPARK"
+            )
             specdec = {
                 "method": "dspark",
                 "model": kwargs.get("draft_model_dir"),

@@ -125,8 +125,10 @@ def create_executor(model_path: str, max_concurrent_requests, kwargs):
         )
     elif kwargs.get("speculative_algorithm", None) == "NONE":
         specdec = None
-    elif kwargs.get("speculative_algorithm", None) == "DSPARK":
-        raise NotImplementedError("DSPARK is only supported by --engine VLLM.")
+    elif kwargs.get("speculative_algorithm", None) in ("DSPARK", "DFLASH2"):
+        raise NotImplementedError(
+            f"{kwargs['speculative_algorithm']} is only supported by --engine VLLM."
+        )
     else:
         specdec = None
 
