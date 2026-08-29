@@ -1,6 +1,7 @@
 schema_version: 1
 seed: 20260822
 training_seq_len: 4096
+maximum_epochs: 1
 maximum_full_context: 32768
 tokenizer_sha256: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 context_buckets: [le4k, 4k_16k, 16k_32k]

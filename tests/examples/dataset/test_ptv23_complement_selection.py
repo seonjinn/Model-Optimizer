@@ -19,6 +19,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -211,3 +212,124 @@ def test_the_selection_order_is_reproducible_across_input_orderings() -> None:
         list(reversed(rows)), config=policy, arm="C", target_assistant_tokens=1000
     )
     assert [row["prompt_id"] for row in forward] == [row["prompt_id"] for row in reversed_input]
+
+
+def test_a_ptv2_row_without_a_language_is_refused_rather_than_admitted() -> None:
+    """Language exists on a row only because the normalizer put it there.
+
+    The PTv2 parquet schema is uuid/license/generator/version/category/reasoning/
+    messages -- there is no language column, and the language of a shard is
+    carried solely by its filename. A filter that reads the field with .get()
+    therefore treats "the normalizer dropped it" and "this row is in an allowed
+    language" as the same case, and every denied-language row enters arm B
+    silently. The build has to stop instead.
+    """
+    module = _load()
+    policy = yaml.safe_load(POLICY.read_text())
+    rows = _rows()
+    for row in rows:
+        if row["pool"] == "ptv2":
+            del row["language"]
+            break
+
+    with pytest.raises(ValueError, match="carries no language"):
+        module.select_ptv23_arm(rows, config=policy, arm="B", target_assistant_tokens=1000)
+
+
+def test_the_denied_languages_come_from_the_policy_not_from_the_code() -> None:
+    """ptv2_languages was declared in the study YAML and read by nothing.
+
+    The deny list existed as documentation while the code matched a hard-coded
+    "de", so editing the policy changed the study's stated design and not its
+    output. The fixture's only multilingual language is ja; denying it has to
+    empty that lane, and an empty lane against a 10% multilingual quota is a
+    shortfall. The shortfall *is* the evidence the policy was read -- the same
+    call with the shipped policy, which allows ja, fills the quota.
+    """
+    module = _load()
+    policy = yaml.safe_load(POLICY.read_text())
+    policy["ptv2_languages"] = {"allow": ["en"], "deny": ["ja"]}
+
+    with pytest.raises(ValueError, match="quota shortfall for multilingual"):
+        module.select_ptv23_arm(_rows(), config=policy, arm="B", target_assistant_tokens=1000)
+
+
+def test_a_language_outside_the_allow_list_is_excluded_without_being_denied() -> None:
+    """Allow and deny are separate gates, and only deny was ever implemented.
+
+    The staged PTv2 tree is a subset of upstream, so a shard in a language the
+    policy never listed is a real possibility. It must not ride in on the
+    absence of an explicit denial.
+    """
+    module = _load()
+    policy = yaml.safe_load(POLICY.read_text())
+    policy["ptv2_languages"] = {"allow": ["en"], "deny": []}
+
+    with pytest.raises(ValueError, match="quota shortfall for multilingual"):
+        module.select_ptv23_arm(_rows(), config=policy, arm="B", target_assistant_tokens=1000)
+
+
+def test_a_language_that_is_both_allowed_and_denied_is_a_policy_error() -> None:
+    module = _load()
+    policy = yaml.safe_load(POLICY.read_text())
+    policy["ptv2_languages"] = {"allow": ["en", "ja"], "deny": ["ja"]}
+
+    with pytest.raises(ValueError, match="both allows and denies"):
+        module.select_ptv23_arm(_rows(), config=policy, arm="B", target_assistant_tokens=1000)
+
+
+def test_the_builder_cli_accepts_the_study_policy_and_writes_a_corpus(tmp_path: Path) -> None:
+    """The study's own selector was reachable from tests and from nothing else.
+
+    main() called select_arm, which reads a pool/category schema this policy
+    does not have, so the documented invocation died on KeyError: 'arms' before
+    reading a single candidate -- and the domain quotas, the SWE replay lanes
+    and the language policy were all dead code in production. Every unit test
+    above called select_ptv23_arm directly, which is exactly why none of them
+    noticed. This one goes through the entrypoint.
+    """
+    module = _load()
+    inventory = tmp_path / "inventory.jsonl"
+    inventory.write_text(
+        "\n".join(json.dumps(row) for row in _rows()) + "\n",
+        encoding="utf-8",
+    )
+    corpus = tmp_path / "corpus"
+
+    exit_code = module.main(
+        [
+            "--inventory",
+            str(inventory),
+            "--config",
+            str(POLICY),
+            "--arm",
+            "B",
+            "--target-assistant-tokens",
+            "1000",
+            "--tokenizer-sha256",
+            "f" * 64,
+            "--output-manifest",
+            str(corpus / "selection.json"),
+            "--output-corpus",
+            str(corpus),
+        ]
+    )
+
+    assert exit_code == 0
+    manifest = json.loads((corpus / "selection.json").read_text(encoding="utf-8"))
+    assert manifest["arm"] == "B"
+    assert manifest["unique_assistant_tokens"] == 1000
+    assert sorted(manifest["category_assistant_tokens"]) == [
+        "ptv2/chat",
+        "ptv2/code",
+        "ptv2/math",
+        "ptv2/multilingual",
+        "ptv2/stem",
+    ]
+    assert list(corpus.glob("train-*.parquet"))
+
+
+def test_a_config_matching_neither_selector_schema_is_refused(tmp_path: Path) -> None:
+    module = _load()
+    with pytest.raises(ValueError, match="declares neither"):
+        module.select_for_config(_rows(), config={"seed": 1}, arm="B", target_assistant_tokens=10)

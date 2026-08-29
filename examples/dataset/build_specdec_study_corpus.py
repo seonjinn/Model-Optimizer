@@ -285,6 +285,58 @@ def select_arm(
     return sorted(all_selected, key=lambda row: (_rank(row, seed), str(row["prompt_id"])))
 
 
+def select_for_config(
+    candidates: list[dict[str, Any]],
+    *,
+    config: dict[str, Any],
+    arm: str,
+    target_assistant_tokens: int,
+    held_out_prompt_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Route to the selector whose schema this config declares.
+
+    Two selectors live here with two incompatible config schemas: the
+    pool/category one for the Qwen3-4B hybrid study, and the domain/lane one
+    for the PTv2+PTv3 complement study. Only the first was ever wired to the
+    CLI, so the complement study's quotas, its SWE replay lanes and its
+    language policy were reachable from tests and from nothing else -- passing
+    its policy to the builder raised KeyError: 'arms' at argument-validation
+    time. Dispatching on the schema the config actually declares is what makes
+    the study's design the thing the corpus is built from.
+
+    Refusing a config that matches both or neither keeps a half-migrated
+    policy from silently picking up whichever branch is checked first.
+    """
+    keys = set(config)
+    pooled = {"arms", "pools"} <= keys
+    domained = {"b_domains", "cd_domains"} <= keys
+    if pooled and domained:
+        raise ValueError(
+            "config declares both the pool/category and domain/lane schemas; "
+            "remove one so the selector is unambiguous"
+        )
+    if not pooled and not domained:
+        raise ValueError(
+            "config declares neither the pool/category schema (arms, pools) nor "
+            "the domain/lane schema (b_domains, cd_domains)"
+        )
+    if domained:
+        return select_ptv23_arm(
+            candidates,
+            config=config,
+            arm=arm,
+            target_assistant_tokens=target_assistant_tokens,
+            held_out_prompt_ids=held_out_prompt_ids,
+        )
+    return select_arm(
+        candidates,
+        config=config,
+        arm=arm,
+        target_assistant_tokens=target_assistant_tokens,
+        held_out_prompt_ids=held_out_prompt_ids,
+    )
+
+
 def token_totals_by(rows: Iterable[dict[str, Any]], key: str) -> dict[str, int]:
     totals: dict[str, int] = defaultdict(int)
     for row in rows:
@@ -305,6 +357,13 @@ def select_ptv23_arm(
     if arm not in {"B", "C", "D"}:
         raise ValueError(f"unknown arm {arm!r}")
     exclusions = (prior_prompt_ids or set()) | (held_out_prompt_ids or set())
+    language_policy = config.get("ptv2_languages") or {}
+    allowed_languages = frozenset(language_policy.get("allow") or ())
+    denied_languages = frozenset(language_policy.get("deny") or ())
+    if allowed_languages & denied_languages:
+        raise ValueError(
+            f"ptv2_languages both allows and denies: {sorted(allowed_languages & denied_languages)}"
+        )
     seen: set[str] = set()
     eligible = []
     for row in candidates:
@@ -317,7 +376,20 @@ def select_ptv23_arm(
         if arm == "B":
             if row["pool"] != "ptv2":
                 continue
-            if row.get("language") == "de":
+            # The PTv2 parquet has no language column at all -- language is encoded
+            # only in the shard filename, so it exists on a row solely because the
+            # normalizer carried it across. Reading it with .get() would make a
+            # normalizer that forgets look like a corpus with nothing to deny, and
+            # every denied-language row would enter arm B silently. Require it.
+            language = row.get("language")
+            if language is None:
+                raise ValueError(
+                    f"ptv2 row {prompt_id} carries no language, so the policy's "
+                    "allow/deny lists cannot be applied to it"
+                )
+            if language in denied_languages:
+                continue
+            if allowed_languages and language not in allowed_languages:
                 continue
             if row["category"] == "swe":
                 continue
@@ -564,7 +636,7 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     os.replace(partial, path)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
@@ -576,7 +648,7 @@ def main() -> int:
     parser.add_argument("--output-manifest", type=Path, required=True)
     parser.add_argument("--output-corpus", type=Path, required=True)
     parser.add_argument("--rows-per-shard", type=int, default=10_000)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     config["tokenizer_sha256"] = args.tokenizer_sha256
@@ -586,7 +658,7 @@ def main() -> int:
         if args.held_out_prompt_ids
         else set()
     )
-    selected = select_arm(
+    selected = select_for_config(
         candidates,
         config=config,
         arm=args.arm,
