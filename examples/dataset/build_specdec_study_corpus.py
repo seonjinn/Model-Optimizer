@@ -369,7 +369,14 @@ def select_ptv23_arm(
             if actual != lane_target:
                 raise ValueError(f"quota shortfall for {domain}/{lane}: {actual} < {lane_target}")
             selected.extend(lane_selected)
-    return selected
+    # Lane-by-lane append leaves the corpus segregated by lane, and the trainer
+    # cuts a corpus with a lexicographic prefix take over sorted shard names
+    # (eagle_utils applies sample_size as a streaming .take). A prefix of a
+    # segregated list is one lane, not a sample of the blend -- which is exactly
+    # how the upstream PTv2 mix lost 9,377 multilingual rows off its tail.
+    # Permuting on a seeded hash of the prompt makes every prefix a uniform
+    # sample of the whole, so the blend survives a corpus resize.
+    return sorted(selected, key=lambda row: (_rank(row, seed), str(row["prompt_id"])))
 
 
 def build_arm_manifest(

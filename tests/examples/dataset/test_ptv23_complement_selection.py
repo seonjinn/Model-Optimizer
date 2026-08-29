@@ -166,3 +166,48 @@ def test_materialized_rows_preserve_prompt_selection_indexes(tmp_path: Path) -> 
     assert stored["selection_index"] == 3
     assert stored["selection_status"] == "primary"
     assert json.loads(stored["canonical_prompt"])["messages"][0]["content"] == "inspect me"
+
+
+def test_every_prefix_of_the_selection_is_a_sample_of_the_blend() -> None:
+    """A prefix of the corpus must hold the blend, not the first lane written.
+
+    The trainer does not read a corpus whole. `sample_size` becomes a streaming
+    `.take(n)` over shards sorted by filename, so whatever composition sits in
+    the first n rows *is* the training mix. Selecting lane by lane and writing
+    that order out would hand a resized run a single-lane corpus while every
+    manifest still reported the full blend -- silently, because nothing
+    downstream re-counts. This is the failure that cost the upstream PTv2 mix
+    9,377 multilingual rows, and it is cheap to make structurally impossible.
+    """
+    module = _load()
+    policy = yaml.safe_load(POLICY.read_text())
+    selected = module.select_ptv23_arm(
+        _rows(), config=policy, arm="C", target_assistant_tokens=1000
+    )
+
+    full = module.token_totals_by(selected, "category")
+    prefix = module.token_totals_by(selected[: len(selected) // 10], "category")
+
+    assert set(prefix) == set(full), f"prefix dropped categories: {sorted(set(full) - set(prefix))}"
+    for category, tokens in full.items():
+        share = prefix[category] / sum(prefix.values())
+        expected = tokens / sum(full.values())
+        assert abs(share - expected) < 0.15, f"{category}: {share:.3f} vs {expected:.3f}"
+
+
+def test_the_selection_order_is_reproducible_across_input_orderings() -> None:
+    """The permutation is seeded by the prompt, not by arrival order.
+
+    A shuffle keyed on anything positional would make the corpus depend on the
+    order the inventory happened to be written in, so two runs of the same
+    config could train on differently-ordered -- and therefore, after a take,
+    differently-composed -- corpora.
+    """
+    module = _load()
+    policy = yaml.safe_load(POLICY.read_text())
+    rows = _rows()
+    forward = module.select_ptv23_arm(rows, config=policy, arm="C", target_assistant_tokens=1000)
+    reversed_input = module.select_ptv23_arm(
+        list(reversed(rows)), config=policy, arm="C", target_assistant_tokens=1000
+    )
+    assert [row["prompt_id"] for row in forward] == [row["prompt_id"] for row in reversed_input]
