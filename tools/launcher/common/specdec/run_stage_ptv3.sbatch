@@ -24,7 +24,18 @@
 set -euo pipefail
 
 [[ -n "${STUDY_ROOT:-}" ]] || { echo "missing required environment: STUDY_ROOT" >&2; exit 2; }
-[[ "$STUDY_ROOT" == /lustre/* ]] || { echo "staged data belongs on Lustre" >&2; exit 2; }
+# Shared parallel storage is not mounted at the same place on every cluster:
+# OCI-HSG, Ptyche and Lyris expose Lustre at /lustre, AWS-CMH and OCI-AGA at
+# /scratch/fsw. An allow-list of one prefix would have rejected a correct path
+# on two of the five, so name the places staged data must NOT go instead --
+# node-local scratch, the NFS home, and the temp dirs -- which is the rule the
+# MARS storage guidance actually states.
+case "$STUDY_ROOT" in
+    /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*)
+        echo "staged data belongs on shared parallel storage, not $STUDY_ROOT" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "STUDY_ROOT must be an absolute path, got: $STUDY_ROOT" >&2; exit 2 ;;
+esac
 [[ -n "${HF_TOKEN:-}" ]] || { echo "missing required environment: HF_TOKEN" >&2; exit 2; }
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || { echo "invalid Slurm job identity" >&2; exit 2; }
 

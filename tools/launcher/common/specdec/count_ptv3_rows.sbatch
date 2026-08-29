@@ -22,7 +22,15 @@
 set -euo pipefail
 
 [[ -n "${STUDY_ROOT:-}" ]] || { echo "missing required environment: STUDY_ROOT" >&2; exit 2; }
-[[ "$STUDY_ROOT" == /lustre/* ]] || { echo "staged data lives on Lustre" >&2; exit 2; }
+# Same reasoning as run_stage_ptv3.sbatch: Lustre is at /lustre on three
+# clusters and /scratch/fsw on the other two, so exclude the places staged data
+# must not be rather than allow-listing one prefix that is not universal.
+case "$STUDY_ROOT" in
+    /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*)
+        echo "staged data lives on shared parallel storage, not $STUDY_ROOT" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "STUDY_ROOT must be an absolute path, got: $STUDY_ROOT" >&2; exit 2 ;;
+esac
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || { echo "invalid Slurm job identity" >&2; exit 2; }
 
 # Locate the counter, which ships beside this file in the repo so the study is
