@@ -211,16 +211,28 @@ revision.
 | `Nemotron-SFT-Math-v4` | `84d42ad0` | 545,431 | 5.5 G | datasets-server |
 | `Nemotron-RL-Math-v2` | `804418c1` | 7,732 | 0.05 G | datasets-server |
 | `Nemotron-SFT-SWE-v3` | `3f73de64` | 237,970 | 11.7 G | datasets-server |
-| `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 1.2 G | datasets-server |
-| `Nemotron-SWE-v1` | `0fe17a96` | 24,875 (floor) | 1.4 G | partial conversion |
+| `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 0.3 G | datasets-server |
+| `Nemotron-SWE-v1` | `0fe17a96` | 24,875 (floor) | 11.1 G | partial conversion |
 | `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | datasets-server, 3 configs |
-| `Nemotron-SFT-SWE-v2` | `bd151f3f` | unmeasured | - | not indexed |
-| `Nemotron-Agentic-v1` | `650d5909` | unmeasured | - | not indexed |
-| `Nemotron-SFT-Agentic-v2` | `7c804833` | unmeasured | - | not indexed |
-| `Nemotron-RL-Lightning-Training-Blend` | `262eb58c` | unmeasured | - | not indexed |
+| `Nemotron-SFT-SWE-v2` | `bd151f3f` | unmeasured | 18.1 G | bytes from HF tree |
+| `Nemotron-Agentic-v1` | `650d5909` | unmeasured | 5.8 G | bytes from HF tree |
+| `Nemotron-SFT-Agentic-v2` | `7c804833` | unmeasured | 21.9 G | bytes from HF tree |
+| `Nemotron-RL-Lightning-Training-Blend` | `262eb58c` | unmeasured | 3.9 G | bytes from HF tree |
+| **Total** | | | **124.8 G** | |
 
 `Open-SWE-Traces` splits across three configs: `v1.0` 151,219, `v1.1` 360,335,
-`v1.2` 53,553.
+`v1.2` 53,553. At 46.5 G it is a third of the corpus on its own, and it is the
+only repository that nests four directory levels below its root.
+
+The byte column is now measured for all ten, summed from the `size` field of
+each pinned revision's recursive tree listing rather than from `du`, which
+under-reports a Lustre tree still being written. Two entries moved far enough to
+matter: `Nemotron-SWE-v1` is 11.1 G rather than the 1.4 G the datasets-server
+reported, consistent with its conversion being partial, and
+`Nemotron-SFT-SWE-v3.5` is 0.3 G rather than 1.2 G. **Bytes are not rows.** The
+four repositories the datasets-server never converted still have no row count,
+so the composition constraint below is unchanged: the blend stays unpinned until
+every row count is read from the staged shards.
 
 Two caveats bind the composition step. Four repositories return zero for both
 row count and byte count, which means the datasets-server has not converted
@@ -601,9 +613,9 @@ evaluation runs regardless. Ptyche is the second training site.
 
 OCI-AGA is the newest addition and the reason overflow is credible: 429 idle
 nodes were measured on 2026-08-28 against `nemotron_sw_post`, with `batch`
-capped at 4 h and `batch_long` at 7 d. Only `batch` is assumed available, since
-`batch_long` requires approval this account does not hold, which makes the 4 h
-chunk-and-chain structure a hard requirement there rather than a convenience.
+capped at 4 h and `batch_long` at 7 d. Only `batch` is used, for the throughput
+reason given under the partition constraint below, so the 4 h chunk-and-chain
+structure applies there as everywhere else.
 Its GPU generation is inferred from node naming and **not yet measured**; a
 one-node probe is queued to settle it, and the serving sweep must not be run
 there until it reports.
@@ -663,12 +675,19 @@ runs there set `NIXL_BACKENDS=LIBFABRIC`, `FI_PROVIDER=efa`, and
 
 ### Partition constraint
 
-Training runs on the `batch`-class partitions only. `batch_long` carries a
-seven-day ceiling and `AllowAccounts=ALL`, so the scheduler does not reject it,
-but using it requires approval this study does not hold. Treating the long
-partition as unavailable is a planning constraint, not a scheduler fact, and
-the distinction is recorded so a later approval can be applied without
-redesigning the run.
+Training runs on the `batch`-class partitions only, which are capped at 4 h on
+OCI-AGA, OCI-HSG and AWS-CMH-03 alike. `batch_long` carries a seven-day ceiling
+and `AllowAccounts=ALL`; `sbatch --test-only -N 16` is accepted there on all
+three and even reports an earlier estimated start than `batch`. The study still
+does not use it.
+
+That estimate answers "when would this one job start," not "which strategy
+finishes the campaign first." A seven-day reservation waits for a large
+contiguous window, while 4 h chunks backfill into gaps that reservation can
+never occupy, so in practice the chain completes sooner even though each chunk
+individually queues later. The long partition additionally requires an approval
+this study does not hold. Both reasons point the same way, and the chunked
+structure below is therefore the design rather than a fallback.
 
 | Cluster    | Partition | MaxTime | Preemption            |
 |------------|-----------|---------|-----------------------|
