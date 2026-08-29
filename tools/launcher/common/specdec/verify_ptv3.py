@@ -26,32 +26,92 @@ MANIFEST = {
     "Nemotron-RL-Lightning-Training-Blend": "262eb58c",
 }
 
-def tree(repo, sha):
-    url = f"https://huggingface.co/api/datasets/nvidia/{repo}/tree/{sha}?recursive=1"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
-    with urllib.request.urlopen(req, timeout=180) as r:
-        return [x for x in json.load(r) if x.get("type") == "file"]
+# Files the stager leaves behind that are not part of any revision. A partial
+# download is renamed into place only on success, so a surviving .part marks an
+# interrupted transfer rather than corruption of the file it belongs to.
+IGNORED_LOCAL_SUFFIXES = (".part",)
 
+
+def _next_page(link_header):
+    """Return the rel="next" URL from an RFC 5988 Link header, or None."""
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        segments = part.split(";")
+        if len(segments) < 2:
+            continue
+        if any(seg.strip().replace(" ", "") in ('rel="next"', "rel=next") for seg in segments[1:]):
+            return segments[0].strip().lstrip("<").rstrip(">")
+    return None
+
+
+def tree(repo, sha):
+    """List every file at a revision, following the API's pagination.
+
+    The tree endpoint caps a response at a fixed page size and advertises the
+    rest through a Link header. Reading only the first page would drop the tail
+    of a large repo's manifest silently -- and because completeness is judged
+    against this list, a dropped tail reads as COMPLETE rather than as an error.
+    """
+    url = f"https://huggingface.co/api/datasets/nvidia/{repo}/tree/{sha}?recursive=1"
+    entries = []
+    while url:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            entries.extend(json.load(r))
+            url = _next_page(r.headers.get("Link"))
+    return [x for x in entries if x.get("type") == "file"]
+
+
+def local_files(out):
+    """Every staged file under a repo, relative to it, ignoring stager scratch."""
+    if not out.is_dir():
+        return set()
+    return {
+        str(p.relative_to(out))
+        for p in out.rglob("*")
+        if p.is_file() and not p.name.endswith(IGNORED_LOCAL_SUFFIXES)
+    }
+
+
+failures = 0
 for repo, sha in MANIFEST.items():
     out = ROOT / repo
     try:
         files = tree(repo, sha)
     except Exception as exc:
         print(f"{repo:38s} TREE_FAILED {exc}")
+        failures += 1
         continue
-    missing = short = 0
+    missing = short = unsized = 0
     have_bytes = want_bytes = 0
     for entry in files:
-        want = entry.get("size") or 0
-        want_bytes += want
+        # Distinguish "the revision reports no size" from "the size is zero":
+        # collapsing them into 0 would skip the comparison below and let a
+        # truncated file pass as complete.
+        want = entry.get("size")
+        if want is None:
+            unsized += 1
+        else:
+            want_bytes += want
         target = out / entry["path"]
         if not target.exists():
             missing += 1
             continue
         actual = target.stat().st_size
         have_bytes += actual
-        if want and actual != want:
+        if want is not None and actual != want:
             short += 1
-    state = "COMPLETE" if (missing == 0 and short == 0 and files) else "INCOMPLETE"
-    print(f"{repo:38s} {state:10s} files={len(files):4d} missing={missing:4d} "
-          f"size_mismatch={short:3d} bytes={have_bytes}/{want_bytes}")
+    # Files on disk that the revision does not list. The row counters glob the
+    # directory rather than replaying this manifest, so an unlisted file would
+    # be counted as data even though nothing here vouches for it.
+    extra = len(local_files(out) - {e["path"] for e in files})
+    ok = files and missing == 0 and short == 0 and unsized == 0 and extra == 0
+    if not ok:
+        failures += 1
+    print(f"{repo:38s} {'COMPLETE' if ok else 'INCOMPLETE':10s} files={len(files):4d} "
+          f"missing={missing:4d} size_mismatch={short:3d} unsized={unsized:3d} "
+          f"extra={extra:3d} bytes={have_bytes}/{want_bytes}")
+
+# Exit non-zero so a caller can gate on staging without parsing this output.
+sys.exit(1 if failures else 0)

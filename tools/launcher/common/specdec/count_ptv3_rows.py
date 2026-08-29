@@ -32,7 +32,10 @@ from pathlib import Path
 __all__ = ["count_repo", "count_shard", "main"]
 
 _READ_BLOCK_BYTES = 8 * 1024 * 1024
-_LINE_SUFFIXES = (".jsonl", ".jsonl.gz", ".json.gz", ".gz")
+# A bare ".gz" is deliberately absent: it would match any gzip file under the
+# repo -- a compressed README, an archive -- and fold its newline count into the
+# row total. Every staged shard names its format before the compression suffix.
+_LINE_SUFFIXES = (".jsonl", ".jsonl.gz", ".json.gz")
 _PARQUET_SUFFIX = ".parquet"
 _SHARD_SUFFIXES = (*_LINE_SUFFIXES, _PARQUET_SUFFIX)
 
@@ -62,21 +65,46 @@ def _count_parquet(path: Path) -> int:
 
 
 def _count_lines(path: Path) -> int:
-    """Count newline-delimited records in one shard, gzipped or plain."""
+    """Count non-empty newline-delimited records in one shard, gzipped or plain.
+
+    Counting newline bytes instead would inflate the total by one for any shard
+    that ends in a blank line, which is the ordinary result of concatenating
+    shards. The row counts here set the corpus blend ratios, so an off-by-one
+    per shard is a silent reweighting rather than a visible failure.
+    """
     opener = gzip.open if path.name.endswith(".gz") else open
-    lines = 0
-    trailing_newline = True
+    records = 0
+    first = None
+    carry = b""
     with opener(path, "rb") as handle:
         while True:
             block = handle.read(_READ_BLOCK_BYTES)
             if not block:
                 break
-            lines += block.count(b"\n")
-            trailing_newline = block.endswith(b"\n")
-    # A final record without a trailing newline is still a record.
-    if not trailing_newline:
-        lines += 1
-    return lines
+            pieces = (carry + block).split(b"\n")
+            carry = pieces.pop()
+            for piece in pieces:
+                if not piece.strip():
+                    continue
+                records += 1
+                if first is None:
+                    first = piece
+    if carry.strip():
+        records += 1
+        if first is None:
+            first = carry
+    # Parse one record. A file that reached this reader without being JSON lines
+    # -- wrong suffix, or a whole file on one line because it uses bare carriage
+    # returns -- would otherwise report a plausible count instead of failing.
+    if first is not None:
+        try:
+            json.loads(first)
+        except ValueError as exc:
+            raise SystemExit(
+                f"{path}: first record is not JSON ({exc}); it is not a JSONL "
+                "shard, so its line count would not be a row count"
+            ) from exc
+    return records
 
 
 def count_repo(repo_dir: Path, workers: int) -> tuple[int, list[str]]:

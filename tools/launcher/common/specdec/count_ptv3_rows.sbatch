@@ -32,9 +32,12 @@ set -euo pipefail
 # into a per-job spool directory, so at run time this file's own directory is
 # /cm/local/.../job<id> and the counter is not there. SLURM_SUBMIT_DIR is the
 # directory the job was submitted from, which is where the repo copy actually
-# lives. Keep the BASH_SOURCE probe last so the script still works when run
-# directly with bash, outside Slurm.
+# lives -- but that is the repo root when the script is submitted by its repo
+# path, as the usage above shows, so the counter's own subdirectory has to be
+# probed too. Keep the BASH_SOURCE probe last so the script still works when
+# run directly with bash, outside Slurm.
 for candidate in "${COUNTER:-}" \
+                 "${SLURM_SUBMIT_DIR:-}/tools/launcher/common/specdec/count_ptv3_rows.py" \
                  "${SLURM_SUBMIT_DIR:-}/count_ptv3_rows.py" \
                  "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/count_ptv3_rows.py"; do
     [[ -n "$candidate" && -r "$candidate" ]] || continue
@@ -42,7 +45,7 @@ for candidate in "${COUNTER:-}" \
     break
 done
 [[ -n "${counter:-}" ]] || {
-    echo "count_ptv3_rows.py not found; set COUNTER or submit from its directory" >&2
+    echo "count_ptv3_rows.py not found; submit from the repo root or set COUNTER" >&2
     exit 2
 }
 echo "counter: $counter"
