@@ -190,12 +190,18 @@ else
         } || true
     )"
 fi
-while IFS=$'\t' read -r index identity boundary _run_name _manifest_account _manifest_partition nodes segment gpus_per_node output_root; do
+while IFS=$'\t' read -r index identity boundary run_name _manifest_account _manifest_partition nodes segment gpus_per_node output_root; do
     [[ -n "$index" ]] || continue
     tuple_identity="${identity}:${boundary}"
     [[ -z "${identities[$tuple_identity]:-}" ]] || { echo "duplicate training tuple: $tuple_identity" >&2; exit 2; }
     identities[$tuple_identity]=1
-    job_name="${JOB_NAME_OVERRIDE:-drafter-train-${identity}-s${boundary}}"
+    job_name="${JOB_NAME_OVERRIDE:-${run_name}-s${boundary}}"
+    # An override that names a different arm than the manifest row silently
+    # trains the wrong experiment under a convincing name.
+    [[ -z "$JOB_NAME_OVERRIDE" || "$job_name" == *"$run_name"* ]] || {
+        echo "job name $job_name does not name the run it would train: $run_name" >&2
+        exit 2
+    }
     cluster_tuple_identity="${CLUSTER_NAME}:${identity}:${boundary}"
     tuple_identity="$cluster_tuple_identity"
     if [[ "$CLUSTER_NAME" == "oci-hsg" ]]; then
@@ -257,6 +263,7 @@ PY
         scheduler_args+=("--gpus-per-node=${gpus_per_node}")
     fi
     args=("${scheduler_args[@]}" --job-name="$job_name" --comment="$tuple_identity" --export="$exports" --output="${output_root}/logs/slurm-%j.out" --error="${output_root}/logs/slurm-%j.err" "${requeue_args[@]}")
+    echo "submitting index=$index run=$run_name experiment=$identity job-name=$job_name"
     [[ -z "$DEPENDENCY" ]] || args+=(--dependency=afterok:"$DEPENDENCY")
     sbatch --test-only "${args[@]}" "$RUNNER"
     if [[ "$DRY_RUN" -eq 1 ]]; then
