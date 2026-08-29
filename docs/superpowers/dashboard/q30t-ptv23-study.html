@@ -47,6 +47,7 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <h2>Done</h2>
 <table>
 <tr><th>Item</th><th>Evidence</th></tr>
+<tr><td><b>Lyris promoted to the GB200 training target</b>; Ptyche viable on backfill</td><td>16 nodes on Lyris <code>gb200</code> start <b>immediately</b> and the partition is <i>not</i> preemptible &mdash; better than any GB300 option, where AWS <code>batch</code> waits ~16 h and Lyris <code>gb300</code> ~3 d. FairShare <code>coreai_dlalgo_llm</code>: Lyris <b>0.524</b>, Ptyche 0.233. Ptyche <code>batch</code> is unusable (~2.5 months), so Ptyche enters through <code>backfill</code> / <code>tcpo-backfill</code>, both preemptible</td></tr>
 <tr><td>Design spec written and committed (979 lines)</td><td><code>docs/superpowers/specs/2026-08-28-q30t-ptv23-from-scratch-drafter-study-design.md</code></td></tr>
 <tr><td>PTV2 English subset staged on all five clusters</td><td>18/18 shards, 3.5&ndash;3.7 G, pinned rev <code>5c89e01d</code>. OCI-HSG, Ptyche, Lyris, AWS-CMH-03, OCI-AGA</td></tr>
 <tr><td>PTV2 row counts promoted from asserted to measured</td><td>1,397,187 admitted English rows, read from <code>dataset_info</code> in the staged README</td></tr>
@@ -79,17 +80,23 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 Start times track the live queue and move; the partition limits and the access verdict do not.</div>
 <table>
 <tr><th>Cluster</th><th>Partition</th><th>Limit</th><th>Est. start</th><th>Wait</th></tr>
-<tr><td>Lyris</td><td><code>gb300-backfill</code></td><td>8 h</td><td>08-28 19:46</td><td><span class="b done">now</span> preemptible</td></tr>
-<tr><td>Lyris</td><td><code>gb200</code></td><td>5 h</td><td>08-28 19:53</td><td><span class="b done">now</span></td></tr>
+<tr><td><b>Lyris</b></td><td><code><b>gb200</b></code></td><td>5 h</td><td>08-28 21:29</td><td><span class="b done">immediate</span> <b>GB200, not preemptible</b></td></tr>
+<tr><td>Lyris</td><td><code>gb200-backfill</code></td><td>8 h</td><td>08-28 21:29</td><td><span class="b done">immediate</span> preemptible</td></tr>
+<tr><td>Ptyche</td><td><code>backfill</code></td><td>8 h</td><td>08-28 22:37</td><td>~1 h, preemptible</td></tr>
+<tr><td>Ptyche</td><td><code>tcpo-backfill</code></td><td>8 h</td><td>08-29 01:06</td><td>~3.5 h, preemptible</td></tr>
+<tr><td>Lyris</td><td><code>gb300</code></td><td>5 h</td><td>08-31 23:18</td><td>~3 d</td></tr>
+<tr><td>Ptyche</td><td><code>batch</code></td><td>5 h</td><td>11-08 21:32</td><td><span class="b blocked">~2.5 months</span></td></tr>
+
+
 <tr><td><b>OCI-AGA</b></td><td><code><b>batch_long</b></code></td><td><b>7 d</b></td><td>08-28 20:05</td><td><span class="b done">now</span></td></tr>
-<tr><td>Ptyche</td><td><code>backfill</code></td><td>8 h</td><td>08-28 20:39</td><td>~1 h, preemptible</td></tr>
+
 <tr><td><b>OCI-HSG</b></td><td><code><b>batch_long</b></code></td><td><b>7 d</b></td><td>08-28 21:15</td><td>~1.5 h</td></tr>
 <tr><td>OCI-HSG</td><td><code>batch</code></td><td>4 h</td><td>08-29 00:00</td><td>~4 h</td></tr>
 <tr><td>OCI-AGA</td><td><code>batch</code></td><td>4 h</td><td>08-29 06:45</td><td>~11 h</td></tr>
 <tr><td>AWS-CMH-03</td><td><code>batch_long</code></td><td>7 d</td><td>08-29 07:26</td><td>~11 h</td></tr>
 <tr><td>AWS-CMH-03</td><td><code>batch</code></td><td>4 h</td><td>08-29 12:22</td><td>~16 h</td></tr>
-<tr><td>Lyris</td><td><code>gb300</code></td><td>5 h</td><td>09-01 12:55</td><td>~4 d</td></tr>
-<tr><td>Ptyche</td><td><code>batch</code></td><td>5 h</td><td>11-08 20:29</td><td><span class="b blocked">~2.5 months</span></td></tr>
+
+
 </table>
 
 <h2>Next</h2>
@@ -110,6 +117,9 @@ Start times track the live queue and move; the partition limits and the access v
 
 <h2>Key insights and mistakes</h2>
 <ol class="ins">
+<li><span class="t">Ptyche and Lyris declare no GPUs to Slurm at all, so every GPU flag is a submission error there.</span>
+<span class="w"><code>GRES=(null)</code> on both: jobs take whole nodes and <code>--gpus-per-node=4</code> is rejected outright with <code>Invalid generic resource (gres) specification</code>. The opposite of AWS-CMH-03, where <code>batch</code> enforces a QOS <i>minimum</i> of 4 GPUs and a CPU-shaped job is refused. So the same submission cannot be portable: the GPU flag must be <b>present</b> on AWS and OCI and <b>absent</b> on Ptyche and Lyris, which is why this belongs in the per-cluster profile rather than a shared template. Both also warn that job names must read <code>&lt;account&gt;-&lt;subproject&gt;.&lt;details&gt;</code> &mdash; a warning, not an error, so it is easy to ignore until someone asks whose job is filling the queue.</span></li>
+
 <li><span class="t"><code>sbatch</code> runs a <i>copy</i> of your script, so resolving a sibling file from <code>BASH_SOURCE</code> can never work.</span>
 <span class="w">The row-count job located its Python counter as &ldquo;the file next to me&rdquo; &mdash; correct under <code>bash</code>, wrong under Slurm, which stages the batch script into a per-job spool directory. At run time the script&rsquo;s own directory was <code>/cm/local/apps/slurm/var/spool/job6674014</code> and the counter was not in it. The job failed in 7 seconds, which is the good case: it failed on a guard that <i>checked the file was readable</i> rather than invoking a missing path and letting Python produce something confusing. <code>SLURM_SUBMIT_DIR</code> is the directory the job was submitted from and is what should be searched, with the <code>BASH_SOURCE</code> probe kept last so the script still runs directly outside Slurm. <b>Under a scheduler, a script does not know where it lives.</b></span></li>
 
