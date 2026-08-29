@@ -242,7 +242,8 @@ part that makes the number usable.
 
 The byte column is now measured for all ten, summed from the `size` field of
 each pinned revision's recursive tree listing rather than from `du`, which
-under-reports a Lustre tree still being written. Two entries moved far enough to
+both under-reports a Lustre tree still being written and over-reports one whose
+in-flight `.part` files it happily counts. Two entries moved far enough to
 matter: `Nemotron-SWE-v1` is 11.1 G rather than the 1.4 G the datasets-server
 reported, consistent with its conversion being partial, and
 `Nemotron-SFT-SWE-v3.5` is 0.3 G rather than 1.2 G. **Bytes are not rows.** The
@@ -256,7 +257,16 @@ Two caveats bind the composition step. Four repositories return zero for both
 row count and byte count, which means the datasets-server has not converted
 them, not that they are empty; their counts must be read from the staged shards
 directly. One of the four, `Nemotron-SFT-SWE-v2`, is now measured; the other
-three are counted as their staging completes. `Nemotron-SWE-v1` reports 24,875 converted rows against an estimate of
+three are counted as their staging completes.
+
+Staging completeness is judged against the pinned revision tree -- every file
+the SHA lists, present at its published size -- and not against the stager's
+own status file, which a restarted run truncates and which drifts from disk.
+Five repositories pass that check byte-exact on AWS: `Nemotron-SFT-Math-v4`,
+`Nemotron-RL-Math-v2`, `Nemotron-SFT-SWE-v3`, `Nemotron-SFT-SWE-v3.5` and
+`Nemotron-SFT-SWE-v2`. `Nemotron-SWE-v1` is **not** among them: it holds 5,901
+bytes of finished files against 11.1 G expected, its single large shard still
+downloading behind a `.part` name that `du` was crediting to the repository. `Nemotron-SWE-v1` reports 24,875 converted rows against an estimate of
 34,772, so its converted count is a floor rather than a total. **No composition
 ratio may be computed from an unmeasured or floor row count.** Until every entry
 above is a measured total read from the pinned staged files, the blend is
@@ -997,6 +1007,24 @@ Hub keeps `nightly-<sha>` tags for roughly ten days, so a nightly pin would
 have needed mirroring to an internal registry before its blobs were pruned; a
 digest pin does not survive blob deletion. Release tags carry no such
 deadline.
+
+The runner consumes the image as a Lustre squashfs by path and re-checks its
+`sha256` against the manifest, so the pin only becomes real once the import
+lands. On OCI-HSG it has:
+`image/vllm_openai_v0280_aarch64_20260829_6673384.sqsh`,
+`sha256:44b75976cc6583f890aff59031a2b5197eda69326e4b071994572f9a614387ba`,
+19,669,938,176 bytes, mode `0444`, with a receipt recording the resolved
+upstream arm64 digest and the presence of all three draft architectures in
+vLLM's registry.
+
+**Per-site squashfs digests are not comparable.** `mksquashfs` output is not
+reproducible, so the same upstream image staged at two sites yields two file
+digests; the AWS and OCI-HSG imports agree on byte size to the byte and differ
+on `sha256`, which is exactly what two honest squashes of identical content
+look like. Cross-site identity is therefore established by resolving the
+upstream arm64 manifest digest at import time and failing when it does not
+match the pin, not by comparing staged files. Without that check a moved tag
+would give one cluster different code with nothing failing.
 
 Two harness properties shape the sweep cost. The runner constructs its engine
 in process through `AsyncLLM.from_engine_args` and cannot attach to an
