@@ -9,7 +9,7 @@ import json
 import sys
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -139,6 +139,15 @@ def test_divergent_non_executable_call_fails_closed_but_executable_call_may_run(
         accept_target_action(target, source, executable=False)
     assert accept_target_action(target, source, executable=True) == "execute"
     assert accept_target_action(source, source, executable=False) == "reuse-recorded"
+
+
+@pytest.mark.parametrize("executable", ["false", 1, 0, None])
+def test_divergent_call_rejects_non_boolean_execution_modes(executable: object) -> None:
+    source = canonical_tool_call(_call("1", "shell", {"cmd": "ls"}))
+    target = canonical_tool_call(_call("7", "shell", {"cmd": "rm file"}))
+
+    with pytest.raises(AgenticPrefixError, match="executable must be a boolean"):
+        accept_target_action(target, source, executable=cast("bool", executable))
 
 
 def test_prefixes_exclude_the_recorded_next_transaction_from_request_bytes() -> None:

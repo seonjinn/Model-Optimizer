@@ -114,6 +114,8 @@ def accept_target_action(
     executable: bool,
 ) -> Literal["execute", "reuse-recorded"]:
     """Choose execution or proven-safe recorded-result reuse for a target call."""
+    if type(executable) is not bool:
+        raise AgenticPrefixError("executable must be a boolean")
     if executable:
         return "execute"
     if recorded_result_matches(target_call, source_call):
