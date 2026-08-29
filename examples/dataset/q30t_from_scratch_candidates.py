@@ -33,6 +33,7 @@ _ADAPTER_FIELDS = {
     "ptv2_messages_tools_v1": ("messages", "tools"),
     "ptv3_messages_tools_v1": ("messages", "tools"),
 }
+_MULTILINGUAL_LANGUAGES = frozenset({"de", "ja", "es", "fr", "it"})
 
 
 class CandidateAdapterError(ValueError):
@@ -130,7 +131,11 @@ def _adapt_row(row: Mapping[str, object], source: SourceRegistryEntry) -> _Adapt
     messages = _mapping_list(_decode(row[messages_field], messages_field), messages_field)
     if not messages:
         raise CandidateAdapterError("source messages must not be empty")
-    tools_value = row.get(tools_field, [])
+    if tools_field not in row:
+        raise CandidateAdapterError(
+            f"source adapter {source.adapter} requires {tools_field!r} tools"
+        )
+    tools_value = row[tools_field]
     tools = _mapping_list(_decode(tools_value, tools_field), tools_field, allow_none=True)
 
     source_row_index = row.get("source_row_index")
@@ -140,6 +145,10 @@ def _adapt_row(row: Mapping[str, object], source: SourceRegistryEntry) -> _Adapt
     if reasoning_mode not in {"reasoning_on", "reasoning_off"}:
         raise CandidateAdapterError("reasoning_mode must be reasoning_on or reasoning_off")
     language = row.get("language", "")
+    if source.lane == "multilingual" and (
+        not isinstance(language, str) or language not in _MULTILINGUAL_LANGUAGES
+    ):
+        raise CandidateAdapterError("multilingual source must declare an approved language")
     if not isinstance(language, str):
         raise CandidateAdapterError("language must be a string")
 

@@ -137,6 +137,55 @@ def test_adapter_name_controls_schema_without_fallback_heuristics() -> None:
         adapt_target_synthesis_row(_historical_row(), _source_entry(adapter="unknown-v1"))
 
 
+def test_adapter_rejects_an_absent_declared_tools_field() -> None:
+    row = _historical_row()
+    row.pop("tools")
+
+    with pytest.raises(CandidateAdapterError, match="tools"):
+        adapt_target_synthesis_row(row, _source_entry(adapter="ptv3_messages_tools_v1"))
+
+
+def test_adapter_normalizes_an_explicit_null_tools_field() -> None:
+    row = _historical_row()
+    row["tools"] = None
+
+    candidate = adapt_target_synthesis_row(
+        row, _source_entry(adapter="ptv3_messages_tools_v1")
+    )
+
+    assert candidate.request_bytes.endswith(b'"tools":[]}')
+
+
+@pytest.mark.parametrize("language", ["de", "ja", "es", "fr", "it"])
+def test_multilingual_candidate_accepts_each_approved_language(language: str) -> None:
+    row = _historical_row()
+    row["language"] = language
+
+    candidate = adapt_target_synthesis_row(
+        row,
+        _source_entry(adapter="ptv3_messages_tools_v1", lane="multilingual"),
+    )
+
+    assert candidate.language == language
+
+
+@pytest.mark.parametrize("language", [None, "", "en"])
+def test_multilingual_candidate_rejects_missing_or_unapproved_language(
+    language: str | None,
+) -> None:
+    row = _historical_row()
+    if language is None:
+        row.pop("language")
+    else:
+        row["language"] = language
+
+    with pytest.raises(CandidateAdapterError, match="approved language"):
+        adapt_target_synthesis_row(
+            row,
+            _source_entry(adapter="ptv3_messages_tools_v1", lane="multilingual"),
+        )
+
+
 def test_normalized_row_hash_authenticates_the_removed_source_response() -> None:
     first = _historical_row(answer="answer one")
     second = _historical_row(answer="answer two")
