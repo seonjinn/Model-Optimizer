@@ -64,10 +64,19 @@ class DFlashBaseModelOutput:
 
     target_hidden: torch.Tensor  # concatenated hidden states from target layers [B, seq, N*H]
     logits: torch.Tensor | None = None  # base model logits [B, seq, vocab]
+    # Post-final-norm base hidden [B, seq, H], i.e. lm_head's input. Consumers that only
+    # need the base distribution at a handful of positions project THIS at those rows
+    # instead of materialising (and then gathering out of) full-sequence logits.
+    base_hidden: torch.Tensor | None = None
 
     @classmethod
     def from_offline_dict(
-        cls, d: dict, base_model_norm=None, base_model_lm_head=None, need_logits=False
+        cls,
+        d: dict,
+        base_model_norm=None,
+        base_model_lm_head=None,
+        need_logits=False,
+        defer_lm_head=False,
     ):
         """Construct from a dict of pre-computed base model outputs (offline training).
 
@@ -84,19 +93,25 @@ class DFlashBaseModelOutput:
         to lm_head would be a corrupt distillation target).
         """
         logits = d.get("base_model_logits")
+        base_hidden = None
         if need_logits and logits is None:
+            out_hiddens = d.get("base_model_hidden_states")
+            if out_hiddens is None:
+                raise KeyError("base_model_hidden_states")
+            base_hidden = _maybe_apply_base_final_norm(out_hiddens, d, base_model_norm)
+            if defer_lm_head:
+                # Caller will project only the rows it needs; skip the full-sequence
+                # [B, seq, vocab] materialisation entirely.
+                return cls(target_hidden=d["aux_hidden_states"], base_hidden=base_hidden)
             if base_model_lm_head is None:
                 raise ValueError(
                     "need_logits=True but base_model_lm_head is None; cannot reconstruct logits."
                 )
-            out_hiddens = d.get("base_model_hidden_states")
-            if out_hiddens is None:
-                raise KeyError("base_model_hidden_states")
-            out_hiddens = _maybe_apply_base_final_norm(out_hiddens, d, base_model_norm)
-            logits = base_model_lm_head(out_hiddens)
+            logits = base_model_lm_head(base_hidden)
         return cls(
             target_hidden=d["aux_hidden_states"],
             logits=logits,
+            base_hidden=base_hidden,
         )
 
 
@@ -172,6 +187,36 @@ class DFlashAttention(nn.Module):
         self._attn_fn = ALL_ATTENTION_FUNCTIONS.get(impl, ALL_ATTENTION_FUNCTIONS["sdpa"])
         return self._attn_fn
 
+    def _attend(self, q, k, v, attention_mask, bsz, q_len):
+        """Run attention and project, routing a FlexAttention BlockMask to the flex kernel.
+
+        ``attention_mask`` is either the dense additive [B, 1, Q, KV] tensor (HF attention
+        dispatch) or a BlockMask carrying the same predicate block-sparsely.
+        """
+        from .dflash_flex_attention import flex_attention_forward, is_block_mask
+
+        if is_block_mask(attention_mask):
+            dropout = 0.0 if not self.training else self.attention_dropout
+            if dropout:
+                raise ValueError(
+                    "FlexAttention path does not support attention_dropout > 0 "
+                    f"(got {dropout}); unset dflash_use_flex_attention."
+                )
+            attn_output = flex_attention_forward(q, k, v, attention_mask, self.scaling)
+        else:
+            attn_fn = self._get_attn_fn()
+            attn_output, _ = attn_fn(
+                self,
+                q,
+                k,
+                v,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+            )
+        return self.o_proj(attn_output.reshape(bsz, q_len, -1))
+
     def forward(self, hidden_states, target_hidden, position_embeddings, attention_mask=None):
         """Forward with KV injection.
 
@@ -205,20 +250,28 @@ class DFlashAttention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # Use HF's attention dispatch (handles GQA internally)
-        attn_fn = self._get_attn_fn()
-        attn_output, _ = attn_fn(
-            self,
-            q,
-            k,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-        )
-        attn_output = attn_output.reshape(bsz, q_len, -1)
-        return self.o_proj(attn_output)
+        return self._attend(q, k, v, attention_mask, bsz, q_len)
+
+
+class _IdentitySublayerWrapper(nn.Module):
+    """No-op sublayer wrapper: the default around each attention/MLP sublayer.
+
+    ``DFlashDecoderLayer`` calls ``prepare()`` before a sublayer and ``finish()``
+    after it, so a variant can transform the sublayer's input and output without
+    the layer's forward growing a branch. This default does nothing and holds no
+    parameters, so it neither appears in ``state_dict()`` nor changes the numerics
+    of a plain DFlash (or Domino/DSpark) draft.
+
+    DFlash2 substitutes ``DFlashGroupedConv`` here (see ``modeling_dflash2.py``).
+    """
+
+    def prepare(self, hidden_states):
+        """Return the sublayer input unchanged, with no state to carry to ``finish``."""
+        return hidden_states, None
+
+    def finish(self, hidden_states, state):
+        """Return the sublayer output unchanged."""
+        return hidden_states
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -231,19 +284,26 @@ class DFlashDecoderLayer(nn.Module):
         self.mlp = _MLP_CLS(config)
         self.input_layernorm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = _NORM_CLS(config.hidden_size, eps=config.rms_norm_eps)
+        # Sublayer wrappers; no-ops unless a variant replaces them (DFlash2).
+        self.attention_conv = _IdentitySublayerWrapper()
+        self.mlp_conv = _IdentitySublayerWrapper()
 
     def forward(self, hidden_states, target_hidden, position_embeddings, attention_mask=None):
         """Forward pass with residual connections."""
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, conv_state = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(
             hidden_states, target_hidden, position_embeddings, attention_mask
         )
+        hidden_states = self.attention_conv.finish(hidden_states, conv_state)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, conv_state = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_conv.finish(hidden_states, conv_state)
         hidden_states = residual + hidden_states
         return hidden_states
 
