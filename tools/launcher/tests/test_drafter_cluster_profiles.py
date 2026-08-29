@@ -44,12 +44,18 @@ def test_profile_accepts_an_explicit_exact_modelopt_commit() -> None:
 
 
 def test_ptyche_profile_uses_exclusive_four_gpu_nodes() -> None:
-    """Pre-Tyche relies on an exclusive allocation instead of a GPU request flag."""
+    """Pre-Tyche relies on an exclusive allocation instead of a GPU request flag.
+
+    The partition is plain `batch` with no fallback: a reservation schedules
+    sooner only while it is held, and `batch_long` needs an approval this study
+    does not have, so every cluster queues the same way and re-queues rather
+    than asking for a longer wall clock.
+    """
     profile = load_cluster_profile(PROFILES / "ptyche.yaml")
 
     assert profile.account == "coreai_dlalgo_llm"
-    assert profile.partition == "36x2-a01r"
-    assert profile.fallback_partition == "batch"
+    assert profile.partition == "batch"
+    assert profile.fallback_partition is None
     assert profile.training_nodes == 16
     assert profile.training_segment == 16
     assert profile.evaluation_nodes == 1
@@ -62,7 +68,7 @@ def test_oci_profile_preserves_gpus_per_node() -> None:
     profile = load_cluster_profile(PROFILES / "oci-hsg.yaml")
 
     assert profile.durable_root == Path(
-        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/modelopt-specdec"
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/sna/specdec_ptv23"
     )
     assert profile.scratch_candidates == (Path("/raid/scratch"),)
     assert scheduler_gpu_args(profile) == ("--gpus-per-node=4",)
@@ -117,7 +123,7 @@ def test_probe_submits_once_after_test_only_when_sbatch_output_is_blank(
     command_dir = tmp_path / "bin"
     command_dir.mkdir()
     calls = tmp_path / "sbatch-calls"
-    _write_command(command_dir / "sacctmgr", 'printf "coreai_dlalgo_llm|36x2-a01r|\\n"\n')
+    _write_command(command_dir / "sacctmgr", 'printf "coreai_dlalgo_llm|batch|\\n"\n')
     _write_command(command_dir / "scontrol", "exit 0\n")
     _write_command(
         command_dir / "sbatch",
@@ -134,7 +140,7 @@ def test_probe_submits_once_after_test_only_when_sbatch_output_is_blank(
             "--profile",
             str(PROFILES / "ptyche.yaml"),
             "--output",
-            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/readiness.json",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/specdec_ptv23/readiness.json",
         ],
         check=False,
         capture_output=True,
@@ -144,13 +150,13 @@ def test_probe_submits_once_after_test_only_when_sbatch_output_is_blank(
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "4242"
     expected_common = (
-        "--account=coreai_dlalgo_llm --partition=36x2-a01r --nodes=1 "
+        "--account=coreai_dlalgo_llm --partition=batch --nodes=1 "
         "--ntasks-per-node=1 --segment=1 --time=00:10:00 "
         "--job-name=drafter-profile-probe-ptyche "
         f"--export=ALL,DRAFTER_LAUNCHER_ROOT={_LAUNCHER_DIR} "
         f"{_PROBE} --inside --profile {PROFILES / 'ptyche.yaml'} "
         "--output /lustre/fsw/coreai_dlalgo_llm/users/sna/"
-        "modelopt-qwen3-drafter-training/readiness.json"
+        "specdec_ptv23/readiness.json"
     )
     assert calls.read_text().splitlines() == [
         f"--test-only {expected_common}",
@@ -166,7 +172,7 @@ def test_probe_dry_run_stops_after_test_only(
     command_dir = tmp_path / "bin"
     command_dir.mkdir()
     calls = tmp_path / "sbatch-calls"
-    _write_command(command_dir / "sacctmgr", 'printf "coreai_dlalgo_llm|36x2-a01r|\\n"\n')
+    _write_command(command_dir / "sacctmgr", 'printf "coreai_dlalgo_llm|batch|\\n"\n')
     _write_command(command_dir / "scontrol", "exit 0\n")
     _write_command(command_dir / "sbatch", 'printf "%s\\n" "$*" >> "$SBATCH_CALLS"\n')
     monkeypatch.setenv("SBATCH_CALLS", str(calls))
@@ -180,7 +186,7 @@ def test_probe_dry_run_stops_after_test_only(
             "--profile",
             str(PROFILES / "ptyche.yaml"),
             "--output",
-            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-qwen3-drafter-training/readiness.json",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/specdec_ptv23/readiness.json",
         ],
         check=False,
         capture_output=True,
@@ -220,7 +226,7 @@ def test_probe_passes_sacctmgr_conditions_as_separate_arguments(
             "--profile",
             str(PROFILES / "lyris.yaml"),
             "--output",
-            "/lustre/fsw/coreai_dlalgo_llm/users/sna/modelopt-specdec/readiness.json",
+            "/lustre/fsw/coreai_dlalgo_llm/users/sna/specdec_ptv23/readiness.json",
         ],
         check=False,
         capture_output=True,
