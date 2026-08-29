@@ -1,0 +1,105 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Q30T PTv2+v3 From-Scratch Drafter Study</title>
+<style>
+:root{--bg:#0f1115;--fg:#e6e6e6;--dim:#9aa0a6;--card:#171a21;--line:#262b35;
+      --ok:#4ade80;--run:#60a5fa;--wait:#fbbf24;--bad:#f87171;--acc:#a78bfa}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,sans-serif;padding:32px 40px;max-width:1180px}
+h1{font-size:24px;margin:0 0 4px}
+h2{font-size:17px;margin:34px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--line);letter-spacing:.02em}
+.sub{color:var(--dim);font-size:13px;margin-bottom:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:8px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.stat .n{font-size:21px;font-weight:600}
+.stat .l{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+table{border-collapse:collapse;width:100%;font-size:13.5px;margin:6px 0 4px}
+th{text-align:left;color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.06em;padding:6px 10px;border-bottom:1px solid var(--line)}
+td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+code{background:#1e222b;padding:1px 5px;border-radius:3px;font-size:12.5px;color:#c3cbd8}
+.b{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.done{background:rgba(74,222,128,.14);color:var(--ok)}
+.wip{background:rgba(96,165,250,.14);color:var(--run)}
+.pend{background:rgba(251,191,36,.14);color:var(--wait)}
+.blocked{background:rgba(248,113,113,.14);color:var(--bad)}
+ol.ins{padding-left:0;list-style:none;counter-reset:i}
+ol.ins li{counter-increment:i;background:var(--card);border:1px solid var(--line);border-left:3px solid var(--acc);
+          border-radius:6px;padding:11px 14px;margin-bottom:9px}
+ol.ins li:before{content:counter(i);color:var(--acc);font-weight:700;margin-right:8px;font-size:12px}
+ol.ins .t{font-weight:600}
+ol.ins .w{display:block;color:var(--dim);font-size:12.5px;margin-top:3px}
+.empty{color:var(--dim);font-style:italic;padding:14px;background:var(--card);border:1px dashed var(--line);border-radius:6px;font-size:13px}
+</style>
+
+<h1>Qwen3-30B-A3B-Thinking &mdash; PTv2+v3 from-scratch drafter study</h1>
+<div class="sub">Three arms (DFlash / DSpark / DFlash2), identical training config, corpus composition is the only controlled variable.
+Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; Last updated 2026-08-28</div>
+
+<div class="grid">
+  <div class="stat"><div class="n">5 / 5</div><div class="l">clusters staged</div></div>
+  <div class="stat"><div class="n">3</div><div class="l">arms</div></div>
+  <div class="stat"><div class="n">3.12&times;</div><div class="l">train step speedup</div></div>
+  <div class="stat"><div class="n">120</div><div class="l">unit tests green</div></div>
+  <div class="stat"><div class="n">0</div><div class="l">training runs launched</div></div>
+</div>
+
+<h2>Done</h2>
+<table>
+<tr><th>Item</th><th>Evidence</th></tr>
+<tr><td>Design spec written and committed (979 lines)</td><td><code>docs/superpowers/specs/2026-08-28-q30t-ptv23-from-scratch-drafter-study-design.md</code></td></tr>
+<tr><td>PTV2 English subset staged on all five clusters</td><td>18/18 shards, 3.5&ndash;3.7 G, pinned rev <code>5c89e01d</code>. OCI-HSG, Ptyche, Lyris, AWS-CMH-03, OCI-AGA</td></tr>
+<tr><td>PTV2 row counts promoted from asserted to measured</td><td>1,397,187 admitted English rows, read from <code>dataset_info</code> in the staged README</td></tr>
+<tr><td>DFlash2 arm merged (PR #2216)</td><td><code>modeling_dflash2.py</code> +314, <code>hf_dflash2.py</code> +198, recipe <code>dflash2.yaml</code></td></tr>
+<tr><td>Training speedups merged (PR #2279)</td><td>1.690 &rarr; 0.541 s/step. FlexAttention block-sparse mask, on-demand teacher rows, split-based TVD chunking</td></tr>
+<tr><td>OCI-AGA enabled as a submission target</td><td>account <code>nemotron_sw_post</code>, FairShare 0.2486, 429 idle nodes, <code>batch</code> 4 h / <code>batch_long</code> 7 d</td></tr>
+<tr><td>ModelOpt checkouts on both GB300 clusters</td><td>AWS-CMH-03 and OCI-AGA at <code>~/modelopt</code>, upstream <code>main</code></td></tr>
+<tr><td>MARS shared-cluster conduct rules encoded into the spec</td><td>storage placement, &lt;25 K files/dir, no unfiltered <code>squeue</code>, &ge;60 s polling</td></tr>
+</table>
+
+<h2>Next</h2>
+<table>
+<tr><th>Item</th><th>State</th><th>Blocks</th></tr>
+<tr><td>Probe job 611308 &mdash; settle whether OCI-AGA is GB200 or GB300</td><td><span class="b pend">queued</span></td><td>GB300 serving sweep</td></tr>
+<tr><td>Stage PTV3 on all five clusters; measure authoritative row counts</td><td><span class="b wip">in progress</span></td><td>corpus composition</td></tr>
+<tr><td>Patch specdec_bench: add <code>DSPARK</code> / <code>DFLASH2</code> to <code>--speculative_algorithm</code></td><td><span class="b pend">not started</span></td><td>any three-arm throughput number</td></tr>
+<tr><td>Decide on PR #2027 (<code>quantize_drafter.py</code>, calibration-free FP8/NVFP4 drafter PTQ)</td><td><span class="b pend">evaluating</span></td><td>NVFP4 reference comparison</td></tr>
+<tr><td>Lyris inode cleanup (93.4 % of soft limit)</td><td><span class="b blocked">user-owned</span></td><td>Lyris as a checkpoint target</td></tr>
+<tr><td>Spec user-review gate, then implementation plan</td><td><span class="b wip">awaiting review</span></td><td>launch</td></tr>
+</table>
+
+<h2>Key results</h2>
+<div class="empty">No training runs launched yet. Acceptance length &tau;, block size B, and end-to-end rollout throughput at both high and low concurrency land here as milestones report.</div>
+
+<h2>Key insights and mistakes</h2>
+<ol class="ins">
+<li><span class="t">A permission denial on one subdirectory is not evidence about the tree.</span>
+<span class="w">Tested only <code>&lt;project&gt;/users</code> on AWS-CMH-03 and OCI-AGA, found it root-owned, and wrote a spec section declaring the study GB200-only. The project root itself is group-writable on both. Walk up one level before concluding. Cost: one wrong spec section and a discarded hardware plan.</span></li>
+
+<li><span class="t">A bounded search proves nothing about what lies outside its bound.</span>
+<span class="w">A <code>find -maxdepth 4</code> scoped to my own directory could not reach a depth-6 path under another user's, and the absence of hits was reported as "no staged corpus exists anywhere." It existed, 42 G of it. State the scope of a negative result alongside the result.</span></li>
+
+<li><span class="t">Unbounded <code>find</code> on shared Lustre from a login node is prohibited, and I ran one.</span>
+<span class="w">MARS records an unbounded scan that ran 20&ndash;29 hours and degraded the filesystem for everyone. Scope every scan to your own directory; never leave one running.</span></li>
+
+<li><span class="t">A revoked token and a gating denial look nothing alike &mdash; check <code>whoami</code>, not the artifact.</span>
+<span class="w">Lyris and Ptyche appeared to lack a token. They had one; it was fully revoked (401 on <code>whoami</code>, not just on the gated dataset). Fingerprint tokens with sha256 and test the identity endpoint before assuming an environment problem.</span></li>
+
+<li><span class="t">DFlash attention was running an Ampere sm80 kernel on Blackwell at roughly 2.5 % of peak.</span>
+<span class="w">A materialized <code>[B,1,Q,KV]</code> additive mask disqualifies every fused backend, so PyTorch silently fell through to the cutlass memory-efficient path, whose only kernel is sm80. That single backward kernel was 59 % of the step. Silent backend fallback is the most expensive kind of correct-but-slow.</span></li>
+
+<li><span class="t">A wrong <code>EAGLE_CAPTURE_IDS</code> final layer id silently caps acceptance length.</span>
+<span class="w">Capturing the second-to-last hidden instead of the true final one trains without error and just produces a worse drafter. There is no failure signal, so the id has to be derived (<code>build_target_layer_ids(n_layers, n_draft) + 1</code>, plus the true final) rather than guessed.</span></li>
+
+<li><span class="t">Trainer memory is set by the loss tensor, not by sequence length.</span>
+<span class="w"><code>[N, vocab]</code> with <code>N = per_device_batch &times; num_anchors &times; block_size</code> dominates, and is independent of <code>training_seq_len</code>. All three arms are held at <code>num_anchors &times; block_size = 4096</code> so memory is comparable across them.</span></li>
+
+<li><span class="t">The three arms do not share a draft length.</span>
+<span class="w">DFlash and DFlash2 give K = B &minus; 1; DSpark gives K = B, because its shift-label alignment does not exclude position 0. Comparing arms at equal B but reporting a single K would misattribute the difference. <code>NUM_SPEC_TOKENS</code> is an independent serving knob bounded above by K.</span></li>
+
+<li><span class="t">Inodes, not capacity, are the binding storage constraint.</span>
+<span class="w">Every cluster has hundreds of terabytes free; Lyris is at 93.4 % of its soft inode limit. Checkpoint and shard layout has to favour few large files over many small ones, and the quota that matters is the one nobody checks.</span></li>
+
+<li><span class="t">Idle GPUs can get the job killed by the scheduler.</span>
+<span class="w">In the producer-consumer topology (vLLM serve nodes plus DDP trainer nodes), a stalled serve leaves trainer GPUs idle and risks auto-termination of a 16-node job. Node counts must be sized so both halves stay busy.</span></li>
+</ol>
