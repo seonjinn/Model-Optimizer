@@ -86,4 +86,5 @@ done
     --workers 48 \
     "${repo_args[@]}" \
     --expect Nemotron-RL-Math-v2=7732 --expect Nemotron-SFT-SWE-v3.5=5115 \
-    --expect Nemotron-SFT-Math-v4=545431 --expect Nemotron-SFT-SWE-v3=237970
+    --expect Nemotron-SFT-Math-v4=545431 --expect Nemotron-SFT-SWE-v3=237970 \
+    --expect Open-SWE-Traces=565107

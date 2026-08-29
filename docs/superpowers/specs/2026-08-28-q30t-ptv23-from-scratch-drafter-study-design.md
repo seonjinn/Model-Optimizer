@@ -213,7 +213,7 @@ revision.
 | `Nemotron-SFT-SWE-v3` | `3f73de64` | 237,970 | 11.7 G | **staged shards, matches index** |
 | `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 0.3 G | **staged shards, matches index** |
 | `Nemotron-SWE-v1` | `0fe17a96` | **51,029** | 11.1 G | **staged shards** |
-| `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | datasets-server, 3 configs |
+| `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | **staged shards, matches index** |
 | `Nemotron-SFT-SWE-v2` | `bd151f3f` | 256,254 | 18.1 G | **staged shards, counter validated** |
 | `Nemotron-Agentic-v1` | `650d5909` | unmeasured | 5.8 G | bytes from HF tree |
 | `Nemotron-SFT-Agentic-v2` | `7c804833` | unmeasured | 21.9 G | bytes from HF tree |
@@ -222,7 +222,13 @@ revision.
 
 `Open-SWE-Traces` splits across three configs: `v1.0` 151,219, `v1.1` 360,335,
 `v1.2` 53,553. At 46.5 G it is a third of the corpus on its own, and it is the
-only repository that nests four directory levels below its root.
+only repository that nests four directory levels below its root. It has now
+finished staging and been counted from its 232 staged shards, which reproduce
+the indexed **565,107** exactly. This is the fifth agreement between the
+counter and the index and by far the largest, which matters more than the
+number itself: the four earlier agreements were on repositories of 5 thousand
+to 545 thousand rows, and none exercised a shard count in the hundreds. The
+counter is now checked at the scale it will actually be used at.
 
 `Nemotron-SFT-SWE-v2` is the first of the four unconverted repositories to be
 counted from the staged bytes: **256,254 rows** across two JSONL shards. That
