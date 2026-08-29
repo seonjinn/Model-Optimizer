@@ -363,9 +363,25 @@ has a different experiment identity.
 
 ## Training contract
 
-The initial family uses block size 8 and proposes seven draft tokens so it can
-be compared with the historical B8 drafters and the currently validated
-DFlash2 serving horizon. A block-size-16 study is a later experiment identity.
+The initial family uses block size 8 so it can be compared with the historical
+B8 drafters and the currently validated DFlash2 serving horizon. A
+block-size-16 study is a later experiment identity.
+
+Block size does not fix the proposal horizon uniformly across the three arms,
+and the difference is intrinsic to each architecture rather than a tunable.
+DFlash supervises `anchor+0` through `anchor+B-1` and its serving walk skips
+the anchor at block position 0, so its horizon is `B - 1`. DFlash2 keeps that
+alignment and additionally zeroes block position 0 in the loss weight mask, so
+its horizon is also `B - 1`. DSpark uses shift-label alignment, supervising
+`anchor+1` through `anchor+B` with position 0 not excluded, so its horizon is
+`B`. At block size 8 this is seven proposed tokens for DFlash and DFlash2 and
+eight for DSpark.
+
+`NUM_SPEC_TOKENS` at serving is a separate knob bounded above by that horizon,
+not derived from it; the DSpark decode loop caps generation at
+`min(steps, block_size)`. Each arm is served at its own maximum horizon, and
+the consequence for cross-arm scoring is handled under Evaluation: raw
+acceptance length is not comparable when the horizons differ.
 
 All three architectures share:
 
@@ -405,7 +421,8 @@ one-node, two-node, and sixteen-node platform sequence.
 The proven Q30 streaming shape uses 16 GB200 nodes, eight target-serving nodes,
 eight trainer nodes, four GPUs per node, 32 trainer ranks, and target tensor
 parallel size 2. A topology change creates a new performance identity and
-cannot be compared as the same throughput run.
+cannot be compared as the same throughput run. This study keeps that shape; it
+does not rebalance the serve-to-trainer split to chase utilization.
 
 Every submission runs Slurm `--test-only`, confirms an exact source commit is
 signed and pushed, checks only the user's or exact job's scheduler state, and
@@ -413,12 +430,182 @@ monitors a newly running job for five minutes. Execution stages all high-churn
 data and caches on node-local `/raid/scratch`; durable corpus, checkpoint, and
 bounded evidence artifacts reside on `/lustre`.
 
+### Measured cluster inventory
+
+Surveyed 2026-08-28 by probe job. Every GPU node carries four GPUs, about 940
+GB of host memory, about 144 CPUs across two sockets, and eight NICs.
+
+| Cluster    | GPU   | HBM per GPU        | Best account      | FairShare |
+|------------|-------|--------------------|-------------------|-----------|
+| OCI-HSG    | GB200 | 189,471 MiB (185.0 GiB) | nemotron_n3_post  | 0.769 |
+| Ptyche     | GB200 | 189,471 MiB (185.0 GiB) | coreai_dlalgo_llm | 0.233 |
+| Lyris      | GB200 / GB300 | 185.0 / 277.5 GiB | coreai_dlalgo_llm | 0.524 |
+| AWS-CMH-03 | GB300 | 284,208 MiB (277.5 GiB) | nemotron_sw_post  | 0.915 |
+| OCI-AGA    | GB300 | 284,208 MiB (277.5 GiB) | nemotron_sw_post  | 0.249 |
+
+`fsort` is an OCI-HSG-only wrapper. Elsewhere read the same numbers from
+`sshare -U -o Account,NormShares,EffectvUsage,FairShare,LevelFS -P`. FairShare
+decays with use, so it is re-read immediately before each wave rather than
+taken from this table.
+
+Submission differs per cluster. OCI-HSG, AWS-CMH-03, and OCI-AGA reject a
+`batch` job that requests no GPUs, so each submission passes
+`--gpus-per-node=4`. Lyris `gb200` and `gb300` report `Gres=(null)` and take
+`--exclusive` instead. Lyris and Ptyche warn when a job name is not formatted
+`coreai_dlalgo_llm-<subproject>.<details>`; that is a warning only, and
+`-A coreai_dlalgo_llm` is the account that works, while
+`-A coreai_dlalgo_llm-<subproject>` is a genuine invalid-account error.
+AWS-hosted nodes use EFA, where NIXL's UCX backend segfaults at agent init, so
+runs there set `NIXL_BACKENDS=LIBFABRIC`, `FI_PROVIDER=efa`, and
+`NCCL_IB_DISABLE=1`.
+
+### Partition constraint
+
+Training runs on the `batch`-class partitions only. `batch_long` carries a
+seven-day ceiling and `AllowAccounts=ALL`, so the scheduler does not reject it,
+but using it requires approval this study does not hold. Treating the long
+partition as unavailable is a planning constraint, not a scheduler fact, and
+the distinction is recorded so a later approval can be applied without
+redesigning the run.
+
+| Cluster    | Partition | MaxTime | Preemption            |
+|------------|-----------|---------|-----------------------|
+| OCI-HSG    | batch     | 4h      | off, GraceTime 600 s  |
+| AWS-CMH-03 | batch     | 4h      | off, GraceTime 600 s  |
+| OCI-AGA    | batch     | 4h      | off, GraceTime 0      |
+| Lyris      | gb200 / gb300 | 5h  | off, MaxNodes 512     |
+| Ptyche     | batch     | 5h      | off                   |
+
+Lyris `gb200-backfill` and `gb300-backfill` raise the ceiling to eight hours at
+`PreemptMode=CANCEL`. A preempted chunk there is cancelled rather than
+requeued, and the 600 s grace is the entire window in which a checkpoint can be
+written. The backfill partitions are therefore not part of the default plan;
+they are usable only with a SIGTERM handler that checkpoints inside the grace,
+and any run that uses them records which chunks were preempted.
+
+### Chunked resume chain
+
+A four- or five-hour ceiling cannot hold a one-to-two-day run, so each run is a
+chain of chunks rather than a single job. Chunks request `--time=03:55:00` on
+the four-hour partitions and `--time=04:55:00` on the five-hour partitions,
+leaving five minutes for teardown inside the wall clock.
+
+Every chunk of a run is submitted at once, each with
+`--dependency=afterany:<previous>`. Dependent jobs accrue age priority while
+held, so queuing the whole chain at t=0 costs nothing and avoids paying a fresh
+queue wait after each chunk. `afterany` rather than `afterok` keeps a single
+node failure from killing the chain; the safety comes instead from each chunk
+asserting on entry that a resumable checkpoint exists and is newer than the
+previous chunk's start, and hard-exiting if it is not. That gives fault
+tolerance without silently training from a stale or corrupt state.
+
+Restart overhead per chunk covers container import, the target `vllm serve`
+load at tensor parallel size 2 across eight nodes, trainer initialization, and
+optimizer-state resume. It is budgeted at twenty minutes and measured in the
+calibration gate; at that budget a four-hour chunk yields about 3.6 hours of
+training and a five-hour chunk about 4.6 hours, so a thirty-hour run is roughly
+nine chunks on `batch` or seven on Lyris and Ptyche. Recovery checkpointing
+runs at `save_steps=500` with `save_total_limit=2`, sized so that at most a few
+minutes of work is lost at a chunk boundary; the permanent milestone
+checkpoints described under Evaluation are a separate, retained set.
+
+Milestone evaluation does not gate the chain. Evaluations are submitted as
+independent jobs against a published milestone checkpoint, so a slow or failed
+evaluation never blocks the next training chunk. Under a chunked plan this
+matters more than it would under a single long job, because chunk boundaries
+now recur every four to five hours across every run in the wave.
+
+### Memory-driven batch sizing
+
+All three arms supervise the same number of positions per sequence:
+`dflash_num_anchors` multiplied by `dflash_block_size` is 4,096 for DFlash at
+512 anchors and block 8, and 4,096 for DSpark and DFlash2 at 256 anchors and
+block 16. The `[N, vocab]` loss tensor that dominates trainer memory therefore
+has the same shape in every arm, with `N` equal to
+`per_device_train_batch_size` times 4,096, and it does not depend on
+`training_seq_len`.
+
+Global batch size is fixed at 512 sequences for every run and every cluster:
+32 trainer ranks times `per_device_train_batch_size` 16 times gradient
+accumulation 1. That shape is sized to fit GB200's 185.0 GiB, which is the
+binding constraint; GB300's 277.5 GiB runs the identical shape with about 1.5x
+headroom. Gradient accumulation is driven to 1 because the DDP all-reduce is
+the largest single kernel in the profiled step, and accumulation multiplies the
+step count without reducing that cost.
+
+Holding global batch size constant across GB200 and GB300 is deliberate.
+Raising it on GB300 to consume the spare memory would change the optimization
+trajectory and make a GB300 run non-comparable to a GB200 run of the same arm.
+The spare memory is banked as headroom against sequence-length outliers and
+activation spikes, not spent.
+
+### Occupancy
+
+The scheduler may terminate a job whose GPUs sit idle, and the streaming
+topology makes that a real risk: the trainers stall whenever the eight serving
+nodes cannot generate hidden states fast enough, and the serving nodes stall in
+the opposite case. A calibration gate ahead of the wave measures serve tokens
+per second per replica, trainer step time, and the largest
+`per_device_train_batch_size` that does not exhaust memory, and the five-minute
+post-launch watch checks utilization on both halves rather than on the trainers
+alone. Rebalancing the eight-to-eight split is out of scope, because it would
+change the performance identity of the run; the calibration numbers instead
+size `SERVE_MAX_NUM_SEQS` and the dataloader worker count so both halves stay
+busy at the fixed topology.
+
 ## Evaluation
 
 Each run is evaluated at initialization, 256M, 1B, and 4B when present. The
 same evaluator source, prompts, target, decoding settings, proposed-token
 horizon, concurrency, and GB200 runtime identity are used for every paired
 comparison.
+
+### Milestones
+
+Milestones are defined by prompts consumed, not by optimizer step, because the
+step count is a function of the global batch size and would not line up across
+arms if that ever changed. The retained milestones are 250k, 500k, 1M, and 2M
+prompts, which at global batch size 512 fall at steps 500, 1,000, 2,000, and
+3,906. The spacing is logarithmic rather than linear because acceptance
+saturates early, so the informative comparisons are concentrated in the first
+quarter of the run. Each milestone is checkpointed permanently, exported, and
+evaluated by an independent job; the recovery checkpoints written every 500
+steps are rotated and are not milestones.
+
+### Comparability of acceptance across arms
+
+Raw acceptance length is not comparable between arms in this study. DSpark
+supervises position 0 of each block and proposes `K = B` tokens, while DFlash
+and DFlash2 mask position 0 out of the loss and propose `K = B - 1`. An arm
+proposing more tokens can report a longer accepted prefix without being
+faster. The primary cross-arm metric is therefore `Output TPS` from the
+harness, which already folds in the proposal horizon and the verifier cost.
+`Joint_Acceptance_Rate[k]` is reported alongside it because it is indexed by
+position and so remains comparable; raw `Average_AL` is reported per arm but
+never used to rank arms against each other.
+
+### Concurrency profile
+
+The rollout workload this drafter serves does not run at a single concurrency.
+A GRPO step starts with many rollouts in flight and decays toward a long tail,
+and the step does not end until the last rollout finishes, so the low-
+concurrency tail dominates wall clock even though it produces a minority of the
+tokens. Measuring at one concurrency would therefore mis-rank the arms.
+
+Evaluation sweeps concurrency over 1, 2, 4, 8, 16, 32, 64, 128, and 256, with
+the low end sampled densely because that is the regime that decides step time.
+Separately, an occupancy profile is measured from a real GRPO rollout: the
+fraction of generated tokens produced at each concurrency bucket. The two
+combine into a single score, the expected rollout time, computed as the sum
+over buckets of tokens in that bucket divided by the throughput measured at
+that concurrency. That score, not any single-point throughput number, ranks the
+arms.
+
+High concurrency is treated as a do-no-harm gate rather than an optimization
+target. At the highest measured concurrency the drafter must reach at least
+parity with autoregressive decoding, since a drafter that wins the tail while
+losing the head can still lengthen the step. Low concurrency is where the
+optimization is expected to pay, and is scored as such.
 
 Required outputs include:
 
