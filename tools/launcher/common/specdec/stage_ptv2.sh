@@ -12,18 +12,36 @@ math-00000-of-00002.parquet math-00001-of-00002.parquet
 code-00000-of-00002.parquet code-00001-of-00002.parquet"
 for i in $(seq 0 11); do FILES="$FILES chat-$(printf '%05d' "$i")-of-00012.parquet"; done
 
+# A non-empty file is not a staged file: a truncated shard is non-empty too.
+# Take the last Content-Length so the value survives the CDN redirect.
+remote_size() {
+  curl -sIL --fail -m 120 -H "Authorization: Bearer $HFTOK" "$1" 2>/dev/null \
+    | awk 'tolower($1) == "content-length:" { n = $2 + 0 } END { print n + 0 }'
+}
+# stat flags are not portable; wc -c is, and a missing file yields 0 either way.
+local_size() { wc -c < "$1" 2>/dev/null | tr -d ' ' || echo 0; }
+
 mkdir -p "$DST" || exit 1
-ok=0; fail=0; failed=""
+ok=0; fail=0; failed=""; bytes=0
 for f in $FILES; do
-  if [ -s "$DST/$f" ]; then ok=$((ok+1)); continue; fi
+  want="$(remote_size "$BASE/$f")"
+  [ "$want" -gt 0 ] 2>/dev/null || { fail=$((fail+1)); failed="$failed $f(no-size)"; continue; }
+  if [ "$(local_size "$DST/$f")" = "$want" ]; then
+    ok=$((ok+1)); bytes=$((bytes+want)); continue
+  fi
   got=0
   for attempt in 1 2; do
     if curl -sSL --fail -m 2400 -H "Authorization: Bearer $HFTOK" \
-         -o "$DST/$f.part" "$BASE/$f" 2>/dev/null; then
+         -o "$DST/$f.part" "$BASE/$f" 2>/dev/null \
+       && [ "$(local_size "$DST/$f.part")" = "$want" ]; then
       mv "$DST/$f.part" "$DST/$f"; got=1; break
     fi
     rm -f "$DST/$f.part"
   done
-  if [ "$got" = 1 ]; then ok=$((ok+1)); else fail=$((fail+1)); failed="$failed $f"; fi
+  if [ "$got" = 1 ]; then ok=$((ok+1)); bytes=$((bytes+want)); else fail=$((fail+1)); failed="$failed $f"; fi
 done
-{ echo "revision=$REV"; echo "ok=$ok fail=$fail"; [ -n "$failed" ] && echo "failed:$failed"; du -sh "$DST"; } > "$DST/../stage_status.txt"
+# du under-reports a Lustre directory that is still being written, so report
+# the bytes actually accounted for instead.
+{ echo "revision=$REV"; echo "ok=$ok fail=$fail"; echo "bytes=$bytes";
+  [ -n "$failed" ] && echo "failed:$failed"; } > "$DST/../stage_status.txt"
+[ "$fail" -eq 0 ]
