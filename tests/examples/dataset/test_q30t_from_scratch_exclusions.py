@@ -415,6 +415,7 @@ def test_short_numeric_answer_requires_an_authenticated_answer_context() -> None
     heldout = _bundle(atoms=(answer,))
 
     assert apply_heldout_union(_candidate("There are 42 items."), heldout) is None
+    assert apply_heldout_union(_candidate("Final answer: 420"), heldout) is None
     exclusion = apply_heldout_union(_candidate("Final answer: 42"), heldout)
     assert exclusion is not None
     assert exclusion.matched_identity == answer.digest

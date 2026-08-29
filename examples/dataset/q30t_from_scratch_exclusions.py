@@ -11,7 +11,7 @@ import os
 import re
 import stat
 import unicodedata
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 from pathlib import Path
@@ -476,7 +476,7 @@ def _candidate_views(candidate: PromptCandidate) -> _CandidateViews:
     counters = _TraversalCounters()
     containers: list[dict[str, object] | list[object]] = []
     text_values: list[str] = []
-    key_values: dict[str, list[str]] = {}
+    key_values: dict[str, list[object]] = {}
     projection = _normalize_candidate_value(
         {
             "messages": payload["messages"],
@@ -489,49 +489,73 @@ def _candidate_views(candidate: PromptCandidate) -> _CandidateViews:
         text_values=text_values,
         key_values=key_values,
     )
-    projection_bytes = _canonical_json(projection)
-    if len(projection_bytes) > _MAX_DECODED_ROW_BYTES:
-        raise FromScratchExclusionError("candidate decoded row exceeds the byte cap")
-
     seen_views: set[tuple[str, int, str]] = set()
-    text = tuple(
-        _record_view("text", value, counters=counters, seen=seen_views)
-        for value in text_values
-        if value
-    )
-    structured = tuple(
-        _record_view(
+    text: list[str] = []
+    for value in text_values:
+        _preflight_containment_view(value, counters)
+        normalized = _containment_text(value)
+        if normalized:
+            _append_unique_view(
+                text,
+                "text",
+                normalized,
+                counters=counters,
+                seen=seen_views,
+            )
+    structured: list[str] = []
+    for container in containers:
+        _preflight_json_view(container, counters, containment=True)
+        _append_unique_view(
+            structured,
             "structured",
             _containment_text(_canonical_json(container).decode("utf-8")),
             counters=counters,
             seen=seen_views,
         )
-        for container in containers
+    normalized_key_values: dict[str, tuple[str, ...]] = {}
+    for key, values in key_values.items():
+        recorded: list[str] = []
+        for value in values:
+            if isinstance(value, str):
+                _preflight_containment_view(value, counters)
+                normalized_value = _containment_text(value)
+            else:
+                _preflight_json_view(value, counters, containment=True)
+                normalized_value = _containment_text(_canonical_json(value).decode("utf-8"))
+            _append_unique_view(
+                recorded,
+                f"key-value:{key}",
+                normalized_value,
+                counters=counters,
+                seen=seen_views,
+            )
+        normalized_key_values[key] = tuple(recorded)
+    whole_lines: list[str] = []
+    for value in text_values:
+        for line in value.split("\n"):
+            _preflight_containment_view(line, counters)
+            normalized_line = _containment_text(line)
+            if normalized_line:
+                _append_unique_view(
+                    whole_lines,
+                    "whole-line",
+                    normalized_line,
+                    counters=counters,
+                    seen=seen_views,
+                )
+    _preflight_json_view(
+        projection,
+        counters,
+        containment=False,
+        per_view_byte_cap=_MAX_DECODED_ROW_BYTES,
     )
-    normalized_key_values = {
-        key: tuple(
-            _record_view(f"key-value:{key}", value, counters=counters, seen=seen_views)
-            for value in values
-        )
-        for key, values in key_values.items()
-    }
-    whole_lines = frozenset(
-        _containment_text(line)
-        for value in text
-        for line in value.split("\n")
-        if _containment_text(line)
-    )
-    raw_record = _record_view(
-        "raw-record",
-        projection_bytes.decode("utf-8"),
-        counters=counters,
-        seen=seen_views,
-    )
+    raw_record = _canonical_json(projection).decode("utf-8")
+    _record_view("raw-record", raw_record, counters=counters, seen=seen_views)
     return _CandidateViews(
         prompt_uuid=shared_prompt_uuid(payload["messages"], payload["tools"]),
-        text=text,
-        structured=structured,
-        whole_lines=whole_lines,
+        text=tuple(text),
+        structured=tuple(structured),
+        whole_lines=tuple(whole_lines),
         key_values=MappingProxyType(normalized_key_values),
         raw_record=raw_record,
     )
@@ -544,7 +568,7 @@ def _normalize_candidate_value(
     counters: _TraversalCounters,
     containers: list[dict[str, object] | list[object]],
     text_values: list[str],
-    key_values: dict[str, list[str]],
+    key_values: dict[str, list[object]],
 ) -> object:
     if depth > _MAX_NESTING_DEPTH:
         raise FromScratchExclusionError("candidate nesting depth exceeds the cap")
@@ -559,7 +583,7 @@ def _normalize_candidate_value(
             _charge_decoded_bytes(counters, normalized_key)
             if normalized_key in normalized:
                 raise FromScratchExclusionError("candidate object has duplicate normalized keys")
-            text_values.append(_containment_text(normalized_key))
+            text_values.append(normalized_key)
             normalized_item = _normalize_candidate_value(
                 item,
                 depth=depth + 1,
@@ -569,7 +593,7 @@ def _normalize_candidate_value(
                 key_values=key_values,
             )
             normalized[normalized_key] = normalized_item
-            key_values.setdefault(normalized_key, []).append(_candidate_key_value(normalized_item))
+            key_values.setdefault(normalized_key, []).append(normalized_item)
         return normalized
     if isinstance(value, list):
         _charge_structured_node(counters)
@@ -593,7 +617,7 @@ def _normalize_candidate_value(
             raise FromScratchExclusionError("candidate string leaves exceed the cap")
         normalized_string = _normalize_text(value)
         _charge_decoded_bytes(counters, normalized_string)
-        text_values.append(_containment_text(normalized_string))
+        text_values.append(normalized_string)
         return normalized_string
     if value is None or isinstance(value, bool):
         return value
@@ -619,10 +643,66 @@ def _charge_decoded_bytes(counters: _TraversalCounters, value: str) -> None:
         raise FromScratchExclusionError("candidate decoded row exceeds the byte cap")
 
 
-def _candidate_key_value(value: object) -> str:
-    if isinstance(value, str):
-        return _containment_text(value)
-    return _containment_text(_canonical_json(value).decode("utf-8"))
+def _preflight_containment_view(value: str, counters: _TraversalCounters) -> None:
+    _start_generated_view(counters)
+    output_started = False
+    pending_space = False
+    for character in value:
+        if character in _WHITE_SPACE:
+            if output_started:
+                pending_space = True
+            continue
+        if pending_space:
+            _charge_generated_view_bytes(counters, 1)
+            pending_space = False
+        _charge_generated_view_bytes(counters, len(character.encode("utf-8")))
+        output_started = True
+
+
+def _preflight_json_view(
+    value: object,
+    counters: _TraversalCounters,
+    *,
+    containment: bool,
+    per_view_byte_cap: int | None = None,
+) -> None:
+    _start_generated_view(counters)
+    per_view_bytes = 0
+    output_started = False
+    pending_space = False
+    for fragment in _canonical_json_fragments(value):
+        if containment:
+            for character in fragment:
+                if character in _WHITE_SPACE:
+                    if output_started:
+                        pending_space = True
+                    continue
+                if pending_space:
+                    per_view_bytes += 1
+                    _charge_generated_view_bytes(counters, 1)
+                    pending_space = False
+                encoded_size = len(character.encode("utf-8"))
+                per_view_bytes += encoded_size
+                _charge_generated_view_bytes(counters, encoded_size)
+                output_started = True
+        else:
+            encoded_size = len(fragment.encode("utf-8"))
+            per_view_bytes += encoded_size
+            _charge_generated_view_bytes(counters, encoded_size)
+        if per_view_byte_cap is not None and per_view_bytes > per_view_byte_cap:
+            raise FromScratchExclusionError("candidate decoded row exceeds the byte cap")
+
+
+def _start_generated_view(counters: _TraversalCounters) -> None:
+    counters.generated_count += 1
+    if counters.generated_count > _MAX_GENERATED_VIEW_COUNT:
+        raise FromScratchExclusionError("candidate generated view count exceeds the cap")
+
+
+def _charge_generated_view_bytes(counters: _TraversalCounters, size: int) -> None:
+    counters.generated_bytes += size
+    if counters.generated_bytes > _MAX_GENERATED_VIEW_BYTES:
+        raise FromScratchExclusionError("candidate generated views exceed the byte cap")
 
 
 def _record_view(
@@ -631,21 +711,28 @@ def _record_view(
     *,
     counters: _TraversalCounters,
     seen: set[tuple[str, int, str]],
-) -> str:
+) -> bool:
     size = len(value.encode("utf-8"))
-    counters.generated_count += 1
-    counters.generated_bytes += size
-    if counters.generated_count > _MAX_GENERATED_VIEW_COUNT:
-        raise FromScratchExclusionError("candidate generated view count exceeds the cap")
-    if counters.generated_bytes > _MAX_GENERATED_VIEW_BYTES:
-        raise FromScratchExclusionError("candidate generated views exceed the byte cap")
     identity = (kind, size, sha256(value.encode("utf-8")).hexdigest())
     if identity not in seen:
         seen.add(identity)
         counters.unique_bytes += size
         if counters.unique_bytes > _MAX_UNIQUE_SCANNED_VIEW_BYTES:
             raise FromScratchExclusionError("candidate unique scanned views exceed the byte cap")
-    return value
+        return True
+    return False
+
+
+def _append_unique_view(
+    output: list[str],
+    kind: str,
+    value: str,
+    *,
+    counters: _TraversalCounters,
+    seen: set[tuple[str, int, str]],
+) -> None:
+    if _record_view(kind, value, counters=counters, seen=seen):
+        output.append(value)
 
 
 def _atom_matches(atom: HeldoutV2Atom, views: _CandidateViews, budget: _MatcherBudget) -> bool:
@@ -704,21 +791,17 @@ def _validate_full_shape_contract(atom: HeldoutV2Atom) -> None:
     if atom.shape_id == 0:
         allowed = atom.domain_id in range(7)
     elif atom.shape_id == 1:
-        allowed = (
-            atom.domain_id in {0, 6} and alphanumeric_count >= 2
-        ) or (
-            atom.domain_id == 1
-            and alphanumeric_count >= 2
-            and not numeric_answer
+        allowed = (atom.domain_id in {0, 6} and alphanumeric_count >= 2) or (
+            atom.domain_id == 1 and alphanumeric_count >= 2 and not numeric_answer
         )
     elif atom.shape_id == 2:
         allowed = atom.domain_id == 1 and (numeric_answer or alphanumeric_count < 2)
     elif atom.shape_id == 3:
         allowed = atom.domain_id in {2, 3, 4} and non_whitespace_count >= 4
     elif atom.shape_id == 4:
-        allowed = (
-            atom.domain_id in {2, 3, 4} and non_whitespace_count < 4
-        ) or (atom.domain_id == 6 and alphanumeric_count < 2)
+        allowed = (atom.domain_id in {2, 3, 4} and non_whitespace_count < 4) or (
+            atom.domain_id == 6 and alphanumeric_count < 2
+        )
     elif atom.shape_id == 5:
         allowed = atom.domain_id == 5 and _is_canonical_structured_json(atom.value)
     elif atom.shape_id == 6:
@@ -760,21 +843,32 @@ def _is_lexical_boundary(character: str | None) -> bool:
 
 
 def _answer_context_contains(view: str, value: str) -> bool:
-    templates = (
-        f"#### {value}",
-        f"answer {value}",
-        f"answer: {value}",
-        f"answer is {value}",
-        f"Answer {value}",
-        f"Answer: {value}",
-        f"Answer is {value}",
-        f"final answer {value}",
-        f"final answer: {value}",
-        f"Final answer {value}",
-        f"Final answer: {value}",
-        f"\\boxed{{{value}}}",
+    contexts = (
+        ("#### ", ""),
+        ("answer ", ""),
+        ("answer: ", ""),
+        ("answer is ", ""),
+        ("Answer ", ""),
+        ("Answer: ", ""),
+        ("Answer is ", ""),
+        ("final answer ", ""),
+        ("final answer: ", ""),
+        ("Final answer ", ""),
+        ("Final answer: ", ""),
+        ("\\boxed{", "}"),
     )
-    return any(template in view for template in templates)
+    for prefix, suffix in contexts:
+        template = f"{prefix}{value}{suffix}"
+        start = 0
+        while (position := view.find(template, start)) >= 0:
+            value_start = position + len(prefix)
+            value_end = value_start + len(value)
+            before = view[value_start - 1] if value_start else None
+            after = view[value_end] if value_end < len(view) else None
+            if _is_lexical_boundary(before) and _is_lexical_boundary(after):
+                return True
+            start = position + 1
+    return False
 
 
 def _validate_component_order(
@@ -1166,6 +1260,16 @@ def _canonical_json(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
     )
+
+
+def _canonical_json_fragments(value: object) -> Iterator[str]:
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return encoder.iterencode(value)
 
 
 def _require_catalog(value: object) -> None:
