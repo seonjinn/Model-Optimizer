@@ -1,12 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Count rows in the staged PTv3 line-delimited shards.
+"""Count rows in the staged PTv3 shards.
 
 The Hugging Face dataset index reports row counts only for repos its parquet
 conversion covers. Four of the ten PTv3 candidates ship raw JSONL and are not
 converted, so their counts have to be measured from the staged bytes. Those
 four are exactly the repos whose share of the blend is still unpinned.
+
+The split runs the other way too: the converted repos are stored *as* parquet,
+so a counter that only understands JSONL reports them as zero rows from zero
+shards. Both formats are handled here, and a repo that yields no shards at all
+is an error rather than a zero - an unrecognised layout is not an empty
+dataset, and this is the one number the blend is computed from.
 
 Counting lines is easy to get quietly wrong - a trailing newline, a shard
 missed by a glob, a gzip member boundary - and a wrong count here silently
@@ -26,7 +32,9 @@ from pathlib import Path
 __all__ = ["count_repo", "count_shard", "main"]
 
 _READ_BLOCK_BYTES = 8 * 1024 * 1024
-_SHARD_SUFFIXES = (".jsonl", ".jsonl.gz", ".json.gz", ".gz")
+_LINE_SUFFIXES = (".jsonl", ".jsonl.gz", ".json.gz", ".gz")
+_PARQUET_SUFFIX = ".parquet"
+_SHARD_SUFFIXES = (*_LINE_SUFFIXES, _PARQUET_SUFFIX)
 
 
 def _is_shard(path: Path) -> bool:
@@ -35,6 +43,25 @@ def _is_shard(path: Path) -> bool:
 
 
 def count_shard(path: Path) -> int:
+    """Count records in one shard, reading parquet footers and JSONL newlines."""
+    if path.name.endswith(_PARQUET_SUFFIX):
+        return _count_parquet(path)
+    return _count_lines(path)
+
+
+def _count_parquet(path: Path) -> int:
+    """Read the row count out of the parquet footer without scanning the data."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise SystemExit(
+            f"{path} is parquet but pyarrow is unavailable; run this inside the "
+            "pinned runtime image rather than reporting a zero"
+        ) from exc
+    return pq.ParquetFile(path).metadata.num_rows
+
+
+def _count_lines(path: Path) -> int:
     """Count newline-delimited records in one shard, gzipped or plain."""
     opener = gzip.open if path.name.endswith(".gz") else open
     lines = 0
@@ -90,6 +117,9 @@ def main() -> None:
             results[repo] = {"status": "absent"}
             continue
         rows, shards = count_repo(repo_dir, args.workers)
+        if not shards:
+            results[repo] = {"status": "no_shards"}
+            continue
         entry: dict[str, object] = {
             "status": "counted",
             "rows": rows,
@@ -109,6 +139,14 @@ def main() -> None:
     disagreed = [repo for repo in checked if not results[repo]["agrees_with_index"]]
     if not checked:
         raise SystemExit("no indexed repo was available to validate the counter")
+    # A staged repo that yields no recognised shard is a format this counter
+    # does not read, not an empty dataset. Reporting it as zero would drop it
+    # from the blend with nothing failing.
+    empty = [repo for repo, entry in results.items() if entry["status"] == "no_shards"]
+    if empty:
+        for repo in empty:
+            print(f"{repo}: staged but no recognised shard found")
+        raise SystemExit("unrecognised shard layout; counts withheld")
     if disagreed:
         for repo in disagreed:
             entry = results[repo]
