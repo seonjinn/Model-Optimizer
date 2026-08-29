@@ -47,6 +47,8 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <h2>Done</h2>
 <table>
 <tr><th>Item</th><th>Evidence</th></tr>
+<tr><td><b>GB200 node shape measured</b> on both Ptyche and Lyris &mdash; identical</td><td><b>4&times; NVIDIA GB200, 189,471 MiB each</b> (740 GiB HBM per node, 11.8 TiB across 16 nodes), aarch64 Neoverse-V2, 144 cores, 955 GB host RAM. The two clusters are interchangeable for a GB200 run, so a job that fits one fits the other</td></tr>
+<tr><td>Lyris login node is <b>x86_64</b> while its compute nodes are aarch64 Grace</td><td>An <code>enroot import</code> run on the login node would resolve the multi-arch manifest against x86 and stage an image the GB200 nodes cannot execute. The image import therefore runs as a job on <code>gb200-backfill</code>, not from the login shell</td></tr>
 <tr><td><b>Lyris promoted to the GB200 training target</b>; Ptyche viable on backfill</td><td>16 nodes on Lyris <code>gb200</code> start <b>immediately</b> and the partition is <i>not</i> preemptible &mdash; better than any GB300 option, where AWS <code>batch</code> waits ~16 h and Lyris <code>gb300</code> ~3 d. FairShare <code>coreai_dlalgo_llm</code>: Lyris <b>0.524</b>, Ptyche 0.233. Ptyche <code>batch</code> is unusable (~2.5 months), so Ptyche enters through <code>backfill</code> / <code>tcpo-backfill</code>, both preemptible</td></tr>
 <tr><td>Design spec written and committed (979 lines)</td><td><code>docs/superpowers/specs/2026-08-28-q30t-ptv23-from-scratch-drafter-study-design.md</code></td></tr>
 <tr><td>PTV2 English subset staged on all five clusters</td><td>18/18 shards, 3.5&ndash;3.7 G, pinned rev <code>5c89e01d</code>. OCI-HSG, Ptyche, Lyris, AWS-CMH-03, OCI-AGA</td></tr>
