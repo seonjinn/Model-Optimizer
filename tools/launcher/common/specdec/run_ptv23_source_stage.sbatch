@@ -57,7 +57,8 @@ PY
 }
 
 job_local_parent="${SLURM_TMPDIR:-/tmp}"
-[[ "$job_local_parent" == /* && "$job_local_parent" != /home* && "$job_local_parent" != /lustre* ]] || {
+[[ "$job_local_parent" == /* && "$job_local_parent" != /home* \
+   && "$job_local_parent" != /lustre* && "$job_local_parent" != /scratch/fsw* ]] || {
     echo "job-local scratch must not use home or Lustre" >&2
     exit 2
 }

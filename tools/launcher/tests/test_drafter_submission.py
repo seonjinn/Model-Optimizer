@@ -264,13 +264,13 @@ def test_model_staging_fails_closed_and_bounds_shared_filesystem_operations() ->
     script = (_LAUNCHER_DIR / "common/specdec/stage_hf_model.sh").read_text()
 
     for required in (
-        '[[ "$SOURCE_DIR" == /lustre/* ]]',
-        '[[ "$ARTIFACT_DIR" == /lustre/* ]]',
+        'is_durable_path "$SOURCE_DIR"',
+        'is_durable_path "$ARTIFACT_DIR"',
         '[[ "$SCRATCH_ROOT" == /raid/scratch/* ]]',
         'SOURCE_CANONICAL="$(realpath -m -- "$SOURCE_DIR")"',
         'ARTIFACT_CANONICAL="$(realpath -m -- "$ARTIFACT_DIR")"',
-        '[[ "$SOURCE_CANONICAL" == /lustre/* ]]',
-        '[[ "$ARTIFACT_CANONICAL" == /lustre/* ]]',
+        'is_durable_path "$SOURCE_CANONICAL"',
+        'is_durable_path "$ARTIFACT_CANONICAL"',
         '[[ "$ARTIFACT_CANONICAL" != "$SOURCE_CANONICAL"/* ]]',
         '[[ "$SOURCE_CANONICAL" != "$ARTIFACT_CANONICAL"/* ]]',
         '[[ ! -e "$ARTIFACT_DIR" && ! -L "$ARTIFACT_DIR" ]]',
@@ -828,7 +828,8 @@ def test_non_oci_training_requires_a_pinned_readiness_receipt_and_local_scratch(
         "validate_scratch_root",
         'receipt["profile"] != profile.name',
         'receipt["scratch_root"]',
-        'scratch.is_relative_to(Path("/lustre"))',
+        'SHARED_STORAGE_ROOTS = (Path("/lustre"), Path("/scratch/fsw"))',
+        "scratch.is_relative_to(root) for root in SHARED_STORAGE_ROOTS",
     ):
         assert required in submitter
     for required in (
@@ -836,10 +837,70 @@ def test_non_oci_training_requires_a_pinned_readiness_receipt_and_local_scratch(
         "CLUSTER_PROFILE_SHA256",
         "READINESS_RECEIPT_SHA256",
         'SCRATCH_JOB_ROOT="${SCRATCH_ROOT%/}/${SLURM_JOB_ID}"',
-        '"$SCRATCH_ROOT" != /lustre*',
+        'is_node_local_path "$SCRATCH_ROOT"',
         "${SCRATCH_ROOT}:${SCRATCH_ROOT}",
     ):
         assert required in runner
+
+
+def _extract_bash_function(script: str, name: str) -> str:
+    start = script.index(f"{name}() {{")
+    end = script.index("\n}\n", start) + len("\n}\n")
+    return script[start:end]
+
+
+@pytest.mark.parametrize(
+    ("path", "durable", "node_local"),
+    [
+        ("/lustre/fsw/portfolios/coreai/projects/p/users/sna", True, False),
+        ("/scratch/fsw/portfolios/nemotron/projects/p/users/sna", True, False),
+        ("/lustre", True, False),
+        ("/scratch/fsw", True, False),
+        ("/raid/scratch/12345", False, True),
+        ("/tmp/staging", False, True),
+        ("/dev/shm/cache", False, True),
+        ("/home/sna/modelopt", False, False),
+        ("relative/path", False, False),
+        ("", False, False),
+    ],
+)
+def test_storage_predicates_classify_both_lustre_mount_points(
+    path: str, durable: bool, node_local: bool
+) -> None:
+    """Shared storage is /lustre on three clusters and /scratch/fsw on two.
+
+    An allow-list naming only /lustre refused to run on AWS-CMH and OCI-AGA, which
+    is why both mount points must classify identically.
+    """
+    runner = (_LAUNCHER_DIR / "common/specdec/run_drafter_training.sbatch").read_text()
+    preamble = _extract_bash_function(runner, "is_durable_path") + _extract_bash_function(
+        runner, "is_node_local_path"
+    )
+    program = (
+        f"{preamble}\n"
+        'if is_durable_path "$1"; then echo -n durable; else echo -n no; fi\n'
+        'if is_node_local_path "$1"; then echo local; else echo no; fi\n'
+    )
+    result = subprocess.run(  # nosec B603 - fixed interpreter, no shell
+        ["bash", "-c", program, "bash", path],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    expected = ("durable" if durable else "no") + ("local" if node_local else "no")
+    assert result.stdout.strip() == expected
+
+
+def test_every_storage_guard_caller_defines_the_predicate_it_calls() -> None:
+    """A predicate pasted into some scripts but not others fails open at runtime."""
+    for script in sorted((_LAUNCHER_DIR / "common/specdec").rglob("*")):
+        if not script.is_file() or script.suffix not in {".sh", ".sbatch"}:
+            continue
+        text = script.read_text()
+        for predicate in ("is_durable_path", "is_node_local_path"):
+            if predicate not in text:
+                continue
+            assert f"{predicate}() {{" in text, f"{script.name} calls undefined {predicate}"
 
 
 def test_non_oci_training_namespaces_scheduler_wandb_and_receipt_identity() -> None:

@@ -10,10 +10,23 @@
 
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 for name in SOURCE_PATH SOURCE_SHA IMAGE_PATH IMAGE_SHA256 AUDIT_RECEIPT AUDIT_RECEIPT_SHA256 PTV2_ROOT PTV2_REVISION PTV3_PROMPT_ROOT PTV3_SOURCE_MANIFEST OUTPUT_RECEIPT; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
-[[ "${SLURM_NNODES:-}" == 1 && "$SOURCE_PATH" == /home/* && "$OUTPUT_RECEIPT" == /lustre/* ]] || {
+[[ "${SLURM_NNODES:-}" == 1 && "$SOURCE_PATH" == /home/* ]] && is_durable_path "$OUTPUT_RECEIPT" || {
     echo "invalid readiness topology or paths" >&2
     exit 2
 }

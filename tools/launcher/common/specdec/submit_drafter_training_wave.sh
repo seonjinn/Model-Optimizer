@@ -5,6 +5,19 @@
 # Render and submit unique four-node cumulative drafter training waves.
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUNNER="${SCRIPT_DIR}/run_drafter_training.sbatch"
@@ -52,7 +65,7 @@ while [[ $# -gt 0 ]]; do
         *) usage ;;
     esac
 done
-[[ "$MANIFEST" == /home/* && "$RECEIPT" == /lustre/* && -f "$MANIFEST" ]] || usage
+[[ "$MANIFEST" == /home/* && -f "$MANIFEST" ]] && is_durable_path "$RECEIPT" || usage
 [[ "$RUNNER" == /home/* ]] || { echo "runner must be in /home source" >&2; exit 2; }
 [[ "$CLUSTER_PROFILE" == /home/* && -f "$CLUSTER_PROFILE" ]] || usage
 [[ -z "$ONLY_STEP" || "$ONLY_STEP" =~ ^[1-9][0-9]*$ ]] || usage
@@ -113,8 +126,14 @@ else:
         raise SystemExit("readiness hardware or Pyxis gate failed")
     scratch = Path(receipt["scratch_root"])
     validate_scratch_root(profile, scratch)
-if not scratch.is_absolute() or scratch.is_relative_to(Path("/lustre")):
-    raise SystemExit("mutable training state cannot use Lustre")
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris and
+# at /scratch/fsw on AWS-CMH and OCI-AGA. Naming only Lustre would let a shared
+# path through as a scratch root on the two clusters that mount it elsewhere.
+SHARED_STORAGE_ROOTS = (Path("/lustre"), Path("/scratch/fsw"))
+if not scratch.is_absolute() or any(
+    scratch.is_relative_to(root) for root in SHARED_STORAGE_ROOTS
+):
+    raise SystemExit("mutable training state cannot use shared parallel storage")
 
 print(profile.name)
 print(profile.account)

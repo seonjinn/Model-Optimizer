@@ -5,6 +5,19 @@
 # Submit train -> public acceptance -> next-train dependencies for one manifest.
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 if [[ "${1:-}" == "--run-evaluation-container" ]]; then
     work_root="/raid/scratch/${SLURM_JOB_ID}/evaluation"
     mkdir -p "$work_root"
@@ -71,7 +84,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ "$MANIFEST" == /home/* && -f "$MANIFEST" && "$EVALUATOR_SCRIPT" == /home/* && "$EVALUATOR_ENV" == /home/* && "$EVALUATOR_CONFIG" == /home/* ]] || usage
-[[ "$RECEIPT_ROOT" == /lustre/* && "$EVAL_OUTPUT_ROOT" == /lustre/* && "$EXPORT_ROOT" == /lustre/* && "$IMAGE" == /lustre/* && "$RUNTIME_ARCHIVE" == /lustre/* ]] || usage
+for durable in RECEIPT_ROOT EVAL_OUTPUT_ROOT EXPORT_ROOT IMAGE RUNTIME_ARCHIVE; do
+    is_durable_path "${!durable}" || usage
+done
 [[ "$RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]] || usage
 [[ -f "$IMAGE" && -f "$RUNTIME_ARCHIVE" ]] || { echo "missing pinned evaluator artifact" >&2; exit 2; }
 mkdir -p "$RECEIPT_ROOT"

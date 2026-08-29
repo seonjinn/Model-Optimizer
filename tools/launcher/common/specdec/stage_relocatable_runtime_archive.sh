@@ -5,6 +5,19 @@
 # Build one verified runtime archive on scratch from an existing Lustre venv.
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 SOURCE_RUNTIME=""
 OUTPUT_ARCHIVE=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,7 +98,8 @@ from common.specdec.cluster_profile import load_cluster_profile, validate_scratc
 validate_scratch_root(load_cluster_profile(Path(sys.argv[1]).resolve()), Path(sys.argv[2]))
 PY
 else
-    [[ "$SOURCE_RUNTIME" == /lustre/* && "$OUTPUT_ARCHIVE" == /lustre/*.tar.zst && "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
+    is_durable_path "$SOURCE_RUNTIME" && is_durable_path "$OUTPUT_ARCHIVE" \
+        && [[ "$OUTPUT_ARCHIVE" == *.tar.zst && "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
 fi
 
 if [[ "$MODE" == "submit" ]]; then

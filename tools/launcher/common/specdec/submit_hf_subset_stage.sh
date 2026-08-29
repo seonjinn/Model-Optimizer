@@ -16,6 +16,19 @@
 
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER_ROOT="${DRAFTER_LAUNCHER_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 RUNNER="$SCRIPT_DIR/run_hf_subset_stage.sbatch"
@@ -42,7 +55,7 @@ while [[ $# -gt 0 ]]; do
         *) usage ;;
     esac
 done
-[[ -f "$PROFILE" && -f "$READINESS" && -f "$PLAN" && "$OUTPUT_ROOT" == /lustre/* ]] || usage
+[[ -f "$PROFILE" && -f "$READINESS" && -f "$PLAN" ]] && is_durable_path "$OUTPUT_ROOT" || usage
 [[ -z "$DEPENDENCY" || "$DEPENDENCY" =~ ^[0-9]+$ ]] || usage
 
 mapfile -t identity < <(PYTHONPATH="$LAUNCHER_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - "$PROFILE" "$READINESS" "$PLAN" "$OUTPUT_ROOT" <<'PY'

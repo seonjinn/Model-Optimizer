@@ -5,6 +5,19 @@
 # Verify that a pinned runtime archive works after node-local extraction.
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 LAUNCHER_ROOT="${DRAFTER_LAUNCHER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 MODE="outer"
@@ -87,7 +100,8 @@ if [[ -n "$PROFILE_DURABLE_ROOT" ]]; then
     [[ "$(realpath -m -- "$RUNTIME_ARCHIVE")" == "$PROFILE_DURABLE_ROOT"/* ]] || usage
     [[ "$(realpath -m -- "$IMAGE_PATH")" == "$PROFILE_DURABLE_ROOT"/* ]] || usage
 else
-    [[ "$RUNTIME_ARCHIVE" == /lustre/* && "$IMAGE_PATH" == /lustre/* && "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
+    is_durable_path "$RUNTIME_ARCHIVE" && is_durable_path "$IMAGE_PATH" \
+        && [[ "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
 fi
 
 if [[ "$MODE" == "outer" ]]; then
@@ -96,7 +110,7 @@ if [[ "$MODE" == "outer" ]]; then
     [[ "$(sha256sum "$RUNTIME_ARCHIVE" | cut -d' ' -f1)" == "$RUNTIME_SHA256" ]] || { echo "runtime archive SHA-256 mismatch" >&2; exit 2; }
     PROBE_LOG="${PROBE_LOG:-$(dirname "$RUNTIME_ARCHIVE")/probes/runtime-probe-%j.out}"
     RUNTIME_ARCHIVE_ROOT="$(dirname "$RUNTIME_ARCHIVE")"
-    [[ "$PROBE_LOG" == /lustre/* ]] || usage
+    is_durable_path "$PROBE_LOG" || usage
     mkdir -p "$(dirname "$PROBE_LOG")"
     if [[ -n "$CLUSTER_PROFILE" ]]; then
         args=(--account="$ACCOUNT" --partition="$PARTITION" --nodes="$PROFILE_EVAL_NODES" --ntasks=1

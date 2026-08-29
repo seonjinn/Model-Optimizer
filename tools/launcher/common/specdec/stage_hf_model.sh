@@ -5,6 +5,19 @@
 # Materialize one immutable Hugging Face artifact without exposing partial Lustre trees.
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 LAUNCHER_ROOT="${DRAFTER_LAUNCHER_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 MODE="submit"
@@ -109,9 +122,9 @@ fi
 
 if [[ -z "$CLUSTER_PROFILE" ]]; then
     if [[ -n "$SOURCE_DIR" ]]; then
-        [[ "$SOURCE_DIR" == /lustre/* ]] || usage
+        is_durable_path "$SOURCE_DIR" || usage
     fi
-    [[ "$ARTIFACT_DIR" == /lustre/* ]] || usage
+    is_durable_path "$ARTIFACT_DIR" || usage
     [[ "$SCRATCH_ROOT" == /raid/scratch/* ]] || usage
 fi
 
@@ -131,7 +144,7 @@ validate_scratch_root(load_cluster_profile(Path(sys.argv[1]).resolve()), Path(sy
 PY
     [[ "$LOG_CANONICAL" == "$SCRATCH_CANONICAL" || "$LOG_CANONICAL" == "$SCRATCH_CANONICAL"/* ]] || usage
 else
-    [[ "$ARTIFACT_CANONICAL" == /lustre/* ]] || usage
+    is_durable_path "$ARTIFACT_CANONICAL" || usage
     [[ "$SCRATCH_CANONICAL" == /raid/scratch/* ]] || usage
     [[ "$LOG_CANONICAL" == /raid/scratch || "$LOG_CANONICAL" == /raid/scratch/* ]] || usage
     PROFILE_GPU_ARGS=(--gpus-per-node=4)
@@ -147,7 +160,7 @@ if [[ -n "$SOURCE_DIR" || -n "$SOURCE_ID" ]]; then
     if [[ -n "$PROFILE_DURABLE_ROOT" ]]; then
         [[ "$SOURCE_CANONICAL" == "$PROFILE_DURABLE_ROOT"/* ]] || usage
     else
-        [[ "$SOURCE_CANONICAL" == /lustre/* ]] || usage
+        is_durable_path "$SOURCE_CANONICAL" || usage
     fi
     [[ "$ARTIFACT_CANONICAL" != "$SOURCE_CANONICAL" ]] || usage
     [[ "$ARTIFACT_CANONICAL" != "$SOURCE_CANONICAL"/* ]] || usage
@@ -157,7 +170,8 @@ if [[ -n "$SOURCE_DIR" || -n "$SOURCE_ID" ]]; then
     SOURCE_IDENTITY="$SOURCE_ID"
     SOURCE_LABEL="$(basename "$SOURCE_DIR")"
 else
-    [[ -n "$REPOSITORY" && "$REVISION" =~ ^[0-9a-f]{40}$ && "$IMAGE" == /lustre/* && "$RUNTIME_ARCHIVE" == /lustre/* ]] || usage
+    [[ -n "$REPOSITORY" && "$REVISION" =~ ^[0-9a-f]{40}$ ]] \
+        && is_durable_path "$IMAGE" && is_durable_path "$RUNTIME_ARCHIVE" || usage
     SOURCE_KIND="hub"
     SOURCE_IDENTITY="$REVISION"
     SOURCE_LABEL="${REPOSITORY//\//-}"

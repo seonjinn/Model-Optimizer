@@ -26,7 +26,17 @@ for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || { echo "invalid Slurm job identity" >&2; exit 2; }
-[[ "$DEST_ROOT" == /lustre/* ]] || { echo "container images belong on Lustre" >&2; exit 2; }
+# Lustre is mounted at /lustre on OCI-HSG, Ptyche and Lyris and at
+# /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix would reject a
+# correct destination on two of the five clusters. Name the storage an image
+# must not be published to instead: node-local scratch that vanishes with the
+# job, and the NFS home the MARS guidance keeps container images out of.
+case "$DEST_ROOT" in
+    /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*)
+        echo "container images belong on shared parallel storage, not $DEST_ROOT" >&2; exit 2 ;;
+    /*) ;;
+    *) echo "DEST_ROOT must be an absolute path, got: $DEST_ROOT" >&2; exit 2 ;;
+esac
 [[ "$IMAGE_TAG" =~ ^[0-9a-zA-Z._-]+$ ]] || { echo "malformed image tag" >&2; exit 2; }
 # enroot needs a URI scheme and rejects a bare name with "Invalid argument",
 # while the digest lookup below already strips docker:// -- so the scheme was
@@ -48,7 +58,9 @@ command -v unsquashfs >/dev/null || { echo "unsquashfs is absent" >&2; exit 2; }
 scratch_parent=""
 for candidate in "${SLURM_TMPDIR:-}" /raid/scratch /raid /tmp; do
     [[ -n "$candidate" && -d "$candidate" && -w "$candidate" ]] || continue
-    [[ "$candidate" != /lustre* && "$candidate" != /home* ]] || continue
+    # SLURM_TMPDIR is site-configured and has been seen pointing at shared
+    # storage; both Lustre mount points have to be named here, not just /lustre.
+    [[ "$candidate" != /lustre* && "$candidate" != /scratch/fsw* && "$candidate" != /home* ]] || continue
     scratch_parent="$candidate"
     break
 done

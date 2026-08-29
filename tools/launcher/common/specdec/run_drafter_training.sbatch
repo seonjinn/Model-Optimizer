@@ -9,6 +9,28 @@ set -euo pipefail
 
 readonly GLOBAL_BATCH_SIZE=512
 
+# Where durable artifacts may live is a per-cluster fact, not a constant:
+# OCI-HSG, Ptyche and Lyris mount Lustre at /lustre, AWS-CMH and OCI-AGA at
+# /scratch/fsw. An allow-list of one prefix refuses to run on two of the five
+# clusters, so state the rule the MARS storage guidance actually gives -- name
+# the storage an artifact must NOT outlive the job on -- and let any shared
+# mount satisfy it.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_node_local_path() {
+    case "${1:-}" in
+        /lustre/*|/lustre|/scratch/fsw/*|/scratch/fsw|/home/*|/home) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 for name in MANIFEST_PATH EXPERIMENT_INDEX MAX_STEPS LAUNCHER_ROOT CLUSTER_NAME CLUSTER_PROFILE_PATH CLUSTER_PROFILE_SHA256 SCRATCH_ROOT; do
     [[ -n "${!name:-}" ]] || { echo "missing required environment: $name" >&2; exit 2; }
 done
@@ -16,13 +38,13 @@ readonly LAUNCHER_ROOT
 [[ "$CLUSTER_PROFILE_PATH" == /home/* && -f "$CLUSTER_PROFILE_PATH" ]] || { echo "cluster profile is missing" >&2; exit 2; }
 [[ "$(sha256sum "$CLUSTER_PROFILE_PATH" | cut -d' ' -f1)" == "$CLUSTER_PROFILE_SHA256" ]] || { echo "cluster profile SHA-256 mismatch" >&2; exit 2; }
 if [[ -n "${READINESS_RECEIPT:-}" ]]; then
-    [[ "$READINESS_RECEIPT" == /lustre/* && -f "$READINESS_RECEIPT" && -n "${READINESS_RECEIPT_SHA256:-}" ]] || { echo "readiness receipt is missing" >&2; exit 2; }
+    is_durable_path "$READINESS_RECEIPT" && [[ -f "$READINESS_RECEIPT" && -n "${READINESS_RECEIPT_SHA256:-}" ]] || { echo "readiness receipt is missing" >&2; exit 2; }
     [[ "$(sha256sum "$READINESS_RECEIPT" | cut -d' ' -f1)" == "$READINESS_RECEIPT_SHA256" ]] || { echo "readiness receipt SHA-256 mismatch" >&2; exit 2; }
 elif [[ "$CLUSTER_NAME" != "oci-hsg" ]]; then
     echo "non-OCI training requires a readiness receipt" >&2
     exit 2
 fi
-[[ "$SCRATCH_ROOT" == /* && "$SCRATCH_ROOT" != /lustre* && "$SCRATCH_ROOT" != /home* ]] || { echo "scratch root must be node-local" >&2; exit 2; }
+is_node_local_path "$SCRATCH_ROOT" || { echo "scratch root must be node-local, got: $SCRATCH_ROOT" >&2; exit 2; }
 readonly SCRATCH_ROOT
 readonly SCRATCH_JOB_ROOT="${SCRATCH_ROOT%/}/${SLURM_JOB_ID}"
 WANDB_NETRC_PATH="${WANDB_NETRC_PATH:-}"
@@ -177,9 +199,10 @@ echo "training allocation: nodes=${ALLOCATED_NODES} segment=${ALLOCATION_SEGMENT
 for name in SOURCE_PATH SOURCE_SHA RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT METHOD BLOCK_SIZE RUN_NAME; do
     [[ -n "${!name:-}" ]] || { echo "missing manifest value: $name" >&2; exit 2; }
 done
-[[ "$SOURCE_PATH" == /home/* && "$IMAGE_PATH" == /lustre/* && "$RUNTIME_ARCHIVE" == /lustre/* && "$TARGET_PATH" == /lustre/* && "$DATASET_PATH" == /lustre/* && "$OUTPUT_ROOT" == /lustre/* ]] || {
-    echo "source must be /home and durable artifacts must be /lustre" >&2; exit 2;
-}
+[[ "$SOURCE_PATH" == /home/* ]] || { echo "source checkout must be in /home, got: $SOURCE_PATH" >&2; exit 2; }
+for durable in IMAGE_PATH RUNTIME_ARCHIVE TARGET_PATH DATASET_PATH OUTPUT_ROOT; do
+    is_durable_path "${!durable}" || { echo "$durable must be on shared storage, got: ${!durable}" >&2; exit 2; }
+done
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "SOURCE_SHA must be a full commit SHA" >&2; exit 2; }
 [[ "$(git -C "$SOURCE_PATH" rev-parse HEAD)" == "$SOURCE_SHA" ]] || { echo "source SHA mismatch" >&2; exit 2; }
 [[ -z "$(git -C "$SOURCE_PATH" status --porcelain)" ]] || { echo "source checkout is dirty" >&2; exit 2; }

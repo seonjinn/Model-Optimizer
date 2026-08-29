@@ -5,6 +5,19 @@
 # Pre-submit the complete 32-run paper-scale matrix as bounded afterok chains.
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 WAVE_SUBMITTER="${SCRIPT_DIR}/submit_drafter_training_wave.sh"
@@ -37,7 +50,7 @@ while [[ $# -gt 0 ]]; do
         *) usage ;;
     esac
 done
-[[ "$MANIFEST" == /home/* && -f "$MANIFEST" && "$RECEIPT" == /lustre/* ]] || usage
+[[ "$MANIFEST" == /home/* && -f "$MANIFEST" ]] && is_durable_path "$RECEIPT" || usage
 [[ -z "$TEST_DEPENDENCY_JOB" || "$TEST_DEPENDENCY_JOB" =~ ^[1-9][0-9]*$ ]] || usage
 [[ -z "$LEGACY_SOURCE_SHA" || "$LEGACY_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "$DRY_RUN" -eq 0 || -n "$TEST_DEPENDENCY_JOB" ]] || usage

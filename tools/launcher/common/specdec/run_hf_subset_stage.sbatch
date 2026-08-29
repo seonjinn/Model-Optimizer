@@ -16,12 +16,27 @@
 
 set -euo pipefail
 
+# Shared parallel storage is mounted at /lustre on OCI-HSG, Ptyche and Lyris
+# and at /scratch/fsw on AWS-CMH and OCI-AGA, so requiring one prefix refuses
+# to run on two of the five clusters. Name the storage a durable artifact must
+# NOT live on instead -- node-local scratch that vanishes with the job, and the
+# NFS home the MARS guidance reserves for source.
+is_durable_path() {
+    case "${1:-}" in
+        /home/*|/raid/*|/tmp/*|/var/*|/cm/*|/dev/shm/*) return 1 ;;
+        /*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 required=(REPO_ROOT SOURCE_COMMIT PROFILE PROFILE_SHA256 PLAN_PATH PLAN_SHA256 IMAGE IMAGE_SHA256 OUTPUT_ROOT READINESS_RECEIPT READINESS_RECEIPT_SHA256)
 for name in "${required[@]}"; do
     [[ -n "${!name:-}" ]] || { echo "missing environment variable: $name" >&2; exit 2; }
 done
 [[ "$REPO_ROOT" == /home/* && "$PLAN_PATH" == "$REPO_ROOT"/* ]] || exit 2
-[[ "$OUTPUT_ROOT" == /lustre/* && "$READINESS_RECEIPT" == /lustre/* && "$IMAGE" == /lustre/* ]] || exit 2
+for durable in OUTPUT_ROOT READINESS_RECEIPT IMAGE; do
+    is_durable_path "${!durable}" || { echo "$durable must be on shared storage, got: ${!durable}" >&2; exit 2; }
+done
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ && "$PLAN_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 2
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || { echo "invalid Slurm job identity" >&2; exit 2; }
 
