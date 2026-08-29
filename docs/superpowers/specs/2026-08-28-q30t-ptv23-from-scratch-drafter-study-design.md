@@ -119,8 +119,10 @@ collision with different canonical prompt bytes is a hard error.
 The physical PTV2 inventory is rooted at revision
 `5c89e01dd720ae0f4058445ed49c5fb68a03c76e` of
 `nvidia/Nemotron-Post-Training-Dataset-v2`. Eligible domains are Math, Code,
-STEM, Chat/instruction, and DE/JA/ES/FR/IT multilingual data, and PTV2 carries
-that domain in the split name rather than in a row field.
+STEM, and Chat/instruction data, and PTV2 carries that domain in the split
+name rather than in a row field. The DE/JA/ES/FR/IT multilingual splits are
+physically present in the repository but are not admitted; see "Multilingual
+is out of scope" below.
 
 A staged PTV2 copy exists on OCI-HSG at
 `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_modelopt/users/haoguo/Nemotron-Post-Training-Dataset-v2`:
@@ -194,8 +196,8 @@ the following families:
   environments;
 - general tools: Nemotron-Agentic-v1 and schema-compatible
   Nemotron-SFT-Agentic-v2 subsets;
-- Code, STEM, instruction following, structured output, and multilingual
-  sources from the pinned PTV3 collection.
+- Code, STEM, instruction following, and structured output sources from the
+  pinned PTV3 collection.
 
 ### The pinned PTV3 core registry
 
@@ -410,8 +412,8 @@ complete.
 
 ### Target-synthesis lane
 
-Math, Code, STEM, instruction, multilingual, and agentless SWE records retain
-only prompt-bearing context. The exact Q30 target regenerates the assistant
+Math, Code, STEM, instruction, and agentless SWE records retain only
+prompt-bearing context. The exact Q30 target regenerates the assistant
 response under a pinned sampling policy. The receipt records request bytes,
 response bytes, target and tokenizer identities, sampling parameters, stop
 reason, token counts, server/runtime digests, and retry history.
@@ -455,16 +457,35 @@ not row, byte, context-token, or file quotas:
 | Agentless SWE target synthesis | 15% |
 | Interactive SWE execution | 10% |
 | General agentic/tool execution | 10% |
-| Math/reasoning | 25% |
+| Math/reasoning | 30% |
 | Code | 15% |
 | STEM/science | 15% |
 | Instruction/chat | 5% |
-| Multilingual | 5% |
 | **Total** | **100%** |
 
-Multilingual selection divides its quota equally among DE, JA, ES, FR, and IT
-after capacity checks. No source is relabelled into another domain to cover a
-shortfall. A short domain blocks that view rather than redistributing quota.
+No source is relabelled into another domain to cover a shortfall. A short
+domain blocks that view rather than redistributing quota.
+
+#### Multilingual is out of scope
+
+Seven lanes, not eight. An earlier revision of this spec asked for a 5%
+multilingual lane while the PTV2 source policy above declared the multilingual
+splits not admitted, and the two statements cannot both hold. The lane is
+removed and its 5% goes to Math/reasoning.
+
+Three reasons decide it that way. The multilingual splits are 38 of the 42
+staged PTV2 GB, so admitting them multiplies the corpus this study moves by
+roughly ten for a lane that is 5% of the mixture. Nothing this study measures
+is multilingual: the evaluation set is AIME/MATH/GSM, SWE-bench, and tool
+trajectories, so a multilingual lane would consume rollout capacity that no
+reported number reads. And the freed share goes to Math because SWE already
+holds three lanes totalling 35% while Math holds one at 25%; moving the 5%
+there brings the two headline workloads to 30% and 35%.
+
+The consequence to accept: this drafter is trained on English prompts and its
+acceptance rate on non-English rollouts is unmeasured, not known to be fine.
+Admitting multilingual later is a new corpus identity and a new comparison, not
+a patch to this one.
 
 ## Corpus cardinality
 
@@ -500,8 +521,8 @@ capacity cannot produce a view, it publishes a blocker receipt.
 states how many unique rows have actually contributed unmasked assistant-loss
 tokens at each checkpoint; reserve rows are never counted as training exposure.
 
-Every capacity and training report contains one row per domain, and one row per
-language inside multilingual, with `eligible`, `attempted`, `accepted`,
+Every capacity and training report contains one row per domain, with
+`eligible`, `attempted`, `accepted`,
 `rejected`, `selected_256m`, `selected_1b`, and `selected_4b` row counts plus
 accepted and selected assistant-loss tokens. Rejection counts are also broken
 down by stable validation reason. This is the authoritative sample-count
@@ -526,11 +547,10 @@ steps at global batch size 512. Its row allocation is:
 | Agentless SWE | 1,536 |
 | Interactive SWE | 1,024 |
 | General agentic/tool | 1,024 |
-| Math/reasoning | 2,560 |
+| Math/reasoning | 3,072 |
 | Code | 1,536 |
 | STEM/science | 1,536 |
 | Instruction/chat | 512 |
-| Multilingual | 512 |
 | **Total** | **10,240** |
 
 The canary proves schema handling, finite loss, gradients, distributed
@@ -557,11 +577,10 @@ assistant-loss tokens with these lane quotas:
 | Agentless SWE | 38,400,000 |
 | Interactive SWE | 25,600,000 |
 | General agentic/tool | 25,600,000 |
-| Math/reasoning | 64,000,000 |
+| Math/reasoning | 76,800,000 |
 | Code | 38,400,000 |
 | STEM/science | 38,400,000 |
 | Instruction/chat | 12,800,000 |
-| Multilingual | 12,800,000 |
 
 This gate detects an initial learning signal and retention problems. No corpus
 or architecture is eliminated solely from the 256M result. The H controls stop
@@ -577,11 +596,10 @@ assistant-loss tokens with these lane quotas:
 | Agentless SWE | 150,000,000 |
 | Interactive SWE | 100,000,000 |
 | General agentic/tool | 100,000,000 |
-| Math/reasoning | 250,000,000 |
+| Math/reasoning | 300,000,000 |
 | Code | 150,000,000 |
 | STEM/science | 150,000,000 |
 | Instruction/chat | 50,000,000 |
-| Multilingual | 50,000,000 |
 
 The data-ablation report at this gate selects the corpus used for the
 three-architecture comparison. Selection requires complete paired evaluator
@@ -1108,7 +1126,7 @@ Required outputs include:
 - SWE-bench-derived held-outs with repository and patch contamination removed;
 - interactive SWE and general tool trajectory acceptance by turn and call
   type;
-- Chat, Code, STEM, and multilingual retention;
+- Chat, Code, and STEM retention;
 - DFlash2 selector accuracy and coverage;
 - exact target-output equivalence under deterministic decoding;
 - checkpoint/export reload and serving evidence.
