@@ -176,21 +176,27 @@ class TestDFlashGroupedConv:
         ).double()
 
     def test_identity_at_initialization(self):
-        """With the dynamic kernel zeroed, the identity base kernel is a no-op.
+        """A fresh convolution is an exact no-op without caller-side mutation.
 
         This is what makes enabling DFlash2 a stable extension of a DFlash backbone
         rather than a perturbation of it.
         """
         conv = self._conv()
-        with torch.no_grad():
-            conv.kernel_projection.weight.zero_()
         x = torch.randn(2, SEQ_LEN, 32, dtype=torch.double)
         out = conv.finish(*conv.prepare(x))
         assert torch.allclose(out, x, atol=1e-12)
 
     def test_taps_do_not_cross_the_block_boundary(self):
-        """Perturbing the last position of a block leaves later blocks untouched."""
+        """Perturbing the last position of a block leaves later blocks untouched.
+
+        The taps have to be given weight first. A freshly built convolution is an
+        exact identity, and under an identity every position is trivially isolated
+        from every other -- so the assertion would hold without saying anything
+        about where the taps stop.
+        """
         conv = self._conv()
+        with torch.no_grad():
+            conv.kernel_projection.weight.fill_(0.01)
         x = torch.randn(2, SEQ_LEN, 32, dtype=torch.double)
         baseline = conv.finish(*conv.prepare(x))
 
@@ -208,6 +214,8 @@ class TestDFlashGroupedConv:
         parallel backbone lacks, without letting a position see the future.
         """
         conv = self._conv()
+        with torch.no_grad():
+            conv.kernel_projection.weight.fill_(0.01)
         x = torch.randn(2, SEQ_LEN, 32, dtype=torch.double)
         baseline = conv.finish(*conv.prepare(x))
 
@@ -315,6 +323,21 @@ class TestDFlash2Forward:
 
         assert out.train_acc[0][0] > 0.9
         assert model._selector_metrics["selector_accuracy"] > 0.9
+
+
+class TestDFlash2CheckpointLoading:
+    """DFlash2 resumes must never degrade into partial DFlash warm-starts."""
+
+    def test_missing_dflash2_tensor_rejects_non_strict_load(self):
+        """Even ``strict=False`` cannot silently random-initialize a DFlash2 tensor."""
+        model = get_tiny_llama(num_hidden_layers=4)
+        mtsp.convert(model, [("dflash", _get_dflash2_config())])
+        module = model.dflash_module
+        state_dict = module.state_dict()
+        del state_dict["layers.0.attention_conv.kernel_projection.weight"]
+
+        with pytest.raises(RuntimeError, match="incomplete DFlash2 checkpoint"):
+            module.load_state_dict(state_dict, strict=False)
 
 
 class TestDFlash2Export:
