@@ -1059,9 +1059,19 @@ Two harness properties shape the sweep cost. The runner constructs its engine
 in process through `AsyncLLM.from_engine_args` and cannot attach to an
 already-running vLLM server, so every concurrency point pays a full engine
 startup and the sweep cannot piggyback on a live rollout server. And
-`--block_size` is the DFlash-family spelling of the proposal horizon, passed
-through as the speculative token count under the relation
-`block_size = draft_length + 1`; `--concurrency` defaults to 1. The relevant
+`--block_size` is B, the DFlash-family block width, which is **not** what vLLM's
+`num_speculative_tokens` means: that field is K, the count actually proposed per
+block, and the relation differs by family. DFlash and DFlash2 predict positions
+1..B-1, so K = B - 1; DSpark's Markov head emits the final position too, so
+K = B. `doc/dflash.md` fixes this independently of the code - the default
+`dflash_block_size` is 8 and the serving example for that checkpoint passes
+`num_speculative_tokens: 7`. The harness forwarded B unconverted, so at
+`--block_size 8` the two DFlash arms would have proposed 8 tokens from drafters
+trained to emit 7 while DSpark correctly got 8, making the acceptance-length
+comparison this study rests on off by one on two arms out of three. The
+conversion now lives in `specdec_bench/models/vllm.py`, which is also where the
+per-method mapping and the architecture assertion live. `--concurrency`
+defaults to 1. The relevant
 flags for this study are `--speculative_algorithm`, `--model_dir`,
 `--draft_model_dir`, `--block_size`, `--concurrency`, `--num_requests`,
 `--dataset` with `--dataset_path`, `--tp_size`, `--trust_remote_code`, and
