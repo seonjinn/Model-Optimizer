@@ -106,8 +106,8 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <td>Everything. Writer done; the reader must take the full 163-file mirror, and language reaches a row only from the shard filename</td></tr>
 
 <tr><td><b>Bring Lyris, Ptyche and OCI-AGA online</b></td>
-<td><span class="b wip">receipts in flight</span></td>
-<td>All parallelism. Each needs a readiness receipt and roughly <b>150 G of staged assets</b> &mdash; image, runtime archive, both targets, the corpus. Lyris has ~88 idle nodes and none of the assets, so staging is its critical path, not capacity</td></tr>
+<td><span class="b wip">Lyris staged, submitting</span></td>
+<td>All parallelism. <b>Lyris is ready</b>: it already held both targets at the exact pinned revisions (<code>ad44e777</code>, <code>144afc2f</code>), the 1,309,377-row corpus and a valid readiness receipt; the 325 M compiled runtime archive and the 6.7 G pinned image were copied across from OCI-HSG. Ptyche and OCI-AGA remain saturated (0 and 1 idle node) and are worth less than the staging effort</td></tr>
 
 <tr><td>Submit the last four Q30 arms (dspark b16 &times;2, dflash b8 &times;2)</td>
 <td><span class="b pend">held for Lyris</span></td>
@@ -187,5 +187,8 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 
 <li><span class="t">An index into the list you built is not an index into the manifest you wrote.</span>
 <span class="w"><code>write_manifest</code> canonicalizes experiment order, so the submitter&rsquo;s <code>--experiment-index</code> addressed different arms than the ones enumerated at build time. Four arms were submitted believing they were DFlash2; they were DFlash and DSpark. Nothing was corrupted &mdash; every arm belonged in the matrix &mdash; but the <i>intended</i> method went unqueued, and a silent method swap is exactly the failure this study cannot detect from its own metrics. Selection now reads the stored order back out of the written file.</span></li>
+
+<li><span class="t">The image is not where DFlash2 comes from at this pin.</span>
+<span class="w">Upstream vLLM ships <code>qwen3_dflash2.py</code> only from <b>0.28.0</b>. The study pins the <b>0.27.1</b> image and gets DFlash2 from the compiled PR-52816 runtime archive that overlays it at run time. So re-staging 0.27.1 from the registry on a second cluster fails the staging script&rsquo;s own draft-architecture check &mdash; that check silently encodes the 0.28.0 assumption. The pinned image had to be <i>copied</i> cluster-to-cluster rather than rebuilt, which is the better outcome anyway: both clusters now run the identical <code>e7be53f2</code> squashfs, so a method comparison cannot be confounded by the environment.</span></li>
 
 </ol>
