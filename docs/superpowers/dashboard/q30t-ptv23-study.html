@@ -50,6 +50,7 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <tr><td>Design spec written and committed (979 lines)</td><td><code>docs/superpowers/specs/2026-08-28-q30t-ptv23-from-scratch-drafter-study-design.md</code></td></tr>
 <tr><td>PTV2 English subset staged on all five clusters</td><td>18/18 shards, 3.5&ndash;3.7 G, pinned rev <code>5c89e01d</code>. OCI-HSG, Ptyche, Lyris, AWS-CMH-03, OCI-AGA</td></tr>
 <tr><td>PTV2 row counts promoted from asserted to measured</td><td>1,397,187 admitted English rows, read from <code>dataset_info</code> in the staged README</td></tr>
+<tr><td>PTV3 core registry pinned; 6 of 10 repos measured</td><td>1,386,230 rows across the six indexed repos. All ten verified <code>pinned == head</code>, so the counts describe the staged revision</td></tr>
 <tr><td>DFlash2 arm merged (PR #2216)</td><td><code>modeling_dflash2.py</code> +314, <code>hf_dflash2.py</code> +198, recipe <code>dflash2.yaml</code></td></tr>
 <tr><td>Training speedups merged (PR #2279)</td><td>1.690 &rarr; 0.541 s/step. FlexAttention block-sparse mask, on-demand teacher rows, split-based TVD chunking</td></tr>
 <tr><td>OCI-AGA enabled as a submission target</td><td>account <code>nemotron_sw_post</code>, FairShare 0.2486, 429 idle nodes, <code>batch</code> 4 h / <code>batch_long</code> 7 d</td></tr>
@@ -66,7 +67,7 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 <tr><th>Item</th><th>State</th><th>Blocks</th></tr>
 <tr><td>Probe job 611352 &mdash; settle whether OCI-AGA is GB200 or GB300</td><td><span class="b pend">queued</span></td><td>GB300 serving sweep</td></tr>
 <tr><td>Finish PTV3 staging (10 pinned repos, ~70 G) on all five clusters</td><td><span class="b wip">in progress</span></td><td>corpus composition</td></tr>
-<tr><td>Measure authoritative PTV3 row counts per repo and per domain</td><td><span class="b pend">not started</span></td><td>the one variable this study controls</td></tr>
+<tr><td>Measure the four unindexed PTV3 repos from the staged shards, and <code>Nemotron-SWE-v1</code> past its 24,875-row floor</td><td><span class="b wip">6 / 10 measured</span></td><td>the one variable this study controls</td></tr>
 <tr><td>Pin a vLLM nightly at or after 2026-08-21 (DFlash2 support, vllm#52816)</td><td><span class="b pend">not started</span></td><td>DFlash2 serving numbers</td></tr>
 <tr><td>Lyris inode cleanup (93.4 % of soft limit)</td><td><span class="b blocked">user-owned</span></td><td>Lyris as a checkpoint target</td></tr>
 <tr><td>Spec user-review gate, then implementation plan</td><td><span class="b wip">awaiting review</span></td><td>launch</td></tr>
@@ -112,6 +113,9 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 
 <li><span class="t">Check upstream before writing the patch, not after.</span>
 <span class="w">Wrote and committed a DSPARK branch for specdec_bench, then found PR #2027 had already merged a better one two days earlier (<code>num_speculative_tokens</code> default 7, plus <code>draft_sample_method</code>). Reset the commit and cherry-picked #2027 instead. A one-minute <code>gh pr list</code> would have saved the whole detour.</span></li>
+
+<li><span class="t">"Rows = 0" from the datasets-server means unconverted, not empty.</span>
+<span class="w">Four of the ten pinned PTV3 repos report zero rows <em>and</em> zero bytes &mdash; the server has not converted them. Reading that as an empty dataset would have silently dropped the entire agentic domain from the blend. A zero that comes with a zero byte count is a missing measurement, not a measurement of zero. <code>Nemotron-SWE-v1</code> is the same trap in softer form: 24,875 converted against an estimated 34,772 is a floor, not a total.</span></li>
 
 <li><span class="t">A cluster QOS can enforce a <em>minimum</em> allocation, not just a maximum.</span>
 <span class="w">A 1-GPU probe on OCI-AGA was rejected with <code>QOSMinGRES</code>; 4 GPUs is the floor. Node generation is also invisible from the scheduler &mdash; <code>Gres=gpu:4</code>, <code>RealMemory=942080</code>, and the feature list are identical on GB200 and GB300, so HBM can only be read from inside a GPU job.</span></li>
