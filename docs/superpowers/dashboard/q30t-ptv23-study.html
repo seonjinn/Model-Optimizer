@@ -86,6 +86,7 @@ Start times track the live queue and move; the partition limits and the access v
 <h2>Next</h2>
 <table>
 <tr><th>Item</th><th>State</th><th>Blocks</th></tr>
+<tr><td><b>Rotate the Hugging Face token</b> &mdash; it was in <code>curl</code> argv on five shared login nodes</td><td><span class="b blocked">user-owned</span></td><td>nothing; the leak is stopped, but the token should be assumed disclosed</td></tr>
 <tr><td>Probe job 611352 &mdash; settle whether OCI-AGA is GB200 or GB300</td><td><span class="b pend">queued</span></td><td>GB300 serving sweep. Lyris needs no probe: its <code>gb200</code> / <code>gb300</code> partitions are named, and GB300 nodes are <code>theia*</code></td></tr>
 <tr><td>Confirm <code>batch_long</code> has no approval gate outside Slurm</td><td><span class="b wip">--test-only passes</span></td><td>whether the run needs 4 h chunk chaining at all</td></tr>
 <tr><td>Finish PTV3 staging (10 pinned repos, ~70 G) on all five clusters</td><td><span class="b wip">in progress</span></td><td>corpus composition</td></tr>
@@ -100,6 +101,12 @@ Start times track the live queue and move; the partition limits and the access v
 
 <h2>Key insights and mistakes</h2>
 <ol class="ins">
+<li><span class="t">The staging script put a live Hugging Face token in <code>curl</code>'s argv on five shared login nodes, and its own header claimed it was safe.</span>
+<span class="w">The comment read "token arrives on stdin and is never written to disk" &mdash; true about disk, and irrelevant. <code>/proc</code> on these nodes carries no <code>hidepid</code>, so every user reads every other user's command line; from one login node I could see 2,620 other users' processes in full. Secrets belong in the environment (<code>/proc/PID/environ</code> is owner-only) or on a pipe (<code>curl -K -</code>), never in argv. Two follow-on traps: <code>pkill -f stage_ptv3.sh</code> does not match the child <code>curl</code> that actually holds the token, and <code>pkill -f "Authorization: Bearer"</code> matches its own ssh command line and kills the session &mdash; use <code>"Authorization: [B]earer"</code>.</span></li>
+
+<li><span class="t">The repository already had a staging tool with sha256 verification, and I wrote a shell script instead.</span>
+<span class="w"><code>examples/dataset/stage_ptv23_sources.py</code> is 741 lines of pinned-revision, atomically-staged, checksum-verified download. The ad-hoc replacement had no integrity check at all and treated any non-empty file as complete, so a truncated shard from an interrupted run would have been counted done forever. This is the second time in this study that not reading the tree first cost real work.</span></li>
+
 <li><span class="t"><code>sbatch --test-only</code> answers "can I, and when" for free &mdash; and it overturned the plan.</span>
 <span class="w">The design assumed <code>batch</code> only, with 4 h chunks chained by <code>--dependency=afterany</code>, because <code>batch_long</code> was believed to need approval. <code>--test-only</code> passes on <code>batch_long</code> on all three OCI/AWS clusters, and the 7-day partition starts <i>sooner</i> than the 4-hour one on every one of them. It never enters the queue, so there is no reason to guess at capacity. Caveat: it validates Slurm limits, not a social approval policy.</span></li>
 
