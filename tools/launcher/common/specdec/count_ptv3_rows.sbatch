@@ -41,16 +41,30 @@ python3 -m venv "$scratch/venv"
 
 mkdir -p "$STUDY_ROOT/receipts"
 
+# Which repos to count. Staging finishes at different times on different
+# clusters, so the caller extends this as repos verify complete rather than
+# editing the file: REPOS="<space-separated names>".
+REPOS="${REPOS:-Nemotron-SFT-Math-v4 Nemotron-RL-Math-v2 Nemotron-SFT-SWE-v3 Nemotron-SFT-SWE-v3.5 Nemotron-SFT-SWE-v2}"
+repo_args=()
+for repo in $REPOS; do
+    repo_args+=(--repo "$repo")
+done
+[[ ${#repo_args[@]} -gt 0 ]] || { echo "REPOS is empty" >&2; exit 2; }
+
 # The --expect values come from the HuggingFace dataset index, not from a
 # previous run of this counter. That is what makes them a cross-check: an
 # agreement means the footer/newline readers and the index independently
-# arrived at the same total. Nemotron-SFT-SWE-v2 has no expectation because
-# the index reports it as empty, which is the reason it needs measuring.
+# arrived at the same total.
+#
+# Two repos deliberately carry no expectation. The index reports
+# Nemotron-SFT-SWE-v2 as empty, which is the reason it needs measuring at all;
+# and Nemotron-SWE-v1's indexed 24,875 describes a partial conversion (1.4 G
+# against the 11.1 G the pinned revision actually holds), so treating it as a
+# reference would assert agreement with a number that was never the total.
 "$scratch/venv/bin/python" "$counter" \
     --data-root "$STUDY_ROOT/ptv3_data" \
     --output "$STUDY_ROOT/receipts/ptv3_rows_${SLURM_JOB_ID}.json" \
     --workers 48 \
-    --repo Nemotron-SFT-Math-v4 --repo Nemotron-RL-Math-v2 \
-    --repo Nemotron-SFT-SWE-v3 --repo Nemotron-SFT-SWE-v3.5 --repo Nemotron-SFT-SWE-v2 \
+    "${repo_args[@]}" \
     --expect Nemotron-RL-Math-v2=7732 --expect Nemotron-SFT-SWE-v3.5=5115 \
     --expect Nemotron-SFT-Math-v4=545431 --expect Nemotron-SFT-SWE-v3=237970
