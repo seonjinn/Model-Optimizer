@@ -19,7 +19,7 @@ MODULE_DIR = ROOT / "examples/dataset"
 
 sys.path.insert(0, str(MODULE_DIR))
 try:
-    import stage_ptv23_sources as stage_module  # pyright: ignore[reportMissingImports]
+    import q30t_from_scratch_sources as source_module  # pyright: ignore[reportMissingImports]
     from q30t_from_scratch_sources import (  # pyright: ignore[reportMissingImports]
         SourceRegistryError,
         load_authenticated_source_registry,
@@ -311,7 +311,7 @@ def test_source_resolution_rejects_path_replacement_during_hashing(
 
     proxy = SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith("__")})
     proxy.read = read_and_replace
-    monkeypatch.setattr(stage_module, "os", proxy)
+    monkeypatch.setattr(source_module, "os", proxy, raising=False)
 
     with pytest.raises(SourceRegistryError, match="changed"):
         resolve_source_path(registry, entry)
@@ -329,3 +329,28 @@ def test_source_resolution_rejects_a_symlink_after_authentication(tmp_path: Path
 
     with pytest.raises(SourceRegistryError, match="unavailable"):
         resolve_source_path(registry, entry)
+
+
+def test_stable_file_identity_uses_bounded_descriptor_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Large files are hashed through bounded descriptor reads, not one buffer."""
+    path = tmp_path / "large-sparse.jsonl"
+    with path.open("wb") as stream:
+        stream.seek(16 * 1024 * 1024)
+        stream.write(b"\n")
+    requested_sizes: list[int] = []
+
+    def recording_read(descriptor: int, size: int) -> bytes:
+        requested_sizes.append(size)
+        return os.read(descriptor, size)
+
+    proxy = SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith("__")})
+    proxy.read = recording_read
+    monkeypatch.setattr(source_module, "os", proxy, raising=False)
+
+    size, digest = source_module._stable_file_identity(path, "large test file")
+
+    assert size == 16 * 1024 * 1024 + 1
+    assert len(digest) == 64
+    assert requested_sizes and max(requested_sizes) <= 8 * 1024 * 1024

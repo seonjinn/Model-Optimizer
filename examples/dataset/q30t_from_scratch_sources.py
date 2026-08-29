@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -19,7 +22,6 @@ from stage_ptv23_sources import (
     SourceIdentity,
     SourceInventory,
     SourceManifestError,
-    _read_regular_no_follow,
     load_source_inventory,
 )
 
@@ -522,8 +524,52 @@ def _sha256(value: object, label: str) -> str:
 
 
 def _stable_file_identity(path: Path, label: str) -> tuple[int, str]:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise SourceRegistryError(f"{label} requires no-follow file descriptors")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        payload = _read_regular_no_follow(path)
-    except (OSError, SourceManifestError) as error:
+        before_path = os.lstat(path)
+        descriptor = os.open(path, flags)
+    except OSError as error:
         raise SourceRegistryError(f"{label} is unavailable or changed while hashing") from error
-    return len(payload), sha256_bytes(payload)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before_path.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or _file_identity(before_path) != _file_identity(before)
+        ):
+            raise SourceRegistryError(f"{label} is not a stable regular file")
+        digest = hashlib.sha256()
+        size = 0
+        while chunk := os.read(descriptor, 8 * 1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise SourceRegistryError(f"{label} changed while hashing") from error
+    finally:
+        os.close(descriptor)
+    try:
+        after_path = os.lstat(path)
+    except OSError as error:
+        raise SourceRegistryError(f"{label} changed while hashing") from error
+    if (
+        size != after.st_size
+        or _file_identity(before) != _file_identity(after)
+        or _file_identity(after_path) != _file_identity(after)
+    ):
+        raise SourceRegistryError(f"{label} changed while hashing")
+    return size, digest.hexdigest()
+
+
+def _file_identity(observation: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        observation.st_dev,
+        observation.st_ino,
+        observation.st_mode,
+        observation.st_nlink,
+        observation.st_size,
+        observation.st_mtime_ns,
+        observation.st_ctime_ns,
+    )
