@@ -212,7 +212,7 @@ revision.
 | `Nemotron-RL-Math-v2` | `804418c1` | 7,732 | 0.007 G | **staged shards, matches index** |
 | `Nemotron-SFT-SWE-v3` | `3f73de64` | 237,970 | 11.7 G | **staged shards, matches index** |
 | `Nemotron-SFT-SWE-v3.5` | `ad641292` | 5,115 | 0.3 G | **staged shards, matches index** |
-| `Nemotron-SWE-v1` | `0fe17a96` | 24,875 (floor) | 11.1 G | partial conversion |
+| `Nemotron-SWE-v1` | `0fe17a96` | **51,029** | 11.1 G | **staged shards** |
 | `Open-SWE-Traces` | `c2114fc8` | 565,107 | 46.5 G | datasets-server, 3 configs |
 | `Nemotron-SFT-SWE-v2` | `bd151f3f` | 256,254 | 18.1 G | **staged shards, counter validated** |
 | `Nemotron-Agentic-v1` | `650d5909` | unmeasured | 5.8 G | bytes from HF tree |
@@ -280,10 +280,17 @@ downloading. `Open-SWE-Traces` is 93 files short of its 234 on OCI-HSG
 (27.1 G of 46.5 G); `Nemotron-Agentic-v1`, `Nemotron-SFT-Agentic-v2` and
 `Nemotron-RL-Lightning-Training-Blend` have not started anywhere.
 
-`Nemotron-SWE-v1` now being complete is what makes its count obtainable. Its
-indexed 24,875 rows describe the 1.4 G the conversion reached, not the 11.1 G
-the pinned revision holds, so that number is a floor and is deliberately **not**
-used as a cross-check against the measured total. **No composition ratio may be
+`Nemotron-SWE-v1` now being complete is what makes its count obtainable, and
+the measurement settles it at **51,029 rows**. The indexed 24,875 described the
+1.4 G the conversion reached, not the 11.1 G the pinned revision holds, so it
+was a floor covering 48.7% of the repository -- and even the 34,772 estimate
+undershot by a third. It was deliberately not used as a cross-check, which is
+why the disagreement is a finding rather than a failed validation.
+
+All five previously measured repositories reproduce their AWS totals exactly on
+OCI-HSG. Two clusters, independently staged from the same pinned revisions,
+counted by the same reader, agreeing to the row -- which tests the staging as
+much as the counter. **No composition ratio may be
 computed from an unmeasured or floor row count.** Until every entry above is a
 measured total read from the pinned staged files, the blend is unpinned and no
 training run is schedulable.
