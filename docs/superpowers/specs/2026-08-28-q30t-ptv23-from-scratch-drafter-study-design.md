@@ -271,15 +271,22 @@ called empty.
 Staging completeness is judged against the pinned revision tree -- every file
 the SHA lists, present at its published size -- and not against the stager's
 own status file, which a restarted run truncates and which drifts from disk.
-Five repositories pass that check byte-exact on AWS: `Nemotron-SFT-Math-v4`,
-`Nemotron-RL-Math-v2`, `Nemotron-SFT-SWE-v3`, `Nemotron-SFT-SWE-v3.5` and
-`Nemotron-SFT-SWE-v2`. `Nemotron-SWE-v1` is **not** among them: it holds 5,901
-bytes of finished files against 11.1 G expected, its single large shard still
-downloading behind a `.part` name that `du` was crediting to the repository. `Nemotron-SWE-v1` reports 24,875 converted rows against an estimate of
-34,772, so its converted count is a floor rather than a total. **No composition
-ratio may be computed from an unmeasured or floor row count.** Until every entry
-above is a measured total read from the pinned staged files, the blend is
-unpinned and no training run is schedulable.
+Progress differs by cluster, so the check is run per site. Six repositories
+pass byte-exact on OCI-HSG, the furthest along: `Nemotron-SFT-Math-v4`,
+`Nemotron-RL-Math-v2`, `Nemotron-SFT-SWE-v3`, `Nemotron-SFT-SWE-v3.5`,
+`Nemotron-SFT-SWE-v2` and `Nemotron-SWE-v1` (11,141,247,963 bytes across 3
+files). The first five also pass on AWS, where `Nemotron-SWE-v1` is still
+downloading. `Open-SWE-Traces` is 93 files short of its 234 on OCI-HSG
+(27.1 G of 46.5 G); `Nemotron-Agentic-v1`, `Nemotron-SFT-Agentic-v2` and
+`Nemotron-RL-Lightning-Training-Blend` have not started anywhere.
+
+`Nemotron-SWE-v1` now being complete is what makes its count obtainable. Its
+indexed 24,875 rows describe the 1.4 G the conversion reached, not the 11.1 G
+the pinned revision holds, so that number is a floor and is deliberately **not**
+used as a cross-check against the measured total. **No composition ratio may be
+computed from an unmeasured or floor row count.** Until every entry above is a
+measured total read from the pinned staged files, the blend is unpinned and no
+training run is schedulable.
 
 Four further repositories are deliberately deferred as too large and too
 general for a Math/SWE-targeted drafter: `Nemotron-Math-v2` (190.52 G),
