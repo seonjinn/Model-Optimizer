@@ -25,11 +25,27 @@ set -euo pipefail
 [[ "$STUDY_ROOT" == /lustre/* ]] || { echo "staged data lives on Lustre" >&2; exit 2; }
 [[ "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || { echo "invalid Slurm job identity" >&2; exit 2; }
 
-# The counter ships next to this script, so the study is reproducible from a
-# clone rather than from whatever happens to sit in a home directory.
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-counter="$script_dir/count_ptv3_rows.py"
-[[ -r "$counter" ]] || { echo "counter not found beside this script: $counter" >&2; exit 2; }
+# Locate the counter, which ships beside this file in the repo so the study is
+# reproducible from a clone rather than from whatever sits in a home directory.
+#
+# BASH_SOURCE is useless for this under sbatch: Slurm copies the batch script
+# into a per-job spool directory, so at run time this file's own directory is
+# /cm/local/.../job<id> and the counter is not there. SLURM_SUBMIT_DIR is the
+# directory the job was submitted from, which is where the repo copy actually
+# lives. Keep the BASH_SOURCE probe last so the script still works when run
+# directly with bash, outside Slurm.
+for candidate in "${COUNTER:-}" \
+                 "${SLURM_SUBMIT_DIR:-}/count_ptv3_rows.py" \
+                 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/count_ptv3_rows.py"; do
+    [[ -n "$candidate" && -r "$candidate" ]] || continue
+    counter="$candidate"
+    break
+done
+[[ -n "${counter:-}" ]] || {
+    echo "count_ptv3_rows.py not found; set COUNTER or submit from its directory" >&2
+    exit 2
+}
+echo "counter: $counter"
 
 scratch="/raid/scratch/${SLURM_JOB_ID}"
 mkdir -p "$scratch"
