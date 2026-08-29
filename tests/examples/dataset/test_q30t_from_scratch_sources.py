@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,7 @@ MODULE_DIR = ROOT / "examples/dataset"
 
 sys.path.insert(0, str(MODULE_DIR))
 try:
+    import stage_ptv23_sources as stage_module  # pyright: ignore[reportMissingImports]
     from q30t_from_scratch_sources import (  # pyright: ignore[reportMissingImports]
         SourceRegistryError,
         load_authenticated_source_registry,
@@ -270,3 +273,59 @@ def test_registry_digest_ignores_receipt_order_and_worker_count(tmp_path: Path) 
         "Nemotron-Math",
         "RL-Math",
     )
+
+
+def test_registry_rejects_a_strict_subset_of_declared_sources(tmp_path: Path) -> None:
+    """A receipt set cannot omit a source family declared by requirements."""
+    entry = source_entry("Nemotron-Math")
+    requirements_path = tmp_path / "requirements.json"
+    requirements_path.write_bytes(_canonical(_requirements(("Nemotron-Math", "RL-Math"))))
+    receipt_path = _write_stage_receipt(tmp_path / "stage", entry)
+
+    with pytest.raises(SourceRegistryError, match="declared source"):
+        load_authenticated_source_registry(
+            requirements_path,
+            expected_sha256=_sha256(requirements_path),
+            stage_receipts={_sha256(receipt_path): receipt_path},
+        )
+
+
+def test_source_resolution_rejects_path_replacement_during_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacing a pathname after descriptor open must invalidate the resolution."""
+    registry = load_test_registry(tmp_path, entries=[source_entry()])
+    entry = registry.entries[0]
+    physical_path = resolve_source_path(registry, entry)
+    replacement = physical_path.with_name("replacement.jsonl")
+    replacement.write_bytes(physical_path.read_bytes())
+    replaced = False
+
+    def read_and_replace(descriptor: int, size: int) -> bytes:
+        nonlocal replaced
+        data = os.read(descriptor, size)
+        if data and not replaced:
+            replacement.replace(physical_path)
+            replaced = True
+        return data
+
+    proxy = SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith("__")})
+    proxy.read = read_and_replace
+    monkeypatch.setattr(stage_module, "os", proxy)
+
+    with pytest.raises(SourceRegistryError, match="changed"):
+        resolve_source_path(registry, entry)
+
+
+def test_source_resolution_rejects_a_symlink_after_authentication(tmp_path: Path) -> None:
+    """A registered pathname cannot resolve through a replacement symlink."""
+    registry = load_test_registry(tmp_path, entries=[source_entry()])
+    entry = registry.entries[0]
+    physical_path = resolve_source_path(registry, entry)
+    target = physical_path.with_name("symlink-target.jsonl")
+    target.write_bytes(physical_path.read_bytes())
+    physical_path.unlink()
+    physical_path.symlink_to(target)
+
+    with pytest.raises(SourceRegistryError, match="unavailable"):
+        resolve_source_path(registry, entry)

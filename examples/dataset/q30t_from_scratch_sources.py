@@ -19,7 +19,7 @@ from stage_ptv23_sources import (
     SourceIdentity,
     SourceInventory,
     SourceManifestError,
-    _sha256_file,
+    _read_regular_no_follow,
     load_source_inventory,
 )
 
@@ -168,6 +168,11 @@ def load_authenticated_source_registry(
             entries.append(entry)
             paths[entry] = physical_path
 
+    declared_source_ids = frozenset().union(*allowed_sources.values())
+    observed_source_ids = {entry.source_id for entry in entries}
+    if observed_source_ids != declared_source_ids:
+        raise SourceRegistryError("stage receipts do not cover every declared source ID")
+
     ordered_entries = tuple(sorted(entries, key=_entry_sort_key))
     logical_identities = {
         (entry.repository, entry.configuration, entry.split, entry.relative_path)
@@ -197,9 +202,10 @@ def resolve_source_path(registry: AuthenticatedSourceRegistry, entry: SourceRegi
     if not isinstance(registry, AuthenticatedSourceRegistry) or not isinstance(entry, SourceRegistryEntry):
         raise SourceRegistryError("source resolution requires registry entry values")
     path = registry._entry_paths.get(entry)
-    if path is None or path.is_symlink() or not path.is_file():
+    if path is None:
         raise SourceRegistryError("registered physical source path is unavailable")
-    if path.stat().st_size != entry.bytes or _sha256_file(path) != entry.file_sha256:
+    size, digest = _stable_file_identity(path, "registered physical source path")
+    if size != entry.bytes or digest != entry.file_sha256:
         raise SourceRegistryError("registered physical source path no longer matches its identity")
     return path
 
@@ -409,12 +415,8 @@ def _entry_from_record(
     if staged_relative.as_posix() != inventory_record.get("staged_path"):
         raise SourceRegistryError("stage source staged path does not match the inventory")
     physical_path = stage_root / staged_relative
-    if (
-        physical_path.is_symlink()
-        or not physical_path.is_file()
-        or physical_path.stat().st_size != bytes_
-        or _sha256_file(physical_path) != file_sha256
-    ):
+    size, digest = _stable_file_identity(physical_path, "stage source physical file")
+    if size != bytes_ or digest != file_sha256:
         raise SourceRegistryError("stage source physical file does not match its identity")
     if not source.license_expression.strip() or source.approved_use is not True:
         raise SourceRegistryError("stage source lacks approved license use")
@@ -517,3 +519,11 @@ def _sha256(value: object, label: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise SourceRegistryError(f"{label} must be a lowercase SHA-256")
     return value
+
+
+def _stable_file_identity(path: Path, label: str) -> tuple[int, str]:
+    try:
+        payload = _read_regular_no_follow(path)
+    except (OSError, SourceManifestError) as error:
+        raise SourceRegistryError(f"{label} is unavailable or changed while hashing") from error
+    return len(payload), sha256_bytes(payload)
