@@ -22,6 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -195,8 +196,7 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
                 self.marker.with_suffix(".excluded").write_bytes(b"called")
                 raise RuntimeError("excluded rows must not be tokenized")
             if any(
-                message.get("content") == "deduplicate-before-tokenization"
-                for message in messages
+                message.get("content") == "deduplicate-before-tokenization" for message in messages
             ):
                 with self.marker.open("ab") as stream:
                     stream.write(b"1")
@@ -229,7 +229,9 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         source_commit="1" * 40,
     )
     try:
-        assert module.candidate_inventory_bytes(serial) == module.candidate_inventory_bytes(parallel)
+        assert module.candidate_inventory_bytes(serial) == module.candidate_inventory_bytes(
+            parallel
+        )
         assert serial.inventory_sha256 == parallel.inventory_sha256
         assert parallel.execution_receipt is not None
         assert parallel.execution_receipt["effective_workers"] == 96
@@ -243,18 +245,17 @@ def test_candidate_process_pool_is_byte_identical_and_bounded(
         assert diagnostics["declared_shard_count"] == 201
         assert len(diagnostics["shards"]) == 201
         assert sum(shard["phase1_row_count"] for shard in diagnostics["shards"]) == 610
-        assert sum(shard["accepted_count"] for shard in diagnostics["shards"]) == len(
-            parallel.rows
-        )
+        assert sum(shard["accepted_count"] for shard in diagnostics["shards"]) == len(parallel.rows)
         first = diagnostics["shards"][0]
         assert first["classification_counts"]["historical_exclusion"] == 1
         assert first["tokenization_counts"]["context_too_long"] == 2
         assert first["accepted_count"] == 4
         assert first["raw_row_schema"]["messages"] == "str"
         assert first["raw_row_schema"]["tools"] == "str"
-        assert diagnostics["reason_exemplars"]["historical_exclusion"][0][
-            "prompt_uuid"
-        ] == excluded_uuid
+        assert (
+            diagnostics["reason_exemplars"]["historical_exclusion"][0]["prompt_uuid"]
+            == excluded_uuid
+        )
         body = dict(diagnostics)
         claimed = body.pop("receipt_sha256")
         assert claimed == module.sha256_bytes(module.canonical_json(body))
@@ -282,9 +283,9 @@ def test_candidate_worker_count_respects_all_bounds() -> None:
 
 
 def test_candidate_diagnostic_compares_post_tokenization_accepted_rows() -> None:
-    diagnostic = (
-        MODULE_PATH.parent / "diagnose_qwen4b_candidate_shard.py"
-    ).read_text(encoding="utf-8")
+    diagnostic = (MODULE_PATH.parent / "diagnose_qwen4b_candidate_shard.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "_tokenize_candidate_shard(" in diagnostic
     assert "SELECT payload FROM tokenized ORDER BY source_row_index" in diagnostic
@@ -349,6 +350,7 @@ def test_inventory_pretokenizes_synthesis_and_binds_source_hashes(tmp_path: Path
         license="ODC-BY-1.0",
         pool="ptv2",
         category="math",
+        language="en",
         response_source="target-synth",
         tool_lane="none",
         manifest_path=manifest,
@@ -389,6 +391,7 @@ def test_inventory_preserves_tool_lane_and_exact_assistant_mask(tmp_path: Path) 
         license="NVIDIA-Open-Model-License",
         pool="ptv3",
         category="agentic_tool",
+        language="en",
         response_source="trace-replay",
         tool_lane="recorded-trace",
         manifest_path=manifest,
@@ -417,6 +420,7 @@ def test_inventory_rejects_mutated_manifested_source(tmp_path: Path) -> None:
         license="license",
         pool="ptv2",
         category="math",
+        language="en",
         response_source="target-synth",
         tool_lane="none",
         manifest_path=manifest,
@@ -888,3 +892,69 @@ def test_context_bucket_rejects_above_32k() -> None:
 
     with pytest.raises(ValueError, match="32K inventory limit"):
         module._context_bucket(32_769)
+
+
+def _ptv2_lane(module: Any, manifest: Path, **overrides: Any) -> Any:
+    fields = {
+        "source_id": "nvidia/Nemotron-Post-Training-Dataset-v2",
+        "source_revision": "a" * 40,
+        "license": "ODC-BY-1.0",
+        "pool": "ptv2",
+        "category": "math",
+        "language": "en",
+        "response_source": "target-synth",
+        "tool_lane": "none",
+        "manifest_path": manifest,
+    }
+    return module.InventorySource(**(fields | overrides))
+
+
+def test_an_inventory_row_carries_the_language_its_lane_declares(tmp_path: Path) -> None:
+    """Selection filters PTv2 by language, and the parquet has no language column.
+
+    Language reaches a row only from the shard filename, so the lane is the
+    finest granularity that knows it. If the row did not carry it, the arm-B
+    language policy would have nothing to read.
+    """
+    module = _load_module()
+    manifest = _write_bound_source(
+        tmp_path,
+        [
+            {
+                "prompt_id": "p1",
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                "_synthesis_assistant_tokens": 1,
+            }
+        ],
+    )
+    rows = module.build_inventory_rows(
+        [_ptv2_lane(module, manifest, language="ja")],
+        tokenizer=FakeTokenizer(),
+        tokenizer_sha256="f" * 64,
+        training_seq_len=4096,
+    )
+    assert [row["language"] for row in rows] == ["ja"]
+
+
+def test_a_lane_that_declares_no_language_is_refused_at_construction(tmp_path: Path) -> None:
+    """The failure belongs where the lane is defined, not where it is selected.
+
+    A lane that forgets its language would otherwise reach selection carrying
+    nothing to filter on, and the whole point of the policy is that a denied
+    language cannot enter arm B by omission.
+    """
+    module = _load_module()
+    manifest = _write_bound_source(tmp_path, [{"prompt_id": "p1", "messages": []}])
+    with pytest.raises(ValueError, match="not a recognized code"):
+        _ptv2_lane(module, manifest, language="")
+
+
+def test_a_language_that_is_not_a_known_code_is_refused(tmp_path: Path) -> None:
+    """A free-text language would silently miss every allow and deny list."""
+    module = _load_module()
+    manifest = _write_bound_source(tmp_path, [{"prompt_id": "p1", "messages": []}])
+    with pytest.raises(ValueError, match="not a recognized code"):
+        _ptv2_lane(module, manifest, language="japanese")

@@ -875,6 +875,7 @@ class InventorySource:
     license: str
     pool: str
     category: str
+    language: str
     response_source: str
     tool_lane: str
     manifest_path: Path
@@ -889,6 +890,13 @@ class InventorySource:
             raise ValueError("source_revision must be a pinned commit digest")
         if self.pool not in {"ptv2", "ptv3"}:
             raise ValueError("inventory pool must be ptv2 or ptv3")
+        # The PTv2 parquet has no language column: language is carried only by
+        # the shard filename, so a lane is the finest granularity that knows it.
+        # Declaring it here rather than parsing it per row makes it a pinned,
+        # auditable property of the lane, and makes a lane that forgets to say
+        # fail at construction instead of at selection.
+        if self.language not in _LANGUAGE_CODES:
+            raise ValueError(f"lane language is not a recognized code: {self.language!r}")
         if self.response_source not in {"target-synth", "trace-replay"}:
             raise ValueError("response_source must be target-synth or trace-replay")
         expected_lane = "none" if self.response_source == "target-synth" else "recorded-trace"
@@ -2747,6 +2755,7 @@ def build_inventory_rows(
                         "prompt_id": prompt_id,
                         "pool": spec.pool,
                         "category": spec.category,
+                        "language": spec.language,
                         "context_bucket": _context_bucket(full_token_count),
                         "full_token_count": full_token_count,
                         "full_assistant_tokens": sum(full_mask),
