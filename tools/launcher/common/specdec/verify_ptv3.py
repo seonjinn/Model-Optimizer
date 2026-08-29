@@ -26,10 +26,17 @@ MANIFEST = {
     "Nemotron-RL-Lightning-Training-Blend": "262eb58c",
 }
 
-# Files the stager leaves behind that are not part of any revision. A partial
-# download is renamed into place only on success, so a surviving .part marks an
-# interrupted transfer rather than corruption of the file it belongs to.
-IGNORED_LOCAL_SUFFIXES = (".part",)
+# The stager's own bookkeeping, written inside each repo directory and belonging
+# to no revision: a cached tree and a log of transfers that failed.
+STAGER_ARTIFACTS = {".tree.json", ".errors"}
+
+# What the row counter would read as data. An unlisted file matching one of
+# these is the case that matters -- the counters glob the directory rather than
+# replaying the revision manifest, so such a file is counted as rows that no
+# revision vouches for. An unlisted file that the counter would skip (a .part
+# from an interrupted transfer, a stray note) is worth reporting but is not a
+# threat to the totals.
+COUNTED_SUFFIXES = (".jsonl", ".jsonl.gz", ".json.gz", ".parquet")
 
 
 def _next_page(link_header):
@@ -64,13 +71,13 @@ def tree(repo, sha):
 
 
 def local_files(out):
-    """Every staged file under a repo, relative to it, ignoring stager scratch."""
+    """Every staged file under a repo, relative to it, minus stager bookkeeping."""
     if not out.is_dir():
         return set()
     return {
         str(p.relative_to(out))
         for p in out.rglob("*")
-        if p.is_file() and not p.name.endswith(IGNORED_LOCAL_SUFFIXES)
+        if p.is_file() and p.name not in STAGER_ARTIFACTS
     }
 
 
@@ -102,16 +109,19 @@ for repo, sha in MANIFEST.items():
         have_bytes += actual
         if want is not None and actual != want:
             short += 1
-    # Files on disk that the revision does not list. The row counters glob the
-    # directory rather than replaying this manifest, so an unlisted file would
-    # be counted as data even though nothing here vouches for it.
-    extra = len(local_files(out) - {e["path"] for e in files})
-    ok = files and missing == 0 and short == 0 and unsized == 0 and extra == 0
+    # Files on disk that the revision does not list, split by whether the row
+    # counter would read them. Only the counted kind can move a total.
+    unlisted = sorted(local_files(out) - {e["path"] for e in files})
+    stray = [f for f in unlisted if f.endswith(COUNTED_SUFFIXES)]
+    ok = files and missing == 0 and short == 0 and unsized == 0 and not stray
     if not ok:
         failures += 1
     print(f"{repo:38s} {'COMPLETE' if ok else 'INCOMPLETE':10s} files={len(files):4d} "
           f"missing={missing:4d} size_mismatch={short:3d} unsized={unsized:3d} "
-          f"extra={extra:3d} bytes={have_bytes}/{want_bytes}")
+          f"stray={len(stray):3d} unlisted={len(unlisted):3d} "
+          f"bytes={have_bytes}/{want_bytes}")
+    for f in unlisted:
+        print(f"{'':38s}   unlisted{' STRAY' if f in stray else ''}: {f}")
 
 # Exit non-zero so a caller can gate on staging without parsing this output.
 sys.exit(1 if failures else 0)
