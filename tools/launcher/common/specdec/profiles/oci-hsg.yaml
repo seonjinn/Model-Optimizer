@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: oci-hsg
-modelopt_commit: 82b91603a95a4913724675b9360ad073395e2122
+modelopt_commit: b549c2d338949e90c33f60d789a42bd375c0bd7b
 ssh_host: oci-hsg-cs-001-vscode-01
 account: nemotron_sw_post
 partition: batch

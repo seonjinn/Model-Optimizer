@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: oci-aga
-modelopt_commit: 82b91603a95a4913724675b9360ad073395e2122
+modelopt_commit: b549c2d338949e90c33f60d789a42bd375c0bd7b
 ssh_host: oci-aga
 account: nemotron_sw_post
 # batch caps at 4 h here, against 5 h on Ptyche and Lyris. batch_long exists but

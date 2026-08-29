@@ -34,7 +34,7 @@ OUTPUT_ROOT = Path(f"{LUSTRE}/specdec_ptv23/training")
 def _paths() -> PinnedPaths:
     return PinnedPaths(
         source_path="/home/sna/modelopt-q30t-design",
-        source_sha="82b91603a95a4913724675b9360ad073395e2122",
+        source_sha="b549c2d338949e90c33f60d789a42bd375c0bd7b",
         image_path=f"{LUSTRE}/modelopt-specdec/image/vllm.sqsh",
         image_sha256="44b75976cc6583f890aff59031a2b5197eda69326e4b071994572f9a614387ba",
         runtime_archive_path=f"{LUSTRE}/modelopt-specdec/runtime/runtime.tar.zst",
