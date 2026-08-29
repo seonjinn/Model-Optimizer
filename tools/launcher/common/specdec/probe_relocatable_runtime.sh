@@ -149,6 +149,26 @@ fi
 rm -rf "$node_root"
 mkdir -p "$node_root/runtime"
 cp -a "$SOURCE_PATH" "$node_root/source"
+# modelopt/__init__.py reads its version through importlib.metadata, so importing
+# it below needs an installed distribution, not just a path. Write the metadata
+# beside the staged source so modelopt still resolves to the checkout this probe
+# is qualifying. The checkout is cloned without tags, so setuptools_scm would
+# report the project's declared fallback, which is what gets written.
+egg_info="$node_root/source/nvidia_modelopt.egg-info"
+mkdir -p "$egg_info"
+distribution_version="$(
+    describe="$(git -C "$SOURCE_PATH" describe --tags --long --match "[0-9]*" 2>/dev/null || true)"
+    if [[ "$describe" =~ ^([0-9][^-]*)-([0-9]+)-g([0-9a-f]+)$ ]]; then
+        printf "%s.dev%s+g%s" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    else
+        sed -nE 's/^fallback_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+            "$SOURCE_PATH/pyproject.toml" | head -n 1
+    fi
+)"
+[[ -n "$distribution_version" ]] || { echo "cannot determine the nvidia-modelopt version" >&2; exit 1; }
+printf "Metadata-Version: 2.4\nName: nvidia-modelopt\nVersion: %s\n" \
+    "$distribution_version" >"$egg_info/PKG-INFO"
+printf "modelopt\n" >"$egg_info/top_level.txt"
 tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
 old_venv="$(sed -nE "s/^[[:space:]]*export[[:space:]]+VIRTUAL_ENV=(.*)$/\\1/p" "$node_root/runtime/bin/activate" | head -n 1)"
 old_venv="${old_venv#\"}"

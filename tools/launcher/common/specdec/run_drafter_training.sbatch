@@ -271,6 +271,31 @@ esac
 export SERVE_NODES NUM_SPEC_TOKENS
 export SERVE_REPLICAS_PER_NODE
 
+# modelopt/__init__.py resolves __version__ through importlib.metadata, so the
+# package cannot be imported from PYTHONPATH alone -- it needs an installed
+# distribution, and neither the container nor the runtime archive carries one.
+# The staging step writes the metadata beside the staged source instead of
+# installing anything, which keeps modelopt resolving to the pinned checkout
+# that the preflight insists on. Derive the version the way a real build would:
+# setuptools_scm reads git describe, and the checkout is cloned without tags, so
+# the project's own declared fallback is the honest answer.
+SOURCE_DISTRIBUTION_VERSION="$(
+    describe="$(git -C "$SOURCE_PATH" describe --tags --long --match "[0-9]*" 2>/dev/null || true)"
+    if [[ "$describe" =~ ^([0-9][^-]*)-([0-9]+)-g([0-9a-f]+)$ ]]; then
+        printf "%s.dev%s+g%s" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    else
+        sed -nE 's/^fallback_version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+            "$SOURCE_PATH/pyproject.toml" | head -n 1
+    fi
+)"
+[[ -n "$SOURCE_DISTRIBUTION_VERSION" ]] || {
+    echo "cannot determine the nvidia-modelopt distribution version" >&2
+    exit 2
+}
+readonly SOURCE_DISTRIBUTION_VERSION
+echo "staged modelopt distribution version: $SOURCE_DISTRIBUTION_VERSION"
+
+export SOURCE_DISTRIBUTION_VERSION
 export SOURCE_PATH SOURCE_SHA IMAGE_PATH RUNTIME_ARCHIVE RUNTIME_ARCHIVE_SHA256 TARGET_PATH DATASET_PATH DATASET_LOCAL_NAME OUTPUT_ROOT EXPORT_PATH SCRATCH_JOB_ROOT STAGE_LOG_ROOT EXPECTED_RNG_STATES TRAINING_IDENTITY TRAINING_FINGERPRINT
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     # shellcheck source=tools/launcher/common/specdec/drafter_requeue_lifecycle.sh
@@ -326,6 +351,11 @@ staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntas
     fi
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
     cp -rP --no-preserve=all -- "$SOURCE_PATH" "$node_root/source"
+    egg_info="$node_root/source/nvidia_modelopt.egg-info"
+    mkdir -p "$egg_info"
+    printf "Metadata-Version: 2.4\nName: nvidia-modelopt\nVersion: %s\n" \
+        "$SOURCE_DISTRIBUTION_VERSION" >"$egg_info/PKG-INFO"
+    printf "modelopt\n" >"$egg_info/top_level.txt"
     tar --extract --file="$RUNTIME_ARCHIVE" --directory="$node_root/runtime"
     old_venv=$(sed -nE "s/^[[:space:]]*export[[:space:]]+VIRTUAL_ENV=(.*)$/\\1/p" "$node_root/runtime/bin/activate" | head -n 1)
     old_venv="${old_venv#\"}"
