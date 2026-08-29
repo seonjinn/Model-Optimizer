@@ -61,6 +61,10 @@ if [[ -z "$WANDB_NETRC_CONTAINER_PATH" ]]; then
         echo "no wandb credential: export WANDB_API_KEY or set WANDB_NETRC_PATH" >&2
         exit 2
     }
+    # Deliberately loose. The job of this check is to catch a *missing*
+    # credential, and a shape rule tight enough to reject every malformed key
+    # would also reject an unusual but valid one -- which blocks the study,
+    # while a malformed key merely fails at wandb init with a clear message.
     [[ "${WANDB_API_KEY}" =~ ^[A-Za-z0-9]{40,}$ ]] || {
         echo "WANDB_API_KEY is not shaped like a wandb key" >&2
         exit 2
@@ -350,7 +354,14 @@ training_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --nta
     export PATH="$VIRTUAL_ENV/bin:$PATH"
     export PYTHONPATH="$node_root/source${PYTHONPATH:+:$PYTHONPATH}"
     if [[ -n "$WANDB_NETRC_CONTAINER_PATH" ]]; then
-        export WANDB_API_KEY="$("$MODELOPT_RUNTIME/bin/python" - "$WANDB_NETRC_CONTAINER_PATH" <<'PY'
+        # Assign first, export second. An export reports its own status, not
+        # the status of the command substitution feeding it, so under set -e a
+        # failed read here would sail through as an empty key -- and because
+        # this branch overwrites whatever was inherited, it would also destroy
+        # a good key that arrived from the job environment. On a 16-node run
+        # the mount only has to fail on one node for that to happen.
+        # No apostrophes in this block: it lives inside a single-quoted body.
+        wandb_api_key="$("$MODELOPT_RUNTIME/bin/python" - "$WANDB_NETRC_CONTAINER_PATH" <<'PY'
 import netrc
 import sys
 
@@ -360,6 +371,8 @@ if credentials is None or not credentials[2]:
 print(credentials[2])
 PY
 )"
+        [[ -n "$wandb_api_key" ]] || { echo "netrc read produced an empty wandb key" >&2; exit 2; }
+        export WANDB_API_KEY="$wandb_api_key"
     fi
     "$MODELOPT_RUNTIME/bin/python" - "$node_root/source" <<'PY'
 import sys

@@ -63,6 +63,53 @@ mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH" "$ENROOT_TEMP_PATH"
 # compared across sites. The upstream manifest digest is the thing that can:
 # it makes "every cluster imported the same vLLM" a checkable claim rather than
 # an assumption, and the arms are only comparable if it holds.
+# These nodes carry a node-level pull-through registry cache in the proxy
+# variables, and it is not uniform across the partition: cpu-dm-0004 imported
+# cleanly while cpu-dm-0007 failed six curl retries on an unresolvable
+# container-cache host. The asymmetry hides well -- curl honours all_proxy for
+# every scheme, Python urllib does not -- so a digest lookup can reach the
+# registry on exactly the node where the import cannot. The proxy is a cache,
+# not an authorisation gateway, so an unusable one is a reason to go direct
+# rather than to fail. Prefer it whenever it actually answers.
+#
+# This runs before the digest lookup, not just before the import: urllib does
+# honour https_proxy and http_proxy, so a broken one of those would otherwise
+# fail the lookup before the import is ever reached.
+command -v getent >/dev/null || { echo "getent is absent" >&2; exit 2; }
+for proxy_var in all_proxy ALL_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY; do
+    proxy_value="${!proxy_var:-}"
+    [[ -n "$proxy_value" ]] || continue
+    proxy_authority="${proxy_value#*://}"
+    proxy_authority="${proxy_authority%%/*}"
+    proxy_authority="${proxy_authority##*@}"
+    if [[ "$proxy_authority" == \[*\]* ]]; then
+        # Bracketed IPv6 literal: the brackets delimit the host, so the port
+        # separator is the colon after the closing bracket, not the ones inside.
+        proxy_host="${proxy_authority%%\]*}"
+        proxy_host="${proxy_host#\[}"
+        proxy_port="${proxy_authority##*\]}"
+        proxy_port="${proxy_port#:}"
+    else
+        proxy_host="${proxy_authority%%:*}"
+        proxy_port="${proxy_authority##*:}"
+        [[ "$proxy_port" != "$proxy_authority" ]] || proxy_port=""
+    fi
+    [[ -n "$proxy_host" ]] || continue
+    reason=""
+    if ! getent hosts "$proxy_host" >/dev/null 2>&1; then
+        reason="does not resolve"
+    elif [[ -n "$proxy_port" ]] && ! timeout 5 bash -c \
+            "exec 3<>/dev/tcp/${proxy_host}/${proxy_port}" 2>/dev/null; then
+        # A drained cache node still resolves. Resolution alone would leave the
+        # import retrying against a host that will never answer.
+        reason="does not accept connections on port $proxy_port"
+    fi
+    if [[ -n "$reason" ]]; then
+        echo "proxy $proxy_var host $proxy_host $reason; going direct"
+        unset "$proxy_var"
+    fi
+done
+
 upstream_digest="$(python3 - "$IMAGE_REF" <<'PY_DIGEST'
 import json
 import sys
@@ -116,27 +163,6 @@ if [[ -n "${EXPECTED_IMAGE_DIGEST:-}" && "$EXPECTED_IMAGE_DIGEST" != "$upstream_
     echo "tag moved: expected $EXPECTED_IMAGE_DIGEST, resolved $upstream_digest" >&2
     exit 2
 fi
-
-# These nodes carry a node-level pull-through registry cache in the proxy
-# variables, and it is not uniform across the partition: cpu-dm-0004 imported
-# cleanly while cpu-dm-0007 failed six curl retries on an unresolvable
-# container-cache host. The asymmetry hides well -- curl honours all_proxy for
-# every scheme, Python's urllib does not -- so the digest resolution above can
-# reach the registry directly on exactly the node where the import cannot.
-# The proxy is a cache, not an authorisation gateway, so an unreachable one is
-# a reason to go direct rather than to fail. Prefer it when it resolves.
-for proxy_var in all_proxy ALL_PROXY https_proxy HTTPS_PROXY http_proxy HTTP_PROXY; do
-    proxy_value="${!proxy_var:-}"
-    [[ -n "$proxy_value" ]] || continue
-    proxy_host="${proxy_value#*://}"
-    proxy_host="${proxy_host%%/*}"
-    proxy_host="${proxy_host##*@}"
-    proxy_host="${proxy_host%%:*}"
-    if [[ -n "$proxy_host" ]] && ! getent hosts "$proxy_host" >/dev/null 2>&1; then
-        echo "proxy $proxy_var=$proxy_host does not resolve; importing direct"
-        unset "$proxy_var"
-    fi
-done
 
 staged="$scratch/image.sqsh"
 enroot import -o "$staged" "$IMAGE_REF"
