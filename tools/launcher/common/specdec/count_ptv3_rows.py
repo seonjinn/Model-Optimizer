@@ -27,6 +27,7 @@ import argparse
 import gzip
 import json
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
@@ -272,15 +273,25 @@ def main() -> None:
         if not repo_dir.is_dir():
             results[repo] = {"status": "absent"}
             continue
+        started = time.monotonic()
         rows, shards = count_repo(repo_dir, args.workers)
+        elapsed = time.monotonic() - started
         if not shards:
             results[repo] = {"status": "no_shards"}
             continue
+        # Whether a wider allocation would help is a measurement, not a guess:
+        # a run that reads far below what the pool could sustain is waiting on
+        # storage, and adding cores to it buys nothing. Recording bytes and
+        # wall time per repo is what lets the next run size itself on evidence.
+        staged_bytes = sum((repo_dir / shard).stat().st_size for shard in shards)
         entry: dict[str, object] = {
             "status": "counted",
             "rows": rows,
             "shard_count": len(shards),
             "shards": shards,
+            "bytes": staged_bytes,
+            "seconds": round(elapsed, 3),
+            "read_mb_per_s": round(staged_bytes / elapsed / 1e6, 1) if elapsed > 0 else None,
         }
         if repo in expected:
             entry["indexed_rows"] = expected[repo]
@@ -315,6 +326,7 @@ def main() -> None:
             {
                 "schema": "ptv3-row-count-v1",
                 "data_root": str(args.data_root),
+                "workers": args.workers,
                 "validated_against": sorted(checked),
                 "repos": results,
             },
@@ -329,7 +341,18 @@ def main() -> None:
             print(f"{repo:<38} {entry['status']}")
             continue
         note = " (matches index)" if entry.get("agrees_with_index") else ""
-        print(f"{repo:<38} rows={entry['rows']:>10,} shards={entry['shard_count']}{note}")
+        print(
+            f"{repo:<38} rows={entry['rows']:>10,} shards={entry['shard_count']} "
+            f"{entry['seconds']}s {entry['read_mb_per_s']}MB/s{note}"
+        )
+
+    total_bytes = sum(int(e.get("bytes", 0)) for e in results.values())
+    total_seconds = sum(float(e.get("seconds", 0.0)) for e in results.values())
+    if total_seconds > 0:
+        print(
+            f"{'TOTAL':<38} {total_bytes / 1e9:.1f}GB in {total_seconds:.1f}s "
+            f"on {args.workers} workers = {total_bytes / total_seconds / 1e6:.0f}MB/s"
+        )
 
 
 if __name__ == "__main__":
