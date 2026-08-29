@@ -146,7 +146,21 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 </table>
 
 <h2>Key results</h2>
-<div class="empty">No training runs launched yet. Acceptance length &tau;, block size B, and end-to-end rollout throughput at both high and low concurrency land here as milestones report.</div>
+<div class="sub" style="margin:0 0 10px">Twelve arms live &mdash; six Thinking on Lyris, six Base on OCI-HSG. Steps below are the latest checkpoint on disk, not the live step counter. Acceptance length &tau; and end-to-end rollout throughput at both concurrency regimes land here as milestones report.</div>
+<table>
+<tr><th>Cluster</th><th>Arm</th><th>Latest ckpt / 25391</th><th>State</th></tr>
+<tr><td>Lyris</td><td><code>thinking dflash b8</code></td><td>9500 &nbsp;<span class="sub">37%</span></td><td><span class="b done">training</span></td></tr>
+<tr><td>Lyris</td><td><code>thinking dflash b16</code></td><td>3500 &nbsp;<span class="sub">14%</span></td><td><span class="b wip">requeued, pending</span></td></tr>
+<tr><td>Lyris</td><td><code>thinking dspark b16</code></td><td>&mdash;</td><td><span class="b done">training</span></td></tr>
+<tr><td>Lyris</td><td><code>thinking dspark b8</code></td><td>&mdash;</td><td><span class="b done">training</span></td></tr>
+<tr><td>Lyris</td><td><code>thinking dflash2 b16</code></td><td>&mdash;</td><td><span class="b done">training</span></td></tr>
+<tr><td>Lyris</td><td><code>thinking dflash2 b8</code></td><td>&mdash;</td><td><span class="b done">training</span></td></tr>
+<tr><td>OCI-HSG</td><td><code>base dflash b16</code></td><td>&mdash;</td><td><span class="b done">training</span></td></tr>
+<tr><td>OCI-HSG</td><td><code>base dflash b8</code></td><td>&mdash;</td><td><span class="b done">training</span></td></tr>
+<tr><td>OCI-HSG</td><td><code>base dspark b16 / b8</code></td><td>&mdash;</td><td><span class="b pend">queued</span></td></tr>
+<tr><td>OCI-HSG</td><td><code>base dflash2 b16 / b8</code></td><td>&mdash;</td><td><span class="b pend">queued</span></td></tr>
+</table>
+<p class="sub">W&amp;B project <code>sna-modelopt-specdec</code>. Run name is the arm plus cluster plus step budget, e.g. <code>sd2-q30-thinking-nemo-dspark-b16-16n-lyris-s25391</code>; the run id is keyed on the experiment id (<code>sd-158e4c3e2dcbab0c-lyris</code>) so a requeue resumes the same chart instead of forking a new one. Slurm job names now match the run name exactly, so <code>squeue</code> reads as the matrix.</p>
 
 <h2>Key insights and mistakes</h2>
 <div class="sub" style="margin:0 0 10px">Consolidated. Each is a lesson that changed how the study is built, not a log entry.</div>
@@ -205,5 +219,11 @@ Goal: speed up multi-turn agentic RL rollout (Math + SWE). &nbsp;&middot;&nbsp; 
 
 <li><span class="t">A schema that accepts unknown keys moves the error to the far side of the allocation.</span>
 <span class="w">Every DSpark and DFlash2 arm on both clusters died at 3&nbsp;min&nbsp;40&nbsp;s on <code>HfTrainingArguments.__init__() got an unexpected keyword argument 'warmup_ratio'</code>. transformers&nbsp;5 <b>removed</b> <code>warmup_ratio</code> and made <code>warmup_steps</code> a float, where a value below 1 is read as the ratio &mdash; measured on-cluster, <code>warmup_steps=0.04</code> gives exactly the 1,016 warmup steps that <code>warmup_ratio=0.04</code> gave over 25,391. The DFlash arms survived only because <code>dflash.yaml</code> happens to write <code>warmup_steps: 100</code>. Nothing caught it earlier because the recipe schema sets <code>extra="allow"</code>, so HF trainer keys pass through unvalidated and the unknown key raises only inside the trainer constructor &mdash; after sixteen nodes are up and every node has staged. <b>The method split was the diagnosis</b>: one method living while two died ruled out infrastructure in a single glance and pointed at a per-recipe difference. A unit test now asserts every key under <code>training:</code> in every speculative recipe is a field the installed <code>TrainingArguments</code> accepts.</span></li>
+
+<li><span class="t">A 16-node arm is 8 nodes of data and 8 nodes of training.</span>
+<span class="w">Reading the launch line back off a running arm: <code>accelerate --num_machines 8 --num_processes 32</code>, with <code>data.streaming_server_url</code> naming sixteen endpoints across eight <i>other</i> hosts. So the node count in the manifest buys half the GPUs a naive reading assumes &mdash; 32 ranks, not 64 &mdash; because the streaming corpus is served from inside the same allocation. This matters for two decisions the study already made on the other reading: GBS is <code>4 &times; 4 &times; 32</code>, and &ldquo;16 nodes&rdquo; in the capacity table is a scheduling cost, not a training width. Any future comparison against a non-streaming baseline has to hold <i>training</i> ranks equal, not nodes.</span></li>
+
+<li><span class="t">Non-empty is not complete, and a stager that cannot fail will not tell you it failed.</span>
+<span class="w"><code>stage_ptv2.sh</code> skipped any shard for which <code>[ -s "$DST/$f" ]</code> held, so a shard truncated by a dropped connection counted as staged forever &mdash; the same defect that once reported a fully staged repo carrying 5,901 bytes. Worse, the script ended on a <code>{...} &gt; status</code> redirect, so it exited 0 whether eighteen shards landed or none did; the caller had no way to know. It now compares every shard against the <code>Content-Length</code> the Hub reports for the pinned revision, both before skipping and after downloading so a short read is retried rather than promoted by <code>mv</code>, and it exits non-zero when any shard fails. <b>A resume check that trusts the filesystem instead of the source is a cache with no invalidation.</b></span></li>
 
 </ol>
