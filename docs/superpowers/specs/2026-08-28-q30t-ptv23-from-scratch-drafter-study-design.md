@@ -443,7 +443,12 @@ GB of host memory, about 144 CPUs across two sockets, and eight NICs.
 | Ptyche     | GB200 | 189,471 MiB (185.0 GiB) | coreai_dlalgo_llm | 0.233 |
 | Lyris      | GB200 / GB300 | 185.0 / 277.5 GiB | coreai_dlalgo_llm | 0.524 |
 | AWS-CMH-03 | GB300 | 284,208 MiB (277.5 GiB) | nemotron_sw_post  | 0.915 |
-| OCI-AGA    | GB300 | 284,208 MiB (277.5 GiB) | nemotron_sw_post  | 0.249 |
+| OCI-AGA    | GB300 (unverified) | not measured   | nemotron_sw_post  | 0.249 |
+
+OCI-AGA's row is the one gap. Its probe job never left the queue at that
+account's FairShare, and `scontrol` reports `Gres=gpu:4` with no model, so its
+GPU is inferred from a node-naming pattern that matches AWS-CMH-03 rather than
+measured. OCI-AGA is not used for a comparison run until a probe confirms it.
 
 `fsort` is an OCI-HSG-only wrapper. Elsewhere read the same numbers from
 `sshare -U -o Account,NormShares,EffectvUsage,FairShare,LevelFS -P`. FairShare
