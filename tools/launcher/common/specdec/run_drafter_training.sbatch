@@ -229,12 +229,54 @@ TRAINING_SAMPLE_SIZE="${TRAINING_SAMPLE_SIZE:-$SAMPLE_SIZE}"
 [[ "$TRAINING_SAMPLE_SIZE" == "$SAMPLE_SIZE" || "$TRAINING_SAMPLE_SIZE" == "-1" ]] || {
     echo "TRAINING_SAMPLE_SIZE must be either the pinned ${SAMPLE_SIZE} or -1" >&2; exit 2;
 }
-TRAINING_SEQ_LEN="${TRAINING_SEQ_LEN:-4096}"
+# The training window belongs to the run, not to the submitting shell. It used
+# to default to 4096 whenever the caller forgot to export it, and nothing in the
+# job disagreed: five PTV3-SWE legs resumed a 16384 arm at 4096 and retrained two
+# thirds of two arms on a window the corpus was not built for. No error, no
+# warning, no record in the receipt; it surfaced only when a benchmark disagreed
+# weeks later. Derive the requirement from the pinned corpus instead, and refuse
+# a caller who contradicts it.
+case "$DATASET_PATH" in
+    *ptv3swe*) REQUIRED_SEQ_LEN=16384 ;;
+    *)         REQUIRED_SEQ_LEN=4096 ;;
+esac
+TRAINING_SEQ_LEN="${TRAINING_SEQ_LEN:-$REQUIRED_SEQ_LEN}"
 [[ "$TRAINING_SEQ_LEN" =~ ^[1-9][0-9]*$ ]] || { echo "TRAINING_SEQ_LEN must be positive" >&2; exit 2; }
+(( TRAINING_SEQ_LEN == REQUIRED_SEQ_LEN )) || {
+    echo "TRAINING_SEQ_LEN ${TRAINING_SEQ_LEN} contradicts the pinned corpus" >&2
+    echo "  corpus:   ${DATASET_PATH}" >&2
+    echo "  requires: ${REQUIRED_SEQ_LEN}" >&2
+    exit 2
+}
+# Each leg of the incident above was internally consistent; only the arm as a
+# whole was not. A per-arm record is the one thing that could have caught it,
+# so pin the window to the output root and refuse to continue an arm at a
+# window it was not trained at.
+WINDOW_LOCK="$OUTPUT_ROOT/training_window.json"
+if [[ -f "$WINDOW_LOCK" ]]; then
+    locked_seq_len="$(sed -nE 's/.*"training_seq_len"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$WINDOW_LOCK" | head -n 1)"
+    [[ "$locked_seq_len" == "$TRAINING_SEQ_LEN" ]] || {
+        echo "arm ${RUN_NAME} was trained at ${locked_seq_len}; refusing to continue it at ${TRAINING_SEQ_LEN}" >&2
+        echo "remove ${WINDOW_LOCK} only when the whole arm is being restarted" >&2
+        exit 2
+    }
+else
+    mkdir -p "$OUTPUT_ROOT"
+    printf '{"training_seq_len": %s, "dataset_path": "%s", "run_name": "%s"}\n' \
+        "$TRAINING_SEQ_LEN" "$DATASET_PATH" "$RUN_NAME" >"$WINDOW_LOCK"
+fi
 # eagle_utils right-truncates to train_len and the sidecar refuses a longer
 # prompt, so a train_len above the serve limit silently trains on truncated
-# rows while the capture path errors. Refuse the pair instead.
-(( TRAINING_SEQ_LEN <= ${SERVE_MAX_MODEL_LEN:-8192} )) || { echo "TRAINING_SEQ_LEN ${TRAINING_SEQ_LEN} exceeds SERVE_MAX_MODEL_LEN ${SERVE_MAX_MODEL_LEN:-8192}" >&2; exit 2; }
+# rows while the capture path errors. Raise the serve limit with the window
+# rather than leaving the caller to keep two exports in sync; the 8192 floor
+# preserves what every pre-existing 4096 arm was served with.
+if (( TRAINING_SEQ_LEN > 8192 )); then
+    SERVE_MAX_MODEL_LEN="${SERVE_MAX_MODEL_LEN:-$TRAINING_SEQ_LEN}"
+else
+    SERVE_MAX_MODEL_LEN="${SERVE_MAX_MODEL_LEN:-8192}"
+fi
+(( TRAINING_SEQ_LEN <= SERVE_MAX_MODEL_LEN )) || { echo "TRAINING_SEQ_LEN ${TRAINING_SEQ_LEN} exceeds SERVE_MAX_MODEL_LEN ${SERVE_MAX_MODEL_LEN}" >&2; exit 2; }
+export SERVE_MAX_MODEL_LEN
 [[ "${SELF_REQUEUE:-0}" =~ ^[01]$ ]] || { echo "SELF_REQUEUE must be 0 or 1" >&2; exit 2; }
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     [[ "${MAX_REQUEUES:-}" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_REQUEUES must be positive" >&2; exit 2; }
