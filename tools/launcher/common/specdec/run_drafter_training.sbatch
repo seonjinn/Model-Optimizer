@@ -277,6 +277,25 @@ else
 fi
 (( TRAINING_SEQ_LEN <= SERVE_MAX_MODEL_LEN )) || { echo "TRAINING_SEQ_LEN ${TRAINING_SEQ_LEN} exceeds SERVE_MAX_MODEL_LEN ${SERVE_MAX_MODEL_LEN}" >&2; exit 2; }
 export SERVE_MAX_MODEL_LEN
+# The serve-side hidden-state pool is sized by max_tokens in the connector extra
+# config, and pin 93352fb0a hardcodes that to 4096 no matter what window the run
+# uses: a 16384 arm on that pin dies about 30 minutes in, inside the first
+# get_batch_samples, on "serve connector max_tokens=4096 < trainer
+# max_seq_len=16384". A prompt longer than a pool slot is silently skipped by the
+# producer, so the trainer raises rather than hang on a /desc that never readies.
+# Later pins derive the pool from SERVE_MAX_MODEL_LEN, but editing a source file
+# cannot reach a run whose checkout is required to be clean at SOURCE_SHA, while
+# an exported variable can. Export it here so the pool tracks the window on every
+# pin. The pool is cheap: 32 slots at 16384 tokens, 4 KV heads and head_dim 128
+# is well under a gigabyte of bf16.
+HS_MAX_TOKENS="${HS_MAX_TOKENS:-$SERVE_MAX_MODEL_LEN}"
+[[ "$HS_MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || { echo "HS_MAX_TOKENS must be positive" >&2; exit 2; }
+(( HS_MAX_TOKENS >= TRAINING_SEQ_LEN )) || {
+    echo "HS_MAX_TOKENS ${HS_MAX_TOKENS} is below TRAINING_SEQ_LEN ${TRAINING_SEQ_LEN}" >&2
+    echo "prompts longer than ${HS_MAX_TOKENS} tokens would be dropped from the hidden-state pool" >&2
+    exit 2
+}
+export HS_MAX_TOKENS
 [[ "${SELF_REQUEUE:-0}" =~ ^[01]$ ]] || { echo "SELF_REQUEUE must be 0 or 1" >&2; exit 2; }
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     [[ "${MAX_REQUEUES:-}" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_REQUEUES must be positive" >&2; exit 2; }
@@ -546,6 +565,7 @@ PY
     export SERVE_MAX_MODEL_LEN="${SERVE_MAX_MODEL_LEN:-8192}"
     export SERVE_READY_TIMEOUT="${SERVE_READY_TIMEOUT:-1800}"
     export HS_POOL_SLOTS=32 SERVE_MAX_NUM_SEQS=16
+    export HS_MAX_TOKENS="${HS_MAX_TOKENS:-$SERVE_MAX_MODEL_LEN}"
     # The hidden-state sidecar has to bind a port the kernel will never hand out
     # as an ephemeral source port. OCI-HSG and aws-cmh set ip_local_port_range to
     # 9000-65000, so the 18999 default sat inside it and a concurrent NCCL/NIXL
