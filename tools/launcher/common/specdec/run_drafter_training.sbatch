@@ -83,11 +83,14 @@ if [[ -z "$WANDB_NETRC_CONTAINER_PATH" ]]; then
         echo "no wandb credential: export WANDB_API_KEY or set WANDB_NETRC_PATH" >&2
         exit 2
     }
-    # Deliberately loose. The job of this check is to catch a *missing*
-    # credential, and a shape rule tight enough to reject every malformed key
-    # would also reject an unusual but valid one -- which blocks the study,
-    # while a malformed key merely fails at wandb init with a clear message.
-    [[ "${WANDB_API_KEY}" =~ ^[A-Za-z0-9]{40,}$ ]] || {
+    # Deliberately loose: printable, no whitespace, long enough. The job of
+    # this check is to catch a *missing* credential. A rule tight enough to
+    # reject every malformed key also rejects unusual but valid ones, which
+    # blocks the study, while a malformed key merely fails at wandb init with a
+    # clear message. This was ^[A-Za-z0-9]{40,}$ until it rejected a live
+    # 86-character key that wandb itself accepts, killing every arm on a new
+    # cluster in preflight. Do not re-tighten it to a character whitelist.
+    [[ "${WANDB_API_KEY}" =~ ^[[:graph:]]{40,}$ ]] || {
         echo "WANDB_API_KEY is not shaped like a wandb key" >&2
         exit 2
     }
@@ -215,6 +218,23 @@ fi
 [[ "$MAX_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_STEPS must be positive" >&2; exit 2; }
 SAVE_STEPS="${SAVE_STEPS:-$MAX_STEPS}"
 [[ "$SAVE_STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "SAVE_STEPS must be positive" >&2; exit 2; }
+# eagle_utils takes two different loading branches off the sign of sample_size.
+# A positive value materializes the whole corpus into a Python list, once per
+# rank and again per dataloader worker; at 44.9 KB a row the 1,179,389-row PTV3
+# corpus is 54 GB a rank, which OOM-killed every task on a 900 GB node. A
+# non-positive value takes the Arrow memory-mapped branch, which keeps every row
+# but shares one mapping across all processes. Only -1 is accepted so this can
+# never become a way to quietly train on fewer rows than the manifest pins.
+TRAINING_SAMPLE_SIZE="${TRAINING_SAMPLE_SIZE:-$SAMPLE_SIZE}"
+[[ "$TRAINING_SAMPLE_SIZE" == "$SAMPLE_SIZE" || "$TRAINING_SAMPLE_SIZE" == "-1" ]] || {
+    echo "TRAINING_SAMPLE_SIZE must be either the pinned ${SAMPLE_SIZE} or -1" >&2; exit 2;
+}
+TRAINING_SEQ_LEN="${TRAINING_SEQ_LEN:-4096}"
+[[ "$TRAINING_SEQ_LEN" =~ ^[1-9][0-9]*$ ]] || { echo "TRAINING_SEQ_LEN must be positive" >&2; exit 2; }
+# eagle_utils right-truncates to train_len and the sidecar refuses a longer
+# prompt, so a train_len above the serve limit silently trains on truncated
+# rows while the capture path errors. Refuse the pair instead.
+(( TRAINING_SEQ_LEN <= ${SERVE_MAX_MODEL_LEN:-8192} )) || { echo "TRAINING_SEQ_LEN ${TRAINING_SEQ_LEN} exceeds SERVE_MAX_MODEL_LEN ${SERVE_MAX_MODEL_LEN:-8192}" >&2; exit 2; }
 [[ "${SELF_REQUEUE:-0}" =~ ^[01]$ ]] || { echo "SELF_REQUEUE must be 0 or 1" >&2; exit 2; }
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     [[ "${MAX_REQUEUES:-}" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_REQUEUES must be positive" >&2; exit 2; }
@@ -350,7 +370,16 @@ staging_step=(srun --nodes="$ALLOCATED_NODES" --ntasks="$ALLOCATED_NODES" --ntas
         rm -rf -- "$node_root"
     fi
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
-    cp -rP --no-preserve=all -- "$SOURCE_PATH" "$node_root/source"
+    # Staging copies this tree onto every node of every arm at once. .git is three
+    # quarters of the bytes and the job never reads it. Worse, any git command in
+    # the pinned tree creates and removes .git/index.lock, and a copy that
+    # enumerates the directory before the lock is gone but opens it after fails
+    # with ENOENT, which kills the staging task and takes the whole step down with
+    # it. Excluding .git removes both the cost and the race. Keep apostrophes out
+    # of this block: in some callers it sits inside a single-quoted bash -c body.
+    mkdir -p "$node_root/source"
+    tar --create --file=- --exclude=./.git --directory="$SOURCE_PATH" . \
+        | tar --extract --file=- --directory="$node_root/source"
     egg_info="$node_root/source/nvidia_modelopt.egg-info"
     mkdir -p "$egg_info"
     printf "Metadata-Version: 2.4\nName: nvidia-modelopt\nVersion: %s\n" \
@@ -378,6 +407,7 @@ else
     "${staging_step[@]}"
 fi
 
+export TRAINING_SEQ_LEN TRAINING_SAMPLE_SIZE
 export PER_DEVICE_TRAIN_BATCH_SIZE GRADIENT_ACCUMULATION_STEPS NUM_ATTENTION_HEADS NUM_KEY_VALUE_HEADS HEAD_DIM INTERMEDIATE_SIZE EAGLE_CAPTURE_IDS SERVE_TP LOSS_OBJECTIVE LOSS_VALUE DFLASH_DPACE_ALPHA METHOD BLOCK_SIZE MAX_STEPS SAVE_STEPS RUN_NAME SAMPLE_SIZE
 export SERVE_NODES CLUSTER_NAME WANDB_NETRC_CONTAINER_PATH WANDB_API_KEY
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
@@ -467,8 +497,23 @@ PY
     export TMPDIR="${SCRATCH_JOB_ROOT}/node-${SLURM_NODEID}/tmp"
     mkdir -p "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" "$TRITON_CACHE_DIR" "$XDG_CACHE_HOME" "$SQLITE_TMPDIR" "$WANDB_DIR" "$WANDB_CACHE_DIR" "$SERVE_LOG_DIR" "$TMPDIR"
     export SERVE_MODEL_NAME="modelopt-${RUN_NAME}"
-    export SERVE_BLOCK_SIZE=32 SERVE_MAX_MODEL_LEN=8192 SERVE_READY_TIMEOUT=1800
+    # A longer-context phase (PTV3 agentic traces at 16384) has to raise the
+    # sidecar limit in lockstep with training_seq_len, and a bigger KV pool
+    # takes longer to come up. Defaults keep every PTV2 arm byte-identical.
+    export SERVE_BLOCK_SIZE=32
+    export SERVE_MAX_MODEL_LEN="${SERVE_MAX_MODEL_LEN:-8192}"
+    export SERVE_READY_TIMEOUT="${SERVE_READY_TIMEOUT:-1800}"
     export HS_POOL_SLOTS=32 SERVE_MAX_NUM_SEQS=16
+    # The hidden-state sidecar has to bind a port the kernel will never hand out
+    # as an ephemeral source port. OCI-HSG and aws-cmh set ip_local_port_range to
+    # 9000-65000, so the 18999 default sat inside it and a concurrent NCCL/NIXL
+    # socket could win the race: one replica dies on EADDRINUSE, the trainer
+    # waits forever for an address that never publishes, and the afterok chain
+    # unwinds behind it. 8700 is below every low bound in the study and clear of
+    # the 8765+ serve API ports. Keep apostrophes out of this block: it sits
+    # inside a single-quoted bash -c body, so one would terminate the string and
+    # break the script at submit time rather than at review time.
+    export HS_SIDECAR_PORT="${HS_SIDECAR_PORT:-8700}"
     export EXPORT_PATH
     loss_args=(
         "dflash.dflash_loss_objective=${LOSS_OBJECTIVE}"
@@ -477,6 +522,12 @@ PY
     if [[ "$METHOD" == dflash ]]; then
         loss_args+=("dflash.dflash_dpace_alpha=${DFLASH_DPACE_ALPHA}")
     fi
+    # Study hook: space-separated Hydra overrides appended last, so a parameter-sweep
+    # cell can change the objective or the schedule without forking the recipe file.
+    extra_args=()
+    if [[ -n "${DFLASH_EXTRA_TRAIN_ARGS:-}" ]]; then
+        read -ra extra_args <<< "${DFLASH_EXTRA_TRAIN_ARGS}"
+    fi
     cd "$node_root/source/tools/launcher"
     exec bash common/eagle3/train_eagle_streaming.sh \
         --config "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml" \
@@ -484,12 +535,12 @@ PY
         model.use_fake_base_for_offline=true \
         data.mode=streaming \
         data.data_path="$node_root/input/$DATASET_LOCAL_NAME" \
-        data.sample_size="${SAMPLE_SIZE}" \
+        data.sample_size="${TRAINING_SAMPLE_SIZE}" \
         training.output_dir="${OUTPUT_ROOT}" \
         training.max_steps="${MAX_STEPS}" \
         training.save_steps="${SAVE_STEPS}" \
         training.save_total_limit=2 \
-        training.training_seq_len=4096 \
+        training.training_seq_len="${TRAINING_SEQ_LEN}" \
         training.answer_only_loss=false \
         training.seed=42 \
         training.per_device_train_batch_size="${PER_DEVICE_TRAIN_BATCH_SIZE}" \
@@ -503,7 +554,8 @@ PY
         dflash.dflash_architecture_config.num_key_value_heads="${NUM_KEY_VALUE_HEADS}" \
         dflash.dflash_architecture_config.head_dim="${HEAD_DIM}" \
         dflash.dflash_architecture_config.intermediate_size="${INTERMEDIATE_SIZE}" \
-        "${loss_args[@]}"
+        "${loss_args[@]}" \
+        ${extra_args[@]+"${extra_args[@]}"}
 ')
 
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then

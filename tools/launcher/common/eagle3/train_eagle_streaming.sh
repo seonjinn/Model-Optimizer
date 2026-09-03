@@ -146,6 +146,9 @@ SERVED_MODEL_NAME="${SERVE_MODEL_NAME:-$HF_MODEL_CKPT}"
 SERVE_READY_TIMEOUT="${SERVE_READY_TIMEOUT:-900}"
 SERVE_NODES="${SERVE_NODES:-1}"
 SERVE_REPLICAS_PER_NODE="${SERVE_REPLICAS_PER_NODE:-1}"
+# Keep this and SERVE_PORT below the node's ip_local_port_range low bound --
+# see check_port_free. The default is only safe on stock kernels; the wave
+# submitters pass an explicit pair per arm.
 HS_SIDECAR_PORT="${HS_SIDECAR_PORT:-18999}"
 SERVE_LOG="${SERVE_LOG:-/scratchspace/vllm_serve.log}"   # serve nodes override with a per-node path
 # Namespace rendezvous/sentinel files per Slurm job (SLURM_JOB_ID: same across an
@@ -191,6 +194,31 @@ resolve_routable_ip() {
     echo "$ip"
 }
 
+# Refuse to start a replica on a port something else already holds, and say so
+# when a port we pick by hand sits inside the kernel's ephemeral range.
+#
+# The GB300 nodes run ip_local_port_range=9000-65000, far wider than the Linux
+# default, and a serve node carries ~40 randomly-placed listeners once vLLM is
+# up (get_open_port binds port 0 for every ZMQ, distributed and NIXL channel).
+# A hand-picked port inside that window is in the same lottery: the kernel can
+# hand it to one of those sockets microseconds before the RDMA connector binds
+# its sidecar, and the bind then fails with EADDRINUSE. One replica out of
+# sixteen dies, the other fifteen publish, and the trainer waits on the missing
+# address until the wall clock runs out. Ports below the low bound are never
+# auto-assigned, which is why every port this script is given should live there.
+check_port_free() {
+    local port="$1" label="$2" low
+    low=$(cut -f1 /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || echo 32768)
+    if [ -n "$low" ] && (( port >= low )); then
+        echo "WARNING: ${label} port ${port} is inside this node's ephemeral range (${low}+); a concurrent socket can win the race for it." >&2
+    fi
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        echo "ERROR: ${label} port ${port} is already in use on $(hostname). Set SERVE_PORT/HS_SIDECAR_PORT to a free port below ${low}." >&2
+        return 1
+    fi
+    return 0
+}
+
 # Start one vllm serve replica in the background and append its PID/log to the supervisor arrays.
 #   $1 = bind host   $2 = tensor-parallel size   $3 = CUDA_VISIBLE_DEVICES ("" -> all)
 #   $4 = API port    $5 = hidden-state sidecar port   $6 = log path
@@ -211,8 +239,16 @@ launch_vllm() {
     # Hidden states move serve -> trainer over NIXL RDMA (no disk round-trip): one
     # pre-registered pinned pool per serve, a tiny HTTP sidecar hands out per-request
     # transfer descriptors. Replicated across TP ranks, so only rank 0 owns the pool.
-    local kvcfg
-    kvcfg="{\"kv_connector\":\"RdmaHiddenStatesConnector\",\"kv_connector_module_path\":\"modelopt.torch.speculative.plugins.rdma_hidden_states_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"sidecar_port\":\"${sidecar_port}\",\"pool_slots\":\"${HS_POOL_SLOTS:-16}\",\"max_tokens\":\"${HS_MAX_TOKENS:-4096}\"}}"
+    # max_tokens is the pool slot capacity, so it has to cover the trainer's
+    # max_seq_len. A prompt longer than a slot is silently skipped by the
+    # producer and the trainer's fetch then hangs on a /desc that never readies;
+    # the streaming dataset raises rather than hang, which is how the 16k PTV3
+    # continuation died on the 4096 default. Sizing from the length the server
+    # itself admits keeps the two in step. The pool is cheap either way: at 16
+    # slots, 16k tokens and 4 KV heads x 128 it is ~268 MB of bf16.
+    local kvcfg hs_max_tokens
+    hs_max_tokens="${HS_MAX_TOKENS:-${SERVE_MAX_MODEL_LEN:-4096}}"
+    kvcfg="{\"kv_connector\":\"RdmaHiddenStatesConnector\",\"kv_connector_module_path\":\"modelopt.torch.speculative.plugins.rdma_hidden_states_connector\",\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"sidecar_port\":\"${sidecar_port}\",\"pool_slots\":\"${HS_POOL_SLOTS:-16}\",\"max_tokens\":\"${hs_max_tokens}\"}}"
     # The container's /usr/local/bin/vllm has a fixed /usr/bin/python3 shebang,
     # which bypasses an activated MODELOPT_RUNTIME. Launch the CLI as a module so
     # its connector and dependencies come from the selected runtime instead.
@@ -345,6 +381,8 @@ PY
     fi
 
     trap cleanup INT TERM EXIT
+    check_port_free "$SERVE_PORT" "serve API" || exit 1
+    check_port_free "$HS_SIDECAR_PORT" "hidden-state sidecar" || exit 1
     launch_vllm "$SERVE_HOST" "$SERVE_TP" "$SERVE_GPU" "$SERVE_PORT" "$HS_SIDECAR_PORT" "$SERVE_LOG"
     wait_vllm_ready "http://${SERVE_HOST}:${SERVE_PORT}" "${SERVE_PIDS[0]}" "$SERVE_LOG" || exit 1
     run_trainer_and_export "http://${SERVE_HOST}:${SERVE_PORT}" "$TRAIN_GPUS" || exit 1
@@ -375,6 +413,8 @@ elif [ "$NODEID" -lt "$SERVE_NODES" ]; then
         replica_api_port=$((SERVE_PORT + replica))
         replica_sidecar_port=$((HS_SIDECAR_PORT + replica))
         replica_log="${SERVE_LOG_DIR:-/scratchspace}/vllm_serve.${NODEID}.${replica}.log"
+        check_port_free "$replica_api_port" "serve API (replica ${replica})" || exit 1
+        check_port_free "$replica_sidecar_port" "hidden-state sidecar (replica ${replica})" || exit 1
         launch_vllm "0.0.0.0" "$SERVE_TP" "$replica_cvd" "$replica_api_port" "$replica_sidecar_port" "$replica_log"
     done
     for ((replica = 0; replica < SERVE_REPLICAS_PER_NODE; replica++)); do

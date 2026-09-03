@@ -44,7 +44,11 @@ from common.specdec.cluster_profile import load_cluster_profile, render_probe_sb
 profile_path = Path(sys.argv[1]).resolve()
 output = Path(sys.argv[2]).resolve()
 profile = load_cluster_profile(profile_path)
-if not output.is_relative_to(profile.durable_root):
+# Resolve both sides: AWS-CMH reaches the same filesystem through /lustre and
+# /scratch/fsw, so comparing a resolved output against a literal durable root
+# rejects a receipt that is in fact inside it. The wave submitter already
+# resolves both sides; this check has to agree with it.
+if not output.is_relative_to(profile.durable_root.resolve()):
     raise ValueError("output must be under the profile durable_root")
 print(profile_path)
 print(output)

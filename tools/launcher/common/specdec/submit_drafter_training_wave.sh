@@ -18,6 +18,20 @@ is_durable_path() {
     esac
 }
 
+# Slurm accepts several walltime spellings; the profiles and this flag use only
+# the two that carry a full day/hour/minute/second reading, so a shorthand like
+# "30" cannot be read as thirty minutes when it means thirty seconds.
+walltime_seconds() {
+    local value="${1:-}" days=0
+    if [[ "$value" == *-* ]]; then
+        days="${value%%-*}"
+        value="${value#*-}"
+    fi
+    [[ "$days" =~ ^[0-9]+$ && "$value" =~ ^([0-9]+):([0-5][0-9]):([0-5][0-9])$ ]] || return 1
+    echo $(( days * 86400 + 10#${BASH_REMATCH[1]} * 3600 + 10#${BASH_REMATCH[2]} * 60
+             + 10#${BASH_REMATCH[3]} ))
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUNNER="${SCRIPT_DIR}/run_drafter_training.sbatch"
@@ -33,6 +47,7 @@ JOB_NAME_OVERRIDE=""
 LEGACY_ADOPTION_SOURCE_SHA=""
 LEGACY_ADOPTION_CHECKPOINT_STEP=""
 SAVE_STEPS=""
+WALLTIME=""
 DEFAULT_REQUEUE_SAVE_STEPS=50
 SELF_REQUEUE=0
 MAX_REQUEUES=50
@@ -40,7 +55,7 @@ REQUEUE_SIGNAL_LEAD=300
 DRY_RUN=0
 
 usage() {
-    echo "usage: $0 --manifest /home/.../manifest.json --receipt /lustre/.../receipt.jsonl [--cluster-profile /home/.../profile.yaml] [--readiness-receipt /lustre/.../profile-probe.json] [--dependency JOBID] [--max-steps N] [--save-steps N] [--self-requeue] [--max-requeues N] [--requeue-signal-lead SECONDS] [--experiment-index N] [--job-name NAME] [--dry-run]" >&2
+    echo "usage: $0 --manifest /home/.../manifest.json --receipt /lustre/.../receipt.jsonl [--cluster-profile /home/.../profile.yaml] [--readiness-receipt /lustre/.../profile-probe.json] [--dependency JOBID] [--max-steps N] [--save-steps N] [--self-requeue] [--max-requeues N] [--requeue-signal-lead SECONDS] [--experiment-index N] [--job-name NAME] [--walltime [days-]HH:MM:SS] [--dry-run]" >&2
     exit 2
 }
 
@@ -53,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --dependency) DEPENDENCY="$2"; shift 2 ;;
         --max-steps) ONLY_STEP="$2"; shift 2 ;;
         --save-steps) SAVE_STEPS="$2"; shift 2 ;;
+        --walltime) WALLTIME="$2"; shift 2 ;;
         --self-requeue) SELF_REQUEUE=1; shift ;;
         --max-requeues) MAX_REQUEUES="$2"; shift 2 ;;
         --requeue-signal-lead) REQUEUE_SIGNAL_LEAD="$2"; shift 2 ;;
@@ -152,6 +168,20 @@ CLUSTER_NAME="${profile_values[0]}"
 PROFILE_ACCOUNT="${profile_values[1]}"
 PROFILE_PARTITION="${profile_values[2]}"
 SCRATCH_ROOT="${profile_values[8]}"
+# The profile walltime is the wall a full production stage is sized against, so
+# a shorter one is always safe and a longer one is not: it would outrun the
+# partition limit and sit unschedulable instead of failing here.
+PROFILE_WALLTIME="${profile_values[5]}"
+profile_walltime_seconds="$(walltime_seconds "$PROFILE_WALLTIME")" \
+    || { echo "cluster profile walltime is not [days-]HH:MM:SS: $PROFILE_WALLTIME" >&2; exit 2; }
+if [[ -z "$WALLTIME" ]]; then
+    WALLTIME="$PROFILE_WALLTIME"
+else
+    requested_walltime_seconds="$(walltime_seconds "$WALLTIME")" \
+        || { echo "--walltime must be [days-]HH:MM:SS" >&2; exit 2; }
+    (( requested_walltime_seconds > 0 && requested_walltime_seconds <= profile_walltime_seconds )) \
+        || { echo "--walltime must be positive and at most the profile walltime $PROFILE_WALLTIME" >&2; exit 2; }
+fi
 [[ "$CLUSTER_NAME" == "oci-hsg" || -n "$READINESS_RECEIPT" ]] || usage
 if [[ -n "$READINESS_RECEIPT" ]]; then
     READINESS_RECEIPT_SHA256="$(sha256sum "$READINESS_RECEIPT" | cut -d' ' -f1)"
@@ -257,7 +287,7 @@ PY
     fi
     account="$PROFILE_ACCOUNT"
     partition="$PROFILE_PARTITION"
-    scheduler_args=(--account="$account" --partition="$partition" "--nodes=${nodes}" --ntasks-per-node=1 "--segment=${segment}" "--time=${profile_values[5]}")
+    scheduler_args=(--account="$account" --partition="$partition" "--nodes=${nodes}" --ntasks-per-node=1 "--segment=${segment}" "--time=${WALLTIME}")
     if [[ "${profile_values[7]}" == "true" ]]; then
         [[ "$gpus_per_node" == "${profile_values[6]}" ]] || { echo "manifest/profile GPU mismatch" >&2; exit 2; }
         scheduler_args+=("--gpus-per-node=${gpus_per_node}")

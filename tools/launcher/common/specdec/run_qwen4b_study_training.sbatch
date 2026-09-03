@@ -383,7 +383,16 @@ stage_step=(srun --nodes=2 --ntasks=2 --ntasks-per-node=1 bash -c '
     [[ "$node_root" == "${SCRATCH_ROOT%/}/${USER}/${SLURM_JOB_ID}/"* ]] || exit 2
     rm -rf -- "$node_root"
     mkdir -p "$node_root/runtime" "$node_root/input" "$node_root/tmp"
-    cp -rP --no-preserve=all -- "$SOURCE_PATH" "$node_root/source"
+    # Staging copies this tree onto every node of every arm at once. .git is three
+    # quarters of the bytes and the job never reads it. Worse, any git command in
+    # the pinned tree creates and removes .git/index.lock, and a copy that
+    # enumerates the directory before the lock is gone but opens it after fails
+    # with ENOENT, which kills the staging task and takes the whole step down with
+    # it. Excluding .git removes both the cost and the race. Keep apostrophes out
+    # of this block: in some callers it sits inside a single-quoted bash -c body.
+    mkdir -p "$node_root/source"
+    tar --create --file=- --exclude=./.git --directory="$SOURCE_PATH" . \
+        | tar --extract --file=- --directory="$node_root/source"
     cp -rL --no-preserve=all -- "$TARGET_PATH" "$node_root/input/target"
     if (( SLURM_NODEID == 1 )); then
         cp -rL --no-preserve=all -- "$CORPUS_PATH" "$node_root/input/corpus"

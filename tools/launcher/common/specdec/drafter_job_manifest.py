@@ -40,6 +40,14 @@ _HORIZONS = {
     ("dspark", 8): 8,
     ("dspark", 16): 16,
 }
+# Segment count of every corpus a production wave may train against. The check
+# exists so a wave can never be launched against a half-built corpus, so a new
+# corpus has to be added here deliberately rather than inferred from the file.
+_CORPUS_SAMPLE_SIZES: dict[str, int] = {
+    "ptv2en-direct": 1_300_000,
+    "ptv3swe-direct-v1": 1_179_389,
+}
+
 _TARGET_SLURM_DEFAULTS = {
     "qwen3-30b-a3b": (
         {"nodes": 2, "segment": 2},
@@ -47,6 +55,15 @@ _TARGET_SLURM_DEFAULTS = {
     ),
     "qwen3-235b-a22b": (
         {"nodes": 4, "segment": 4},
+        {"nodes": 16, "segment": 16},
+    ),
+    # Three sanctioned widths rather than the usual two. Qwen3-8B serves at
+    # tp 1, so the serve half scales down to a single node, and the cluster is
+    # rarely idle enough to hold sixteen nodes per arm across a six-arm wave;
+    # eight is the width a full wave can actually get scheduled at.
+    "qwen3-8b": (
+        {"nodes": 2, "segment": 2},
+        {"nodes": 8, "segment": 8},
         {"nodes": 16, "segment": 16},
     ),
 }
@@ -154,6 +171,8 @@ class TargetTopology:
             32,
         ):
             raise ValueError("Q235 accumulation must match the pinned 4/16-node topology")
+        if self.target_kind == "qwen3-8b" and self.gradient_accumulation_steps not in (8, 16, 64):
+            raise ValueError("Qwen3-8B accumulation must match the pinned 2/8/16-node topology")
 
 
 _TARGET_DEFAULTS = {
@@ -174,6 +193,22 @@ _TARGET_DEFAULTS = {
         "gradient_accumulation_steps": 32,
         "num_attention_heads": 64,
         "num_key_value_heads": 4,
+        "head_dim": 128,
+        "intermediate_size": 12288,
+    },
+    # The drafter is built at the target's width, so a dense target costs more
+    # than its parameter count suggests: Qwen3-8B is hidden 4096 against the
+    # 30B MoE's 2048, which makes the same five-layer drafter 3.4x the
+    # parameters and doubles activation bytes per token. Halving the per-device
+    # batch against Q30 keeps a 16k-sequence step inside HBM, and serve_tp is 1
+    # because the entire target is 16 GB.
+    "qwen3-8b": {
+        "capture_ids": (2, 10, 18, 26, 34, 36),
+        "serve_tp": 1,
+        "per_device_train_batch_size": 2,
+        "gradient_accumulation_steps": 64,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
         "head_dim": 128,
         "intermediate_size": 12288,
     },
@@ -242,8 +277,17 @@ class DrafterExperiment:
             )
         if not self.cumulative_max_steps or any(step < 1 for step in self.cumulative_max_steps):
             raise ValueError("cumulative_max_steps must contain positive boundaries")
-        if self.sample_size != 1_300_000:
-            raise ValueError("production sample_size must be exactly 1,300,000")
+        expected_sample_size = _CORPUS_SAMPLE_SIZES.get(self.dataset)
+        if expected_sample_size is None:
+            raise ValueError(
+                f"unknown production corpus {self.dataset!r}; add its segment count to "
+                "_CORPUS_SAMPLE_SIZES before submitting against it"
+            )
+        if self.sample_size != expected_sample_size:
+            raise ValueError(
+                f"production sample_size for {self.dataset} must be exactly "
+                f"{expected_sample_size:,}"
+            )
         if tuple(sorted(set(self.cumulative_max_steps))).__len__() != len(
             self.cumulative_max_steps
         ):

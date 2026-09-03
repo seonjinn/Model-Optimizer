@@ -215,7 +215,16 @@ JOB_ROOT="${SCRATCH_ROOT%/}/${USER}/${SLURM_JOB_ID}/qwen4b-synthesis-${EXPERIMEN
 rm -rf -- "$JOB_ROOT"
 mkdir -p "$JOB_ROOT/input" "$JOB_ROOT/runtime" "$JOB_ROOT/replicas" "$JOB_ROOT/logs"
 mkdir -p "$ATTEMPT_ROOT/replicas"
-cp -rP --no-preserve=all -- "$SOURCE_PATH" "$JOB_ROOT/source"
+# Staging copies this tree onto every node of every arm at once. .git is three
+# quarters of the bytes and the job never reads it. Worse, any git command in
+# the pinned tree creates and removes .git/index.lock, and a copy that
+# enumerates the directory before the lock is gone but opens it after fails
+# with ENOENT, which kills the staging task and takes the whole step down with
+# it. Excluding .git removes both the cost and the race. Keep apostrophes out
+# of this block: in some callers it sits inside a single-quoted bash -c body.
+mkdir -p "$JOB_ROOT/source"
+tar --create --file=- --exclude=./.git --directory="$SOURCE_PATH" . \
+    | tar --extract --file=- --directory="$JOB_ROOT/source"
 cp -rL --no-preserve=all -- "$TARGET_PATH" "$JOB_ROOT/input/target"
 cp -rL --no-preserve=all -- "$PROMPT_DATA_ROOT" "$JOB_ROOT/input/prompts"
 python3 - "$JOB_ROOT/input/generation-identity.json" "$TARGET_REVISION" "$TOKENIZER_SHA256" \
