@@ -296,6 +296,67 @@ HS_MAX_TOKENS="${HS_MAX_TOKENS:-$SERVE_MAX_MODEL_LEN}"
     exit 2
 }
 export HS_MAX_TOKENS
+
+# The streaming fetch queue is host memory, and it stays invisible until the
+# window grows. Each rank keeps num_workers x prefetch x per_device_train_batch_size
+# samples in flight, on every rank of a node at once, before the collator runs.
+# At 4096 that queue is a rounding error. At 16384 it is not: the first PTV3-SWE
+# arms to run with a correctly sized hidden-state pool (3534670/3534672) peaked
+# at 885 GiB of 900 GiB RealMemory and were cgroup-OOM-killed 29 minutes in, 23
+# oom_kill events, before step 1. Their predecessors survived the same window on
+# the same pin only because a 4096 pool was silently filtering every long prompt
+# back out of the stream. Size the queue from the window, and refuse at submit
+# rather than at minute 29.
+#
+# num_workers is the only queue-depth knob that reaches the DataLoader. The
+# trainer builds its own loader (examples/speculative_decoding/main.py) passing
+# num_workers, pin_memory and persistent_workers but not prefetch_factor, so
+# training.dataloader_prefetch_factor is accepted by the extra=allow config and
+# then ignored: torch holds 2 batches per worker regardless. Solve for workers
+# against that fixed depth instead of pretending prefetch is tunable.
+#
+# HS_RESIDENCY_MULTIPLIER turns raw captured bytes into observed host bytes. The
+# raw tensor is capture_ids x hidden x 2 per token, but each in-flight sample
+# also carries the /done clone, the aux reshape copy, its slot in the padded
+# collated batch, and per-worker allocator arenas that never return to the OS.
+# 9x is measured off 3534670: Qwen3-30B-A3B, 6 captures, hidden 2048, 16384
+# tokens, 4 workers, 4 ranks per node.
+TORCH_PREFETCH_DEPTH=2
+HS_RESIDENCY_BUDGET_PCT="${HS_RESIDENCY_BUDGET_PCT:-25}"
+HS_RESIDENCY_MULTIPLIER="${HS_RESIDENCY_MULTIPLIER:-9}"
+[[ "$HS_RESIDENCY_BUDGET_PCT" =~ ^[1-9][0-9]?$ ]] || { echo "HS_RESIDENCY_BUDGET_PCT must be 1-99" >&2; exit 2; }
+[[ "$HS_RESIDENCY_MULTIPLIER" =~ ^[1-9][0-9]*$ ]] || { echo "HS_RESIDENCY_MULTIPLIER must be positive" >&2; exit 2; }
+TARGET_HIDDEN_SIZE="$(grep -o '"hidden_size"[[:space:]]*:[[:space:]]*[0-9]\+' "$TARGET_PATH/config.json" | head -1 | grep -o '[0-9]\+$' || true)"
+[[ "$TARGET_HIDDEN_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "no hidden_size in ${TARGET_PATH}/config.json" >&2; exit 2; }
+CAPTURE_COUNT=$(( $(tr -cd , <<<"$EAGLE_CAPTURE_IDS" | wc -c) + 1 ))
+NODE_MEM_MIB=$(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo) / 1024 ))
+(( NODE_MEM_MIB > 0 )) || { echo "could not read MemTotal" >&2; exit 2; }
+# Host cost of one dataloader worker, counted across every rank on a node.
+RESIDENCY_WORKER_MIB=$(( CAPTURE_COUNT * TARGET_HIDDEN_SIZE * 2 * TRAINING_SEQ_LEN / 1048576 \
+    * HS_RESIDENCY_MULTIPLIER * TORCH_PREFETCH_DEPTH * PER_DEVICE_TRAIN_BATCH_SIZE * GPUS_PER_NODE ))
+RESIDENCY_BUDGET_MIB=$(( NODE_MEM_MIB * HS_RESIDENCY_BUDGET_PCT / 100 ))
+(( RESIDENCY_WORKER_MIB > 0 )) || { echo "residency worker cost computed as zero" >&2; exit 2; }
+derived_workers=$(( RESIDENCY_BUDGET_MIB / RESIDENCY_WORKER_MIB ))
+(( derived_workers > 4 )) && derived_workers=4
+(( derived_workers >= 1 )) || {
+    echo "one dataloader worker needs ${RESIDENCY_WORKER_MIB} MiB per node against a ${RESIDENCY_BUDGET_MIB} MiB budget" >&2
+    echo "window ${TRAINING_SEQ_LEN} cannot stream on this topology: lower per_device_train_batch_size in the manifest" >&2
+    echo "(that changes the training fingerprint, so it needs a new output root and re-adoption)" >&2
+    exit 2
+}
+STREAMING_NUM_WORKERS="${STREAMING_NUM_WORKERS:-$derived_workers}"
+[[ "$STREAMING_NUM_WORKERS" =~ ^[1-9][0-9]*$ ]] || { echo "STREAMING_NUM_WORKERS must be positive" >&2; exit 2; }
+RESIDENCY_PREDICTED_MIB=$(( STREAMING_NUM_WORKERS * RESIDENCY_WORKER_MIB ))
+(( RESIDENCY_PREDICTED_MIB <= RESIDENCY_BUDGET_MIB )) || {
+    echo "streaming queue predicted at ${RESIDENCY_PREDICTED_MIB} MiB per node, budget ${RESIDENCY_BUDGET_MIB} MiB of ${NODE_MEM_MIB} MiB" >&2
+    echo "${STREAMING_NUM_WORKERS} workers at window ${TRAINING_SEQ_LEN} would OOM the trainer nodes" >&2
+    echo "unset STREAMING_NUM_WORKERS to let the job derive it" >&2
+    exit 2
+}
+export STREAMING_NUM_WORKERS
+echo "host residency: window=${TRAINING_SEQ_LEN} captures=${CAPTURE_COUNT} hidden=${TARGET_HIDDEN_SIZE}" \
+     "worker=${RESIDENCY_WORKER_MIB}MiB workers=${STREAMING_NUM_WORKERS} predicted=${RESIDENCY_PREDICTED_MIB}MiB" \
+     "budget=${RESIDENCY_BUDGET_MIB}MiB node=${NODE_MEM_MIB}MiB"
 [[ "${SELF_REQUEUE:-0}" =~ ^[01]$ ]] || { echo "SELF_REQUEUE must be 0 or 1" >&2; exit 2; }
 if [[ "${SELF_REQUEUE:-0}" == 1 ]]; then
     [[ "${MAX_REQUEUES:-}" =~ ^[1-9][0-9]*$ ]] || { echo "MAX_REQUEUES must be positive" >&2; exit 2; }
@@ -590,6 +651,38 @@ PY
     if [[ -n "${DFLASH_EXTRA_TRAIN_ARGS:-}" ]]; then
         read -ra extra_args <<< "${DFLASH_EXTRA_TRAIN_ARGS}"
     fi
+    # glibc hands every thread of every forked dataloader worker its own arena
+    # and never returns them, which inflates RSS past what the tensors explain.
+    # The default cap here is 8 arenas per core against 140 cores. Set
+    # DFLASH_EXTRA_TRAIN_ARGS training.dataloader_pin_memory=false as well if a
+    # node still runs close: it is the one other loader knob main.py honours.
+    export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-4}"
+    # A cgroup OOM leaves behind an oom_kill count and nothing else, and the
+    # serve logs that would explain it sit on node-local scratch that is wiped
+    # with the job. Sample host memory per node into the output root so the next
+    # leg is sized from a measured curve. Backgrounded before the exec below, so
+    # it outlives the replacement and dies with the step. No apostrophes here:
+    # this block sits inside a single-quoted bash -c body.
+    rss_dir="${OUTPUT_ROOT}/logs/rss-${SLURM_JOB_ID}"
+    mkdir -p "$rss_dir"
+    (
+        rss_tsv="${rss_dir}/${SLURMD_NODENAME}.tsv"
+        printf "epoch\tused_mib\ttotal_mib\tpct\n" >"$rss_tsv"
+        rss_warned=0
+        while :; do
+            rss_total=$(sed -n "s/^MemTotal: *\([0-9]*\) kB/\1/p" /proc/meminfo)
+            rss_avail=$(sed -n "s/^MemAvailable: *\([0-9]*\) kB/\1/p" /proc/meminfo)
+            rss_used_mib=$(( (rss_total - rss_avail) / 1024 ))
+            rss_total_mib=$(( rss_total / 1024 ))
+            rss_pct=$(( rss_used_mib * 100 / rss_total_mib ))
+            printf "%s\t%s\t%s\t%s\n" "$(date +%s)" "$rss_used_mib" "$rss_total_mib" "$rss_pct" >>"$rss_tsv"
+            if (( rss_pct >= 85 )) && (( rss_warned == 0 )); then
+                echo "HOST MEMORY WARNING ${SLURMD_NODENAME}: ${rss_used_mib}/${rss_total_mib} MiB (${rss_pct} percent)" >&2
+                rss_warned=1
+            fi
+            sleep 30
+        done
+    ) &
     cd "$node_root/source/tools/launcher"
     exec bash common/eagle3/train_eagle_streaming.sh \
         --config "modules/Model-Optimizer/modelopt_recipes/general/speculative_decoding/${METHOD}.yaml" \
